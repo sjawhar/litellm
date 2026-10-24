@@ -3104,6 +3104,26 @@ class TestOverrideOpenAIResponseModel:
         # Verify the model WAS overridden to requested model
         assert response_obj["model"] == requested_model
 
+    @pytest.mark.parametrize(
+        ("provider_model", "client_model"),
+        [
+            pytest.param("claude-opus-4-8", "claude-opus-4-8", id="anthropic-fallback-model-kept"),
+            pytest.param("claude-fable-5", "fable-alias", id="routed-model-restamped"),
+            pytest.param("claude-fable-5-20260607", "fable-alias", id="routed-snapshot-restamped"),
+        ],
+    )
+    def test_override_keeps_a_model_the_provider_fell_back_to(self, provider_model: str, client_model: str):
+        response_obj = {"model": provider_model}
+
+        _override_openai_response_model(
+            response_obj=response_obj,
+            requested_model="fable-alias",
+            log_context="test_context",
+            routed_model="anthropic/claude-fable-5",
+        )
+
+        assert response_obj["model"] == client_model
+
     def test_override_model_overrides_when_no_fallback_object(self):
         """
         Test that when no fallback occurred (object response), the model is overridden
