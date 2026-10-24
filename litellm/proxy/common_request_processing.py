@@ -37,6 +37,7 @@ from litellm.anthropic_interface.exceptions import AnthropicErrorSseFrame, anthr
 from litellm.constants import (
     DD_TRACER_STREAMING_CHUNK_YIELD_RESOURCE,
     DEFAULT_MAX_RECURSE_DEPTH,
+    LITELLM_CLIENT_DISCONNECT_DETAIL,
     LITELLM_DETAILED_TIMING,
     LITELLM_HTTP_STATUS_CLIENT_DISCONNECTED,
     MAX_LITELLM_CALL_ID_LENGTH,
@@ -246,6 +247,7 @@ else:
     ProxyConfig = Any
 from litellm.proxy.anthropic_endpoints.streaming_model_restamp import (
     AnthropicStreamModelRestamper,
+    provider_model_is_routed,
 )
 from litellm.proxy.litellm_pre_call_utils import (
     add_litellm_data_to_request,
@@ -1369,12 +1371,33 @@ def is_azure_model_router_request(model: str, hidden_params: Mapping[str, object
 _is_azure_model_router_request: Final = is_azure_model_router_request
 
 
+def _resolved_provider(request_data: Mapping[str, object]) -> object:
+    logging_obj: Final = request_data.get("litellm_logging_obj")
+    call_details: Final = getattr(logging_obj, "model_call_details", None)
+    return call_details.get("custom_llm_provider") if isinstance(call_details, Mapping) else None
+
+
+def _server_side_fallback_routed_model(request_data: Mapping[str, object]) -> str | None:
+    """
+    The routed deployment's provider model (litellm_params.model, recorded by the Router in its own request metadata
+    bucket), on a request that carries Anthropic's server-side `fallbacks` to the direct Anthropic provider: the only
+    request where the provider can answer with another model. The provider is the resolved one, the value the
+    request filter forwards `fallbacks` on. None for every other request, whose response model is restamped as always.
+    """
+    if request_data.get("fallbacks") is None or _resolved_provider(request_data) != "anthropic":
+        return None
+    router_bucket: Final = request_data.get("litellm_metadata")
+    deployment: Final = router_bucket.get("deployment") if isinstance(router_bucket, Mapping) else None
+    return deployment if isinstance(deployment, str) and deployment else None
+
+
 def _override_openai_response_model(
     *,
     response_obj: object,
     requested_model: str,
     log_context: str,
     return_raw_model_name: bool = False,
+    routed_model: str | None = None,
 ) -> None:
     """
     Force the OpenAI-compatible `model` field in the response to match what the client requested.
@@ -1397,6 +1420,8 @@ def _override_openai_response_model(
        that was used (e.g., gpt-5-nano-2025-08-07) instead of the router model.
     3. If this was a fastest_response batch completion, use the winning model's
        model group name instead of the comma-separated list the client sent.
+    4. If ``routed_model`` is given and the provider answered with another model (Anthropic's
+       server-side fallback), we preserve the provider's model.
     """
     if return_raw_model_name or not requested_model:
         return
@@ -1445,6 +1470,8 @@ def _override_openai_response_model(
         if "model" not in response_obj:
             return
         downstream_model = response_obj.get("model")
+        if not provider_model_is_routed(downstream_model, routed_model):
+            return
         if downstream_model != requested_model:
             verbose_proxy_logger.debug(
                 "%s: response model mismatch - requested=%r downstream=%r. Overriding response['model'] to requested model.",
@@ -1459,6 +1486,8 @@ def _override_openai_response_model(
         return
 
     downstream_model = getattr(response_obj, "model", None)
+    if not provider_model_is_routed(downstream_model, routed_model):
+        return
     if downstream_model != requested_model:
         verbose_proxy_logger.debug(
             "%s: response model mismatch - requested=%r downstream=%r. Overriding response.model to requested model.",
@@ -1655,7 +1684,7 @@ def _has_attribute_error_in_chain(exc: Exception) -> bool:
     return False
 
 
-_CLIENT_DISCONNECT_DETAIL: Final = "Client disconnected the request"
+_CLIENT_DISCONNECT_DETAIL: Final = LITELLM_CLIENT_DISCONNECT_DETAIL
 
 
 @runtime_checkable
@@ -2990,6 +3019,9 @@ class ProxyBaseLLMRequestProcessing:
                 requested_model=requested_model_from_client,
                 log_context=f"litellm_call_id={logging_obj.litellm_call_id}",
                 return_raw_model_name=should_return_raw_model_name(self.data),
+                routed_model=(
+                    _server_side_fallback_routed_model(self.data) if route_type == "anthropic_messages" else None
+                ),
             )
 
         fastapi_response.headers.update(
@@ -4106,7 +4138,11 @@ class ProxyBaseLLMRequestProcessing:
         event in place of the provider's model, matching what the non-streaming
         response reports.
         """
-        restamper: Final = AnthropicStreamModelRestamper(restamp_model) if restamp_model else None
+        restamper: Final = (
+            AnthropicStreamModelRestamper(restamp_model, routed_model=_server_side_fallback_routed_model(request_data))
+            if restamp_model
+            else None
+        )
         return ProxyBaseLLMRequestProcessing.async_streaming_data_generator(
             response=response,
             user_api_key_dict=user_api_key_dict,
