@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, cast
 
 import litellm
 from litellm._logging import verbose_router_logger
@@ -314,6 +314,18 @@ _PER_REQUEST_FALLBACK_CONTROL_KEYS: Final = (
 )
 
 
+def provider_owns_fallbacks_field(kwargs: Mapping[str, object]) -> bool:
+    """On /v1/messages, `fallbacks` is Anthropic's server-side fallback parameter, never the Router's own list"""
+    function_name: Final[object] = getattr(kwargs.get("original_generic_function"), "__name__", None)
+    return function_name == "anthropic_messages"
+
+
+def request_fallbacks(kwargs: Mapping[str, object], router_fallbacks: list[object] | None) -> list[object] | None:
+    if provider_owns_fallbacks_field(kwargs):
+        return router_fallbacks
+    return cast("list[object] | None", kwargs.get("fallbacks", router_fallbacks))  # cast-ok: router attribute type
+
+
 @dataclass(frozen=True, slots=True)
 class MidStreamFallbackControls:
     """
@@ -381,6 +393,9 @@ def mid_stream_fallback_hop_kwargs(
 
 
 _MID_STREAM_RETRY_STRIPPED_KEYS: Final = (*_PER_REQUEST_FALLBACK_CONTROL_KEYS, "original_function")
+_PROVIDER_FALLBACKS_RETRY_STRIPPED_KEYS: Final = tuple(
+    key for key in _MID_STREAM_RETRY_STRIPPED_KEYS if key != "fallbacks"
+)
 _MID_STREAM_RETRY_ATTEMPTED_KEY: Final = "attempted_retries"
 _MID_STREAM_RETRY_BUDGET_KEY: Final = "max_retries"
 
@@ -393,7 +408,12 @@ def mid_stream_retry_kwargs(
     pops the per-request controls and the chain's original_function before any attempt runs, and
     the controls carrier the snapshot still holds restores the overrides into the retry's own hop.
     """
-    return {key: value for key, value in hop_kwargs.items() if key not in _MID_STREAM_RETRY_STRIPPED_KEYS}
+    stripped: Final = (
+        _PROVIDER_FALLBACKS_RETRY_STRIPPED_KEYS
+        if provider_owns_fallbacks_field(hop_kwargs)
+        else _MID_STREAM_RETRY_STRIPPED_KEYS
+    )
+    return {key: value for key, value in hop_kwargs.items() if key not in stripped}
 
 
 def _request_metadata_bucket(kwargs: Mapping[str, object]) -> Mapping[str, object] | None:

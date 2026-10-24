@@ -998,6 +998,19 @@ class ChunkProcessor:
         ]
         return values[-1] if values else None
 
+    def _last_iterations(self, chunks: Sequence["_UsageBearingChunk | ModelResponse"]) -> list[object] | None:
+        """
+        The last ``usage.iterations`` a chunk carried. Anthropic sends every attempt's model and tokens there on the
+        final ``message_delta``, and a reply its server-side fallback served is priced attempt by attempt from it.
+        """
+        values: Final = [
+            value
+            for chunk in chunks
+            if (usage_chunk := self._extract_usage_chunk(chunk)) is not None
+            and isinstance(value := getattr(usage_chunk, "iterations", None), list)
+        ]
+        return values[-1] if values else None
+
     @staticmethod
     def _finish_reason_of_choice(choice: object) -> str | None:
         match choice:
@@ -1170,6 +1183,7 @@ class ChunkProcessor:
             for field, value in (
                 ("inference_geo", calculated_usage_per_chunk["inference_geo"]),
                 ("speed", calculated_usage_per_chunk["speed"]),
+                ("iterations", self._last_iterations(chunks)),
             )
             if value is not None
         }
