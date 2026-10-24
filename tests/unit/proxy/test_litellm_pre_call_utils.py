@@ -1282,6 +1282,7 @@ async def test_key_metadata_enable_prompt_caching_promoted_to_request_root(key_v
         "_code_interpreter_interception_sandbox_key",
         "_headroom_interception_converted_stream",
         "max_agentic_loops",
+        "router_fallbacks",
     ],
 )
 async def test_add_litellm_data_to_request_strips_callback_control_fields(
@@ -1317,6 +1318,7 @@ async def test_add_litellm_data_to_request_strips_callback_control_fields(
         "_code_interpreter_interception_sandbox_key": "forged-key",
         "_headroom_interception_converted_stream": True,
         "max_agentic_loops": 9999,
+        "router_fallbacks": [{"model": "gpt-3.5-turbo", "api_base": "https://attacker.example"}],
     }
     sample_value = sample_values[control_field]
 
@@ -9044,3 +9046,28 @@ def test_arize_otlp_protocol_on_a_key_logging_entry_reaches_the_destination(monk
         assert destinations[0].endpoint == "https://arize.internal.example/v1/traces"
     finally:
         is_otel_v2_enabled.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "beta_lines",
+    [
+        pytest.param(("server-side-fallback-2026-07-01", "prompt-caching-2024-07-31"), id="opt-in-first"),
+        pytest.param(("prompt-caching-2024-07-31", "server-side-fallback-2026-07-01"), id="opt-in-last"),
+    ],
+)
+def test_repeated_anthropic_beta_lines_reach_routing_as_auth_sees_them(beta_lines):
+    from starlette.datastructures import Headers
+
+    from litellm.llms.anthropic.common_utils import (
+        anthropic_beta_opts_into_server_side_fallback,
+        anthropic_owns_fallbacks,
+    )
+    from litellm.proxy.litellm_pre_call_utils import add_provider_specific_headers_to_request, clean_headers
+
+    headers = Headers(raw=[(b"anthropic-beta", line.encode()) for line in beta_lines])
+    data: dict = {}
+    add_provider_specific_headers_to_request(data=data, headers=clean_headers(headers))
+
+    assert anthropic_beta_opts_into_server_side_fallback(headers) is True
+    assert anthropic_owns_fallbacks(data) is True
+    assert data["provider_specific_header"]["extra_headers"]["anthropic-beta"].split(",") == list(beta_lines)

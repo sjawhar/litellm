@@ -1344,14 +1344,14 @@ async def test_track_cost_callback_releases_reservation_for_unpollable_interacti
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", ["completed", "requires_action"])
+@pytest.mark.parametrize("status", ["completed", "requires_action", "requires_continuation"])
 async def test_track_cost_callback_alerts_when_an_interaction_that_produced_output_has_no_usage(status):
     """
-    ``completed`` and ``requires_action`` both mean the model produced output,
-    so a usage block is always expected with them. One arriving without it
-    means the charge for real work was lost, which is exactly what the
-    cost-tracking alert is for: silencing it here would let an operator's
-    interactions bill nothing with no signal that anything went wrong.
+    ``completed``, ``requires_action`` and ``requires_continuation`` all mean
+    the model produced output, so a usage block is always expected with them.
+    One arriving without it means the charge for real work was lost, which is
+    exactly what the cost-tracking alert is for: silencing it here would let an
+    operator's interactions bill nothing with no signal that anything went wrong.
 
     The reservation still has to be released, since suppressing the alert was
     never what freed it.
@@ -1472,6 +1472,7 @@ async def test_callback_handles_every_status_the_interactions_api_can_return():
         "cancelled",
         "incomplete",
         "budget_exceeded",
+        "requires_continuation",
     }
 
 

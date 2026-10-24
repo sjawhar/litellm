@@ -1,6 +1,7 @@
 # What is this?
 ## File for 'response_cost' calculation in Logging
 import logging
+import re
 import time
 from collections.abc import Mapping, Sequence
 from functools import lru_cache
@@ -9,7 +10,12 @@ from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
 from httpx import Response
 from pydantic import BaseModel, TypeAdapter
-from typing_extensions import ReadOnly, TypedDict, assert_never
+from typing_extensions import (
+    ReadOnly,
+    TypedDict,
+    TypeIs,  # noqa: TID251  # TypeIs reaches typing only on 3.13
+    assert_never,
+)
 
 import litellm
 import litellm._logging
@@ -116,6 +122,7 @@ from litellm.types.llms.openai import (
 from litellm.types.rerank import RerankBilledUnits, RerankResponse
 from litellm.types.utils import (
     CallTypesLiteral,
+    CostBreakdown,
     LiteLLMRealtimeStreamLoggingObject,
     LlmProviders,
     LlmProvidersSet,
@@ -1404,6 +1411,130 @@ def _split_responses_ws_logging_object_by_service_tier(
     )
 
 
+def _as_mapping(value: object) -> Mapping[str, object] | None:
+    if isinstance(value, Mapping):
+        return cast("Mapping[str, object]", value)
+    if isinstance(value, BaseModel):
+        return value.model_dump()
+    return None
+
+
+def _is_iteration_list(value: object) -> TypeIs[Sequence[object]]:  # guard-ok: isinstance cannot type the items
+    return isinstance(value, Sequence) and not isinstance(value, str)
+
+
+def _is_mapping(value: object) -> TypeIs[Mapping[object, object]]:  # guard-ok: isinstance cannot type the keys
+    return isinstance(value, Mapping)
+
+
+# Pricing inputs that hold for every attempt of the request (region uplift, fast mode, tier), and those that the top
+# level reports for the attempt that produced the reply (server tool calls such as web search).
+_REQUEST_WIDE_USAGE_FIELDS: Final = ("inference_geo", "speed", "service_tier")
+_SERVED_ATTEMPT_USAGE_FIELDS: Final = ("server_tool_use",)
+
+
+def _split_anthropic_fallback_iterations(
+    completion_response: object,
+) -> tuple[tuple[str | None, Mapping[str, object]], ...] | None:
+    """
+    A /v1/messages response that Anthropic's server-side fallback served lists every attempt in
+    ``usage.iterations``, each with its own model (a ``fallback_message`` entry marks the model that
+    answered). Returns one response per attempt, carrying that attempt's model and usage alone, so each
+    attempt is priced at its own model's rates. Every attempt is billed, including a decline that
+    Anthropic does not bill for some refusal categories.
+    """
+    response: Final = _as_mapping(completion_response) if _is_mapping(completion_response) else None
+    raw_usage: Final[object] = (
+        response.get("usage") if response is not None else getattr(completion_response, "usage", None)
+    )
+    usage_mapping: Final = _as_mapping(raw_usage) if _is_mapping(raw_usage) else None
+    iterations: Final[object] = (
+        usage_mapping.get("iterations") if usage_mapping is not None else getattr(raw_usage, "iterations", None)
+    )
+    if not _is_iteration_list(iterations):
+        return None
+    entries: Final = tuple(entry for entry in map(_as_mapping, iterations) if entry is not None)
+    if not any(entry.get("type") == "fallback_message" for entry in entries):
+        return None
+    usage: Final[Mapping[str, object]] = _as_mapping(raw_usage) or MappingProxyType({})
+    response_model: Final[object] = (
+        response.get("model") if response is not None else getattr(completion_response, "model", None)
+    )
+    request_wide: Final = {key: usage[key] for key in _REQUEST_WIDE_USAGE_FIELDS if usage.get(key) is not None}
+    served_only: Final = {key: usage[key] for key in _SERVED_ATTEMPT_USAGE_FIELDS if usage.get(key) is not None}
+    return tuple(
+        (
+            entry_model if isinstance(entry_model := entry.get("model"), str) else None,
+            {
+                "model": entry_model if isinstance(entry_model, str) else response_model,
+                "usage": {
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    **request_wide,
+                    **(served_only if entry.get("type") == "fallback_message" else {}),
+                    **{
+                        key: value for key, value in entry.items() if key not in ("type", "model") and value is not None
+                    },
+                },
+            },
+        )
+        for entry in entries
+    )
+
+
+def is_model_or_dated_snapshot(candidate: str, model: str) -> bool:
+    """Whether ``candidate`` is ``model`` or its dated snapshot (``model-YYYYMMDD``)"""
+    return candidate == model or re.fullmatch(re.escape(model) + r"-\d{8}", candidate) is not None
+
+
+def _summed_breakdown(breakdowns: Sequence[CostBreakdown], field: str) -> float | None:
+    values: Final = tuple(value for breakdown in breakdowns if isinstance(value := breakdown.get(field), (int, float)))
+    return sum(values) if values else None
+
+
+def _sum_attempt_costs(
+    priced_attempts: Sequence[tuple[float, CostBreakdown | None]],
+    litellm_logging_obj: "LitellmLoggingObject | None",
+    custom_llm_provider: str | None,
+) -> float:
+    """
+    Add up the attempts of one request. Each attempt was priced as a whole request, so a fixed per-request margin is
+    taken off all but one, and the logging object gets one breakdown that adds the attempts up instead of the last
+    attempt's alone.
+    """
+    fixed_margin: Final = (
+        _apply_cost_margin(base_cost=0.0, custom_llm_provider=custom_llm_provider)[2]
+        if litellm.cost_margin_config
+        else 0.0
+    )
+    duplicated_fixed_margin: Final = fixed_margin * (len(priced_attempts) - 1)
+    total_cost: Final = sum(cost for cost, _ in priced_attempts) - duplicated_fixed_margin
+    breakdowns: Final = tuple(breakdown for _, breakdown in priced_attempts if breakdown is not None)
+    if litellm_logging_obj is None or not breakdowns or len(breakdowns) != len(priced_attempts):
+        return total_cost
+    first: Final = breakdowns[0]
+    summed_margin_total: Final = _summed_breakdown(breakdowns, "margin_total_amount")
+    litellm_logging_obj.set_cost_breakdown(
+        input_cost=_summed_breakdown(breakdowns, "input_cost") or 0.0,
+        output_cost=_summed_breakdown(breakdowns, "output_cost") or 0.0,
+        total_cost=total_cost,
+        cost_for_built_in_tools_cost_usd_dollar=_summed_breakdown(breakdowns, "tool_usage_cost") or 0.0,
+        original_cost=_summed_breakdown(breakdowns, "original_cost"),
+        discount_percent=first.get("discount_percent"),
+        discount_amount=_summed_breakdown(breakdowns, "discount_amount"),
+        margin_percent=first.get("margin_percent"),
+        margin_fixed_amount=first.get("margin_fixed_amount"),
+        margin_total_amount=None if summed_margin_total is None else summed_margin_total - duplicated_fixed_margin,
+        cache_read_cost=_summed_breakdown(breakdowns, "cache_read_cost"),
+        cache_creation_cost=_summed_breakdown(breakdowns, "cache_creation_cost"),
+        reasoning_cost=_summed_breakdown(breakdowns, "reasoning_cost"),
+        service_tier=first.get("service_tier"),
+        data_residency=first.get("data_residency"),
+        vertex_location=first.get("vertex_location"),
+    )
+    return total_cost
+
+
 def _response_time_ms_for_cost(
     completion_response: object,
     litellm_logging_obj: LitellmLoggingObject | None,
@@ -1517,6 +1648,40 @@ def completion_cost(
                     for part in ws_tier_parts
                 )
 
+        fallback_parts: Final = _split_anthropic_fallback_iterations(completion_response)
+        if fallback_parts is not None:
+            routed_model: Final = (litellm_model_name or model or "").split("/", 1)[-1]
+
+            def price_attempt(attempt_model: str | None, part: Mapping[str, object]) -> float:
+                routed: Final = attempt_model is None or is_model_or_dated_snapshot(attempt_model, routed_model)
+                return completion_cost(
+                    completion_response=part,
+                    call_type=call_type,
+                    custom_llm_provider=custom_llm_provider,
+                    region_name=region_name,
+                    optional_params=optional_params,
+                    standard_built_in_tools_params=standard_built_in_tools_params,
+                    litellm_logging_obj=litellm_logging_obj,
+                    service_tier=service_tier,
+                    data_residency=data_residency,
+                    vertex_location=vertex_location,
+                    model=model if routed else f"anthropic/{attempt_model}",
+                    custom_cost_per_token=custom_cost_per_token if routed else None,
+                    custom_pricing=custom_pricing if routed else None,
+                    base_model=base_model if routed else None,
+                    litellm_model_name=litellm_model_name if routed else None,
+                    router_model_id=router_model_id if routed else None,
+                )
+
+            priced_attempts: Final = tuple(
+                (
+                    price_attempt(attempt_model, part),
+                    litellm_logging_obj.cost_breakdown if litellm_logging_obj is not None else None,
+                )
+                for attempt_model, part in fallback_parts
+            )
+            return _sum_attempt_costs(priced_attempts, litellm_logging_obj, custom_llm_provider)
+
         if (
             (call_type == "aimage_generation" or call_type == "image_generation")
             and model is not None
@@ -1590,18 +1755,17 @@ def completion_cost(
                     else:
                         usage_obj = getattr(completion_response, "usage", {})
                     if isinstance(usage_obj, BaseModel) and not _is_known_usage_objects(usage_obj=usage_obj):
-                        _usage_for_dump = cast(BaseModel, usage_obj)
                         setattr(
                             completion_response,
                             "usage",
-                            litellm.Usage(**_usage_for_dump.model_dump()),
+                            litellm.Usage(**usage_obj.model_dump()),
                         )
                     if isinstance(usage_obj, (DecisionsUsage, OpenAIDecisionUsage)):
                         _usage = _decisions_usage(usage_obj).model_dump()
                     elif usage_obj is None:
                         _usage = {}
                     elif isinstance(usage_obj, BaseModel):
-                        _usage = cast(BaseModel, usage_obj).model_dump()
+                        _usage = usage_obj.model_dump()
                     else:
                         _usage = usage_obj
 

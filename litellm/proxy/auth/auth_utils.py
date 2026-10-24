@@ -2,13 +2,14 @@ import importlib.util
 import os
 import re
 import sys
-from collections.abc import Collection, Iterator, Mapping
+from collections.abc import Collection, Iterable, Iterator, Mapping
 from functools import lru_cache
 from logging import Logger
 from typing import Any, Final, Protocol
 
 from fastapi import HTTPException, Request, status
 from pydantic import PositiveInt, TypeAdapter, ValidationError
+from typing_extensions import TypeIs  # noqa: TID251  # TypeIs reaches typing only on 3.13
 
 import litellm
 from litellm import Router, constants, provider_list
@@ -32,6 +33,11 @@ from litellm.llms.azure.passthrough.transformation import azure_router_model_in_
 from litellm.llms.nvidia_nim.passthrough.transformation import nvidia_nim_model_group_in_path
 from litellm.proxy._types import *
 from litellm.proxy.common_utils.http_parsing_utils import extract_nested_form_metadata
+from litellm.router_utils.clientside_credential_handler import (
+    reject_fallback_target_credentials,
+    reject_fallback_target_routing,
+)
+from litellm.router_utils.fallback_event_handlers import ROUTER_FALLBACKS_KWARG
 from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     LITELLM_PASS_THROUGH_ENDPOINT_MARKER,
 )
@@ -496,24 +502,69 @@ def _check_banned_params(
         )
 
 
+# The client wrapper swaps a model for this mapping's value on a context-window error (litellm/utils.py)
+CONTEXT_WINDOW_FALLBACK_DICT_FIELD: Final = "context_window_fallback_dict"
+# A mock param on a target would make the hop answer without the gate that stops a top-level one
+_FALLBACK_TARGET_MOCK_FIELDS: Final = frozenset(
+    {
+        "mock_response",
+        "mock_tool_calls",
+        "mock_testing_fallbacks",
+        "mock_testing_context_fallbacks",
+        "mock_testing_content_policy_fallbacks",
+        "mock_testing_rate_limit_error",
+        "mock_timeout",
+        "mock_delay",
+    }
+)
 _FALLBACK_FIELDS: Final[tuple[str, ...]] = (
     "fallbacks",
+    ROUTER_FALLBACKS_KWARG,
     "context_window_fallbacks",
     "content_policy_fallbacks",
+    # A Router init setting, never read per request; checked so a body copy can never carry a target past auth.
+    "default_fallbacks",
 )
 
+_ERROR_FALLBACK_FIELDS: Final[tuple[str, ...]] = ("context_window_fallbacks", "content_policy_fallbacks")
 
-def _iter_fallback_field_values(request_body: Mapping[str, object]) -> Iterator[object]:
+
+def _reject_non_list_error_fallbacks(request_body: Mapping[str, object]) -> None:
     override: Final = request_body.get("router_settings_override")
     for source in (request_body, override):
-        if isinstance(source, Mapping):
+        if not _is_mapping(source):
+            continue
+        for field in _ERROR_FALLBACK_FIELDS:
+            value = source.get(field)
+            if value is not None and not isinstance(value, list):
+                raise ValueError(f"Rejected Request: {field} must be a list of model groups.")
+
+
+def _is_mapping(value: object) -> TypeIs[Mapping[object, object]]:  # guard-ok: isinstance cannot type a mapping's keys
+    return isinstance(value, Mapping)
+
+
+def _iter_fallback_field_values(request_body: Mapping[str, object], skip_body_fallbacks: bool) -> Iterator[object]:
+    override: Final = request_body.get("router_settings_override")
+    for source in (request_body, override):
+        if _is_mapping(source):
             for field in _FALLBACK_FIELDS:
-                yield source.get(field)
+                if not (skip_body_fallbacks and source is request_body and field == "fallbacks"):
+                    yield source.get(field)
+    context_window_swaps: Final = request_body.get(CONTEXT_WINDOW_FALLBACK_DICT_FIELD)
+    if _is_mapping(context_window_swaps):
+        yield list(context_window_swaps.values())
 
 
 def _iter_fallback_targets(value: object, depth: int) -> Iterator[str | Mapping[str, object]]:
     if depth > 2 * litellm.ROUTER_MAX_FALLBACKS:
         raise ValueError("Rejected Request: fallback nesting exceeds the allowed validation depth.")
+    if _is_mapping(value):
+        # The Router iterates a fallback list, and iterating a mapping walks its keys, so each key is a target
+        yield from (key for key in value if isinstance(key, str))
+        for target_list in value.values():
+            yield from _iter_fallback_targets(target_list, depth + 1)
+        return
     if not isinstance(value, list):
         return
     for item in value:
@@ -531,8 +582,14 @@ def _iter_fallback_targets(value: object, depth: int) -> Iterator[str | Mapping[
                     yield from _iter_fallback_targets(target_list, depth + 1)
 
 
-def iter_request_fallback_targets(request_body: Mapping[str, object]) -> Iterator[str | Mapping[str, object]]:
-    for value in _iter_fallback_field_values(request_body):
+def iter_request_fallback_targets(
+    request_body: Mapping[str, object], *, skip_body_fallbacks: bool = False
+) -> Iterator[str | Mapping[str, object]]:
+    """
+    The targets of every LiteLLM fallback list the request carries. ``skip_body_fallbacks`` leaves out the body's
+    ``fallbacks``, for a request whose field is Anthropic's server-side fallback list instead.
+    """
+    for value in _iter_fallback_field_values(request_body, skip_body_fallbacks):
         yield from _iter_fallback_targets(value, 0)
 
 
@@ -546,14 +603,27 @@ def fallback_target_model_name(target: object) -> str | None:
     return None
 
 
+def _target_model_names(targets: Iterable[object]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(name for target in targets if (name := fallback_target_model_name(target)) is not None))
+
+
 def request_fallback_model_names(request_body: Mapping[str, object]) -> tuple[str, ...]:
-    return tuple(
-        dict.fromkeys(
-            name
-            for target in iter_request_fallback_targets(request_body)
-            if (name := fallback_target_model_name(target)) is not None
-        )
-    )
+    return _target_model_names(iter_request_fallback_targets(request_body))
+
+
+def anthropic_fallback_model_names(request_body: Mapping[str, object]) -> tuple[str, ...]:
+    """The models named in the body's ``fallbacks`` read as Anthropic's server-side fallback list"""
+    return _target_model_names(_iter_fallback_targets(request_body.get("fallbacks"), 0))
+
+
+def _reject_fallback_target_credentials(target: Mapping[str, object], allows_client_credentials: bool) -> None:
+    """A caller credential, endpoint or mock param never rides on a fallback target; the opt-in admits only the first two"""
+    mocked: Final = sorted(field for field in target if field in _FALLBACK_TARGET_MOCK_FIELDS)
+    if mocked:
+        raise ValueError(f"Rejected Request: a fallback target may not carry {', '.join(mocked)}.")
+    reject_fallback_target_routing(target)
+    if not allows_client_credentials:
+        reject_fallback_target_credentials(target)
 
 
 def _reject_url_valued_fallback_target(value: str) -> None:
@@ -571,7 +641,7 @@ def _reject_url_valued_fallback_target(value: str) -> None:
 
 
 def is_request_body_safe(
-    request_body: dict,
+    request_body: dict[str, object],
     general_settings: dict,
     llm_router: Router | None,
     model: str,
@@ -606,6 +676,8 @@ def is_request_body_safe(
     if "model_list" in request_body:
         raise ValueError("Rejected Request: model_list is not allowed in the request body.")
     manages_deployments: Final = route_manages_deployments(route)
+    allows_client_credentials: Final[bool] = general_settings.get("allow_client_side_credentials") is True
+    _reject_non_list_error_fallbacks(request_body)
     _check_banned_params(request_body, general_settings, llm_router, model, manages_deployments=manages_deployments)
     for nested_key in _NESTED_CONFIG_KEYS:
         nested = _coerce_metadata_to_dict(request_body.get(nested_key))
@@ -626,10 +698,12 @@ def is_request_body_safe(
     for target in iter_request_fallback_targets(request_body):
         if isinstance(target, dict):
             _check_banned_params(target, general_settings, llm_router, model, manages_deployments=manages_deployments)
+        if isinstance(target, Mapping):
+            _reject_fallback_target_credentials(target, allows_client_credentials)
             target_model = target.get("model")
             if isinstance(target_model, str):
                 _reject_url_valued_fallback_target(target_model)
-        elif isinstance(target, str):
+        else:
             _reject_url_valued_fallback_target(target)
     litellm_params: Final = _coerce_metadata_to_dict(request_body.get("litellm_params"))
     if litellm_params is not None:
@@ -796,8 +870,6 @@ def get_request_route(request: Request) -> str:
             return str(request.url.path)
         raw_path: Final[str] = str(scope.get("path", request.url.path))
         root_path: Final[str] = str(scope.get("app_root_path", scope.get("root_path", ""))).rstrip("/")
-        if not isinstance(raw_path, str):
-            return str(request.url.path)
         # Strip root_path only when it matches whole path segments — guarding
         # against sibling paths like "/apifoo" being truncated under
         # root_path="/api". Trailing slashes on root_path are stripped above,
