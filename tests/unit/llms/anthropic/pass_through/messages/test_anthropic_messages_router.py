@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import json
 import struct
 import uuid
@@ -11,6 +12,7 @@ from zlib import crc32
 
 import httpx
 import pytest
+import respx
 
 import litellm
 from litellm.integrations.custom_logger import CustomLogger
@@ -617,3 +619,474 @@ async def test_tool_search_forwards_deferred_tools_and_beta_header(
     assert [block for block in response["content"] if block["type"] == "tool_use"] == [
         {"type": "tool_use", "id": "toolu_1", "name": tool_name, "input": tool_input}
     ]
+
+
+_FALLBACK_TARGET: Final = "claude-opus-4-8"
+_SERVER_SIDE_FALLBACK_BETAS: Final = "server-side-fallback-2026-07-01,context-management-2025-06-27"
+
+
+def _router_with_fallback_target_group() -> Router:
+    return Router(
+        model_list=[
+            {"model_name": _ALIAS, "litellm_params": {"model": f"anthropic/{_ANTHROPIC_MODEL}", "api_key": "fake-key"}},
+            {
+                "model_name": _FALLBACK_TARGET,
+                "litellm_params": {"model": f"anthropic/{_FALLBACK_TARGET}", "api_key": "fake-key"},
+            },
+        ],
+        num_retries=0,
+    )
+
+
+def _sent_models(route: respx.Route) -> list[str]:
+    return [json.loads(call.request.read())["model"] for call in route.calls]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fallbacks", [[{"model": _FALLBACK_TARGET}], [_FALLBACK_TARGET], "default"])
+async def test_router_aanthropic_messages_does_not_switch_models_for_request_fallbacks(
+    respx_mock: respx.MockRouter, fallbacks: object
+):
+    route: Final = respx_mock.post(url__regex=_ANTHROPIC_URL).mock(
+        return_value=httpx.Response(500, json={"type": "error", "error": {"type": "api_error", "message": "boom"}})
+    )
+    with pytest.raises(litellm.InternalServerError):
+        await _router_with_fallback_target_group().aanthropic_messages(
+            messages=[{"role": "user", "content": _PROMPT}],
+            model=_ALIAS,
+            max_tokens=100,
+            fallbacks=fallbacks,
+        )
+    assert _sent_models(route) == [_ANTHROPIC_MODEL]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fallbacks", ["default", [{_ALIAS: [_FALLBACK_TARGET]}]])
+async def test_router_aanthropic_messages_returns_refusal_as_is_when_request_sets_fallbacks(
+    respx_mock: respx.MockRouter, fallbacks: object
+):
+    refusal: Final = {
+        **_anthropic_body(),
+        "content": [],
+        "stop_reason": "refusal",
+        "stop_details": {"type": "refusal", "category": "cyber", "explanation": "declined"},
+    }
+    route: Final = respx_mock.post(url__regex=_ANTHROPIC_URL).mock(return_value=httpx.Response(200, json=refusal))
+    response: Final = await _router_with_fallback_target_group().aanthropic_messages(
+        messages=[{"role": "user", "content": _PROMPT}],
+        model=_ALIAS,
+        max_tokens=100,
+        fallbacks=fallbacks,
+    )
+    assert _sent_models(route) == [_ANTHROPIC_MODEL]
+    assert isinstance(response, dict)
+    assert response["stop_reason"] == "refusal"
+    assert response["stop_details"] == refusal["stop_details"]
+
+
+_REFUSAL_STOP_DETAILS: Final = {"type": "refusal", "category": "cyber", "explanation": "declined"}
+
+
+def _refusal_sse_body() -> bytes:
+    events: Final = (
+        _STREAM_EVENTS[0],
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "refusal", "stop_sequence": None, "stop_details": _REFUSAL_STOP_DETAILS},
+            "usage": {"output_tokens": 0},
+        },
+        {"type": "message_stop"},
+    )
+    return "".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events).encode()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fallbacks", ["default", [{_ALIAS: [_FALLBACK_TARGET]}]])
+async def test_router_aanthropic_messages_streams_refusal_as_is_when_request_sets_fallbacks(
+    respx_mock: respx.MockRouter, fallbacks: object
+):
+    route: Final = respx_mock.post(url__regex=_ANTHROPIC_URL).mock(
+        return_value=httpx.Response(200, content=_refusal_sse_body(), headers={"content-type": "text/event-stream"})
+    )
+    stream: Final = await _router_with_fallback_target_group().aanthropic_messages(
+        messages=[{"role": "user", "content": _PROMPT}],
+        model=_ALIAS,
+        max_tokens=100,
+        stream=True,
+        fallbacks=fallbacks,
+    )
+    events: Final = await _stream_events(stream)
+    assert _sent_models(route) == [_ANTHROPIC_MODEL]
+    deltas: Final = [event for event in events if event.get("type") == "message_delta"]
+    assert [delta["delta"]["stop_details"] for delta in deltas] == [_REFUSAL_STOP_DETAILS]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fallbacks", ["default", [{"model": _FALLBACK_TARGET}], "not-a-valid-value"])
+async def test_router_aanthropic_messages_forwards_server_side_fallbacks_unchanged(
+    respx_mock: respx.MockRouter, fallbacks: object
+):
+    route: Final = respx_mock.post(url__regex=_ANTHROPIC_URL).mock(
+        return_value=httpx.Response(200, json=_anthropic_body())
+    )
+    await _router(_ALIAS, _ANTHROPIC_MODEL).aanthropic_messages(
+        messages=[{"role": "user", "content": _PROMPT}],
+        model=_ALIAS,
+        max_tokens=100,
+        fallbacks=fallbacks,
+        extra_headers={"anthropic-beta": _SERVER_SIDE_FALLBACK_BETAS},
+    )
+    request: Final = route.calls.last.request
+    assert json.loads(request.read())["fallbacks"] == fallbacks
+    assert set(_SERVER_SIDE_FALLBACK_BETAS.split(",")) <= set(request.headers["anthropic-beta"].split(","))
+
+
+@pytest.mark.asyncio
+async def test_router_aanthropic_messages_config_fallback_still_runs_without_forwarding_field_to_bedrock(
+    respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+):
+    _set_fake_aws_env(monkeypatch)
+    anthropic_route: Final = respx_mock.post(url__regex=_ANTHROPIC_URL).mock(
+        return_value=httpx.Response(
+            401, json={"type": "error", "error": {"type": "authentication_error", "message": "invalid x-api-key"}}
+        )
+    )
+    bedrock_route: Final = respx_mock.post(url__regex=_BEDROCK_INVOKE_URL).mock(
+        return_value=httpx.Response(200, json=_anthropic_body(model=_BEDROCK_SONNET, msg_id="msg_bedrock"))
+    )
+    router: Final = Router(
+        model_list=[
+            {"model_name": _ALIAS, "litellm_params": {"model": f"anthropic/{_ANTHROPIC_MODEL}", "api_key": "bad-key"}},
+            {"model_name": f"bedrock/{_BEDROCK_SONNET}", "litellm_params": {"model": f"bedrock/{_BEDROCK_SONNET}"}},
+        ],
+        fallbacks=[{_ALIAS: [f"bedrock/{_BEDROCK_SONNET}"]}],
+    )
+    response: Final = await router.aanthropic_messages(
+        messages=[{"role": "user", "content": _PROMPT}],
+        model=_ALIAS,
+        max_tokens=100,
+        fallbacks="default",
+    )
+    assert json.loads(anthropic_route.calls.last.request.read())["fallbacks"] == "default"
+    assert bedrock_route.call_count == 1
+    assert "fallbacks" not in json.loads(bedrock_route.calls.last.request.read())
+    _assert_anthropic_message(response, _BEDROCK_SONNET)
+
+
+@pytest.mark.asyncio
+async def test_router_aanthropic_messages_translated_provider_neither_receives_nor_acts_on_fallbacks(
+    respx_mock: respx.MockRouter,
+):
+    route: Final = respx_mock.post(url__regex=_OPENAI_RESPONSES_URL).mock(
+        return_value=httpx.Response(200, json=_OPENAI_BODY)
+    )
+    await _router(_ALIAS, _OPENAI_MODEL).aanthropic_messages(
+        messages=[{"role": "user", "content": _PROMPT}],
+        model=_ALIAS,
+        max_tokens=100,
+        fallbacks=[{"model": "openai/gpt-4.1"}],
+    )
+    sent: Final = json.loads(route.calls.last.request.read())
+    assert route.call_count == 1
+    assert sent["model"] == "gpt-4.1-mini"
+    assert "fallbacks" not in sent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "url", "fallbacks"),
+    [
+        pytest.param(_ANTHROPIC_MODEL, _ANTHROPIC_URL, "default", id="anthropic-default"),
+        pytest.param(_ANTHROPIC_MODEL, _ANTHROPIC_URL, [{"model": _FALLBACK_TARGET}], id="anthropic-list"),
+        pytest.param(_BEDROCK_MODEL, _BEDROCK_INVOKE_URL, "default", id="bedrock-invoke-default"),
+    ],
+)
+async def test_router_aanthropic_messages_with_fallbacks_still_logs_success(
+    respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch, model: str, url: str, fallbacks: object
+):
+    _set_fake_aws_env(monkeypatch)
+    messages: Final = _unique_messages()
+    recorder: Final = _RecordingLogger(messages)
+    monkeypatch.setattr(litellm, "callbacks", [recorder])
+    respx_mock.post(url__regex=url).mock(return_value=httpx.Response(200, json=_anthropic_body()))
+    await _router(_ALIAS, model).aanthropic_messages(
+        messages=messages, model=_ALIAS, max_tokens=100, fallbacks=fallbacks
+    )
+    await _wait_for_payload(recorder)
+    assert [payload["status"] for payload in recorder.payloads] == ["success"]
+    assert recorder.payloads[0]["response_cost"] > 0
+
+
+@pytest.mark.asyncio
+async def test_router_aanthropic_messages_logs_each_fallback_attempt_at_its_own_model(
+    respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+):
+    attempts: Final = (("message", _ANTHROPIC_MODEL, 535, 0), ("fallback_message", _FALLBACK_TARGET, 412, 264))
+    body: Final = {
+        **_anthropic_body(model=_FALLBACK_TARGET),
+        "usage": {
+            "input_tokens": 412,
+            "output_tokens": 264,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "iterations": [
+                {"type": kind, "model": model, "input_tokens": tokens_in, "output_tokens": tokens_out}
+                for kind, model, tokens_in, tokens_out in attempts
+            ],
+        },
+    }
+    messages: Final = _unique_messages()
+    recorder: Final = _RecordingLogger(messages)
+    monkeypatch.setattr(litellm, "callbacks", [recorder])
+    respx_mock.post(url__regex=_ANTHROPIC_URL).mock(return_value=httpx.Response(200, json=body))
+    await _router(_ALIAS, _ANTHROPIC_MODEL).aanthropic_messages(
+        messages=messages, model=_ALIAS, max_tokens=100, fallbacks="default"
+    )
+    await _wait_for_payload(recorder)
+    expected: Final = sum(
+        tokens_in * litellm.model_cost[model]["input_cost_per_token"]
+        + tokens_out * litellm.model_cost[model]["output_cost_per_token"]
+        for _, model, tokens_in, tokens_out in attempts
+    )
+    assert recorder.payloads[0]["response_cost"] == pytest.approx(expected)
+
+
+@pytest.mark.asyncio
+async def test_router_aanthropic_messages_logs_each_streamed_fallback_attempt_at_its_own_model(
+    respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+):
+    attempts: Final = (("message", _ANTHROPIC_MODEL, 535, 0), ("fallback_message", _FALLBACK_TARGET, 412, 264))
+    tokens: Final = {"cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+    events: Final = (
+        {
+            "type": "message_start",
+            "message": {
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": _FALLBACK_TARGET,
+                "content": [],
+                "usage": {"input_tokens": 412, "output_tokens": 1, **tokens},
+            },
+        },
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": _JOKE}},
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": {
+                "input_tokens": 412,
+                "output_tokens": 264,
+                **tokens,
+                "iterations": [
+                    {"type": kind, "model": model, "input_tokens": tokens_in, "output_tokens": tokens_out, **tokens}
+                    for kind, model, tokens_in, tokens_out in attempts
+                ],
+            },
+        },
+        {"type": "message_stop"},
+    )
+    sse: Final = "".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events).encode()
+    messages: Final = _unique_messages()
+    recorder: Final = _RecordingLogger(messages)
+    monkeypatch.setattr(litellm, "callbacks", [recorder])
+    respx_mock.post(url__regex=_ANTHROPIC_URL).mock(
+        return_value=httpx.Response(200, content=sse, headers={"content-type": "text/event-stream"})
+    )
+    stream: Final = await _router(_ALIAS, _ANTHROPIC_MODEL).aanthropic_messages(
+        messages=messages, model=_ALIAS, max_tokens=100, stream=True, fallbacks="default"
+    )
+    await _stream_events(stream)
+    await _wait_for_payload(recorder)
+    expected: Final = sum(
+        tokens_in * litellm.model_cost[model]["input_cost_per_token"]
+        + tokens_out * litellm.model_cost[model]["output_cost_per_token"]
+        for _, model, tokens_in, tokens_out in attempts
+    )
+    assert recorder.payloads[0]["response_cost"] == pytest.approx(expected)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prefix_mismatch_behavior", "kept_thinking"), [("error", True), ("drop_block", False)], ids=["pinned", "drop"]
+)
+async def test_router_aanthropic_messages_sends_a_pinned_replay_with_every_thinking_block(
+    respx_mock: respx.MockRouter, prefix_mismatch_behavior: str, kept_thinking: bool
+):
+    from litellm.litellm_core_utils.prompt_templates.common_utils import encrypted_reasoning_signature
+
+    unsigned_empty: Final = {"type": "thinking", "thinking": ""}
+    bridged: Final = {"type": "thinking", "thinking": "", "signature": encrypted_reasoning_signature("opaque")}
+    route: Final = respx_mock.post(url__regex=_ANTHROPIC_URL).mock(
+        return_value=httpx.Response(200, json=_anthropic_body())
+    )
+    await _router(_ALIAS, _ANTHROPIC_MODEL).aanthropic_messages(
+        messages=[
+            {"role": "user", "content": _PROMPT},
+            {"role": "assistant", "content": [unsigned_empty, bridged, {"type": "text", "text": "answer"}]},
+            {"role": "user", "content": "again"},
+        ],
+        model=_ALIAS,
+        max_tokens=100,
+        thinking={"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": prefix_mismatch_behavior}},
+    )
+    sent: Final = json.loads(route.calls.last.request.read())
+    assistant_content: Final = sent["messages"][1]["content"]
+    expected: Final = (
+        [unsigned_empty, bridged, {"type": "text", "text": "answer"}]
+        if kept_thinking
+        else [{"type": "text", "text": "answer"}]
+    )
+    assert assistant_content == expected
+
+
+
+@pytest.mark.asyncio
+async def test_router_aanthropic_messages_treats_a_pin_the_deployment_drops_as_no_pin(respx_mock: respx.MockRouter):
+    unsigned_empty: Final = {"type": "thinking", "thinking": ""}
+    signed: Final = {"type": "thinking", "thinking": "plan", "signature": "sig"}
+
+    def _anthropic(request: httpx.Request) -> httpx.Response:
+        sent = json.loads(request.read())
+        if unsigned_empty in sent["messages"][1]["content"]:
+            return httpx.Response(
+                400,
+                json={
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "messages.1.content.0.thinking: each thinking block must contain thinking",
+                    },
+                },
+            )
+        return httpx.Response(200, json=_anthropic_body())
+
+    route: Final = respx_mock.post(url__regex=_ANTHROPIC_URL).mock(side_effect=_anthropic)
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": _ALIAS,
+                "litellm_params": {
+                    "model": f"anthropic/{_ANTHROPIC_MODEL}",
+                    "api_key": "fake-key",
+                    "additional_drop_params": ["thinking.block_binding"],
+                },
+            }
+        ],
+        num_retries=0,
+    )
+    await router.aanthropic_messages(
+        messages=[
+            {"role": "user", "content": _PROMPT},
+            {"role": "assistant", "content": [unsigned_empty, signed, {"type": "text", "text": "answer"}]},
+            {"role": "user", "content": "again"},
+        ],
+        model=_ALIAS,
+        max_tokens=100,
+        thinking={"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "error"}},
+    )
+    sent: Final = json.loads(route.calls.last.request.read())
+    assert route.call_count == 1
+    assert sent["messages"][1]["content"] == [signed, {"type": "text", "text": "answer"}]
+
+
+
+class _ThinkingRewriteHook(CustomLogger):
+    def __init__(self, thinking: Mapping[str, object]) -> None:
+        super().__init__()
+        self._thinking: Final = thinking
+
+    async def async_pre_request_hook(
+        self, model: str, messages: list, kwargs: dict[str, object]
+    ) -> dict[str, object]:  # mutable-ok: the hook contract returns the request kwargs dict
+        return {**kwargs, "thinking": dict(self._thinking)}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("caller", "hook", "empty_block_sent"),
+    [("error", "drop_block", False), ("drop_block", "error", True)],
+    ids=["hook-unpins", "hook-pins"],
+)
+async def test_router_aanthropic_messages_sanitizes_under_the_pin_a_pre_request_hook_leaves(
+    respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch, caller: str, hook: str, empty_block_sent: bool
+):
+    unsigned_empty: Final = {"type": "thinking", "thinking": ""}
+    signed: Final = {"type": "thinking", "thinking": "plan", "signature": "sig"}
+    monkeypatch.setattr(
+        litellm,
+        "callbacks",
+        [_ThinkingRewriteHook({"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": hook}})],
+    )
+    route: Final = respx_mock.post(url__regex=_ANTHROPIC_URL).mock(
+        return_value=httpx.Response(200, json=_anthropic_body())
+    )
+    await _router(_ALIAS, _ANTHROPIC_MODEL).aanthropic_messages(
+        messages=[
+            {"role": "user", "content": _PROMPT},
+            {"role": "assistant", "content": [unsigned_empty, signed, {"type": "text", "text": "answer"}]},
+            {"role": "user", "content": "again"},
+        ],
+        model=_ALIAS,
+        max_tokens=100,
+        thinking={"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": caller}},
+    )
+    sent: Final = json.loads(route.calls.last.request.read())
+    assert route.call_count == 1
+    assert (unsigned_empty in sent["messages"][1]["content"]) is empty_block_sent
+    assert signed in sent["messages"][1]["content"]
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("caller", "hook"), [("error", "drop_block"), ("drop_block", "error")], ids=["unpins", "pins"])
+async def test_router_aanthropic_messages_keeps_cache_control_injection_when_a_hook_changes_the_pin(
+    respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch, caller: str, hook: str
+):
+    monkeypatch.setattr(
+        litellm,
+        "callbacks",
+        [_ThinkingRewriteHook({"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": hook}})],
+    )
+    route: Final = respx_mock.post(url__regex=_ANTHROPIC_URL).mock(
+        return_value=httpx.Response(200, json=_anthropic_body())
+    )
+    await _router(_ALIAS, _ANTHROPIC_MODEL).aanthropic_messages(
+        messages=[{"role": "user", "content": _PROMPT}],
+        model=_ALIAS,
+        max_tokens=100,
+        thinking={"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": caller}},
+        cache_control_injection_points=[{"location": "message", "role": "user"}],
+    )
+    sent: Final = json.loads(route.calls.last.request.read())
+    first_user_content: Final = sent["messages"][0]["content"]
+    assert isinstance(first_user_content, list)
+    assert first_user_content[-1].get("cache_control") == {"type": "ephemeral"}
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefix_mismatch_behavior", ["error", "drop_block"])
+async def test_router_aanthropic_messages_wire_messages_match_the_autorouter_baseline_body(
+    respx_mock: respx.MockRouter, prefix_mismatch_behavior: str
+):
+    from litellm.llms.anthropic.prompt_cache_prediction import prepare_native_baseline_body
+
+    request: Final = {
+        "messages": [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": [{"type": "thinking", "thinking": ""}]},
+            {"role": "user", "content": "again"},
+        ],
+        "max_tokens": 100,
+        "thinking": {"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": prefix_mismatch_behavior}},
+        "cache_control_injection_points": [{"location": "message", "index": 2}],
+    }
+    route: Final = respx_mock.post(url__regex=_ANTHROPIC_URL).mock(
+        return_value=httpx.Response(200, json=_anthropic_body())
+    )
+    await _router(_ALIAS, _ANTHROPIC_MODEL).aanthropic_messages(model=_ALIAS, **copy.deepcopy(request))
+    baseline: Final = prepare_native_baseline_body({**request, "model": _ALIAS}, f"anthropic/{_ANTHROPIC_MODEL}")
+    assert baseline is not None
+    assert json.loads(route.calls.last.request.read())["messages"] == json.loads(json.dumps(baseline["messages"]))

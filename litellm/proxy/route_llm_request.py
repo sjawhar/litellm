@@ -680,8 +680,12 @@ async def _route_request_single_attempt(  # noqa: ANN202  # returns unawaited pr
             "enable_tag_filtering",
         ]
 
+        # On /v1/messages the request's `fallbacks` is Anthropic's server-side fallback parameter
+        provider_owned: Final[frozenset[str]] = (
+            frozenset({"fallbacks"}) if route_type == "anthropic_messages" else frozenset()
+        )
         for key in per_request_settings:
-            if override_settings.get(key) is not None and key not in data:
+            if override_settings.get(key) is not None and key not in data and key not in provider_owned:
                 data[key] = override_settings[key]
 
         # Use main router with overridden kwargs

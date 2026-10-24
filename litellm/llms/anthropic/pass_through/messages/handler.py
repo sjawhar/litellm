@@ -16,6 +16,7 @@ from litellm.integrations.anthropic_cache_control_hook import AnthropicCacheCont
 from litellm.litellm_core_utils.exception_mapping_utils import exception_type
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.llms.anthropic.common_utils import (
+    strip_empty_content_blocks_from_anthropic_messages,
     strip_provider_specific_fields_from_anthropic_messages,
     tools_marked_for_a_tool_config_point,
 )
@@ -36,7 +37,13 @@ from litellm.utils import ProviderConfigManager, client
 from ..adapters.handler import LiteLLMMessagesToCompletionTransformationHandler
 from ..responses_adapters.handler import LiteLLMMessagesToResponsesAPIHandler
 from .interceptors import get_messages_interceptors
-from .utils import AnthropicMessagesRequestUtils, mock_response, prepare_native_messages
+from .utils import (
+    AnthropicMessagesRequestUtils,
+    mock_response,
+    prepare_native_messages,
+    sanitize_native_messages,
+    thinking_pinned_after_drops,
+)
 
 __all__ = ("anthropic_messages", "anthropic_messages_handler")
 
@@ -249,9 +256,7 @@ async def anthropic_messages(
 
     Runs the empty-content-block sanitizer before any backend dispatch.
     """
-    messages, system = prepare_native_messages(
-        messages, system, kwargs, model=model, custom_llm_provider=custom_llm_provider, tools=tools, api_base=api_base
-    )
+    messages = sanitize_native_messages(messages, keep_thinking=True)  # rebind-ok: the hooks see sanitized messages
 
     original_stream: Final = stream or kwargs.get("_websearch_interception_converted_stream", False)
 
@@ -297,6 +302,22 @@ async def anthropic_messages(
     request_kwargs.pop("litellm_params", None)
     # Merge back any other modifications
     kwargs.update(request_kwargs)
+    # Thinking blocks wait for the pin a pre-request hook leaves: an unpinned request drops its empty unsigned ones,
+    # before cache-control injection, which then runs once on the messages that go out.
+    dispatched_messages, dispatched_system = prepare_native_messages(
+        (
+            messages
+            if thinking_pinned_after_drops(thinking, kwargs.get("additional_drop_params"))
+            else strip_empty_content_blocks_from_anthropic_messages(messages)
+        ),
+        system,
+        kwargs,
+        model=model,
+        custom_llm_provider=custom_llm_provider,
+        tools=tools,
+        api_base=api_base,
+        presanitized=True,
+    )
 
     # Short-circuit web-search-only requests: detect the pattern, execute
     # search directly via Tavily/Perplexity, and return a synthetic response
@@ -305,7 +326,7 @@ async def anthropic_messages(
     # callers get SSE events instead of a plain dict.
     short_circuit_response: Final = await _try_websearch_short_circuit(
         model=model,
-        messages=messages,
+        messages=dispatched_messages,
         tools=tools,
         custom_llm_provider=custom_llm_provider,
         stream=original_stream,
@@ -321,7 +342,7 @@ async def anthropic_messages(
         if interceptor.can_handle(tools, custom_llm_provider):
             return await interceptor.handle(
                 model=model,
-                messages=messages,
+                messages=dispatched_messages,
                 tools=tools,
                 stream=original_stream,
                 max_tokens=max_tokens,
@@ -330,7 +351,7 @@ async def anthropic_messages(
                 api_base=api_base,
                 metadata=metadata,
                 stop_sequences=stop_sequences,
-                system=system,
+                system=dispatched_system,
                 temperature=temperature,
                 thinking=thinking,
                 tool_choice=tool_choice,
@@ -345,12 +366,12 @@ async def anthropic_messages(
     func: Final = partial(
         anthropic_messages_handler,
         max_tokens=max_tokens,
-        messages=messages,
+        messages=dispatched_messages,
         model=model,
         metadata=metadata,
         stop_sequences=stop_sequences,
         stream=stream,
-        system=system,
+        system=dispatched_system,
         temperature=temperature,
         thinking=thinking,
         tool_choice=tool_choice,
@@ -361,9 +382,9 @@ async def anthropic_messages(
         api_base=api_base,
         client=client,
         custom_llm_provider=custom_llm_provider,
-        # messages were already empty-content-block sanitized at the top of this
-        # function and are NOT reassigned before this dispatch, so the handler
-        # can skip its (otherwise redundant) second full-messages scan. Passed
+        # messages were already empty-content-block sanitized above, thinking
+        # blocks under the pin the pre-request hooks left, so the handler can
+        # skip its (otherwise redundant) second full-messages scan. Passed
         # explicitly (not via **kwargs) so it only affects this direct
         # dispatch -- interceptor / sync entry points still sanitize.
         _litellm_messages_presanitized=True,
@@ -440,6 +461,7 @@ def anthropic_messages_handler(
         tools=tools,
         api_base=api_base,
         presanitized=bool(kwargs.pop("_litellm_messages_presanitized", False)),
+        keep_thinking=thinking_pinned_after_drops(thinking, kwargs.get("additional_drop_params")),
     )
 
     metadata = validate_anthropic_api_metadata(metadata)
@@ -548,6 +570,9 @@ def anthropic_messages_handler(
             cache_control_ttl=_deployment_supports_cache_control_ttl(kwargs.get("model_info")),
         )
     if anthropic_messages_provider_config is None:
+        # Anthropic's server-side `fallbacks` has no equivalent here, and litellm.acompletion would read it as
+        # its own client-side fallback list and switch models.
+        kwargs.pop("fallbacks", None)
         # Route to Responses API for OpenAI / Azure, chat/completions for everything else.
         if kwargs.get("compaction") is None and _should_route_to_responses_api(
             custom_llm_provider, original_model, model

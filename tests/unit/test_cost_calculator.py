@@ -8683,3 +8683,140 @@ def test_bedrock_registered_cache_prices_preserve_dynamic_threshold_rates(
     assert entry is not None
     assert entry[1]["input_cost_per_token_above_300k_tokens"] == 0.03
     assert entry[1][tier_field] == (tier_override if tier_override is not None else 0.007)
+
+
+def _anthropic_fallback_response(requested: str, served: str) -> Mapping[str, object]:
+    return {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": served,
+        "content": [{"type": "text", "text": "hi"}],
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 412,
+            "output_tokens": 264,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "iterations": [
+                {
+                    "type": "message",
+                    "model": requested,
+                    "input_tokens": 535,
+                    "output_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                },
+                {
+                    "type": "fallback_message",
+                    "model": served,
+                    "input_tokens": 412,
+                    "output_tokens": 264,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                },
+            ],
+        },
+    }
+
+
+def _price(model: str, input_tokens: int, output_tokens: int) -> float:
+    entry: Final = litellm.model_cost[model]
+    return input_tokens * entry["input_cost_per_token"] + output_tokens * entry["output_cost_per_token"]
+
+
+@pytest.mark.usefixtures("_local_model_cost_map")
+def test_anthropic_server_side_fallback_prices_each_attempt_at_its_own_model():
+    requested: Final = "claude-fable-5"
+    served: Final = "claude-opus-4-8"
+    cost: Final = completion_cost(
+        completion_response=_anthropic_fallback_response(requested, served),
+        model=f"anthropic/{requested}",
+        custom_llm_provider="anthropic",
+        call_type="anthropic_messages",
+    )
+    assert cost == pytest.approx(_price(requested, 535, 0) + _price(served, 412, 264))
+
+
+
+@pytest.mark.usefixtures("_local_model_cost_map")
+def test_anthropic_server_side_fallback_keeps_request_wide_and_served_attempt_charges():
+    requested: Final = "claude-fable-5"
+    served: Final = "claude-opus-4-8"
+    request_wide: Final = {"inference_geo": "us", "speed": "fast"}
+    served_extras: Final = {"server_tool_use": {"web_search_requests": 3}}
+    response: Final = _anthropic_fallback_response(requested, served)
+    usage: Final = cast(Mapping[str, object], response["usage"])
+    fallback_response: Final = {**response, "usage": {**usage, **request_wide, **served_extras}}
+
+    def single_attempt_cost(model: str, tokens_in: int, tokens_out: int, extras: Mapping[str, object]) -> float:
+        return completion_cost(
+            completion_response={
+                **response,
+                "model": model,
+                "usage": {
+                    "input_tokens": tokens_in,
+                    "output_tokens": tokens_out,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    **request_wide,
+                    **extras,
+                },
+            },
+            model=f"anthropic/{model}",
+            custom_llm_provider="anthropic",
+            call_type="anthropic_messages",
+        )
+
+    cost: Final = completion_cost(
+        completion_response=fallback_response,
+        model=f"anthropic/{requested}",
+        custom_llm_provider="anthropic",
+        call_type="anthropic_messages",
+    )
+    assert cost == pytest.approx(
+        single_attempt_cost(requested, 535, 0, {}) + single_attempt_cost(served, 412, 264, served_extras)
+    )
+
+
+
+@pytest.mark.usefixtures("_local_model_cost_map")
+def test_anthropic_server_side_fallback_charges_a_fixed_margin_once(monkeypatch: pytest.MonkeyPatch):
+    requested: Final = "claude-fable-5"
+    served: Final = "claude-opus-4-8"
+    monkeypatch.setattr(litellm, "cost_margin_config", {"anthropic": {"fixed_amount": 0.01}})
+    cost: Final = completion_cost(
+        completion_response=_anthropic_fallback_response(requested, served),
+        model=f"anthropic/{requested}",
+        custom_llm_provider="anthropic",
+        call_type="anthropic_messages",
+    )
+    assert cost == pytest.approx(_price(requested, 535, 0) + _price(served, 412, 264) + 0.01)
+
+
+
+@pytest.mark.usefixtures("_local_model_cost_map")
+def test_anthropic_server_side_fallback_stores_one_breakdown_for_all_attempts():
+    requested: Final = "claude-fable-5"
+    served: Final = "claude-opus-4-8"
+    logging_obj: Final = Logging(
+        model=f"anthropic/{requested}",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=False,
+        call_type="anthropic_messages",
+        start_time=datetime.datetime(2026, 10, 28, 12, 0, 0),
+        litellm_call_id="server-side-fallback-breakdown",
+        function_id="f",
+    )
+    cost: Final = completion_cost(
+        completion_response=_anthropic_fallback_response(requested, served),
+        model=f"anthropic/{requested}",
+        custom_llm_provider="anthropic",
+        call_type="anthropic_messages",
+        litellm_logging_obj=logging_obj,
+    )
+    breakdown: Final = logging_obj.cost_breakdown
+    assert breakdown is not None
+    assert breakdown["total_cost"] == pytest.approx(cost)
+    assert breakdown["input_cost"] + breakdown["output_cost"] == pytest.approx(cost)
+    assert breakdown["original_cost"] == pytest.approx(cost)
