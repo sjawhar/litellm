@@ -7,6 +7,7 @@ Source: litellm/llms/chatgpt/responses/transformation.py
 import hashlib
 import json
 from collections.abc import Generator
+from pathlib import Path
 from typing import Final
 from unittest.mock import MagicMock, patch
 
@@ -19,6 +20,7 @@ from litellm.llms.chatgpt.common_utils import (
     get_chatgpt_session_id,
 )
 from litellm.llms.chatgpt.responses.transformation import ChatGPTResponsesAPIConfig
+from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.llms.openai.common_utils import OpenAIError
 from litellm.main import responses_api_bridge_check
 from litellm.types.router import GenericLiteLLMParams
@@ -446,3 +448,40 @@ def test_generated_session_ids_are_skipped():
 
 def test_uuid4_fallback_without_any_key():
     assert ensure_chatgpt_session_id({}) != ensure_chatgpt_session_id({})
+
+
+@pytest.mark.asyncio
+async def test_prompt_cache_key_kwarg_reaches_session_id_header(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """The proxy passes prompt_cache_key as a plain kwarg, since aresponses() has no named parameter for it"""
+    monkeypatch.setenv("CHATGPT_TOKEN_DIR", str(tmp_path))
+    (tmp_path / "auth.json").write_text(
+        json.dumps({"access_token": "access-123", "expires_at": 4102444800, "account_id": "acct-123"})
+    )
+    completed: Final = {
+        "type": "response.completed",
+        "response": {
+            "id": "resp_test",
+            "object": "response",
+            "created_at": 1700000000,
+            "status": "completed",
+            "model": "gpt-6-astra",
+            "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "pong"}]}],
+        },
+    }
+    respond: Final = MagicMock(
+        return_value=httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=f"data: {json.dumps(completed)}\n\ndata: [DONE]\n\n",
+        )
+    )
+
+    response: Final = await litellm.aresponses(
+        model="chatgpt/gpt-6-astra",
+        input="ping",
+        prompt_cache_key="omp-session-123",
+        client=AsyncHTTPHandler(transport=httpx.MockTransport(respond)),
+    )
+
+    assert response.output_text == "pong"
+    assert respond.call_args.args[0].headers["session_id"] == "omp-session-123"
