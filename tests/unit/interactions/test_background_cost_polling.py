@@ -152,6 +152,21 @@ async def test_poller_bills_an_interaction_paused_for_a_tool_result():
 
 
 @pytest.mark.asyncio
+async def test_poller_bills_an_interaction_stopped_for_a_continuation_request():
+    logging_obj = _logging_obj()
+    fetch, calls = _fetch_sequence(
+        _response("in_progress", with_usage=False),
+        _response("requires_continuation", with_usage=True),
+    )
+
+    outcome = await poll_and_log_background_interaction_cost(_context(logging_obj), fetch_interaction=fetch)
+
+    assert outcome == "billed"
+    assert len(calls) == 2
+    assert logging_obj.model_call_details["standard_logging_object"]["total_tokens"] == 175
+
+
+@pytest.mark.asyncio
 async def test_poller_does_not_pin_the_budget_for_an_interaction_paused_for_a_tool_result():
     reservation = _reservation()
     logging_obj = _logging_obj_with_reservation(reservation)

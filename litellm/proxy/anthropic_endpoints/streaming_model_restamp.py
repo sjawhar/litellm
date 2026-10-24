@@ -14,6 +14,8 @@ from typing import Final
 
 from pydantic import TypeAdapter, ValidationError
 
+from litellm.cost_calculator import is_model_or_dated_snapshot
+
 _MESSAGE_START_EVENT: Final = "message_start"
 _MESSAGE_START_MARKER: Final = b"message_start"
 _SSE_DATA_FIELD: Final = "data:"
@@ -24,16 +26,33 @@ _PING_MARKERS: Final = (b"event: ping", b'"type": "ping"', b'"type":"ping"')
 _EVENT_ADAPTER: Final = TypeAdapter(Mapping[str, object])
 
 
-def _restamped_event(event: Mapping[str, object], requested_model: str) -> Mapping[str, object] | None:
-    message: Final = event.get("message")
-    if event.get("type") != _MESSAGE_START_EVENT or not isinstance(message, dict):
+def provider_model_is_routed(provider_model: object, routed_model: str | None) -> bool:
+    """
+    Whether the provider's ``model`` is the routed deployment's model (or its dated snapshot). Anything else
+    means the provider itself served another model, as Anthropic's server-side fallback does, and the
+    client must see that model.
+    """
+    if routed_model is None or not isinstance(provider_model, str):
+        return True
+    return is_model_or_dated_snapshot(provider_model, routed_model.split("/", 1)[-1])
+
+
+def _restamped_event(
+    event: Mapping[str, object], requested_model: str, routed_model: str | None = None
+) -> Mapping[str, object] | None:
+    if event.get("type") != _MESSAGE_START_EVENT:
         return None
-    if message.get("model") == requested_model:
+    try:
+        message: Final = _EVENT_ADAPTER.validate_python(event.get("message"))
+    except ValidationError:
+        return None
+    provider_model: Final = message.get("model")
+    if provider_model == requested_model or not provider_model_is_routed(provider_model, routed_model):
         return None
     return {**event, "message": {**message, "model": requested_model}}
 
 
-def _restamped_data_line(line: str, requested_model: str) -> str | None:
+def _restamped_data_line(line: str, requested_model: str, routed_model: str | None = None) -> str | None:
     stripped: Final = line.strip()
     if not stripped.startswith(_SSE_DATA_FIELD):
         return None
@@ -44,22 +63,24 @@ def _restamped_data_line(line: str, requested_model: str) -> str | None:
         event: Final = _EVENT_ADAPTER.validate_json(payload)
     except ValidationError:
         return None
-    restamped: Final = _restamped_event(event, requested_model)
+    restamped: Final = _restamped_event(event, requested_model, routed_model)
     if restamped is None:
         return None
     terminator: Final = line[len(line.rstrip("\r\n")) :]
     return f"data: {json.dumps(restamped, separators=(',', ':'))}{terminator}"
 
 
-def _restamped_frame(frame: str, requested_model: str) -> str | None:
+def _restamped_frame(frame: str, requested_model: str, routed_model: str | None = None) -> str | None:
     lines: Final = frame.splitlines(keepends=True)
-    restamped: Final = tuple(_restamped_data_line(line, requested_model) for line in lines)
+    restamped: Final = tuple(_restamped_data_line(line, requested_model, routed_model) for line in lines)
     if all(line is None for line in restamped):
         return None
     return "".join(new if new is not None else old for new, old in zip(restamped, lines))
 
 
-def restamp_anthropic_stream_chunk_model(chunk: object, requested_model: str) -> object:
+def restamp_anthropic_stream_chunk_model(
+    chunk: object, requested_model: str, routed_model: str | None = None
+) -> object:
     """
     Return ``chunk`` with the ``message_start`` model replaced by ``requested_model``.
 
@@ -70,18 +91,18 @@ def restamp_anthropic_stream_chunk_model(chunk: object, requested_model: str) ->
             event: Final = _EVENT_ADAPTER.validate_python(chunk)
         except ValidationError:
             return chunk
-        return _restamped_event(event, requested_model) or chunk
+        return _restamped_event(event, requested_model, routed_model) or chunk
 
     if isinstance(chunk, (bytes, bytearray)):
         if _MESSAGE_START_EVENT.encode() not in chunk:
             return chunk
-        restamped_bytes: Final = _restamped_frame(chunk.decode("utf-8", errors="ignore"), requested_model)
+        restamped_bytes: Final = _restamped_frame(chunk.decode("utf-8", errors="ignore"), requested_model, routed_model)
         return chunk if restamped_bytes is None else restamped_bytes.encode("utf-8")
 
     if isinstance(chunk, str):
         if _MESSAGE_START_EVENT not in chunk:
             return chunk
-        restamped_text: Final = _restamped_frame(chunk, requested_model)
+        restamped_text: Final = _restamped_frame(chunk, requested_model, routed_model)
         return chunk if restamped_text is None else restamped_text
 
     return chunk
@@ -104,8 +125,9 @@ class AnthropicStreamModelRestamper:
     later chunk passes through untouched.
     """
 
-    def __init__(self, requested_model: str) -> None:
+    def __init__(self, requested_model: str, routed_model: str | None = None) -> None:
         self._requested_model: Final = requested_model
+        self._routed_model: Final = routed_model
         self._held = b""
         self._armed = True
 
@@ -116,7 +138,7 @@ class AnthropicStreamModelRestamper:
             return self._process_encoded(bytes(chunk))
         if isinstance(chunk, str):
             return self._process_encoded(chunk.encode("utf-8"))
-        restamped: Final = restamp_anthropic_stream_chunk_model(chunk, self._requested_model)
+        restamped: Final = restamp_anthropic_stream_chunk_model(chunk, self._requested_model, self._routed_model)
         if isinstance(chunk, dict) and chunk.get("type") not in (None, "ping"):
             self._armed = False
         return restamped
@@ -127,7 +149,7 @@ class AnthropicStreamModelRestamper:
         self._armed = False
         if not held:
             return b""
-        restamped: Final = restamp_anthropic_stream_chunk_model(held, self._requested_model)
+        restamped: Final = restamp_anthropic_stream_chunk_model(held, self._requested_model, self._routed_model)
         return restamped if isinstance(restamped, bytes) else held
 
     def _process_encoded(self, data: bytes) -> bytes:
@@ -165,7 +187,7 @@ class AnthropicStreamModelRestamper:
         if _MESSAGE_START_MARKER not in frames[decider]:
             return closed
         restamped_text: Final = _restamped_frame(
-            frames[decider].decode("utf-8", errors="ignore"), self._requested_model
+            frames[decider].decode("utf-8", errors="ignore"), self._requested_model, self._routed_model
         )
         if restamped_text is None:
             return closed

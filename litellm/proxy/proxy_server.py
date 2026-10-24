@@ -380,7 +380,10 @@ from litellm.proxy.auth.auth_utils import (
     warn_once_if_custom_auth_skips_common_checks,
 )
 from litellm.proxy.auth.fallback_budget import router_fallback_budget_check
-from litellm.proxy.auth.fallback_model_access import router_fallback_access_check
+from litellm.proxy.auth.fallback_model_access import (
+    fallback_target_credentials_allowed,
+    router_fallback_access_check,
+)
 from litellm.proxy.auth.handle_jwt import JWTHandler
 from litellm.proxy.auth.litellm_license import AUTO_ROUTER_LICENSE_REMEDY, LicenseCheck
 from litellm.proxy.auth.login_throttle import (
@@ -602,7 +605,10 @@ from litellm.proxy.hooks.model_max_budget_limiter import (  # noqa: F401, RUF100
     PROXY_VirtualKeyModelMaxBudgetLimiter,
     _PROXY_VirtualKeyModelMaxBudgetLimiter,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
 )
-from litellm.proxy.hooks.parallel_request_limiter_v3 import fail_closed_rate_limit_enforcement_enabled
+from litellm.proxy.hooks.parallel_request_limiter_v3 import (
+    fail_closed_rate_limit_enforcement_enabled,
+    warn_rate_limits_are_per_worker,
+)
 from litellm.proxy.hooks.prompt_injection_detection import (  # noqa: F401, RUF100  # legacy module exports
     OPTIONAL_PromptInjectionDetection,
     _OPTIONAL_PromptInjectionDetection,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
@@ -6911,6 +6917,7 @@ class ProxyConfig:
 
         if os.getenv("NUM_WORKERS", "1") != "1" and redis_usage_cache is None:
             warn_login_counters_are_per_worker(os.getenv("NUM_WORKERS", "1"))
+            warn_rate_limits_are_per_worker(os.getenv("NUM_WORKERS", "1"))
         if declared_proxy_ranges(general_settings) is None:
             warn_source_login_limit_is_off()
 
@@ -7259,6 +7266,9 @@ class ProxyConfig:
             fallback_access_check=router_fallback_access_check,
             fallback_budget_check=router_fallback_budget_check,
             auto_router_capability_limit=_license_check.auto_router_capability_limit,
+        )
+        router.fallback_target_credentials_allowed = (  # rebind-ok: config router_settings must not set this predicate
+            fallback_target_credentials_allowed
         )
 
         if redis_usage_cache is not None and router.cache.redis_cache is None:
@@ -7755,6 +7765,7 @@ class ProxyConfig:
                         fallback_budget_check=router_fallback_budget_check,
                         auto_router_capability_limit=_license_check.auto_router_capability_limit,
                     )
+                    llm_router.fallback_target_credentials_allowed = fallback_target_credentials_allowed
                     verbose_proxy_logger.debug("updated llm_router: %s", llm_router)
             else:
                 verbose_proxy_logger.debug("len new_models: %s", len(models_list))

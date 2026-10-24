@@ -354,6 +354,86 @@ async def test_async_post_call_failure_hook_reads_used_client_oauth_token_from_t
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "request_route, metadata_buckets, expected",
+    [
+        pytest.param(
+            "/v1/messages",
+            {
+                "metadata": {"user_id": "s1", "model_group": "client-chosen"},
+                "litellm_metadata": {"model_group": "claude-refuse"},
+            },
+            "claude-refuse",
+            id="messages_router_stamped",
+        ),
+        pytest.param(
+            "/v1/messages",
+            {
+                "metadata": {"user_id": "s1", "model_group": "client-chosen"},
+                "litellm_metadata": {"user_api_key_hash": "proxy"},
+            },
+            "",
+            id="messages_never_routed",
+        ),
+        pytest.param(
+            "/v1/chat/completions",
+            {"metadata": {"model_group": "claude-refuse"}},
+            "claude-refuse",
+            id="chat_router_stamped",
+        ),
+        pytest.param(
+            "/v1/chat/completions",
+            {
+                "metadata": {"model_group": "claude-refuse"},
+                "litellm_params": {"litellm_metadata": {"model_group": "client-chosen"}},
+            },
+            "claude-refuse",
+            id="caller_sent_litellm_params",
+        ),
+        pytest.param(
+            "/v1/messages",
+            {"metadata": {"user_id": "s1"}, "litellm_metadata": {"model_group": {"forged": "object"}}},
+            "",
+            id="non_string_stamp",
+        ),
+    ],
+)
+async def test_async_post_call_failure_hook_takes_model_group_from_the_routes_stamped_bucket(
+    request_route: str, metadata_buckets: dict, expected: str
+):
+    """On /v1/messages the request's own metadata belongs to the caller and the router stamps
+    model_group into litellm_metadata, so the failure row must read that bucket, as the success row does"""
+    logger = ProxyDBLogger()
+    request_data = {
+        "model": "claude-refuse",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "proxy_server_request": {"request_id": "test_request_id"},
+        **metadata_buckets,
+    }
+
+    with patch(
+        "litellm.proxy.db.db_spend_update_writer.DBSpendUpdateWriter.update_database",
+        new_callable=AsyncMock,
+    ) as mock_update_database:
+        await logger.async_post_call_failure_hook(
+            request_data=request_data,
+            original_exception=Exception("rate limited"),
+            user_api_key_dict=UserAPIKeyAuth(api_key="test_api_key", request_route=request_route),
+        )
+
+    payload = get_logging_payload(
+        kwargs=mock_update_database.call_args[1]["kwargs"],
+        response_obj={},
+        start_time=datetime.now(),
+        end_time=datetime.now(),
+    )
+    assert payload["model_group"] == expected
+    row_metadata = mock_update_database.call_args[1]["kwargs"]["litellm_params"]["metadata"]
+    assert row_metadata.get("model_group", "") == expected
+    assert expected or "model_group" not in row_metadata
+
+
+@pytest.mark.asyncio
 async def test_async_post_call_failure_hook_bills_guardrail_cost_on_blocked_request():
     """LIT-5651: a request blocked by a guardrail never reaches the LLM, but the
     guardrail invocation itself is billed by the provider. The failure row must
@@ -1344,14 +1424,14 @@ async def test_track_cost_callback_releases_reservation_for_unpollable_interacti
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", ["completed", "requires_action"])
+@pytest.mark.parametrize("status", ["completed", "requires_action", "requires_continuation"])
 async def test_track_cost_callback_alerts_when_an_interaction_that_produced_output_has_no_usage(status):
     """
-    ``completed`` and ``requires_action`` both mean the model produced output,
-    so a usage block is always expected with them. One arriving without it
-    means the charge for real work was lost, which is exactly what the
-    cost-tracking alert is for: silencing it here would let an operator's
-    interactions bill nothing with no signal that anything went wrong.
+    ``completed``, ``requires_action`` and ``requires_continuation`` all mean
+    the model produced output, so a usage block is always expected with them.
+    One arriving without it means the charge for real work was lost, which is
+    exactly what the cost-tracking alert is for: silencing it here would let an
+    operator's interactions bill nothing with no signal that anything went wrong.
 
     The reservation still has to be released, since suppressing the alert was
     never what freed it.
@@ -1472,6 +1552,7 @@ async def test_callback_handles_every_status_the_interactions_api_can_return():
         "cancelled",
         "incomplete",
         "budget_exceeded",
+        "requires_continuation",
     }
 
 

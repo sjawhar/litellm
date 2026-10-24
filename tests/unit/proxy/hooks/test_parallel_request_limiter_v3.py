@@ -6,7 +6,8 @@ import asyncio
 import logging
 import sys
 import time
-from collections.abc import Iterator, Sequence
+import uuid
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Final, List, Optional
@@ -14,17 +15,22 @@ from typing import Any, Dict, Final, List, Optional
 import pytest
 from fastapi import HTTPException
 from pydantic import TypeAdapter
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 import litellm
 from litellm import Router
 from litellm.caching.caching import DualCache
 from litellm.caching.in_memory_cache import InMemoryCache
+from litellm.caching.redis_cache import RedisCircuitBreakerOpenError
 from litellm.constants import INTERNAL_CALL_ORIGIN_METADATA_KEY
-from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy._types import LiteLLM_TeamTable, UserAPIKeyAuth
+from litellm.proxy.auth.team_grants import team_grants
 from litellm.proxy.common_utils.proxy_rate_limit_error import ProxyRateLimitError
 from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.proxy.hooks.parallel_request_limiter_v3 import (
     PARALLEL_REQUEST_SLOT_TTL_SECONDS,
+    PARALLEL_SLOT_RELEASE_RETRY_LIMIT,
     ParallelSlotAcquisition,
     PROXY_MaxParallelRequestsHandler_v3,
     RateLimitDescriptor,
@@ -1089,6 +1095,32 @@ async def test_parallel_gauge_uses_atomic_redis_script_v3():
         )
     assert exc_info.value.status_code == 429
     assert "max_parallel_requests" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_a_full_local_mirror_defers_to_the_redis_gauge_v3() -> None:
+    """The local mirror holds the count from this pod's last script reply, and a release on another pod never
+    reaches it. A pod whose mirror last read full must ask Redis, or it refuses the team until its own slot ends."""
+    local_cache: Final = DualCache()
+    handler: Final = _PROXY_MaxParallelRequestsHandler(internal_usage_cache=InternalUsageCache(local_cache))
+    caller: Final = _token_caller_of_team(max_parallel_requests=2)
+    team_gauge: Final = f"{{team:{_TEAM_SLOT_TEAM_ID}}}:max_parallel_requests"
+    await local_cache.async_set_cache(key=team_gauge, value=2, local_only=True)
+    acquired: Final[list[list[str]]] = []  # mutable-ok: records the script calls
+
+    async def redis_with_room(keys: Sequence[str], args: Sequence[object]) -> list[int]:
+        acquired.append(list(keys))
+        return [0, 2]
+
+    handler.parallel_acquire_script = redis_with_room
+    _request_stash.set(None)
+    await handler.async_pre_call_hook(
+        user_api_key_dict=caller, cache=local_cache, data={"model": "gpt-4o"}, call_type=""
+    )
+
+    assert acquired == [[team_gauge]]
+    stash: Final = get_request_stash()
+    assert stash is not None and stash.parallel_slot is not None
 
 
 @pytest.mark.asyncio
@@ -4341,6 +4373,266 @@ async def test_success_event_releases_parallel_slot_v3(monkeypatch):
         data={"model": "gpt-3.5-turbo"},
         call_type="",
     )
+
+
+_TEAM_SLOT_TEAM_ID: Final = "team-signed-in-by-token"
+
+
+def _token_caller_of_team(max_parallel_requests: int) -> UserAPIKeyAuth:
+    team: Final = LiteLLM_TeamTable(team_id=_TEAM_SLOT_TEAM_ID, max_parallel_requests=max_parallel_requests)
+    return UserAPIKeyAuth(api_key=None, team_id=team.team_id, **team_grants(team, None, None))
+
+
+async def _admit_on(
+    pod: _PROXY_MaxParallelRequestsHandler, caller: UserAPIKeyAuth, call_id: str
+) -> RequestRateLimiterStash:
+    _request_stash.set(None)
+    await pod.async_pre_call_hook(
+        user_api_key_dict=caller,
+        cache=pod.internal_usage_cache.dual_cache,
+        data={"model": "gpt-4o", "litellm_call_id": call_id},
+        call_type="",
+    )
+    stash: Final = get_request_stash()
+    assert stash is not None and stash.parallel_slot is not None
+    return stash
+
+
+async def _refusal_on(pod: _PROXY_MaxParallelRequestsHandler, caller: UserAPIKeyAuth) -> HTTPException:
+    _request_stash.set(None)
+    with pytest.raises(HTTPException) as refused:
+        await pod.async_pre_call_hook(
+            user_api_key_dict=caller,
+            cache=pod.internal_usage_cache.dual_cache,
+            data={"model": "gpt-4o", "litellm_call_id": "refused-" + uuid.uuid4().hex},
+            call_type="",
+        )
+    return refused.value
+
+
+async def _end_request(
+    ending: str,
+    pod: _PROXY_MaxParallelRequestsHandler,
+    caller: UserAPIKeyAuth,
+    stash: RequestRateLimiterStash,
+) -> None:
+    _request_stash.set(stash)
+    kwargs: Final = {"litellm_call_id": stash.owner_litellm_call_id}
+    if ending == "success":
+        await pod.async_log_success_event(
+            kwargs=kwargs,
+            response_obj=ModelResponse(usage=Usage(prompt_tokens=5, completion_tokens=5, total_tokens=10)),
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+        )
+    elif ending == "failure":
+        await pod.async_log_failure_event(kwargs=kwargs, response_obj=None, start_time=None, end_time=None)
+    else:
+        await pod.async_release_max_parallel_requests_on_disconnect(caller)
+
+
+class _GaugeRedis:
+    """One Redis that every pod shares, holding each gauge's slot ids the way the acquire and release scripts do.
+    An acquire whose reply is lost has already added its slot, and while ``down`` no call reaches Redis."""
+
+    def __init__(self, lost_acquire_replies: int = 0, down_after_lost_reply: bool = False) -> None:
+        self.gauges: Final[dict[str, set[str]]] = {}
+        self.lost_acquire_replies = lost_acquire_replies
+        self.down_after_lost_reply: Final = down_after_lost_reply
+        self.down = False
+        self.breaker_open = False
+        self.release_attempts: Final[list[tuple[str, ...]]] = []
+
+    def slots(self, key: str) -> frozenset[str]:
+        return frozenset(self.gauges.get(key, ()))
+
+    def async_register_script(self, script: str) -> Callable[[Sequence[str], Sequence[object]], Awaitable[list[int]]]:
+        from litellm.proxy.hooks import parallel_request_limiter_v3 as v3
+
+        async def run(keys: Sequence[str], args: Sequence[object]) -> list[int]:
+            if script == v3.PARALLEL_RELEASE_SCRIPT:
+                self.release_attempts.append(tuple(str(arg) for arg in args))
+            if self.breaker_open:
+                raise RedisCircuitBreakerOpenError("Redis circuit breaker is open, skipping run_script")
+            if self.down:
+                raise RedisConnectionError("Error 111 connecting to 127.0.0.1:6379. Connection refused.")
+            if script == v3.PARALLEL_ACQUIRE_SCRIPT:
+                return self._acquire(keys, args)
+            if script == v3.PARALLEL_RELEASE_SCRIPT:
+                return self._release(keys, args)
+            raise AssertionError(f"unexpected script: {script[:60]}")
+
+        return run
+
+    def _acquire(self, keys: Sequence[str], args: Sequence[object]) -> list[int]:
+        limits: Final = [int(str(limit)) for limit in args[0::3]]
+        for index, (key, limit) in enumerate(zip(keys, limits), start=1):
+            in_flight = len(self.gauges.get(key, ()))
+            if in_flight + 1 > limit:
+                return [1, index, in_flight, limit]
+        for key, slot_id in zip(keys, args[2::3]):
+            self.gauges.setdefault(key, set()).add(str(slot_id))
+        if self.lost_acquire_replies:
+            self.lost_acquire_replies -= 1
+            self.down = self.down_after_lost_reply
+            raise RedisTimeoutError("Timeout reading from 127.0.0.1:6379")
+        return [0, *(len(self.gauges[key]) for key in keys)]
+
+    def _release(self, keys: Sequence[str], args: Sequence[object]) -> list[int]:
+        for key, slot_id in zip(keys, args):
+            self.gauges.get(key, set()).discard(str(slot_id))
+        return [len(self.gauges.get(key, ())) for key in keys]
+
+
+_TEAM_GAUGE: Final = f"{{team:{_TEAM_SLOT_TEAM_ID}}}:max_parallel_requests"
+
+
+def _pod(
+    redis: _GaugeRedis, *, fail_closed: bool = False, clock: TimeController | None = None
+) -> _PROXY_MaxParallelRequestsHandler:
+    return _PROXY_MaxParallelRequestsHandler(
+        internal_usage_cache=InternalUsageCache(DualCache(redis_cache=redis)),  # pyright: ignore[reportArgumentType]  # duck-typed Redis double
+        time_provider=None if clock is None else clock.now,
+        fail_closed_resolver=lambda: fail_closed,
+        parallel_slot_release_retry_delays=(0.0,),
+    )
+
+
+async def _until(condition: Callable[[], bool]) -> None:
+    for _ in range(100):
+        if condition():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("the condition still did not hold after the event loop ran 100 times")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["success", "failure", "disconnect"])
+async def test_team_parallel_limit_spans_limiter_instances_for_a_token_caller_v3(ending: str) -> None:
+    """A caller that signs in with a token has no key, so the team's max_parallel_requests is its only
+    concurrency limit. Three limiter instances, each with its own local cache, share one Redis the way three pods
+    do: the team's third call in flight is refused wherever it lands, each way a call can end frees exactly its
+    slot, and a pod whose own count last read full admits the team once another pod frees a slot."""
+    redis: Final = _GaugeRedis()
+    pods: Final = (_pod(redis), _pod(redis), _pod(redis))
+    caller: Final = _token_caller_of_team(max_parallel_requests=2)
+
+    first: Final = await _admit_on(pods[0], caller, "team-call-1")
+    await _admit_on(pods[1], caller, "team-call-2")
+    assert first.parallel_slot is not None and first.parallel_slot["counter_keys"] == [_TEAM_GAUGE]
+
+    refused: Final = await _refusal_on(pods[2], caller)
+    assert refused.status_code == 429
+    assert f"team: {_TEAM_SLOT_TEAM_ID}." in refused.detail and "Limit type: max_parallel_requests." in refused.detail
+
+    await _end_request(ending, pods[0], caller, first)
+    assert len(redis.slots(_TEAM_GAUGE)) == 1
+
+    await _admit_on(pods[1], caller, "team-call-3")
+    assert (await _refusal_on(pods[0], caller)).status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_fail_closed_lost_acquire_reply_does_not_strand_the_team_slot_v3() -> None:
+    """Redis can run the acquire script and lose its reply, on a reset connection or a read timeout. Fail-closed
+    then refuses the call with 503, and the slot the script added must not count against the team for an hour."""
+    redis: Final = _GaugeRedis(lost_acquire_replies=1)
+    pods: Final = (_pod(redis, fail_closed=True), _pod(redis, fail_closed=True))
+    caller: Final = _token_caller_of_team(max_parallel_requests=1)
+
+    assert (await _refusal_on(pods[0], caller)).status_code == 503
+    assert redis.slots(_TEAM_GAUGE) == frozenset()
+    await _admit_on(pods[1], caller, "after-the-lost-reply")
+
+
+@pytest.mark.asyncio
+async def test_fail_closed_lost_acquire_reply_is_released_once_redis_answers_again_v3() -> None:
+    """When Redis goes away right after it ran the acquire, the release cannot reach it at once, nor on the next
+    tries. The slot is released as soon as Redis answers again."""
+    redis: Final = _GaugeRedis(lost_acquire_replies=1, down_after_lost_reply=True)
+    pod: Final = _pod(redis, fail_closed=True)
+    caller: Final = _token_caller_of_team(max_parallel_requests=1)
+
+    assert (await _refusal_on(pod, caller)).status_code == 503
+    await _until(lambda: len(redis.release_attempts) >= 3)
+    assert len(redis.slots(_TEAM_GAUGE)) == 1
+
+    redis.down = False
+    await _until(lambda: not redis.slots(_TEAM_GAUGE))
+    await _admit_on(pod, caller, "after-redis-answers-again")
+
+
+@pytest.mark.asyncio
+async def test_a_slot_release_that_cannot_reach_redis_is_retried_until_it_does_v3() -> None:
+    """A call that ends while Redis is away frees its slot on its own pod at once, and in Redis once Redis answers
+    again after refusing the next tries, so the team's other pods stop counting it then and not an hour later."""
+    redis: Final = _GaugeRedis()
+    pods: Final = (_pod(redis), _pod(redis))
+    caller: Final = _token_caller_of_team(max_parallel_requests=1)
+    held: Final = await _admit_on(pods[0], caller, "ends-while-redis-is-away")
+
+    redis.down = True
+    await _end_request("failure", pods[0], caller, held)
+    await _until(lambda: len(redis.release_attempts) >= 3)
+    assert len(redis.slots(_TEAM_GAUGE)) == 1
+
+    redis.down = False
+    await _until(lambda: not redis.slots(_TEAM_GAUGE))
+    await _admit_on(pods[1], caller, "after-redis-answers-again")
+
+
+@pytest.mark.asyncio
+async def test_fail_closed_acquire_refused_by_the_open_circuit_breaker_sends_no_release_v3() -> None:
+    """An open circuit breaker refuses the acquire before it reaches Redis, so the acquire added no slot. A release
+    for it would queue one more retry for every call refused while Redis is down."""
+    redis: Final = _GaugeRedis()
+    redis.breaker_open = True
+    pod: Final = _pod(redis, fail_closed=True)
+
+    assert (await _refusal_on(pod, _token_caller_of_team(max_parallel_requests=1))).status_code == 503
+    assert redis.release_attempts == []
+
+
+@pytest.mark.asyncio
+async def test_releases_held_for_retry_are_capped_and_the_newest_left_to_expire_v3() -> None:
+    """During a long outage every call that ends queues a release, mostly of slots Redis never saw. The queue keeps
+    the oldest, the ones most likely to hold a slot from before the outage, and drops the rest."""
+    redis: Final = _GaugeRedis()
+    pod: Final = _pod(redis)
+    slot_ids: Final = tuple(f"slot-{index}" for index in range(PARALLEL_SLOT_RELEASE_RETRY_LIMIT + 1))
+    redis.gauges[_TEAM_GAUGE] = set(slot_ids)
+
+    redis.down = True
+    for slot_id in slot_ids:
+        await pod._release_parallel_request_slots(ParallelSlotAcquisition(slot_id=slot_id, counter_keys=[_TEAM_GAUGE]))
+    redis.down = False
+    await _until(lambda: len(redis.slots(_TEAM_GAUGE)) <= 1)
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    assert redis.slots(_TEAM_GAUGE) == frozenset({slot_ids[-1]})
+
+
+@pytest.mark.asyncio
+async def test_a_release_held_past_the_slot_ttl_is_dropped_v3() -> None:
+    """By the time the slot's TTL has passed, the acquire and count scripts have pruned it from the gauge, so the
+    release has nothing left to do and is not sent."""
+    redis: Final = _GaugeRedis()
+    clock: Final = TimeController()
+    pod: Final = _pod(redis, clock=clock)
+    redis.gauges[_TEAM_GAUGE] = {"slot-past-its-ttl"}
+
+    redis.down = True
+    await pod._release_parallel_request_slots(
+        ParallelSlotAcquisition(slot_id="slot-past-its-ttl", counter_keys=[_TEAM_GAUGE])
+    )
+    clock.advance(PARALLEL_REQUEST_SLOT_TTL_SECONDS)
+    redis.down = False
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    assert redis.release_attempts == [("slot-past-its-ttl",)]
+
 
 
 @pytest.mark.asyncio

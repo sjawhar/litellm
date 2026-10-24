@@ -728,11 +728,14 @@ async def _build_streaming(client_events, backend_ws):
     client_ws.send_text = send_text
     client_ws.receive_text = input_queue.get
 
-    logging_obj = MagicMock()
-    logging_obj.pre_call = MagicMock()
-    logging_obj.async_success_handler = AsyncMock()
-    logging_obj.success_handler = MagicMock()
-    logging_obj.model_call_details = {}
+    logging_obj: Final = MagicMock(
+        pre_call=MagicMock(),
+        async_success_handler=AsyncMock(),
+        success_handler=MagicMock(),
+        dispatch_success_handlers=AsyncMock(),
+        dispatch_failure_handlers=AsyncMock(),
+        model_call_details={},
+    )
 
     streaming = RealTimeStreaming(
         websocket=client_ws,

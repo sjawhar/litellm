@@ -13,6 +13,7 @@ from fastapi import HTTPException, Request
 from pydantic import TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 from starlette.datastructures import Headers
+from typing_extensions import TypeIs  # noqa: TID251  # TypeIs reaches typing only on 3.13
 
 import litellm
 from litellm._logging import verbose_logger, verbose_proxy_logger
@@ -216,6 +217,7 @@ def sanitize_for_log(value: object) -> str:
 
 
 from litellm.router import Router
+from litellm.router_utils.fallback_event_handlers import MID_STREAM_FALLBACK_CONTROLS_KEY, ROUTER_FALLBACKS_KWARG
 from litellm.secret_managers.main import get_secret_bool
 from litellm.types.llms.anthropic import ANTHROPIC_API_HEADERS
 from litellm.types.services import ServiceTypes
@@ -348,6 +350,12 @@ _UNTRUSTED_ROOT_CONTROL_FIELDS: Final = (
     # protection on a real deployment failure or force a false "not caller-controlled"
     # reading that lets its own bad timeout cool down deployments other tenants rely on.
     "client_side_timeout",
+    # Set only by route_request, from the key/team router_settings (a client's own router_settings_override loses its
+    # fallbacks under the server-side-fallback beta). A body value would skip every fallback check.
+    ROUTER_FALLBACKS_KWARG,
+    # Router-internal fallback state, never a caller's to set.
+    "fallback_model_group",
+    MID_STREAM_FALLBACK_CONTROLS_KEY,
 )
 
 _UNTRUSTED_METADATA_CONTROL_FIELDS: Final = (
@@ -406,12 +414,14 @@ _CLIENT_PRICING_CONTROL_FIELDS: Final = frozenset(CustomPricingLiteLLMParams.mod
 # into response_cost and spend; a client seeding it forges (even negative)
 # guardrail cost.
 _CLIENT_PRICING_METADATA_FIELDS: Final = frozenset({"model_info", "standard_logging_guardrail_information"})
-# ``attempted_fallbacks`` and ``original_model_group`` are written by the router
-# and read by spend logs as fact; a client value has no legitimate meaning and no
-# key or team setting keeps it, so the strip is never gated.
+# ``model_group``, ``attempted_fallbacks`` and ``original_model_group`` are written
+# by the router (or by an endpoint that names the group itself) and read by spend
+# logs as fact; a client value has no legitimate meaning and no key or team setting
+# keeps it, so the strip is never gated.
 _ROUTER_RESERVED_METADATA_FIELDS: Final = frozenset(
     {
         "attempted_fallbacks",
+        "model_group",
         "original_model_group",
         "previous_models",
         "request_retry_count",
@@ -664,7 +674,7 @@ def _strip_client_pricing_overrides(data: dict[str, object]) -> None:
 def _strip_router_reserved_metadata(
     data: dict[str, object],  # mutable-ok: strips in place on the request body the pre-call pipeline threads through
 ) -> None:
-    """Drop the router-owned fallback stamps from any client-supplied metadata bucket."""
+    """Drop the router-owned stamps from any client-supplied metadata bucket."""
     for metadata_key in ("metadata", "litellm_metadata"):
         if not isinstance(metadata := data.get(metadata_key), dict):
             continue
@@ -673,6 +683,31 @@ def _strip_router_reserved_metadata(
             verbose_proxy_logger.debug(
                 "Stripped router-reserved metadata field from request body: %s.%s", metadata_key, field
             )
+
+
+class EndpointModelGroup(str):
+    """A model_group an endpoint named itself (an A2A agent, an MCP or search tool). A request body can
+    only carry a plain str, so this type is how the router-stamp strip tells the proxy's value apart."""
+
+    __slots__ = ()
+
+
+def _is_metadata_bucket(value: object) -> TypeIs[Mapping[str, object]]:  # guard-ok: request metadata keys are str
+    return isinstance(value, dict)
+
+
+def _is_caller_router_stamp(field: str, value: object) -> bool:
+    return field in _ROUTER_RESERVED_METADATA_FIELDS and not isinstance(value, EndpointModelGroup)
+
+
+def without_router_reserved_fields(request_data: Mapping[str, object]) -> Mapping[str, Mapping[str, object]]:
+    """Both metadata buckets of a request rejected before ``add_litellm_data_to_request``, without the
+    router-owned stamps the caller sent, for the failure spend row it still writes from its body."""
+    return {
+        bucket_name: {field: value for field, value in bucket.items() if not _is_caller_router_stamp(field, value)}
+        for bucket_name in ("metadata", "litellm_metadata")
+        if _is_metadata_bucket(bucket := request_data.get(bucket_name))
+    }
 
 
 def get_metadata_variable_name(request: Request) -> str:
@@ -1227,6 +1262,9 @@ def _tenant_service_name(user_api_key_dict: UserAPIKeyAuth) -> str | None:
     )
 
 
+_COMMA_JOINED_REPEATED_HEADERS: Final = frozenset({"anthropic-beta"})
+
+
 def clean_headers(
     headers: Headers,
     litellm_key_header_name: str | None = None,
@@ -1276,7 +1314,11 @@ def clean_headers(
         elif header_lower not in _SPECIAL_HEADERS_CACHE and (
             litellm_key_lower is None or header_lower != litellm_key_lower
         ):
-            clean_headers[header] = value
+            clean_headers[header] = (
+                f"{clean_headers[header]},{value}"
+                if header_lower in _COMMA_JOINED_REPEATED_HEADERS and header in clean_headers
+                else value
+            )
     return clean_headers
 
 
@@ -2124,6 +2166,7 @@ async def add_litellm_data_to_request(
     proxy_config: ProxyConfig,
     general_settings: dict[str, Any] | None = None,
     version: str | None = None,
+    model_group: str | None = None,
 ):
     """
     Adds LiteLLM-specific data to the request.
@@ -2134,6 +2177,8 @@ async def add_litellm_data_to_request(
         user_api_key_dict (UserAPIKeyAuth): The user API key dictionary.
         general_settings (Optional[Dict[str, Any]], optional): General settings. Defaults to None.
         version (Optional[str], optional): Version. Defaults to None.
+        model_group (Optional[str], optional): The group an endpoint names itself (an A2A agent, an MCP or
+            search tool), stamped after the caller's own model_group is stripped. Defaults to None.
 
     Returns:
         dict: The modified data dictionary.
@@ -2152,7 +2197,6 @@ async def add_litellm_data_to_request(
         if _allow_client_mock_response and _internal_key in _CLIENT_MOCK_CONTROL_FIELDS:
             continue
         data.pop(_internal_key, None)
-    _reject_url_valued_destinations(data)
     _raw_metadata_by_field: Final = {
         _metadata_field: data.pop(_metadata_field)
         for _metadata_field in ("metadata", "litellm_metadata")
@@ -2160,6 +2204,9 @@ async def add_litellm_data_to_request(
     }
     for _metadata_field, _raw_metadata in _raw_metadata_by_field.items():
         data[_metadata_field] = _normalized_metadata_object(_metadata_field, _raw_metadata)
+    # Before any check below can reject the request: a rejected request still writes its failure spend row from data.
+    _strip_router_reserved_metadata(data)
+    _reject_url_valued_destinations(data)
     # Strip spoofable auth metadata from user-supplied metadata dict
     _user_metadata = data.get("metadata")
     if isinstance(_user_metadata, dict):
@@ -2244,6 +2291,10 @@ async def add_litellm_data_to_request(
     _metadata_variable_name: Final = get_metadata_variable_name(request)
     if data.get(_metadata_variable_name, None) is None:
         data[_metadata_variable_name] = {}
+    if model_group is not None:
+        data[_metadata_variable_name]["model_group"] = EndpointModelGroup(  # rebind-ok: data is the body built in place
+            model_group
+        )
 
     data.update(
         LiteLLMProxyRequestSetup.add_litellm_data_for_backend_llm_call(
@@ -2336,14 +2387,14 @@ async def add_litellm_data_to_request(
     # via multipart/form-data or extra_body) cannot smuggle admin fields past
     # the isinstance(dict) guard.
     #
-    # The proxy populates a family of ``user_api_key_*`` fields below
-    # (user_api_key_metadata, user_api_key_user_id, user_api_key_alias,
-    # user_api_key_spend, user_api_key_team_metadata, …) into
-    # data[_metadata_variable_name]. Because the proxy only writes to ONE of
-    # the two metadata dicts, a caller pre-populating any of these keys on
+    # The proxy populates a family of ``user_api_key`` fields below
+    # (user_api_key, user_api_key_metadata, user_api_key_user_id,
+    # user_api_key_alias, user_api_key_spend, user_api_key_team_metadata, …)
+    # into data[_metadata_variable_name]. Because the proxy only writes to ONE
+    # of the two metadata dicts, a caller pre-populating any of these keys on
     # the OTHER metadata dict would have their forged values surface in
     # guardrails, spend tracking, audit logs, and identity resolution. Strip
-    # by prefix so new ``user_api_key_*`` fields added in the future are
+    # by prefix so new ``user_api_key*`` fields added in the future are
     # covered without per-key maintenance.
     for _meta_key in ("metadata", "litellm_metadata"):
         _user_meta = data.get(_meta_key)
@@ -2353,7 +2404,7 @@ async def add_litellm_data_to_request(
                 allow_client_message_redaction_opt_out=(_allow_client_message_redaction_opt_out),
             )
             for _k in [
-                k for k in _user_meta if k.startswith("user_api_key_") or k in _UNTRUSTED_METADATA_CONTROL_FIELDS
+                k for k in _user_meta if k.startswith("user_api_key") or k in _UNTRUSTED_METADATA_CONTROL_FIELDS
             ]:
                 _user_meta.pop(_k, None)
 
@@ -2364,7 +2415,6 @@ async def add_litellm_data_to_request(
     # would silently skip the field.
     if not _key_or_team_allows_client_pricing_override(user_api_key_dict):
         _strip_client_pricing_overrides(data)
-    _strip_router_reserved_metadata(data)
 
     # Same reason as the strips above: runs after the metadata string-to-dict parse
     # so JSON-string metadata cannot smuggle callback credentials past the dict guard.

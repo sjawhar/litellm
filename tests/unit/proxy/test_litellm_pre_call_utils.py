@@ -475,11 +475,12 @@ async def test_add_litellm_data_to_request_strips_admin_injection_slots():
 
 @pytest.mark.asyncio
 async def test_add_litellm_data_to_request_strips_all_user_api_key_prefix_keys():
-    """Strip must cover the full user_api_key_* family, not a hand-maintained
-    list of 2-3 names. Proxy writes a dozen such fields (user_id, alias,
-    spend, team_id, request_route, …) and an attacker populating any of them
+    """Strip must cover the full user_api_key family, the bare key included, not a
+    hand-maintained list of 2-3 names. Proxy writes a dozen such fields (user_id,
+    alias, spend, team_id, request_route, …) and an attacker populating any of them
     in the non-authoritative metadata key would otherwise forge identity /
-    spend in audit logs and guardrails."""
+    spend in audit logs and guardrails. The bare user_api_key is the one every
+    standard-logging payload falls back to for user_api_key_hash."""
     from litellm.proxy.litellm_pre_call_utils import add_litellm_data_to_request
 
     request_mock = MagicMock(spec=Request)
@@ -493,6 +494,7 @@ async def test_add_litellm_data_to_request_strips_all_user_api_key_prefix_keys()
     request_mock.client.host = "127.0.0.1"
 
     attacker_injected = {
+        "user_api_key": "f" * 64,
         "user_api_key_user_id": "victim",
         "user_api_key_alias": "admin-key",
         "user_api_key_spend": 0.0,
@@ -528,11 +530,53 @@ async def test_add_litellm_data_to_request_strips_all_user_api_key_prefix_keys()
         version="test-version",
     )
 
-    # The non-authoritative metadata dict must not retain ANY attacker-injected
-    # user_api_key_* key.
+    # Neither the non-authoritative metadata dict nor the authoritative one may
+    # retain an attacker-injected user_api_key key.
     other = updated.get("litellm_metadata") or {}
-    attacker_leaks = [k for k in other if k.startswith("user_api_key_")]
+    attacker_leaks = [k for k in other if k.startswith("user_api_key")]
     assert attacker_leaks == [], f"Unexpected leaked keys: {attacker_leaks}"
+    assert (updated.get("metadata") or {}).get("user_api_key") == user_api_key_dict.api_key
+
+
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_strips_the_bare_user_api_key_the_proxy_does_not_own():
+    """On /v1/messages the proxy stamps litellm_metadata, so a caller's
+    metadata.user_api_key outlives the strip unless it covers the bare name too.
+    get_standard_logging_metadata turns a sha256-shaped one into the standard
+    logging payload's user_api_key_hash, which its consumers log, label metrics
+    with and file spend rows under."""
+    from litellm.proxy.litellm_pre_call_utils import add_litellm_data_to_request
+
+    request_mock = MagicMock(spec=Request)
+    request_mock.url = MagicMock()
+    request_mock.url.path = "/v1/messages"
+    request_mock.url.__str__.return_value = "http://localhost/v1/messages"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {"Content-Type": "application/json"}
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    user_api_key_dict = UserAPIKeyAuth(api_key="hashed-key", user_id="real-user", metadata={}, team_metadata={})
+
+    updated = await add_litellm_data_to_request(
+        data={
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"user_api_key": "f" * 64},
+            "litellm_metadata": {},
+        },
+        request=request_mock,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    assert {
+        "metadata": (updated.get("metadata") or {}).get("user_api_key"),
+        "litellm_metadata": (updated.get("litellm_metadata") or {}).get("user_api_key"),
+    } == {"metadata": None, "litellm_metadata": user_api_key_dict.api_key}
 
 
 @pytest.mark.asyncio
@@ -1282,6 +1326,7 @@ async def test_key_metadata_enable_prompt_caching_promoted_to_request_root(key_v
         "_code_interpreter_interception_sandbox_key",
         "_headroom_interception_converted_stream",
         "max_agentic_loops",
+        "router_fallbacks",
     ],
 )
 async def test_add_litellm_data_to_request_strips_callback_control_fields(
@@ -1317,6 +1362,7 @@ async def test_add_litellm_data_to_request_strips_callback_control_fields(
         "_code_interpreter_interception_sandbox_key": "forged-key",
         "_headroom_interception_converted_stream": True,
         "max_agentic_loops": 9999,
+        "router_fallbacks": [{"model": "gpt-3.5-turbo", "api_base": "https://attacker.example"}],
     }
     sample_value = sample_values[control_field]
 
@@ -8049,6 +8095,7 @@ def _reserved_stamp_key(key_metadata: dict | None = None) -> UserAPIKeyAuth:
 
 _PLANTED_STAMPS = {
     "attempted_fallbacks": 99,
+    "model_group": "spoofed-group",
     "original_model_group": "spoofed-group",
     "request_retry_count": -100,
     "previous_models": [{"exception_type": "Timeout", "deployment_id": "spoofed", "attempted_retries": 101}],
@@ -8083,6 +8130,7 @@ async def test_add_litellm_data_to_request_strips_router_reserved_stamps_from_bo
 
     assert "litellm_metadata" not in updated
     assert "attempted_fallbacks" not in updated["metadata"]
+    assert "model_group" not in updated["metadata"]
     assert "original_model_group" not in updated["metadata"]
     assert "_client_output_ceiling" not in updated["metadata"]
     assert "request_retry_count" not in updated["metadata"]
@@ -8112,6 +8160,7 @@ async def test_add_litellm_data_to_request_strips_router_reserved_stamps_from_js
 
     assert "litellm_metadata" not in updated
     assert "attempted_fallbacks" not in updated["metadata"]
+    assert "model_group" not in updated["metadata"]
     assert "original_model_group" not in updated["metadata"]
     assert "request_retry_count" not in updated["metadata"]
     assert updated["metadata"]["client_key"] == "client_value"
@@ -8141,6 +8190,7 @@ async def test_add_litellm_data_to_request_strips_router_reserved_stamps_despite
     assert "litellm_metadata" not in updated
     assert updated["metadata"]["model_info"] == {"input_cost_per_token": 0.0}
     assert "attempted_fallbacks" not in updated["metadata"]
+    assert "model_group" not in updated["metadata"]
     assert "original_model_group" not in updated["metadata"]
     assert "request_retry_count" not in updated["metadata"]
 
@@ -8169,8 +8219,118 @@ async def test_add_litellm_data_to_request_strips_router_reserved_stamps_on_resp
 
     for bucket in ("metadata", "litellm_metadata"):
         assert "attempted_fallbacks" not in updated[bucket]
+        assert "model_group" not in updated[bucket]
         assert "original_model_group" not in updated[bucket]
         assert updated[bucket]["client_key"] == "client_value"
+
+
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_strips_client_model_group_on_messages_route():
+    """/v1/messages forwards the caller's own metadata to Anthropic and keeps the proxy's fields in
+    litellm_metadata; a model_group planted in either one never reaches the spend row"""
+    from litellm.proxy.litellm_pre_call_utils import add_litellm_data_to_request
+
+    data = {
+        "model": "claude-refuse",
+        "max_tokens": 5,
+        "messages": [{"role": "user", "content": "hi"}],
+        "metadata": {"user_id": "s1", "model_group": "client-chosen"},
+        "litellm_metadata": {"model_group": "client-chosen"},
+    }
+
+    updated = await add_litellm_data_to_request(
+        data=data,
+        request=_reserved_stamp_request("/v1/messages"),
+        user_api_key_dict=_reserved_stamp_key(),
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    assert "model_group" not in updated["metadata"]
+    assert "model_group" not in updated["litellm_metadata"]
+    assert updated["metadata"]["user_id"] == "s1"
+
+
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_strips_reserved_stamps_before_it_can_reject_the_request():
+    """A request add_litellm_data_to_request rejects still writes a failure spend row from the same
+    dict, so the reserved keys must already be gone when the rejection is raised"""
+    from litellm.proxy.litellm_pre_call_utils import add_litellm_data_to_request
+
+    data = {
+        "model": "gpt-3.5-turbo",
+        "messages": [{"role": "user", "content": "hi"}],
+        "metadata": dict(_PLANTED_STAMPS),
+    }
+
+    with pytest.raises(ProxyException):
+        await add_litellm_data_to_request(
+            data=data,
+            request=_reserved_stamp_request("/v1/chat/completions"),
+            user_api_key_dict=_reserved_stamp_key(),
+            proxy_config=MagicMock(),
+            general_settings={"missing_session_id": "reject"},
+            version="test-version",
+        )
+
+    assert "model_group" not in data["metadata"]
+    assert "original_model_group" not in data["metadata"]
+    assert data["metadata"]["client_key"] == "client_value"
+
+
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_strips_reserved_stamps_before_rejecting_a_url_valued_model():
+    """The URL-valued model check is the first rejection after the metadata parse, so the strip must
+    already have run when it raises"""
+    from fastapi import HTTPException
+
+    from litellm.proxy.litellm_pre_call_utils import add_litellm_data_to_request
+
+    data = {
+        "model": "https://attacker.example/v1/chat/completions",
+        "messages": [{"role": "user", "content": "hi"}],
+        "metadata": dict(_PLANTED_STAMPS),
+    }
+
+    with pytest.raises(HTTPException):
+        await add_litellm_data_to_request(
+            data=data,
+            request=_reserved_stamp_request("/v1/chat/completions"),
+            user_api_key_dict=_reserved_stamp_key(),
+            proxy_config=MagicMock(),
+            general_settings={},
+            version="test-version",
+        )
+
+    assert "model_group" not in data["metadata"]
+    assert "original_model_group" not in data["metadata"]
+    assert data["metadata"]["client_key"] == "client_value"
+
+
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_stamps_the_endpoints_own_model_group_over_the_callers():
+    """Endpoints that name the group themselves (A2A agents, MCP tools, search tools) hand it in
+    separately, so it lands in the proxy's bucket after the caller's value is stripped"""
+    from litellm.proxy.litellm_pre_call_utils import add_litellm_data_to_request
+
+    data = {
+        "model": "MCP: demo-tool",
+        "metadata": {"model_group": "client-chosen", "client_key": "client_value"},
+    }
+
+    updated = await add_litellm_data_to_request(
+        data=data,
+        request=_reserved_stamp_request("/mcp-rest/tools/call"),
+        user_api_key_dict=_reserved_stamp_key(),
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+        model_group="MCP: demo-tool",
+    )
+
+    assert updated["metadata"]["model_group"] == "MCP: demo-tool"
+    assert updated["metadata"]["client_key"] == "client_value"
 
 
 @pytest.mark.asyncio
@@ -8198,6 +8358,7 @@ async def test_router_keeps_proxy_metadata_bucket_identity_after_reserved_stamp_
     )
     proxy_bucket = request_data["metadata"]
     assert "attempted_fallbacks" not in proxy_bucket
+    assert "model_group" not in proxy_bucket
     assert "original_model_group" not in proxy_bucket
     router = litellm.Router(
         model_list=[
@@ -8221,6 +8382,7 @@ async def test_router_keeps_proxy_metadata_bucket_identity_after_reserved_stamp_
     assert forwarded_buckets == [proxy_bucket]
     assert forwarded_buckets[0] is proxy_bucket
     assert proxy_bucket["attempted_fallbacks"] == 0
+    assert proxy_bucket["model_group"] == "gpt-3.5-turbo"
     assert proxy_bucket.get("original_model_group") != "spoofed-group"
     proxy_bucket["standard_logging_guardrail_information"] = [{"guardrail_name": "postcall-guard"}]
     assert forwarded_buckets[0]["standard_logging_guardrail_information"] == [{"guardrail_name": "postcall-guard"}]
@@ -9044,3 +9206,28 @@ def test_arize_otlp_protocol_on_a_key_logging_entry_reaches_the_destination(monk
         assert destinations[0].endpoint == "https://arize.internal.example/v1/traces"
     finally:
         is_otel_v2_enabled.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "beta_lines",
+    [
+        pytest.param(("server-side-fallback-2026-07-01", "prompt-caching-2024-07-31"), id="opt-in-first"),
+        pytest.param(("prompt-caching-2024-07-31", "server-side-fallback-2026-07-01"), id="opt-in-last"),
+    ],
+)
+def test_repeated_anthropic_beta_lines_reach_routing_as_auth_sees_them(beta_lines):
+    from starlette.datastructures import Headers
+
+    from litellm.llms.anthropic.common_utils import (
+        anthropic_beta_opts_into_server_side_fallback,
+        anthropic_owns_fallbacks,
+    )
+    from litellm.proxy.litellm_pre_call_utils import add_provider_specific_headers_to_request, clean_headers
+
+    headers = Headers(raw=[(b"anthropic-beta", line.encode()) for line in beta_lines])
+    data: dict = {}
+    add_provider_specific_headers_to_request(data=data, headers=clean_headers(headers))
+
+    assert anthropic_beta_opts_into_server_side_fallback(headers) is True
+    assert anthropic_owns_fallbacks(data) is True
+    assert data["provider_specific_header"]["extra_headers"]["anthropic-beta"].split(",") == list(beta_lines)

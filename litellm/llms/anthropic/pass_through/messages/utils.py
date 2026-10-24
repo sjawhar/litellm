@@ -1,14 +1,18 @@
 from collections.abc import Iterable, Mapping, Sequence
-from functools import lru_cache
+from functools import lru_cache, reduce
 from typing import TYPE_CHECKING, Any, Final, cast, get_type_hints
 
 from pydantic import JsonValue
 
 from litellm.integrations.anthropic_cache_control_hook import AnthropicCacheControlHook
+from litellm.litellm_core_utils.dot_notation_indexing import delete_nested_value
 from litellm.llms.anthropic.common_utils import (
+    anthropic_owns_fallbacks,
+    anthropic_request_errors_on_thinking_binding_mismatch,
     flatten_unencrypted_web_search_results_in_anthropic_messages,
     sanitize_tool_use_ids_in_anthropic_messages,
     strip_empty_content_blocks_from_anthropic_messages,
+    validated_object_list,
 )
 from litellm.llms.anthropic.pass_through.utils import is_reasoning_auto_summary_enabled
 from litellm.types.llms.anthropic import (
@@ -28,6 +32,17 @@ INCOMPLETE_STREAM_ERROR_MESSAGE: Final = (
     "Provider stream ended before emitting a message_stop event; "
     "the response is incomplete and any partial content (e.g. tool_use input JSON) may be truncated."
 )
+
+
+def thinking_pinned_after_drops(thinking: object, additional_drop_params: object) -> bool:
+    """
+    Whether ``thinking.block_binding`` still asks for the error once the deployment's
+    ``additional_drop_params`` are applied, the same drop the request on the wire gets
+    """
+    drops: Final = tuple(path for path in validated_object_list(additional_drop_params) or () if isinstance(path, str))
+    return anthropic_request_errors_on_thinking_binding_mismatch(
+        reduce(delete_nested_value, drops, {"thinking": thinking})
+    )
 
 
 def get_safeguard_refusal_stop_details(response: object) -> Mapping[str, Any] | None:
@@ -138,12 +153,13 @@ def prepare_native_messages(
     tools: list[dict[str, JsonValue]] | None = None,
     api_base: str | None = None,
     presanitized: bool = False,
+    thinking: object = None,
 ) -> tuple[list[dict[str, JsonValue]], str | list[dict[str, JsonValue]] | None]:
     normalized: Final = (
         messages
         if presanitized
-        else flatten_unencrypted_web_search_results_in_anthropic_messages(
-            sanitize_tool_use_ids_in_anthropic_messages(strip_empty_content_blocks_from_anthropic_messages(messages))
+        else normalize_native_messages(
+            messages, keep_thinking=thinking_pinned_after_drops(thinking, kwargs.get("additional_drop_params"))
         )
     )
     return cast(  # cast-ok: legacy normalizers and injection preserve the JSON message and system shapes
@@ -160,10 +176,15 @@ def prepare_native_messages(
     )
 
 
-def normalize_native_messages(messages: Sequence[object]) -> list[dict[str, object]]:
-    """Apply the block rewrites every /v1/messages request gets before it reaches a provider."""
+def normalize_native_messages(messages: Sequence[object], *, keep_thinking: bool = False) -> list[dict[str, object]]:
+    """
+    Apply the block rewrites every /v1/messages request gets before it reaches a provider. ``keep_thinking`` keeps
+    every thinking block, for a request whose ``thinking.block_binding`` asks Anthropic for the error instead.
+    """
     return flatten_unencrypted_web_search_results_in_anthropic_messages(
-        sanitize_tool_use_ids_in_anthropic_messages(strip_empty_content_blocks_from_anthropic_messages(messages))
+        sanitize_tool_use_ids_in_anthropic_messages(
+            strip_empty_content_blocks_from_anthropic_messages(messages, keep_thinking=keep_thinking)
+        )
     )
 
 
@@ -177,6 +198,9 @@ def anthropic_messages_optional_param_keys() -> frozenset[str]:
     full-pass cost from the /v1/messages request-parse path.
     """
     return frozenset(get_type_hints(AnthropicMessagesRequestOptionalParams).keys())
+
+
+_DIRECT_ANTHROPIC_ONLY_PARAMS: Final = frozenset({"fallbacks"})
 
 
 class AnthropicMessagesRequestUtils:
@@ -195,12 +219,17 @@ class AnthropicMessagesRequestUtils:
             params: Dictionary of parameters to filter
             model: Resolved model id; when set, unsupported params may be dropped
             drop_params: Per-request drop_params flag (also respects litellm.drop_params)
-            custom_llm_provider: Routed provider; fast mode is gated to direct Anthropic
+            custom_llm_provider: Routed provider; fast mode is gated to direct Anthropic, and server-side
+                fallbacks to direct Anthropic on a request whose anthropic-beta header opts in
 
         Returns:
             AnthropicMessagesRequestOptionalParams instance with only the valid parameters
         """
-        valid_keys: Final = anthropic_messages_optional_param_keys()
+        valid_keys: Final = (
+            anthropic_messages_optional_param_keys()
+            if custom_llm_provider == "anthropic" and anthropic_owns_fallbacks(params)
+            else anthropic_messages_optional_param_keys() - _DIRECT_ANTHROPIC_ONLY_PARAMS
+        )
         filtered_params: Final = {k: v for k, v in params.items() if k in valid_keys and v is not None}
         if model is not None:
             from litellm.llms.anthropic.chat.transformation import AnthropicConfig
