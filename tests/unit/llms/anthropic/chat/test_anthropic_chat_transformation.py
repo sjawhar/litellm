@@ -8069,14 +8069,14 @@ def _edits_for(keeps_thinking: bool) -> list[dict[str, str]]:
         pytest.param("claude-sonnet-4-5", {"reasoning_effort": "high"}, True, id="reasoning-effort-high"),
     ],
 )
-def test_map_openai_params_drops_clear_thinking_edit_exactly_when_thinking_is(model, params, keeps_thinking):
-    """context_management comes first so the edit is already mapped when thinking is dropped"""
+@pytest.mark.parametrize("context_management_first", [True, False])
+def test_map_openai_params_drops_clear_thinking_edit_exactly_when_thinking_is(
+    model, params, keeps_thinking, context_management_first
+):
+    context_management: Final = {"context_management": {"edits": [CLEAR_THINKING_EDIT, CLEAR_TOOL_USES_EDIT]}}
+    rest: Final = {"max_tokens": 8192, **params}
     result = AnthropicConfig().map_openai_params(
-        non_default_params={
-            "context_management": {"edits": [CLEAR_THINKING_EDIT, CLEAR_TOOL_USES_EDIT]},
-            "max_tokens": 8192,
-            **params,
-        },
+        non_default_params={**context_management, **rest} if context_management_first else {**rest, **context_management},
         optional_params={},
         model=model,
         drop_params=False,
@@ -8084,6 +8084,28 @@ def test_map_openai_params_drops_clear_thinking_edit_exactly_when_thinking_is(mo
 
     assert ("thinking" in result) is keeps_thinking
     assert result["context_management"] == {"edits": _edits_for(keeps_thinking)}
+
+
+@pytest.mark.parametrize(
+    ("model", "reasoning_effort"),
+    [
+        pytest.param("claude-fable-5", "none", id="always-on-model"),
+        pytest.param("claude-sonnet-4-5", {"summary": "concise"}, id="effort-less-dict"),
+    ],
+)
+def test_map_openai_params_keeps_clear_thinking_edit_when_thinking_was_not_dropped(model, reasoning_effort):
+    result = AnthropicConfig().map_openai_params(
+        non_default_params={
+            "context_management": {"edits": [CLEAR_THINKING_EDIT]},
+            "max_tokens": 8192,
+            "reasoning_effort": reasoning_effort,
+        },
+        optional_params={},
+        model=model,
+        drop_params=False,
+    )
+
+    assert result["context_management"] == {"edits": [CLEAR_THINKING_EDIT]}
 
 
 @pytest.mark.parametrize("modify_params", [True, False])

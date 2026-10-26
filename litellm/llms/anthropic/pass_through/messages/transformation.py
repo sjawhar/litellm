@@ -86,6 +86,9 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
     def _carries_thinking_block_binding(self) -> bool:
         return type(self) is AnthropicMessagesConfig
 
+    def _drop_thinking(self, optional_params: dict) -> None:  # mutable-ok: edits optional params in place
+        pop_thinking_and_clear_thinking_edits(optional_params)
+
     def get_supported_anthropic_messages_params(self, model: str) -> list:
         return [
             "messages",
@@ -382,9 +385,8 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
             messages=messages,
         )
 
-    @staticmethod
     def _translate_reasoning_effort_to_anthropic(
-        model: str, optional_params: dict, max_tokens: int | None, custom_llm_provider: str
+        self, model: str, optional_params: dict, max_tokens: int | None, custom_llm_provider: str
     ) -> None:
         """Map OpenAI-style ``reasoning_effort`` to native Anthropic params.
 
@@ -413,7 +415,10 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
             raise AnthropicError(message=str(e.message), status_code=400)
 
         if mapped_thinking is None:
-            pop_thinking_and_clear_thinking_edits(optional_params)
+            if AnthropicModelInfo._is_always_on_thinking_model(model, custom_llm_provider):
+                optional_params.pop("thinking", None)
+            else:
+                self._drop_thinking(optional_params)
             optional_params.pop("output_config", None)
             return
 
@@ -443,9 +448,8 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
             existing_output_config.setdefault("effort", mapped_effort)
             optional_params["output_config"] = existing_output_config
 
-    @staticmethod
     def _translate_adaptive_effort_for_non_adaptive_model(
-        model: str, optional_params: dict, max_tokens: int | None, custom_llm_provider: str
+        self, model: str, optional_params: dict, max_tokens: int | None, custom_llm_provider: str
     ) -> None:
         """Translate the 4.6+ adaptive-thinking interface (``thinking.type=adaptive``
         and/or ``output_config.effort``) down to what an older Anthropic model
@@ -508,7 +512,7 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
             or AnthropicConfig.validate_effort_for_model(model, effort, custom_llm_provider) is None
         ):
             if adaptive_thinking:
-                pop_thinking_and_clear_thinking_edits(optional_params)
+                self._drop_thinking(optional_params)
             return
 
         supports_thinking: Final = AnthropicModelInfo.supports_model_capability(
@@ -536,7 +540,7 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
             optional_params["thinking"] = capped_thinking
         else:
             verbose_logger.warning(DROP_UNSUPPORTED_ADAPTIVE_EFFORT_WARNING, model)
-            pop_thinking_and_clear_thinking_edits(optional_params)
+            self._drop_thinking(optional_params)
 
         if isinstance(output_config, dict) and "effort" in output_config:
             residual: Final = {k: v for k, v in output_config.items() if k != "effort"}

@@ -1723,7 +1723,15 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
                 # Pass through top-level cache_control for automatic prompt caching
                 optional_params["cache_control"] = value
 
-        if "thinking" not in optional_params and ({"thinking", "reasoning_effort"} & non_default_params.keys()):
+        reasoning_effort_param: Final = non_default_params.get("reasoning_effort")
+        requested_effort: Final = (
+            reasoning_effort_param.get("effort") if isinstance(reasoning_effort_param, dict) else reasoning_effort_param
+        )
+        if (
+            "thinking" not in optional_params
+            and ("thinking" in non_default_params or isinstance(requested_effort, str))
+            and not AnthropicModelInfo._is_always_on_thinking_model(model, self._resolved_provider)
+        ):
             pop_thinking_and_clear_thinking_edits(optional_params)
 
         ## handle thinking tokens

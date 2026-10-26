@@ -1719,7 +1719,7 @@ def _is_clear_thinking_edit(edit: object) -> bool:
     return isinstance(edit, dict) and str(edit.get("type", "")).startswith("clear_thinking_")
 
 
-def pop_thinking_and_clear_thinking_edits(params: dict[str, Any]) -> None:  # mutable-ok: edits request params in place
+def pop_thinking_and_clear_thinking_edits(params: MutableMapping[str, object]) -> None:  # mutable-ok: edits in place
     """
     Remove ``thinking`` from an Anthropic Messages request or its optional
     params, together with the ``clear_thinking_*`` context-management edits
