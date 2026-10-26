@@ -100,6 +100,7 @@ from ..common_utils import (
     AnthropicError,
     AnthropicModelInfo,
     eager_input_streaming_flag,
+    pop_thinking_and_clear_thinking_edits,
     process_anthropic_headers,
     requires_native_compaction_beta,
     strip_advisor_blocks_from_messages,
@@ -1722,6 +1723,9 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
                 # Pass through top-level cache_control for automatic prompt caching
                 optional_params["cache_control"] = value
 
+        if "thinking" not in optional_params and ({"thinking", "reasoning_effort"} & non_default_params.keys()):
+            pop_thinking_and_clear_thinking_edits(optional_params)
+
         ## handle thinking tokens
         self.update_optional_params_with_thinking_tokens(
             non_default_params=non_default_params, optional_params=optional_params
@@ -2003,7 +2007,7 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
             and not any_assistant_message_has_thinking_blocks(messages)
         ):
             if litellm.modify_params:
-                optional_params.pop("thinking", None)
+                pop_thinking_and_clear_thinking_edits(optional_params)
                 litellm.verbose_logger.warning(
                     "Dropping 'thinking' param because the last assistant message with tool_calls "
                     "has no thinking_blocks. The model won't use extended thinking for this turn."

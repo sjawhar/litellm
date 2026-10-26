@@ -8046,3 +8046,69 @@ def test_transform_request_tool_config_point_without_tools_drops_the_key():
     assert "cache_control_injection_points" not in data
     assert "tools" not in data
     assert litellm_params["metadata"] == {}
+
+
+CLEAR_THINKING_EDIT: Final = {"type": "clear_thinking_20251015", "keep": "all"}
+CLEAR_TOOL_USES_EDIT: Final = {"type": "clear_tool_uses_20250919"}
+
+
+def _edits_for(keeps_thinking: bool) -> list[dict[str, str]]:
+    return [CLEAR_THINKING_EDIT, CLEAR_TOOL_USES_EDIT] if keeps_thinking else [CLEAR_TOOL_USES_EDIT]
+
+
+@pytest.mark.parametrize(
+    ("model", "params", "keeps_thinking"),
+    [
+        pytest.param(
+            "claude-haiku-4-5", {"thinking": {"type": "adaptive"}, "max_tokens": 1000}, False, id="adaptive-unfit-dropped"
+        ),
+        pytest.param(
+            "claude-haiku-4-5", {"thinking": {"type": "adaptive"}, "max_tokens": 8192}, True, id="adaptive-translated"
+        ),
+        pytest.param("claude-sonnet-4-5", {"reasoning_effort": "none"}, False, id="reasoning-effort-none"),
+        pytest.param("claude-sonnet-4-5", {"reasoning_effort": "high"}, True, id="reasoning-effort-high"),
+    ],
+)
+def test_map_openai_params_drops_clear_thinking_edit_exactly_when_thinking_is(model, params, keeps_thinking):
+    """context_management comes first so the edit is already mapped when thinking is dropped"""
+    result = AnthropicConfig().map_openai_params(
+        non_default_params={
+            "context_management": {"edits": [CLEAR_THINKING_EDIT, CLEAR_TOOL_USES_EDIT]},
+            "max_tokens": 8192,
+            **params,
+        },
+        optional_params={},
+        model=model,
+        drop_params=False,
+    )
+
+    assert ("thinking" in result) is keeps_thinking
+    assert result["context_management"] == {"edits": _edits_for(keeps_thinking)}
+
+
+@pytest.mark.parametrize("modify_params", [True, False])
+def test_transform_request_drops_clear_thinking_edit_with_thinking_for_tool_turn_without_thinking_blocks(
+    monkeypatch, modify_params
+):
+    monkeypatch.setattr(litellm, "modify_params", modify_params)
+    result = AnthropicConfig().transform_request(
+        model="claude-sonnet-4-5",
+        messages=[
+            {"role": "user", "content": "Look it up"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "found"},
+        ],
+        optional_params={
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "context_management": {"edits": [CLEAR_THINKING_EDIT, CLEAR_TOOL_USES_EDIT]},
+        },
+        litellm_params={},
+        headers={},
+    )
+
+    assert ("thinking" in result) is not modify_params
+    assert result["context_management"] == {"edits": _edits_for(not modify_params)}
