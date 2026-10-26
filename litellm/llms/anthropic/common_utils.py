@@ -1720,12 +1720,26 @@ def strip_thinking_blocks_from_anthropic_messages_request_dict(
 ) -> None:
     """
     Mutate an Anthropic Messages-style request dict: strip thinking blocks from
-    ``messages`` and remove the top-level ``thinking`` extended-thinking param.
+    ``messages``, remove the top-level ``thinking`` extended-thinking param, and
+    drop ``clear_thinking_*`` context-management edits, which Anthropic rejects
+    without ``thinking``.
     """
     msgs: Final = data.get("messages")
     if isinstance(msgs, list):
         data["messages"] = strip_thinking_blocks_from_anthropic_messages(msgs)
     data.pop("thinking", None)
+    context_management: Final = data.get("context_management")
+    if not isinstance(context_management, dict) or not isinstance(context_management.get("edits"), list):
+        return
+    edits: Final = [
+        edit
+        for edit in context_management["edits"]
+        if not (isinstance(edit, dict) and str(edit.get("type", "")).startswith("clear_thinking_"))
+    ]
+    if edits:
+        data["context_management"] = {**context_management, "edits": edits}
+    else:
+        data.pop("context_management")
 
 
 def strip_empty_content_blocks_from_anthropic_messages(

@@ -1560,6 +1560,44 @@ class TestAnthropicThinkingSignatureSelfHeal:
         assert "thinking" not in data
         assert data["messages"] == []
 
+    @pytest.mark.parametrize(
+        ("other_edits", "expected_context_management"),
+        [
+            pytest.param(
+                [{"type": "clear_tool_uses_20250919", "keep": {"type": "tool_uses", "value": 3}}],
+                {"edits": [{"type": "clear_tool_uses_20250919", "keep": {"type": "tool_uses", "value": 3}}]},
+                id="other-edits-kept",
+            ),
+            pytest.param([], None, id="only-clear-thinking"),
+        ],
+    )
+    def test_strip_thinking_request_dict_drops_clear_thinking_edits(self, other_edits, expected_context_management):
+        from litellm.llms.anthropic.common_utils import (
+            strip_thinking_blocks_from_anthropic_messages_request_dict,
+        )
+
+        data = {
+            "model": "claude-opus-4-8",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "unsigned"},
+                        {"type": "text", "text": "hello"},
+                    ],
+                },
+            ],
+            "thinking": {"type": "adaptive"},
+            "context_management": {
+                "edits": [{"type": "clear_thinking_20251015", "keep": "all"}, *other_edits],
+            },
+        }
+        strip_thinking_blocks_from_anthropic_messages_request_dict(data)
+        assert "thinking" not in data
+        assert data["messages"][1]["content"] == [{"type": "text", "text": "hello"}]
+        assert data.get("context_management") == expected_context_management
+
     def test_strip_empty_content_blocks_from_anthropic_messages(self):
         """Covers #22930.  The core regression scenario: an assistant message
         with an empty text block alongside ``tool_use`` loses the empty block
