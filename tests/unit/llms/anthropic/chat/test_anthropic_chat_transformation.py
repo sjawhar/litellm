@@ -8108,13 +8108,20 @@ def test_map_openai_params_keeps_clear_thinking_edit_when_thinking_was_not_dropp
     assert result["context_management"] == {"edits": [CLEAR_THINKING_EDIT]}
 
 
-@pytest.mark.parametrize("modify_params", [True, False])
+@pytest.mark.parametrize(
+    ("model", "modify_params", "keeps_thinking", "keeps_edit"),
+    [
+        pytest.param("claude-sonnet-4-5", True, False, False, id="dropped"),
+        pytest.param("claude-sonnet-4-5", False, True, True, id="modify-params-off"),
+        pytest.param("claude-fable-5", True, False, True, id="always-on-keeps-edit"),
+    ],
+)
 def test_transform_request_drops_clear_thinking_edit_with_thinking_for_tool_turn_without_thinking_blocks(
-    monkeypatch, modify_params
+    monkeypatch, model, modify_params, keeps_thinking, keeps_edit
 ):
     monkeypatch.setattr(litellm, "modify_params", modify_params)
     result = AnthropicConfig().transform_request(
-        model="claude-sonnet-4-5",
+        model=model,
         messages=[
             {"role": "user", "content": "Look it up"},
             {
@@ -8132,5 +8139,5 @@ def test_transform_request_drops_clear_thinking_edit_with_thinking_for_tool_turn
         headers={},
     )
 
-    assert ("thinking" in result) is not modify_params
-    assert result["context_management"] == {"edits": _edits_for(not modify_params)}
+    assert ("thinking" in result) is keeps_thinking
+    assert result["context_management"] == {"edits": _edits_for(keeps_edit)}

@@ -223,6 +223,44 @@ class TestRequestBody:
         )
         assert "stream" not in body
 
+    @pytest.mark.parametrize(
+        ("model", "thinking_params", "expected_thinking", "expected_edit_types"),
+        [
+            pytest.param(
+                "anthropic.claude-3-5-haiku-20241022-v1:0",
+                {"thinking": {"type": "adaptive"}},
+                None,
+                ["clear_tool_uses_20250919"],
+                id="no-thinking-support-drops-edit",
+            ),
+            pytest.param(
+                "anthropic.claude-opus-4-5-20251101-v1:0",
+                {"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}},
+                {"type": "enabled", "budget_tokens": 1024},
+                ["clear_thinking_20251015", "clear_tool_uses_20250919"],
+                id="thinking-added-back-keeps-edit",
+            ),
+        ],
+    )
+    def test_clear_thinking_edit_forwarded_only_with_thinking(
+        self, model, thinking_params, expected_thinking, expected_edit_types
+    ):
+        body = BedrockMantleAnthropicMessagesConfig().transform_anthropic_messages_request(
+            model=model,
+            messages=[{"role": "user", "content": "ping"}],
+            anthropic_messages_optional_request_params={
+                "max_tokens": 32000,
+                **thinking_params,
+                "context_management": {
+                    "edits": [{"type": "clear_thinking_20251015", "keep": "all"}, {"type": "clear_tool_uses_20250919"}]
+                },
+            },
+            litellm_params=GenericLiteLLMParams(),
+            headers={},
+        )
+        assert body.get("thinking") == expected_thinking
+        assert [edit["type"] for edit in body["context_management"]["edits"]] == expected_edit_types
+
 
 class TestAuth:
     def test_bearer_from_api_key_skips_aws_credentials(self):

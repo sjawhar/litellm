@@ -2015,7 +2015,10 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
             and not any_assistant_message_has_thinking_blocks(messages)
         ):
             if litellm.modify_params:
-                pop_thinking_and_clear_thinking_edits(optional_params)
+                if AnthropicModelInfo._is_always_on_thinking_model(model, self._resolved_provider):
+                    optional_params.pop("thinking", None)
+                else:
+                    pop_thinking_and_clear_thinking_edits(optional_params)
                 litellm.verbose_logger.warning(
                     "Dropping 'thinking' param because the last assistant message with tool_calls "
                     "has no thinking_blocks. The model won't use extended thinking for this turn."
