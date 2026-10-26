@@ -1,3 +1,5 @@
+from typing import Final
+
 import pytest
 
 from litellm.constants import (
@@ -336,8 +338,8 @@ def test_reasoning_effort_budget_capped_for_openai_like_messages_upstream():
     assert result["max_tokens"] == 4000
 
 
-CLEAR_THINKING_EDIT = {"type": "clear_thinking_20251015", "keep": "all"}
-CLEAR_TOOL_USES_EDIT = {"type": "clear_tool_uses_20250919"}
+CLEAR_THINKING_EDIT: Final = {"type": "clear_thinking_20251015", "keep": "all"}
+CLEAR_TOOL_USES_EDIT: Final = {"type": "clear_tool_uses_20250919"}
 
 
 @pytest.mark.parametrize(
@@ -366,3 +368,13 @@ def test_clear_thinking_edit_dropped_exactly_when_thinking_is(model, params, kee
     assert ("thinking" in result) is keeps_thinking
     expected_edits = [CLEAR_THINKING_EDIT, CLEAR_TOOL_USES_EDIT] if keeps_thinking else [CLEAR_TOOL_USES_EDIT]
     assert result["context_management"] == {"edits": expected_edits}
+
+
+def test_clear_thinking_edit_kept_for_always_on_thinking_model_without_thinking():
+    """An always-on model keeps thinking adaptively after reasoning_effort='none' drops the param"""
+    result = _transform(
+        "claude-fable-5",
+        {"max_tokens": 8192, "reasoning_effort": "none", "context_management": {"edits": [CLEAR_THINKING_EDIT]}},
+    )
+
+    assert result["context_management"] == {"edits": [CLEAR_THINKING_EDIT]}
