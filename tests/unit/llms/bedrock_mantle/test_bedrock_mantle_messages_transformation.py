@@ -18,6 +18,7 @@ import respx
 
 import litellm
 from litellm.caching.llm_caching_handler import LLMClientCache
+from litellm.constants import BEDROCK_MIN_THINKING_BUDGET_TOKENS
 from litellm.llms.bedrock.base_aws_llm import BaseAWSLLM
 from litellm.llms.bedrock_mantle.messages.transformation import (
     BedrockMantleAnthropicMessagesConfig,
@@ -236,7 +237,7 @@ class TestRequestBody:
             pytest.param(
                 "anthropic.claude-opus-4-5-20251101-v1:0",
                 {"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}},
-                {"type": "enabled", "budget_tokens": 1024},
+                {"type": "enabled", "budget_tokens": BEDROCK_MIN_THINKING_BUDGET_TOKENS},
                 ["clear_thinking_20251015", "clear_tool_uses_20250919"],
                 id="thinking-added-back-keeps-edit",
             ),
@@ -260,6 +261,16 @@ class TestRequestBody:
         )
         assert body.get("thinking") == expected_thinking
         assert [edit["type"] for edit in body["context_management"]["edits"]] == expected_edit_types
+
+    def test_disabled_thinking_without_edits_is_untouched(self):
+        body = BedrockMantleAnthropicMessagesConfig().transform_anthropic_messages_request(
+            model="anthropic.claude-3-5-haiku-20241022-v1:0",
+            messages=[{"role": "user", "content": "ping"}],
+            anthropic_messages_optional_request_params={"max_tokens": 8, "thinking": {"type": "disabled"}},
+            litellm_params=GenericLiteLLMParams(),
+            headers={},
+        )
+        assert body["thinking"] == {"type": "disabled"}
 
 
 class TestAuth:

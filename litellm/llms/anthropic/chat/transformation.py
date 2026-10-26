@@ -100,7 +100,7 @@ from ..common_utils import (
     AnthropicError,
     AnthropicModelInfo,
     eager_input_streaming_flag,
-    pop_thinking_and_clear_thinking_edits,
+    pop_thinking_for_model,
     process_anthropic_headers,
     requires_native_compaction_beta,
     strip_advisor_blocks_from_messages,
@@ -1727,12 +1727,10 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
         requested_effort: Final = (
             reasoning_effort_param.get("effort") if isinstance(reasoning_effort_param, dict) else reasoning_effort_param
         )
-        if (
-            "thinking" not in optional_params
-            and ("thinking" in non_default_params or isinstance(requested_effort, str))
-            and not AnthropicModelInfo._is_always_on_thinking_model(model, self._resolved_provider)
+        if "thinking" not in optional_params and (
+            "thinking" in non_default_params or isinstance(requested_effort, str)
         ):
-            pop_thinking_and_clear_thinking_edits(optional_params)
+            pop_thinking_for_model(optional_params, model, self._resolved_provider)
 
         ## handle thinking tokens
         self.update_optional_params_with_thinking_tokens(
@@ -2015,10 +2013,7 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
             and not any_assistant_message_has_thinking_blocks(messages)
         ):
             if litellm.modify_params:
-                if AnthropicModelInfo._is_always_on_thinking_model(model, self._resolved_provider):
-                    optional_params.pop("thinking", None)
-                else:
-                    pop_thinking_and_clear_thinking_edits(optional_params)
+                pop_thinking_for_model(optional_params, model, self._resolved_provider)
                 litellm.verbose_logger.warning(
                     "Dropping 'thinking' param because the last assistant message with tool_calls "
                     "has no thinking_blocks. The model won't use extended thinking for this turn."
