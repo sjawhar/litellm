@@ -1715,31 +1715,48 @@ def strip_encrypted_reasoning_blocks_from_anthropic_messages(
     return [m for m in stripped if m is not None]
 
 
+def _is_clear_thinking_edit(edit: object) -> bool:
+    return isinstance(edit, dict) and str(edit.get("type", "")).startswith("clear_thinking_")
+
+
+def pop_thinking_and_clear_thinking_edits(params: dict[str, Any]) -> None:  # mutable-ok: edits request params in place
+    """
+    Remove ``thinking`` from an Anthropic Messages request or its optional
+    params, together with the ``clear_thinking_*`` context-management edits
+    that Anthropic rejects without it.  ``context_management`` itself goes only
+    when such an edit was removed and nothing else is left in it.
+    """
+    params.pop("thinking", None)
+    context_management: Final = params.get("context_management")
+    if not isinstance(context_management, dict):
+        return
+    edits: Final = context_management.get("edits")
+    if not isinstance(edits, list):
+        return
+    kept_edits: Final = [edit for edit in edits if not _is_clear_thinking_edit(edit)]
+    if len(kept_edits) == len(edits):
+        return
+    if not kept_edits and context_management.keys() == {"edits"}:
+        params.pop("context_management")
+        return
+    params["context_management"] = {  # rebind-ok: callers mutate their request params in place
+        **context_management,
+        "edits": kept_edits,
+    }
+
+
 def strip_thinking_blocks_from_anthropic_messages_request_dict(
     data: dict[str, Any],
 ) -> None:
     """
     Mutate an Anthropic Messages-style request dict: strip thinking blocks from
-    ``messages``, remove the top-level ``thinking`` extended-thinking param, and
-    drop ``clear_thinking_*`` context-management edits, which Anthropic rejects
-    without ``thinking``.
+    ``messages`` and remove ``thinking`` with its dependent context-management
+    edits (see :func:`pop_thinking_and_clear_thinking_edits`).
     """
     msgs: Final = data.get("messages")
     if isinstance(msgs, list):
         data["messages"] = strip_thinking_blocks_from_anthropic_messages(msgs)
-    data.pop("thinking", None)
-    context_management: Final = data.get("context_management")
-    if not isinstance(context_management, dict) or not isinstance(context_management.get("edits"), list):
-        return
-    edits: Final = [
-        edit
-        for edit in context_management["edits"]
-        if not (isinstance(edit, dict) and str(edit.get("type", "")).startswith("clear_thinking_"))
-    ]
-    if edits:
-        data["context_management"] = {**context_management, "edits": edits}
-    else:
-        data.pop("context_management")
+    pop_thinking_and_clear_thinking_edits(data)
 
 
 def strip_empty_content_blocks_from_anthropic_messages(
