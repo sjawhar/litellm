@@ -28,7 +28,7 @@ from ...common_utils import (
     AnthropicModelInfo,
     merge_anthropic_beta_headers,
     optionally_handle_anthropic_oauth,
-    pop_thinking_and_clear_thinking_edits,
+    pop_thinking_for_model,
     requires_native_compaction_beta,
     strip_advisor_blocks_from_messages,
     strip_encrypted_reasoning_blocks_from_anthropic_messages,
@@ -86,8 +86,13 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
     def _carries_thinking_block_binding(self) -> bool:
         return type(self) is AnthropicMessagesConfig
 
-    def _drop_thinking(self, optional_params: dict) -> None:  # mutable-ok: edits optional params in place
-        pop_thinking_and_clear_thinking_edits(optional_params)
+    def _drop_thinking(
+        self,
+        optional_params: dict,  # mutable-ok: edits optional params in place
+        model: str,
+        custom_llm_provider: str,
+    ) -> None:
+        pop_thinking_for_model(optional_params, model, custom_llm_provider)
 
     def get_supported_anthropic_messages_params(self, model: str) -> list:
         return [
@@ -415,10 +420,7 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
             raise AnthropicError(message=str(e.message), status_code=400)
 
         if mapped_thinking is None:
-            if AnthropicModelInfo._is_always_on_thinking_model(model, custom_llm_provider):
-                optional_params.pop("thinking", None)
-            else:
-                self._drop_thinking(optional_params)
+            self._drop_thinking(optional_params, model, custom_llm_provider)
             optional_params.pop("output_config", None)
             return
 
@@ -512,7 +514,7 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
             or AnthropicConfig.validate_effort_for_model(model, effort, custom_llm_provider) is None
         ):
             if adaptive_thinking:
-                self._drop_thinking(optional_params)
+                self._drop_thinking(optional_params, model, custom_llm_provider)
             return
 
         supports_thinking: Final = AnthropicModelInfo.supports_model_capability(
@@ -540,7 +542,7 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
             optional_params["thinking"] = capped_thinking
         else:
             verbose_logger.warning(DROP_UNSUPPORTED_ADAPTIVE_EFFORT_WARNING, model)
-            self._drop_thinking(optional_params)
+            self._drop_thinking(optional_params, model, custom_llm_provider)
 
         if isinstance(output_config, dict) and "effort" in output_config:
             residual: Final = {k: v for k, v in output_config.items() if k != "effort"}

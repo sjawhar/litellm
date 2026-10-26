@@ -1719,14 +1719,12 @@ def _is_clear_thinking_edit(edit: object) -> bool:
     return isinstance(edit, dict) and str(edit.get("type", "")).startswith("clear_thinking_")
 
 
-def pop_thinking_and_clear_thinking_edits(params: MutableMapping[str, object]) -> None:  # mutable-ok: edits in place
+def drop_clear_thinking_edits(params: MutableMapping[str, object]) -> None:  # mutable-ok: edits in place
     """
-    Remove ``thinking`` from an Anthropic Messages request or its optional
-    params, together with the ``clear_thinking_*`` context-management edits
-    that Anthropic rejects without it.  ``context_management`` itself goes only
-    when such an edit was removed and nothing else is left in it.
+    Remove the ``clear_thinking_*`` context-management edits, which Anthropic
+    rejects without ``thinking``.  ``context_management`` itself goes only when
+    such an edit was removed and nothing else is left in it.
     """
-    params.pop("thinking", None)
     context_management: Final = params.get("context_management")
     if not isinstance(context_management, dict):
         return
@@ -1743,6 +1741,24 @@ def pop_thinking_and_clear_thinking_edits(params: MutableMapping[str, object]) -
         **context_management,
         "edits": kept_edits,
     }
+
+
+def pop_thinking_and_clear_thinking_edits(params: MutableMapping[str, object]) -> None:  # mutable-ok: edits in place
+    """Remove ``thinking`` together with the edits that need it, see :func:`drop_clear_thinking_edits`."""
+    params.pop("thinking", None)
+    drop_clear_thinking_edits(params)
+
+
+def pop_thinking_for_model(
+    params: MutableMapping[str, object],  # mutable-ok: edits in place
+    model: str,
+    custom_llm_provider: str,
+) -> None:
+    """Remove ``thinking``, and its clear_thinking edits unless the model always thinks anyway."""
+    if AnthropicModelInfo._is_always_on_thinking_model(model, custom_llm_provider):
+        params.pop("thinking", None)
+        return
+    pop_thinking_and_clear_thinking_edits(params)
 
 
 def strip_thinking_blocks_from_anthropic_messages_request_dict(

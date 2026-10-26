@@ -89,7 +89,12 @@ class AmazonAnthropicClaudeMessagesConfig(
     def _carries_thinking_block_binding(self) -> bool:
         return type(self) is AmazonAnthropicClaudeMessagesConfig
 
-    def _drop_thinking(self, optional_params: dict) -> None:  # mutable-ok: edits optional params in place
+    def _drop_thinking(
+        self,
+        optional_params: dict,  # mutable-ok: edits optional params in place
+        model: str,
+        custom_llm_provider: str,
+    ) -> None:
         """Keep the clear_thinking edit: it makes
         ``_ensure_thinking_for_clear_thinking_context_management`` add thinking back,
         and ``_filter_context_management_for_bedrock_invoke`` strips it before sending."""
