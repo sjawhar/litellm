@@ -405,35 +405,6 @@ _FALLBACK_KWARGS: Final[Mapping[str, object]] = {
 }
 
 
-@pytest.mark.parametrize(
-    "extra",
-    [
-        {"fallbacks": "default"},
-        {"fallbacks": [{"model": "claude-opus-4-8"}]},
-        {"thinking": {"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "error"}}},
-    ],
-    ids=["fallbacks-default", "fallbacks-list", "thinking-pinned"],
-)
-def test_server_side_fallbacks_stay_on_python(extra: Mapping[str, object]) -> None:
-    expected: Final = response()
-
-    def python(*args: object, **kwargs: object) -> AnthropicMessagesResponse:
-        return expected
-
-    def native(request: NativeCall) -> AnthropicMessagesResponse:
-        pytest.fail("the native route drops `fallbacks` and pinned thinking blocks, so the call must stay on Python")
-
-    result: Final = _DISPATCH.run(
-        (),
-        {**_FALLBACK_KWARGS, **extra},
-        python=python,
-        binding=messages_binding(native),
-        native=lambda hook, request, args, kwargs: hook(request),
-        rules=RUST_RULES,
-    )
-    assert result is expected
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "extra",

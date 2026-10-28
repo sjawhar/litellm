@@ -249,6 +249,8 @@ async def anthropic_messages(
 
     Runs the empty-content-block sanitizer before any backend dispatch.
     """
+    unsanitized_messages: Final = messages
+    first_pass_pins_thinking: Final = thinking_pinned_after_drops(thinking, kwargs.get("additional_drop_params"))
     messages, system = prepare_native_messages(
         messages,
         system,
@@ -257,7 +259,7 @@ async def anthropic_messages(
         custom_llm_provider=custom_llm_provider,
         tools=tools,
         api_base=api_base,
-        keep_thinking=thinking_pinned_after_drops(thinking, kwargs.get("additional_drop_params")),
+        keep_thinking=first_pass_pins_thinking,
     )
 
     original_stream: Final = stream or kwargs.get("_websearch_interception_converted_stream", False)
@@ -348,11 +350,14 @@ async def anthropic_messages(
 
     loop: Final = asyncio.get_event_loop()
     kwargs["is_async"] = True
+    pin_kept_by_hooks: Final = first_pass_pins_thinking == thinking_pinned_after_drops(
+        thinking, kwargs.get("additional_drop_params")
+    )
 
     func: Final = partial(
         anthropic_messages_handler,
         max_tokens=max_tokens,
-        messages=messages,
+        messages=messages if pin_kept_by_hooks else unsanitized_messages,
         model=model,
         metadata=metadata,
         stop_sequences=stop_sequences,
@@ -370,10 +375,12 @@ async def anthropic_messages(
         custom_llm_provider=custom_llm_provider,
         # messages were already empty-content-block sanitized at the top of this
         # function and are NOT reassigned before this dispatch, so the handler
-        # can skip its (otherwise redundant) second full-messages scan. Passed
-        # explicitly (not via **kwargs) so it only affects this direct
-        # dispatch -- interceptor / sync entry points still sanitize.
-        _litellm_messages_presanitized=True,
+        # can skip its (otherwise redundant) second full-messages scan, unless a
+        # pre-request hook changed the thinking pin: the handler then sanitizes the
+        # caller's messages once, under the final pin. Passed explicitly (not via
+        # **kwargs) so it only affects this direct dispatch -- interceptor / sync
+        # entry points still sanitize.
+        _litellm_messages_presanitized=pin_kept_by_hooks,
         **kwargs,
     )
     ctx: Final = contextvars.copy_context()
