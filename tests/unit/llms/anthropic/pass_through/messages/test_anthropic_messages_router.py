@@ -1035,3 +1035,30 @@ async def test_router_aanthropic_messages_sanitizes_under_the_pin_a_pre_request_
     assert route.call_count == 1
     assert (unsigned_empty in sent["messages"][1]["content"]) is empty_block_sent
     assert signed in sent["messages"][1]["content"]
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("caller", "hook"), [("error", "drop_block"), ("drop_block", "error")], ids=["unpins", "pins"])
+async def test_router_aanthropic_messages_keeps_cache_control_injection_when_a_hook_changes_the_pin(
+    respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch, caller: str, hook: str
+):
+    monkeypatch.setattr(
+        litellm,
+        "callbacks",
+        [_ThinkingRewriteHook({"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": hook}})],
+    )
+    route: Final = respx_mock.post(url__regex=_ANTHROPIC_URL).mock(
+        return_value=httpx.Response(200, json=_anthropic_body())
+    )
+    await _router(_ALIAS, _ANTHROPIC_MODEL).aanthropic_messages(
+        messages=[{"role": "user", "content": _PROMPT}],
+        model=_ALIAS,
+        max_tokens=100,
+        thinking={"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": caller}},
+        cache_control_injection_points=[{"location": "message", "role": "user"}],
+    )
+    sent: Final = json.loads(route.calls.last.request.read())
+    first_user_content: Final = sent["messages"][0]["content"]
+    assert isinstance(first_user_content, list)
+    assert first_user_content[-1].get("cache_control") == {"type": "ephemeral"}

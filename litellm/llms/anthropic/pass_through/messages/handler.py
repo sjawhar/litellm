@@ -16,6 +16,7 @@ from litellm.integrations.anthropic_cache_control_hook import AnthropicCacheCont
 from litellm.litellm_core_utils.exception_mapping_utils import exception_type
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.llms.anthropic.common_utils import (
+    strip_empty_content_blocks_from_anthropic_messages,
     strip_provider_specific_fields_from_anthropic_messages,
     tools_marked_for_a_tool_config_point,
 )
@@ -249,8 +250,6 @@ async def anthropic_messages(
 
     Runs the empty-content-block sanitizer before any backend dispatch.
     """
-    unsanitized_messages: Final = messages
-    first_pass_pins_thinking: Final = thinking_pinned_after_drops(thinking, kwargs.get("additional_drop_params"))
     messages, system = prepare_native_messages(
         messages,
         system,
@@ -259,7 +258,7 @@ async def anthropic_messages(
         custom_llm_provider=custom_llm_provider,
         tools=tools,
         api_base=api_base,
-        keep_thinking=first_pass_pins_thinking,
+        keep_thinking=True,
     )
 
     original_stream: Final = stream or kwargs.get("_websearch_interception_converted_stream", False)
@@ -306,6 +305,12 @@ async def anthropic_messages(
     request_kwargs.pop("litellm_params", None)
     # Merge back any other modifications
     kwargs.update(request_kwargs)
+    # Thinking blocks wait for the pin a pre-request hook leaves: an unpinned request drops its empty unsigned ones.
+    dispatched_messages: Final = (
+        messages
+        if thinking_pinned_after_drops(thinking, kwargs.get("additional_drop_params"))
+        else strip_empty_content_blocks_from_anthropic_messages(messages)
+    )
 
     # Short-circuit web-search-only requests: detect the pattern, execute
     # search directly via Tavily/Perplexity, and return a synthetic response
@@ -314,7 +319,7 @@ async def anthropic_messages(
     # callers get SSE events instead of a plain dict.
     short_circuit_response: Final = await _try_websearch_short_circuit(
         model=model,
-        messages=messages,
+        messages=dispatched_messages,
         tools=tools,
         custom_llm_provider=custom_llm_provider,
         stream=original_stream,
@@ -330,7 +335,7 @@ async def anthropic_messages(
         if interceptor.can_handle(tools, custom_llm_provider):
             return await interceptor.handle(
                 model=model,
-                messages=messages,
+                messages=dispatched_messages,
                 tools=tools,
                 stream=original_stream,
                 max_tokens=max_tokens,
@@ -350,14 +355,11 @@ async def anthropic_messages(
 
     loop: Final = asyncio.get_event_loop()
     kwargs["is_async"] = True
-    pin_kept_by_hooks: Final = first_pass_pins_thinking == thinking_pinned_after_drops(
-        thinking, kwargs.get("additional_drop_params")
-    )
 
     func: Final = partial(
         anthropic_messages_handler,
         max_tokens=max_tokens,
-        messages=messages if pin_kept_by_hooks else unsanitized_messages,
+        messages=dispatched_messages,
         model=model,
         metadata=metadata,
         stop_sequences=stop_sequences,
@@ -373,14 +375,12 @@ async def anthropic_messages(
         api_base=api_base,
         client=client,
         custom_llm_provider=custom_llm_provider,
-        # messages were already empty-content-block sanitized at the top of this
-        # function and are NOT reassigned before this dispatch, so the handler
-        # can skip its (otherwise redundant) second full-messages scan, unless a
-        # pre-request hook changed the thinking pin: the handler then sanitizes the
-        # caller's messages once, under the final pin. Passed explicitly (not via
-        # **kwargs) so it only affects this direct dispatch -- interceptor / sync
-        # entry points still sanitize.
-        _litellm_messages_presanitized=pin_kept_by_hooks,
+        # messages were already empty-content-block sanitized above, thinking
+        # blocks under the pin the pre-request hooks left, so the handler can
+        # skip its (otherwise redundant) second full-messages scan. Passed
+        # explicitly (not via **kwargs) so it only affects this direct
+        # dispatch -- interceptor / sync entry points still sanitize.
+        _litellm_messages_presanitized=True,
         **kwargs,
     )
     ctx: Final = contextvars.copy_context()
