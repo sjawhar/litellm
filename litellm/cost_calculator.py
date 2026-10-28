@@ -1,6 +1,7 @@
 # What is this?
 ## File for 'response_cost' calculation in Logging
 import logging
+import re
 import time
 from collections.abc import Mapping, Sequence
 from functools import lru_cache
@@ -1404,6 +1405,60 @@ def _split_responses_ws_logging_object_by_service_tier(
     )
 
 
+def _as_mapping(value: object) -> Mapping[str, object] | None:
+    if isinstance(value, Mapping):
+        return cast("Mapping[str, object]", value)
+    if isinstance(value, BaseModel):
+        return value.model_dump()
+    return None
+
+
+def _split_anthropic_fallback_iterations(
+    completion_response: object,
+) -> tuple[tuple[str | None, Mapping[str, object]], ...] | None:
+    """
+    A /v1/messages response that Anthropic's server-side fallback served lists every attempt in
+    ``usage.iterations``, each with its own model (a ``fallback_message`` entry marks the model that
+    answered). Returns one response per attempt, carrying that attempt's model and usage alone, so each
+    attempt is priced at its own model's rates. Every attempt is billed, including a decline that
+    Anthropic does not bill for some refusal categories.
+    """
+    response: Final = completion_response if isinstance(completion_response, Mapping) else None
+    usage: Final = _as_mapping(
+        response.get("usage") if response is not None else getattr(completion_response, "usage", None)
+    )
+    iterations: Final = usage.get("iterations") if usage is not None else None
+    if not isinstance(iterations, Sequence) or isinstance(iterations, str):
+        return None
+    entries: Final = tuple(entry for entry in map(_as_mapping, iterations) if entry is not None)
+    if not any(entry.get("type") == "fallback_message" for entry in entries):
+        return None
+    response_model: Final = (
+        response.get("model") if response is not None else getattr(completion_response, "model", None)
+    )
+    return tuple(
+        (
+            entry_model if isinstance(entry_model := entry.get("model"), str) else None,
+            {
+                "model": entry_model if isinstance(entry_model, str) else response_model,
+                "usage": {
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    **{
+                        key: value for key, value in entry.items() if key not in ("type", "model") and value is not None
+                    },
+                },
+            },
+        )
+        for entry in entries
+    )
+
+
+def _is_same_model(attempt_model: str, routed_model: str) -> bool:
+    """Whether an attempt ran on the routed model or on its dated snapshot"""
+    return attempt_model == routed_model or re.fullmatch(re.escape(routed_model) + r"-\d{8}", attempt_model) is not None
+
+
 def _response_time_ms_for_cost(
     completion_response: object,
     litellm_logging_obj: LitellmLoggingObject | None,
@@ -1516,6 +1571,37 @@ def completion_cost(
                     )
                     for part in ws_tier_parts
                 )
+
+        fallback_parts: Final = _split_anthropic_fallback_iterations(completion_response)
+        if fallback_parts is not None:
+            routed_model: Final = (litellm_model_name or model or "").split("/", 1)[-1]
+            return sum(
+                completion_cost(
+                    completion_response=part,
+                    call_type=call_type,
+                    custom_llm_provider=custom_llm_provider,
+                    region_name=region_name,
+                    optional_params=optional_params,
+                    standard_built_in_tools_params=standard_built_in_tools_params,
+                    litellm_logging_obj=litellm_logging_obj,
+                    service_tier=service_tier,
+                    data_residency=data_residency,
+                    vertex_location=vertex_location,
+                    **(
+                        {
+                            "model": model,
+                            "custom_cost_per_token": custom_cost_per_token,
+                            "custom_pricing": custom_pricing,
+                            "base_model": base_model,
+                            "litellm_model_name": litellm_model_name,
+                            "router_model_id": router_model_id,
+                        }
+                        if attempt_model is None or _is_same_model(attempt_model, routed_model)
+                        else {"model": f"anthropic/{attempt_model}"}
+                    ),
+                )
+                for attempt_model, part in fallback_parts
+            )
 
         if (
             (call_type == "aimage_generation" or call_type == "image_generation")

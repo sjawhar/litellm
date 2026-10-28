@@ -814,3 +814,38 @@ async def test_router_aanthropic_messages_with_fallbacks_still_logs_success(
     await _wait_for_payload(recorder)
     assert [payload["status"] for payload in recorder.payloads] == ["success"]
     assert recorder.payloads[0]["response_cost"] > 0
+
+
+
+@pytest.mark.asyncio
+async def test_router_aanthropic_messages_logs_each_fallback_attempt_at_its_own_model(
+    respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+):
+    attempts: Final = (("message", _ANTHROPIC_MODEL, 535, 0), ("fallback_message", _FALLBACK_TARGET, 412, 264))
+    body: Final = {
+        **_anthropic_body(model=_FALLBACK_TARGET),
+        "usage": {
+            "input_tokens": 412,
+            "output_tokens": 264,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "iterations": [
+                {"type": kind, "model": model, "input_tokens": tokens_in, "output_tokens": tokens_out}
+                for kind, model, tokens_in, tokens_out in attempts
+            ],
+        },
+    }
+    messages: Final = _unique_messages()
+    recorder: Final = _RecordingLogger(messages)
+    monkeypatch.setattr(litellm, "callbacks", [recorder])
+    respx_mock.post(url__regex=_ANTHROPIC_URL).mock(return_value=httpx.Response(200, json=body))
+    await _router(_ALIAS, _ANTHROPIC_MODEL).aanthropic_messages(
+        messages=messages, model=_ALIAS, max_tokens=100, fallbacks="default"
+    )
+    await _wait_for_payload(recorder)
+    expected: Final = sum(
+        tokens_in * litellm.model_cost[model]["input_cost_per_token"]
+        + tokens_out * litellm.model_cost[model]["output_cost_per_token"]
+        for _, model, tokens_in, tokens_out in attempts
+    )
+    assert recorder.payloads[0]["response_cost"] == pytest.approx(expected)

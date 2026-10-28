@@ -8683,3 +8683,56 @@ def test_bedrock_registered_cache_prices_preserve_dynamic_threshold_rates(
     assert entry is not None
     assert entry[1]["input_cost_per_token_above_300k_tokens"] == 0.03
     assert entry[1][tier_field] == (tier_override if tier_override is not None else 0.007)
+
+
+def _anthropic_fallback_response(requested: str, served: str) -> Mapping[str, object]:
+    return {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": served,
+        "content": [{"type": "text", "text": "hi"}],
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 412,
+            "output_tokens": 264,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "iterations": [
+                {
+                    "type": "message",
+                    "model": requested,
+                    "input_tokens": 535,
+                    "output_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                },
+                {
+                    "type": "fallback_message",
+                    "model": served,
+                    "input_tokens": 412,
+                    "output_tokens": 264,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                },
+            ],
+        },
+    }
+
+
+def _price(model: str, input_tokens: int, output_tokens: int) -> float:
+    entry: Final = litellm.model_cost[model]
+    return input_tokens * entry["input_cost_per_token"] + output_tokens * entry["output_cost_per_token"]
+
+
+@pytest.mark.usefixtures("_local_model_cost_map")
+def test_anthropic_server_side_fallback_prices_each_attempt_at_its_own_model():
+    requested: Final = "claude-fable-5"
+    served: Final = "claude-opus-4-8"
+    cost: Final = completion_cost(
+        completion_response=_anthropic_fallback_response(requested, served),
+        model=f"anthropic/{requested}",
+        custom_llm_provider="anthropic",
+        call_type="anthropic_messages",
+    )
+    assert cost == pytest.approx(_price(requested, 535, 0) + _price(served, 412, 264))
