@@ -1413,6 +1413,12 @@ def _as_mapping(value: object) -> Mapping[str, object] | None:
     return None
 
 
+# Pricing inputs that hold for every attempt of the request (region uplift, fast mode, tier), and those that the top
+# level reports for the attempt that produced the reply (server tool calls such as web search).
+_REQUEST_WIDE_USAGE_FIELDS: Final = ("inference_geo", "speed", "service_tier")
+_SERVED_ATTEMPT_USAGE_FIELDS: Final = ("server_tool_use",)
+
+
 def _split_anthropic_fallback_iterations(
     completion_response: object,
 ) -> tuple[tuple[str | None, Mapping[str, object]], ...] | None:
@@ -1436,6 +1442,8 @@ def _split_anthropic_fallback_iterations(
     response_model: Final = (
         response.get("model") if response is not None else getattr(completion_response, "model", None)
     )
+    request_wide: Final = {key: usage[key] for key in _REQUEST_WIDE_USAGE_FIELDS if usage.get(key) is not None}
+    served_only: Final = {key: usage[key] for key in _SERVED_ATTEMPT_USAGE_FIELDS if usage.get(key) is not None}
     return tuple(
         (
             entry_model if isinstance(entry_model := entry.get("model"), str) else None,
@@ -1447,6 +1455,8 @@ def _split_anthropic_fallback_iterations(
                     **{
                         key: value for key, value in entry.items() if key not in ("type", "model") and value is not None
                     },
+                    **request_wide,
+                    **(served_only if entry.get("type") == "fallback_message" else {}),
                 },
             },
         )
