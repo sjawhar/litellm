@@ -1370,28 +1370,24 @@ def is_azure_model_router_request(model: str, hidden_params: Mapping[str, object
 _is_azure_model_router_request: Final = is_azure_model_router_request
 
 
-_DIRECT_ANTHROPIC_PREFIX: Final = "anthropic/"
+def _resolved_provider(request_data: Mapping[str, object]) -> object:
+    logging_obj: Final = request_data.get("litellm_logging_obj")
+    call_details: Final = getattr(logging_obj, "model_call_details", None)
+    return call_details.get("custom_llm_provider") if isinstance(call_details, Mapping) else None
 
 
 def _server_side_fallback_routed_model(request_data: Mapping[str, object]) -> str | None:
     """
-    The routed deployment's provider model (litellm_params.model, recorded by the Router in the request metadata), on
-    a request that carries Anthropic's server-side `fallbacks` to a direct Anthropic deployment: the only request
-    where the provider can answer with another model. None for every other request, whose response model is
-    restamped as always.
+    The routed deployment's provider model (litellm_params.model, recorded by the Router in its own request metadata
+    bucket), on a request that carries Anthropic's server-side `fallbacks` to the direct Anthropic provider: the only
+    request where the provider can answer with another model. The provider is the resolved one, the value the
+    request filter forwards `fallbacks` on. None for every other request, whose response model is restamped as always.
     """
-    if request_data.get("fallbacks") is None:
+    if request_data.get("fallbacks") is None or _resolved_provider(request_data) != "anthropic":
         return None
-    buckets: Final = (request_data.get(name) for name in ("litellm_metadata", "metadata"))
-    deployments: Final = (bucket.get("deployment") for bucket in buckets if isinstance(bucket, Mapping))
-    return next(
-        (
-            deployment
-            for deployment in deployments
-            if isinstance(deployment, str) and deployment.startswith(_DIRECT_ANTHROPIC_PREFIX)
-        ),
-        None,
-    )
+    router_bucket: Final = request_data.get("litellm_metadata")
+    deployment: Final = router_bucket.get("deployment") if isinstance(router_bucket, Mapping) else None
+    return deployment if isinstance(deployment, str) and deployment else None
 
 
 def _override_openai_response_model(
