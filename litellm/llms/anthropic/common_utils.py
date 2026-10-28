@@ -1727,6 +1727,8 @@ def strip_thinking_blocks_from_anthropic_messages_request_dict(
 
 def strip_empty_content_blocks_from_anthropic_messages(
     messages: Sequence[object],
+    *,
+    keep_thinking: bool = False,
 ) -> list[Any]:
     """
     Return a new message list with empty or whitespace-only ``{"type": "text"}``
@@ -1758,6 +1760,9 @@ def strip_empty_content_blocks_from_anthropic_messages(
     omitted, matching :func:`strip_thinking_blocks_from_anthropic_messages`.
     The caller's list and its content blocks are never mutated; modified
     messages are returned as shallow copies with a fresh content list.
+
+    ``keep_thinking`` leaves every thinking block in place, for a request whose
+    ``thinking.block_binding`` asks Anthropic for the error instead.
     """
     out: Final[list[Any]] = []
     for m in messages:
@@ -1765,7 +1770,11 @@ def strip_empty_content_blocks_from_anthropic_messages(
             out.append(m)
             continue
         content = m["content"]
-        filtered = [b for b in content if not _is_empty_text_block(b) and not is_empty_unsigned_thinking_block(b)]
+        filtered = [
+            b
+            for b in content
+            if not _is_empty_text_block(b) and (keep_thinking or not is_empty_unsigned_thinking_block(b))
+        ]
         if len(filtered) == len(content):
             out.append(m)
         elif filtered:

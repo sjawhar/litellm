@@ -138,12 +138,15 @@ def prepare_native_messages(
     tools: list[dict[str, JsonValue]] | None = None,
     api_base: str | None = None,
     presanitized: bool = False,
+    keep_thinking: bool = False,
 ) -> tuple[list[dict[str, JsonValue]], str | list[dict[str, JsonValue]] | None]:
     normalized: Final = (
         messages
         if presanitized
         else flatten_unencrypted_web_search_results_in_anthropic_messages(
-            sanitize_tool_use_ids_in_anthropic_messages(strip_empty_content_blocks_from_anthropic_messages(messages))
+            sanitize_tool_use_ids_in_anthropic_messages(
+                strip_empty_content_blocks_from_anthropic_messages(messages, keep_thinking=keep_thinking)
+            )
         )
     )
     return cast(  # cast-ok: legacy normalizers and injection preserve the JSON message and system shapes
