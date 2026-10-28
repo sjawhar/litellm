@@ -233,7 +233,7 @@ from litellm.router_utils.fallback_event_handlers import (
     mid_stream_fallback_snapshot_kwargs,
     mid_stream_retry_kwargs,
     per_request_fallback_controls,
-    provider_owns_fallbacks_field,
+    pop_request_fallbacks,
     record_disable_fallbacks,
     record_pre_routing_selection,
     record_retry_attempt,
@@ -5932,7 +5932,11 @@ class Router:
                     "content_policy_fallbacks",
                     cast("list[object] | None", self.content_policy_fallbacks),  # cast-ok: untyped router attribute
                 ),
-                regular_fallbacks=cast("list[object] | None", self.fallbacks),  # cast-ok: untyped router attribute
+                regular_fallbacks=request_fallbacks(
+                    kwargs,
+                    cast("list[object] | None", self.fallbacks),  # cast-ok: untyped router attribute
+                    anthropic_messages_call=True,
+                ),
             )
         except Exception:  # noqa: BLE001  # should_retry_this_error declines by raising the error it was given
             return False
@@ -6046,7 +6050,11 @@ class Router:
 
         try:
             model_group: Final = cast(str, initial_kwargs.get("model"))  # cast-ok: model group
-            fallbacks: Final[list | None] = self.fallbacks  # mutable-ok: matches the common_utils list|None param
+            fallbacks: Final[list | None] = request_fallbacks(  # mutable-ok: matches the common_utils list|None param
+                initial_kwargs,
+                cast("list[object] | None", self.fallbacks),  # cast-ok: untyped router attribute
+                anthropic_messages_call=True,
+            )
             context_window_fallbacks: Final[list | None] = initial_kwargs.get(  # mutable-ok: matches the param below
                 "context_window_fallbacks", self.context_window_fallbacks
             )
@@ -8037,8 +8045,9 @@ class Router:
     async def async_function_with_retries(self, *args, **kwargs):
         verbose_router_logger.debug("Inside async function with retries.")
         original_function: Final = kwargs.pop("original_function")
-        fallbacks: Final = (
-            self.fallbacks if provider_owns_fallbacks_field(kwargs) else kwargs.pop("fallbacks", self.fallbacks)
+        fallbacks: Final = pop_request_fallbacks(
+            kwargs,
+            cast("list[object] | None", self.fallbacks),  # cast-ok: untyped router attribute
         )
         parent_otel_span: Final = get_parent_otel_span_from_kwargs(kwargs)
         context_window_fallbacks: Final = kwargs.pop("context_window_fallbacks", self.context_window_fallbacks)
@@ -8881,7 +8890,11 @@ class Router:
             return self._has_content_policy_fallback(model_group, kwargs)
         if self._has_default_fallbacks():
             return True
-        fallbacks: Final = self.fallbacks
+        fallbacks: Final = request_fallbacks(
+            kwargs,
+            cast("list[object] | None", self.fallbacks),  # cast-ok: untyped router attribute
+            anthropic_messages_call=True,
+        )
         if fallbacks is None:
             return False
         resolved, _ = get_fallback_model_group_for_lookup_groups(
@@ -8929,7 +8942,11 @@ class Router:
         content_policy_fallbacks: Final = kwargs.get("content_policy_fallbacks", self.content_policy_fallbacks)
         if content_policy_fallbacks is not None and self._has_content_policy_fallback(model_group, kwargs):
             return True
-        fallbacks: Final = self.fallbacks
+        fallbacks: Final = request_fallbacks(
+            kwargs,
+            cast("list[object] | None", self.fallbacks),  # cast-ok: untyped router attribute
+            anthropic_messages_call=True,
+        )
         if not fallbacks:
             return False
         if check_non_standard_fallback_format(fallbacks=fallbacks):

@@ -8,7 +8,7 @@ import re
 from collections.abc import Mapping, MutableMapping, Sequence
 from datetime import datetime, timezone
 from types import MappingProxyType
-from typing import Any, ClassVar, Final, Literal, TypeVar
+from typing import Any, ClassVar, Final, Literal, TypeVar, cast
 from urllib.parse import quote
 
 import httpx
@@ -1656,6 +1656,47 @@ def anthropic_request_errors_on_thinking_binding_mismatch(request_body: object) 
     thinking: Final = validated_object_mapping(body.get("thinking")) if body is not None else None
     binding: Final = validated_object_mapping(thinking.get("block_binding")) if thinking is not None else None
     return binding is not None and binding.get("prefix_mismatch_behavior") == "error"
+
+
+_SERVER_SIDE_FALLBACK_BETA_PREFIX: Final = "server-side-fallback-"
+
+
+def anthropic_beta_opts_into_server_side_fallback(headers: object) -> bool:
+    """Whether ``headers`` carry a ``server-side-fallback-*`` token in ``anthropic-beta``"""
+    if not isinstance(headers, Mapping):
+        return False
+    header_items: Final = tuple(cast("Mapping[object, object]", headers).items())  # cast-ok: any header mapping
+    beta_values: Final = tuple(
+        value
+        for name, value in header_items
+        if isinstance(name, str) and name.lower() == "anthropic-beta" and isinstance(value, str)
+    )
+    return any(
+        token.strip().startswith(_SERVER_SIDE_FALLBACK_BETA_PREFIX) for token in ",".join(beta_values).split(",")
+    )
+
+
+def anthropic_owns_fallbacks(request: Mapping[str, object]) -> bool:
+    """
+    Whether the request's ``fallbacks`` field is Anthropic's server-side fallback list instead of LiteLLM's client-side
+    one: the request's ``anthropic-beta`` header opts into server-side fallback. ``request`` is the request kwargs,
+    whose headers arrive as ``headers``, ``extra_headers`` or the proxy's ``provider_specific_header``.
+    """
+    scoped: Final = request.get("provider_specific_header")
+    scoped_mapping: Final = validated_object_mapping(scoped)
+    scoped_headers: Final = (
+        (scoped_mapping,) if scoped_mapping is not None else tuple(validated_object_list(scoped) or ())
+    )
+    return any(
+        map(
+            anthropic_beta_opts_into_server_side_fallback,
+            (
+                request.get("headers"),
+                request.get("extra_headers"),
+                *((validated_object_mapping(header) or {}).get("extra_headers") for header in scoped_headers),
+            ),
+        )
+    )
 
 
 def strip_thinking_blocks_from_anthropic_messages(messages: Sequence[object]) -> list[object]:

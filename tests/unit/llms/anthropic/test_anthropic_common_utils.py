@@ -4405,3 +4405,33 @@ def test_anthropic_error_frame_exception_classes_an_overloaded_frame_as_internal
     error: Final = anthropic_error_frame_exception("overloaded_error", "Overloaded", 503, "claude-sonnet-4-5")
 
     assert type(error) is litellm.InternalServerError
+
+
+@pytest.mark.parametrize(
+    ("request_kwargs", "expected"),
+    [
+        pytest.param(
+            {"extra_headers": {"anthropic-beta": "server-side-fallback-2026-07-01"}}, True, id="extra-headers"
+        ),
+        pytest.param({"headers": {"Anthropic-Beta": "a-beta, server-side-fallback-2026-06-01"}}, True, id="headers"),
+        pytest.param(
+            {
+                "provider_specific_header": [
+                    {"custom_llm_provider": "typesafe", "extra_headers": {"x-other": "1"}},
+                    {"custom_llm_provider": "anthropic", "extra_headers": {"anthropic-beta": "server-side-fallback-x"}},
+                ]
+            },
+            True,
+            id="proxy-scoped-headers",
+        ),
+        pytest.param({"extra_headers": {"anthropic-beta": "fallback-credit-2026-07-01"}}, False, id="other-beta"),
+        pytest.param({"extra_headers": {"x-server-side-fallback-2026-07-01": "1"}}, False, id="other-header"),
+        pytest.param({"fallbacks": "default"}, False, id="no-headers"),
+    ],
+)
+def test_anthropic_owns_fallbacks_only_when_the_beta_header_opts_in(
+    request_kwargs: Mapping[str, object], expected: bool
+) -> None:
+    from litellm.llms.anthropic.common_utils import anthropic_owns_fallbacks
+
+    assert anthropic_owns_fallbacks(request_kwargs) is expected

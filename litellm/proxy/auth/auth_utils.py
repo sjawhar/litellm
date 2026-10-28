@@ -2,7 +2,7 @@ import importlib.util
 import os
 import re
 import sys
-from collections.abc import Collection, Iterator, Mapping
+from collections.abc import Collection, Iterable, Iterator, Mapping
 from functools import lru_cache
 from logging import Logger
 from typing import Any, Final, Protocol
@@ -503,12 +503,13 @@ _FALLBACK_FIELDS: Final[tuple[str, ...]] = (
 )
 
 
-def _iter_fallback_field_values(request_body: Mapping[str, object]) -> Iterator[object]:
+def _iter_fallback_field_values(request_body: Mapping[str, object], skip_body_fallbacks: bool) -> Iterator[object]:
     override: Final = request_body.get("router_settings_override")
     for source in (request_body, override):
         if isinstance(source, Mapping):
             for field in _FALLBACK_FIELDS:
-                yield source.get(field)
+                if not (skip_body_fallbacks and source is request_body and field == "fallbacks"):
+                    yield source.get(field)
 
 
 def _iter_fallback_targets(value: object, depth: int) -> Iterator[str | Mapping[str, object]]:
@@ -531,8 +532,14 @@ def _iter_fallback_targets(value: object, depth: int) -> Iterator[str | Mapping[
                     yield from _iter_fallback_targets(target_list, depth + 1)
 
 
-def iter_request_fallback_targets(request_body: Mapping[str, object]) -> Iterator[str | Mapping[str, object]]:
-    for value in _iter_fallback_field_values(request_body):
+def iter_request_fallback_targets(
+    request_body: Mapping[str, object], *, skip_body_fallbacks: bool = False
+) -> Iterator[str | Mapping[str, object]]:
+    """
+    The targets of every LiteLLM fallback list the request carries. ``skip_body_fallbacks`` leaves out the body's
+    ``fallbacks``, for a request whose field is Anthropic's server-side fallback list instead.
+    """
+    for value in _iter_fallback_field_values(request_body, skip_body_fallbacks):
         yield from _iter_fallback_targets(value, 0)
 
 
@@ -546,14 +553,17 @@ def fallback_target_model_name(target: object) -> str | None:
     return None
 
 
+def _target_model_names(targets: Iterable[object]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(name for target in targets if (name := fallback_target_model_name(target)) is not None))
+
+
 def request_fallback_model_names(request_body: Mapping[str, object]) -> tuple[str, ...]:
-    return tuple(
-        dict.fromkeys(
-            name
-            for target in iter_request_fallback_targets(request_body)
-            if (name := fallback_target_model_name(target)) is not None
-        )
-    )
+    return _target_model_names(iter_request_fallback_targets(request_body))
+
+
+def anthropic_fallback_model_names(request_body: Mapping[str, object]) -> tuple[str, ...]:
+    """The models named in the body's ``fallbacks`` read as Anthropic's server-side fallback list"""
+    return _target_model_names(_iter_fallback_targets(request_body.get("fallbacks"), 0))
 
 
 def _reject_url_valued_fallback_target(value: str) -> None:

@@ -13,6 +13,7 @@ from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.core_helpers import get_metadata_variable_name_from_kwargs, safe_deep_copy
 from litellm.litellm_core_utils.get_llm_provider_logic import inferred_provider
 from litellm.litellm_core_utils.sensitive_data_masker import mask_sensitive_structure
+from litellm.llms.anthropic.common_utils import anthropic_owns_fallbacks
 from litellm.router_utils.add_retry_fallback_headers import (
     add_fallback_headers_to_response,
     get_fallback_error_info,
@@ -305,8 +306,10 @@ def carry_over_pre_routing_selection(live_kwargs: Mapping[str, object], snapshot
 
 
 MID_STREAM_FALLBACK_CONTROLS_KEY: Final = "_mid_stream_fallback_controls"
+ROUTER_FALLBACKS_KWARG: Final = "router_fallbacks"
 _PER_REQUEST_FALLBACK_CONTROL_KEYS: Final = (
     "fallbacks",
+    ROUTER_FALLBACKS_KWARG,
     "context_window_fallbacks",
     "content_policy_fallbacks",
     "num_retries",
@@ -314,16 +317,40 @@ _PER_REQUEST_FALLBACK_CONTROL_KEYS: Final = (
 )
 
 
-def provider_owns_fallbacks_field(kwargs: Mapping[str, object]) -> bool:
-    """On /v1/messages, `fallbacks` is Anthropic's server-side fallback parameter, never the Router's own list"""
+def provider_owns_fallbacks_field(kwargs: Mapping[str, object], *, anthropic_messages_call: bool = False) -> bool:
+    """
+    Whether this anthropic_messages request's `fallbacks` is Anthropic's server-side fallback list, which then goes to
+    Anthropic as is while the Router's own per-request list rides in ROUTER_FALLBACKS_KWARG. A caller that knows the
+    call is anthropic_messages says so, since not every kwargs carries ``original_generic_function``.
+    """
     function_name: Final[object] = getattr(kwargs.get("original_generic_function"), "__name__", None)
-    return function_name == "anthropic_messages"
+    return (anthropic_messages_call or function_name == "anthropic_messages") and anthropic_owns_fallbacks(kwargs)
 
 
-def request_fallbacks(kwargs: Mapping[str, object], router_fallbacks: list[object] | None) -> list[object] | None:
-    if provider_owns_fallbacks_field(kwargs):
-        return router_fallbacks
-    return cast("list[object] | None", kwargs.get("fallbacks", router_fallbacks))  # cast-ok: router attribute type
+def _router_fallbacks_key(kwargs: Mapping[str, object], anthropic_messages_call: bool) -> str:
+    return (
+        ROUTER_FALLBACKS_KWARG
+        if provider_owns_fallbacks_field(kwargs, anthropic_messages_call=anthropic_messages_call)
+        else "fallbacks"
+    )
+
+
+def request_fallbacks(
+    kwargs: Mapping[str, object], router_fallbacks: list[object] | None, *, anthropic_messages_call: bool = False
+) -> list[object] | None:
+    """The Router's fallback list for this request: the per-request override, else the Router's own"""
+    return cast(  # cast-ok: same type as the router attribute
+        "list[object] | None", kwargs.get(_router_fallbacks_key(kwargs, anthropic_messages_call), router_fallbacks)
+    )
+
+
+def pop_request_fallbacks(
+    kwargs: dict[str, object],  # mutable-ok: async_function_with_retries pops its controls before the attempt runs
+    router_fallbacks: list[object] | None,
+) -> list[object] | None:
+    return cast(  # cast-ok: same type as the router attribute
+        "list[object] | None", kwargs.pop(_router_fallbacks_key(kwargs, False), router_fallbacks)
+    )
 
 
 @dataclass(frozen=True, slots=True)

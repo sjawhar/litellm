@@ -14963,6 +14963,9 @@ async def test_anthropic_messages_default_wildcard_fallback_still_buffers_lifecy
     assert [chunk async for chunk in wrapped] == [_anthropic_messages_content_chunk("hi")]
 
 
+_SERVER_SIDE_FALLBACK_BETA = {"anthropic-beta": "server-side-fallback-2026-07-01"}
+
+
 def _anthropic_messages_two_order_primary_model_list() -> list:
     return [
         {
@@ -14989,21 +14992,34 @@ def _anthropic_messages_two_order_primary_model_list() -> list:
         pytest.param(
             {"fallbacks": [{"*": ["fallback"]}]},
             {"model": "primary", "fallbacks": None},
-            True,
-            id="request-field-does-not-override-router-wildcard",
+            False,
+            id="wildcard-overridden-by-request-none",
         ),
         pytest.param({"fallbacks": [{"*": ["fallback"]}]}, {"model": "primary"}, True, id="wildcard"),
+        pytest.param({"fallbacks": None}, {"model": "primary", "fallbacks": [{"model": "fallback"}]}, True, id="request-dict-fallback"),
+        pytest.param({"fallbacks": None}, {"model": "primary", "fallbacks": ["fallback"]}, True, id="request-list-fallback"),
         pytest.param(
-            {"fallbacks": None},
-            {"model": "primary", "fallbacks": [{"model": "fallback"}]},
-            False,
-            id="request-dict-is-anthropic-server-side-fallback",
+            {"fallbacks": [{"*": ["fallback"]}]},
+            {"model": "primary", "fallbacks": None, "extra_headers": _SERVER_SIDE_FALLBACK_BETA},
+            True,
+            id="beta-request-field-does-not-override-router-wildcard",
         ),
         pytest.param(
             {"fallbacks": None},
-            {"model": "primary", "fallbacks": ["fallback"]},
+            {"model": "primary", "fallbacks": [{"model": "fallback"}], "extra_headers": _SERVER_SIDE_FALLBACK_BETA},
             False,
-            id="request-list-is-anthropic-server-side-fallback",
+            id="beta-request-dict-is-anthropic-server-side-fallback",
+        ),
+        pytest.param(
+            {"fallbacks": None},
+            {
+                "model": "primary",
+                "fallbacks": "default",
+                "router_fallbacks": [{"primary": ["fallback"]}],
+                "extra_headers": _SERVER_SIDE_FALLBACK_BETA,
+            },
+            True,
+            id="beta-router-fallbacks-kwarg",
         ),
         pytest.param(
             {"fallbacks": [{"primary": ["fallback"]}]},
@@ -15054,8 +15070,8 @@ def test_anthropic_messages_stream_can_fall_back_order_levels(orders, expected):
         pytest.param({"model": "primary", "_target_order": 2}, False, id="top-order-no-order-fallback"),
         pytest.param(
             {"model": "primary", "_target_order": 2, "fallbacks": [{"primary": ["fallback"]}]},
-            False,
-            id="top-order-request-field-is-not-a-router-fallback",
+            True,
+            id="top-order-external-fallback",
         ),
     ],
 )
@@ -15101,8 +15117,8 @@ async def test_anthropic_messages_order_fallback_still_buffers_lifecycle_frames(
 
 
 @pytest.mark.asyncio
-async def test_anthropic_messages_disable_fallbacks_forwards_message_start_live():
-    """A per-request disable_fallbacks turns off the router's wildcard
+async def test_anthropic_messages_request_fallbacks_none_forwards_message_start_live():
+    """A per-request fallbacks=None override disables the router's wildcard
     fallback, so lifecycle frames reach the client live before content."""
     router = _anthropic_messages_make_router(fallbacks=[{"*": ["fallback"]}])
     content_released = asyncio.Event()
@@ -15113,7 +15129,7 @@ async def test_anthropic_messages_disable_fallbacks_forwards_message_start_live(
         yield _anthropic_messages_content_chunk("hi")
 
     wrapped = await router._aanthropic_messages_streaming_iterator(
-        response=source(), initial_kwargs={"model": "primary", "disable_fallbacks": True}
+        response=source(), initial_kwargs={"model": "primary", "fallbacks": None}
     )
 
     assert await asyncio.wait_for(wrapped.__anext__(), timeout=1) == _anthropic_messages_message_start_chunk()

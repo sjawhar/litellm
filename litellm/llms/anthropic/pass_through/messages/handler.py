@@ -16,6 +16,7 @@ from litellm.integrations.anthropic_cache_control_hook import AnthropicCacheCont
 from litellm.litellm_core_utils.exception_mapping_utils import exception_type
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.llms.anthropic.common_utils import (
+    anthropic_owns_fallbacks,
     strip_empty_content_blocks_from_anthropic_messages,
     strip_provider_specific_fields_from_anthropic_messages,
     tools_marked_for_a_tool_config_point,
@@ -570,9 +571,8 @@ def anthropic_messages_handler(
             cache_control_ttl=_deployment_supports_cache_control_ttl(kwargs.get("model_info")),
         )
     if anthropic_messages_provider_config is None:
-        # Anthropic's server-side `fallbacks` has no equivalent here, and litellm.acompletion would read it as
-        # its own client-side fallback list and switch models.
-        kwargs.pop("fallbacks", None)
+        if anthropic_owns_fallbacks(kwargs):
+            kwargs.pop("fallbacks", None)
         # Route to Responses API for OpenAI / Azure, chat/completions for everything else.
         if kwargs.get("compaction") is None and _should_route_to_responses_api(
             custom_llm_provider, original_model, model

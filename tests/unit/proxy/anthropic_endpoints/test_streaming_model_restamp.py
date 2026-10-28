@@ -111,6 +111,12 @@ async def test_sse_generator_keeps_provider_model_when_restamping_is_off():
     assert _model_from_frame(chunks[0]) == "claude-haiku-4-5-20251001"
 
 
+_SERVER_SIDE_FALLBACK_HEADER = {
+    "custom_llm_provider": "anthropic",
+    "extra_headers": {"anthropic-beta": "server-side-fallback-2026-07-01"},
+}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("provider_model", "fallbacks", "client_model"),
@@ -119,10 +125,13 @@ async def test_sse_generator_keeps_provider_model_when_restamping_is_off():
         pytest.param("claude-fable-5", "default", "fable-alias", id="routed-model-restamped"),
         pytest.param("claude-fable-5-20260607", "default", "fable-alias", id="routed-snapshot-restamped"),
         pytest.param("claude-opus-4-8", None, "fable-alias", id="no-fallbacks-always-restamped"),
+        pytest.param(
+            "claude-opus-4-8", [{"fable-alias": ["opus"]}], "fable-alias", id="litellm-fallbacks-without-beta-restamped"
+        ),
     ],
 )
 async def test_sse_generator_keeps_a_model_the_provider_fell_back_to(
-    provider_model: str, fallbacks: str | None, client_model: str
+    provider_model: str, fallbacks: object, client_model: str
 ):
     proxy_logging_obj = _proxy_logging_obj_streaming([_message_start_frame(provider_model)])
     request_data = {
@@ -130,6 +139,7 @@ async def test_sse_generator_keeps_a_model_the_provider_fell_back_to(
         "litellm_metadata": {"deployment": "anthropic/claude-fable-5"},
         "litellm_logging_obj": SimpleNamespace(model_call_details={"custom_llm_provider": "anthropic"}),
         **({"fallbacks": fallbacks} if fallbacks is not None else {}),
+        **({"provider_specific_header": _SERVER_SIDE_FALLBACK_HEADER} if isinstance(fallbacks, str) else {}),
     }
 
     chunks = [
