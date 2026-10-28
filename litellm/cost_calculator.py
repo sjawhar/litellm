@@ -1431,15 +1431,16 @@ def _split_anthropic_fallback_iterations(
     Anthropic does not bill for some refusal categories.
     """
     response: Final = completion_response if isinstance(completion_response, Mapping) else None
-    usage: Final = _as_mapping(
-        response.get("usage") if response is not None else getattr(completion_response, "usage", None)
+    raw_usage: Final = response.get("usage") if response is not None else getattr(completion_response, "usage", None)
+    iterations: Final = (
+        raw_usage.get("iterations") if isinstance(raw_usage, Mapping) else getattr(raw_usage, "iterations", None)
     )
-    iterations: Final = usage.get("iterations") if usage is not None else None
     if not isinstance(iterations, Sequence) or isinstance(iterations, str):
         return None
     entries: Final = tuple(entry for entry in map(_as_mapping, iterations) if entry is not None)
     if not any(entry.get("type") == "fallback_message" for entry in entries):
         return None
+    usage: Final[Mapping[str, object]] = _as_mapping(raw_usage) or MappingProxyType({})
     response_model: Final = (
         response.get("model") if response is not None else getattr(completion_response, "model", None)
     )
@@ -1465,9 +1466,9 @@ def _split_anthropic_fallback_iterations(
     )
 
 
-def _is_same_model(attempt_model: str, routed_model: str) -> bool:
-    """Whether an attempt ran on the routed model or on its dated snapshot"""
-    return attempt_model == routed_model or re.fullmatch(re.escape(routed_model) + r"-\d{8}", attempt_model) is not None
+def is_model_or_dated_snapshot(candidate: str, model: str) -> bool:
+    """Whether ``candidate`` is ``model`` or its dated snapshot (``model-YYYYMMDD``)"""
+    return candidate == model or re.fullmatch(re.escape(model) + r"-\d{8}", candidate) is not None
 
 
 def _summed_breakdown(breakdowns: Sequence[CostBreakdown], field: str) -> float | None:
@@ -1656,7 +1657,7 @@ def completion_cost(
                                 "litellm_model_name": litellm_model_name,
                                 "router_model_id": router_model_id,
                             }
-                            if attempt_model is None or _is_same_model(attempt_model, routed_model)
+                            if attempt_model is None or is_model_or_dated_snapshot(attempt_model, routed_model)
                             else {"model": f"anthropic/{attempt_model}"}
                         ),
                     ),
