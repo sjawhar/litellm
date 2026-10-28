@@ -145,6 +145,20 @@ def anthropic_system_to_openai_message(system: object) -> ChatCompletionSystemMe
     return ChatCompletionSystemMessage(role="system", content=system)
 
 
+def sanitize_native_messages(
+    messages: list[dict[str, JsonValue]], *, keep_thinking: bool = False
+) -> list[dict[str, JsonValue]]:
+    """The block rewrites every /v1/messages request gets, without the cache-control injection"""
+    return cast(  # cast-ok: the legacy normalizers preserve the JSON message shape
+        list[dict[str, JsonValue]],
+        flatten_unencrypted_web_search_results_in_anthropic_messages(
+            sanitize_tool_use_ids_in_anthropic_messages(
+                strip_empty_content_blocks_from_anthropic_messages(messages, keep_thinking=keep_thinking)
+            )
+        ),
+    )
+
+
 def prepare_native_messages(
     messages: list[dict[str, JsonValue]],
     system: str | list[dict[str, JsonValue]] | None,
@@ -157,15 +171,7 @@ def prepare_native_messages(
     presanitized: bool = False,
     keep_thinking: bool = False,
 ) -> tuple[list[dict[str, JsonValue]], str | list[dict[str, JsonValue]] | None]:
-    normalized: Final = (
-        messages
-        if presanitized
-        else flatten_unencrypted_web_search_results_in_anthropic_messages(
-            sanitize_tool_use_ids_in_anthropic_messages(
-                strip_empty_content_blocks_from_anthropic_messages(messages, keep_thinking=keep_thinking)
-            )
-        )
-    )
+    normalized: Final = messages if presanitized else sanitize_native_messages(messages, keep_thinking=keep_thinking)
     return cast(  # cast-ok: legacy normalizers and injection preserve the JSON message and system shapes
         tuple[list[dict[str, JsonValue]], str | list[dict[str, JsonValue]] | None],
         AnthropicCacheControlHook.maybe_inject_cache_control(
