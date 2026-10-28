@@ -179,6 +179,9 @@ def anthropic_messages_optional_param_keys() -> frozenset[str]:
     return frozenset(get_type_hints(AnthropicMessagesRequestOptionalParams).keys())
 
 
+_DIRECT_ANTHROPIC_ONLY_PARAMS: Final = frozenset({"fallbacks"})
+
+
 class AnthropicMessagesRequestUtils:
     @staticmethod
     def get_requested_anthropic_messages_optional_param(
@@ -195,12 +198,16 @@ class AnthropicMessagesRequestUtils:
             params: Dictionary of parameters to filter
             model: Resolved model id; when set, unsupported params may be dropped
             drop_params: Per-request drop_params flag (also respects litellm.drop_params)
-            custom_llm_provider: Routed provider; fast mode is gated to direct Anthropic
+            custom_llm_provider: Routed provider; fast mode and server-side fallbacks are gated to direct Anthropic
 
         Returns:
             AnthropicMessagesRequestOptionalParams instance with only the valid parameters
         """
-        valid_keys: Final = anthropic_messages_optional_param_keys()
+        valid_keys: Final = (
+            anthropic_messages_optional_param_keys()
+            if custom_llm_provider == "anthropic"
+            else anthropic_messages_optional_param_keys() - _DIRECT_ANTHROPIC_ONLY_PARAMS
+        )
         filtered_params: Final = {k: v for k, v in params.items() if k in valid_keys and v is not None}
         if model is not None:
             from litellm.llms.anthropic.chat.transformation import AnthropicConfig

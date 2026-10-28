@@ -474,6 +474,25 @@ async def test_route_request_with_router_settings_override_preserves_existing():
     assert call_kwargs["timeout"] == 30
 
 
+@pytest.mark.asyncio
+async def test_route_request_router_settings_override_keeps_key_fallbacks_out_of_anthropic_messages_body():
+    data = {
+        "model": "claude-group",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "max_tokens": 10,
+        "router_settings_override": {"fallbacks": [{"claude-group": ["other-group"]}], "num_retries": 3},
+    }
+    llm_router = MagicMock()
+    llm_router.anthropic_messages.return_value = "success"
+
+    response = await route_request(data, llm_router, None, "anthropic_messages")
+
+    assert response == "success"
+    call_kwargs = llm_router.anthropic_messages.call_args[1]
+    assert "fallbacks" not in call_kwargs
+    assert call_kwargs["num_retries"] == 3
+
+
 def test_gated_mock_params_cover_mock_router_testing_params():
     """``GATED_MOCK_PARAM_NAMES`` is hardcoded to avoid a cyclic import
     against ``litellm.types.router``. This test guards against drift — if a

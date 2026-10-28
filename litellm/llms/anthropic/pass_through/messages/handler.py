@@ -548,6 +548,9 @@ def anthropic_messages_handler(
             cache_control_ttl=_deployment_supports_cache_control_ttl(kwargs.get("model_info")),
         )
     if anthropic_messages_provider_config is None:
+        # Anthropic's server-side `fallbacks` has no equivalent here, and litellm.acompletion would read it as
+        # its own client-side fallback list and switch models.
+        kwargs.pop("fallbacks", None)
         # Route to Responses API for OpenAI / Azure, chat/completions for everything else.
         if kwargs.get("compaction") is None and _should_route_to_responses_api(
             custom_llm_provider, original_model, model

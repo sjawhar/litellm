@@ -106,6 +106,7 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
             "output_config",
             "reasoning_effort",
             "safeguards",
+            *(("fallbacks",) if self._resolved_provider == "anthropic" else ()),
             # TODO: Add Anthropic `metadata` support
             # "metadata",
         ]
