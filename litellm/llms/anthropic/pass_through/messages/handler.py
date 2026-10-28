@@ -16,7 +16,6 @@ from litellm.integrations.anthropic_cache_control_hook import AnthropicCacheCont
 from litellm.litellm_core_utils.exception_mapping_utils import exception_type
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.llms.anthropic.common_utils import (
-    anthropic_request_errors_on_thinking_binding_mismatch,
     strip_provider_specific_fields_from_anthropic_messages,
     tools_marked_for_a_tool_config_point,
 )
@@ -37,7 +36,7 @@ from litellm.utils import ProviderConfigManager, client
 from ..adapters.handler import LiteLLMMessagesToCompletionTransformationHandler
 from ..responses_adapters.handler import LiteLLMMessagesToResponsesAPIHandler
 from .interceptors import get_messages_interceptors
-from .utils import AnthropicMessagesRequestUtils, mock_response, prepare_native_messages
+from .utils import AnthropicMessagesRequestUtils, mock_response, prepare_native_messages, thinking_pinned_after_drops
 
 __all__ = ("anthropic_messages", "anthropic_messages_handler")
 
@@ -258,7 +257,7 @@ async def anthropic_messages(
         custom_llm_provider=custom_llm_provider,
         tools=tools,
         api_base=api_base,
-        keep_thinking=anthropic_request_errors_on_thinking_binding_mismatch({"thinking": thinking}),
+        keep_thinking=thinking_pinned_after_drops(thinking, kwargs.get("additional_drop_params")),
     )
 
     original_stream: Final = stream or kwargs.get("_websearch_interception_converted_stream", False)
@@ -448,7 +447,7 @@ def anthropic_messages_handler(
         tools=tools,
         api_base=api_base,
         presanitized=bool(kwargs.pop("_litellm_messages_presanitized", False)),
-        keep_thinking=anthropic_request_errors_on_thinking_binding_mismatch({"thinking": thinking}),
+        keep_thinking=thinking_pinned_after_drops(thinking, kwargs.get("additional_drop_params")),
     )
 
     metadata = validate_anthropic_api_metadata(metadata)

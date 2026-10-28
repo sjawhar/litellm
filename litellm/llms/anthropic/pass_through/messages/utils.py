@@ -1,11 +1,13 @@
 from collections.abc import Iterable, Mapping, Sequence
-from functools import lru_cache
+from functools import lru_cache, reduce
 from typing import TYPE_CHECKING, Any, Final, cast, get_type_hints
 
 from pydantic import JsonValue
 
 from litellm.integrations.anthropic_cache_control_hook import AnthropicCacheControlHook
+from litellm.litellm_core_utils.dot_notation_indexing import delete_nested_value
 from litellm.llms.anthropic.common_utils import (
+    anthropic_request_errors_on_thinking_binding_mismatch,
     flatten_unencrypted_web_search_results_in_anthropic_messages,
     sanitize_tool_use_ids_in_anthropic_messages,
     strip_empty_content_blocks_from_anthropic_messages,
@@ -28,6 +30,21 @@ INCOMPLETE_STREAM_ERROR_MESSAGE: Final = (
     "Provider stream ended before emitting a message_stop event; "
     "the response is incomplete and any partial content (e.g. tool_use input JSON) may be truncated."
 )
+
+
+def thinking_pinned_after_drops(thinking: object, additional_drop_params: object) -> bool:
+    """
+    Whether ``thinking.block_binding`` still asks for the error once the deployment's
+    ``additional_drop_params`` are applied, the same drop the request on the wire gets
+    """
+    drops: Final = (
+        tuple(path for path in additional_drop_params if isinstance(path, str))
+        if isinstance(additional_drop_params, (list, tuple))
+        else ()
+    )
+    return anthropic_request_errors_on_thinking_binding_mismatch(
+        reduce(delete_nested_value, drops, {"thinking": thinking})
+    )
 
 
 def get_safeguard_refusal_stop_details(response: object) -> Mapping[str, Any] | None:
