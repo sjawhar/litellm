@@ -789,3 +789,28 @@ async def test_router_aanthropic_messages_translated_provider_neither_receives_n
     assert route.call_count == 1
     assert sent["model"] == "gpt-4.1-mini"
     assert "fallbacks" not in sent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "url", "fallbacks"),
+    [
+        pytest.param(_ANTHROPIC_MODEL, _ANTHROPIC_URL, "default", id="anthropic-default"),
+        pytest.param(_ANTHROPIC_MODEL, _ANTHROPIC_URL, [{"model": _FALLBACK_TARGET}], id="anthropic-list"),
+        pytest.param(_BEDROCK_MODEL, _BEDROCK_INVOKE_URL, "default", id="bedrock-invoke-default"),
+    ],
+)
+async def test_router_aanthropic_messages_with_fallbacks_still_logs_success(
+    respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch, model: str, url: str, fallbacks: object
+):
+    _set_fake_aws_env(monkeypatch)
+    messages: Final = _unique_messages()
+    recorder: Final = _RecordingLogger(messages)
+    monkeypatch.setattr(litellm, "callbacks", [recorder])
+    respx_mock.post(url__regex=url).mock(return_value=httpx.Response(200, json=_anthropic_body()))
+    await _router(_ALIAS, model).aanthropic_messages(
+        messages=messages, model=_ALIAS, max_tokens=100, fallbacks=fallbacks
+    )
+    await _wait_for_payload(recorder)
+    assert [payload["status"] for payload in recorder.payloads] == ["success"]
+    assert recorder.payloads[0]["response_cost"] > 0

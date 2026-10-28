@@ -2001,7 +2001,10 @@ def client(original_function):
             kwargs["litellm_call_id"] = str(uuid.uuid4())
 
         model: Final[str | None] = args[0] if len(args) > 0 else kwargs.get("model", None)
-        is_completion_with_fallbacks: Final = kwargs.get("fallbacks") is not None
+        # On anthropic_messages, `fallbacks` is Anthropic's server-side parameter, not completion_with_fallbacks
+        is_completion_with_fallbacks: Final = (
+            kwargs.get("fallbacks") is not None and call_type != CallTypes.anthropic_messages.value
+        )
         kwargs.pop("_is_litellm_internal_call", None)  # discard if injected
         _is_litellm_internal_call: Final = is_internal_call.get()
         _deployment_call_end_time: datetime.datetime | None = None
@@ -3284,6 +3287,8 @@ def _get_builtin_model_info_for_registration(model: str, custom_llm_provider: st
 
 
 _runtime_registered_model_cost: Final[dict[str, dict[str, object]]] = {}  # mutable-ok: replayed on reload
+
+
 class _RegisteredPricingFields:
     """Explicitly registered rates per cost-map key, tied to the ``litellm.model_cost`` object they were
     registered on so a replaced catalog starts without them, as the entries they describe do."""
