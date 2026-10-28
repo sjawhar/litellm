@@ -729,6 +729,67 @@ async def test_router_aanthropic_messages_with_the_beta_still_falls_back_on_key_
 
 
 @pytest.mark.asyncio
+async def test_router_aanthropic_messages_reads_the_beta_from_the_proxy_scoped_headers(respx_mock: respx.MockRouter):
+    route: Final = respx_mock.post(url__regex=_ANTHROPIC_URL).mock(
+        return_value=httpx.Response(500, json={"type": "error", "error": {"type": "api_error", "message": "boom"}})
+    )
+    with pytest.raises(litellm.InternalServerError):
+        await _router_with_fallback_target_group().aanthropic_messages(
+            messages=[{"role": "user", "content": _PROMPT}],
+            model=_ALIAS,
+            max_tokens=100,
+            fallbacks=[{"model": _FALLBACK_TARGET}],
+            provider_specific_header={"custom_llm_provider": "anthropic,bedrock", "extra_headers": _BETA_HEADERS},
+        )
+    assert _sent_models(route) == [_ANTHROPIC_MODEL]
+    assert _sent_bodies(route)[0]["fallbacks"] == [{"model": _FALLBACK_TARGET}]
+    assert _SERVER_SIDE_FALLBACK_BETAS.split(",")[0] in route.calls.last.request.headers["anthropic-beta"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fallbacks", ["default", {"model": _FALLBACK_TARGET}])
+async def test_router_aanthropic_messages_rejects_litellm_fallbacks_that_are_not_a_list(
+    respx_mock: respx.MockRouter, fallbacks: object
+):
+    route: Final = respx_mock.post(url__regex=_ANTHROPIC_URL).mock(
+        return_value=httpx.Response(200, json=_anthropic_body())
+    )
+    with pytest.raises(litellm.BadRequestError, match="must be a list"):
+        await _router_with_fallback_target_group().aanthropic_messages(
+            messages=[{"role": "user", "content": _PROMPT}],
+            model=_ALIAS,
+            max_tokens=100,
+            fallbacks=fallbacks,
+        )
+    assert route.call_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "url", "body"),
+    [
+        pytest.param(f"anthropic/{_ANTHROPIC_MODEL}", _ANTHROPIC_URL, _anthropic_body(), id="anthropic"),
+        pytest.param(_OPENAI_MODEL, _OPENAI_RESPONSES_URL, _OPENAI_BODY, id="responses-adapter"),
+    ],
+)
+async def test_sdk_anthropic_messages_with_litellm_fallbacks_logs_one_success(
+    respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch, model: str, url: str, body: Mapping[str, object]
+):
+    messages: Final = _unique_messages()
+    recorder: Final = _RecordingLogger(messages)
+    monkeypatch.setattr(litellm, "callbacks", [recorder])
+    route: Final = respx_mock.post(url__regex=url).mock(return_value=httpx.Response(200, json=body))
+    await litellm.anthropic_messages(
+        model=model, api_key="fake-key", messages=messages, max_tokens=100, fallbacks=[_FALLBACK_TARGET]
+    )
+    await _wait_for_payload(recorder)
+    await asyncio.sleep(0.5)
+    assert route.call_count == 1
+    assert "fallbacks" not in json.loads(route.calls.last.request.read())
+    assert [payload["status"] for payload in recorder.payloads] == ["success"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("fallbacks", ["default", [{_ALIAS: [_FALLBACK_TARGET]}]])
 async def test_router_aanthropic_messages_returns_refusal_as_is_when_request_sets_fallbacks(
     respx_mock: respx.MockRouter, fallbacks: object
