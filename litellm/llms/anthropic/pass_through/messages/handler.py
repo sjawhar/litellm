@@ -16,6 +16,7 @@ from litellm.integrations.anthropic_cache_control_hook import AnthropicCacheCont
 from litellm.litellm_core_utils.exception_mapping_utils import exception_type
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.llms.anthropic.common_utils import (
+    anthropic_request_errors_on_thinking_binding_mismatch,
     strip_provider_specific_fields_from_anthropic_messages,
     tools_marked_for_a_tool_config_point,
 )
@@ -250,7 +251,14 @@ async def anthropic_messages(
     Runs the empty-content-block sanitizer before any backend dispatch.
     """
     messages, system = prepare_native_messages(
-        messages, system, kwargs, model=model, custom_llm_provider=custom_llm_provider, tools=tools, api_base=api_base
+        messages,
+        system,
+        kwargs,
+        model=model,
+        custom_llm_provider=custom_llm_provider,
+        tools=tools,
+        api_base=api_base,
+        keep_thinking=anthropic_request_errors_on_thinking_binding_mismatch({"thinking": thinking}),
     )
 
     original_stream: Final = stream or kwargs.get("_websearch_interception_converted_stream", False)
@@ -440,6 +448,7 @@ def anthropic_messages_handler(
         tools=tools,
         api_base=api_base,
         presanitized=bool(kwargs.pop("_litellm_messages_presanitized", False)),
+        keep_thinking=anthropic_request_errors_on_thinking_binding_mismatch({"thinking": thinking}),
     )
 
     metadata = validate_anthropic_api_metadata(metadata)

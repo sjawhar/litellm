@@ -816,7 +816,6 @@ async def test_router_aanthropic_messages_with_fallbacks_still_logs_success(
     assert recorder.payloads[0]["response_cost"] > 0
 
 
-
 @pytest.mark.asyncio
 async def test_router_aanthropic_messages_logs_each_fallback_attempt_at_its_own_model(
     respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
@@ -849,7 +848,6 @@ async def test_router_aanthropic_messages_logs_each_fallback_attempt_at_its_own_
         for _, model, tokens_in, tokens_out in attempts
     )
     assert recorder.payloads[0]["response_cost"] == pytest.approx(expected)
-
 
 
 @pytest.mark.asyncio
@@ -906,3 +904,37 @@ async def test_router_aanthropic_messages_logs_each_streamed_fallback_attempt_at
         for _, model, tokens_in, tokens_out in attempts
     )
     assert recorder.payloads[0]["response_cost"] == pytest.approx(expected)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prefix_mismatch_behavior", "kept_thinking"), [("error", True), ("drop_block", False)], ids=["pinned", "drop"]
+)
+async def test_router_aanthropic_messages_sends_a_pinned_replay_with_every_thinking_block(
+    respx_mock: respx.MockRouter, prefix_mismatch_behavior: str, kept_thinking: bool
+):
+    from litellm.litellm_core_utils.prompt_templates.common_utils import encrypted_reasoning_signature
+
+    unsigned_empty: Final = {"type": "thinking", "thinking": ""}
+    bridged: Final = {"type": "thinking", "thinking": "", "signature": encrypted_reasoning_signature("opaque")}
+    route: Final = respx_mock.post(url__regex=_ANTHROPIC_URL).mock(
+        return_value=httpx.Response(200, json=_anthropic_body())
+    )
+    await _router(_ALIAS, _ANTHROPIC_MODEL).aanthropic_messages(
+        messages=[
+            {"role": "user", "content": _PROMPT},
+            {"role": "assistant", "content": [unsigned_empty, bridged, {"type": "text", "text": "answer"}]},
+            {"role": "user", "content": "again"},
+        ],
+        model=_ALIAS,
+        max_tokens=100,
+        thinking={"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": prefix_mismatch_behavior}},
+    )
+    sent: Final = json.loads(route.calls.last.request.read())
+    assistant_content: Final = sent["messages"][1]["content"]
+    expected: Final = (
+        [unsigned_empty, bridged, {"type": "text", "text": "answer"}]
+        if kept_thinking
+        else [{"type": "text", "text": "answer"}]
+    )
+    assert assistant_content == expected
