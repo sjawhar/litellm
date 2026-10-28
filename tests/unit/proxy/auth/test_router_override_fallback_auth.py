@@ -389,3 +389,29 @@ async def test_anthropic_server_side_fallbacks_need_key_access_but_no_router_gro
     else:
         with pytest.raises(Exception, match="claude-opus-4-8"):
             await check
+
+
+def test_body_router_fallbacks_get_the_banned_param_check():
+    from litellm.proxy.auth.auth_utils import is_request_body_safe
+
+    with pytest.raises(ValueError, match="api_base"):
+        is_request_body_safe(
+            {"model": "primary", "router_fallbacks": [{"model": "primary", "api_base": "https://attacker.example"}]},
+            {},
+            _router_without_fallback_group(),
+            "primary",
+        )
+
+
+@pytest.mark.asyncio
+async def test_body_router_fallbacks_need_key_model_access():
+    router = _router_without_fallback_group()
+    with pytest.raises(Exception, match="claude-opus-4-8"):
+        await enforce_key_and_fallback_model_access(
+            valid_token=_key_with_models(["primary"]),
+            request_data={"model": "primary", "router_fallbacks": [{"primary": ["claude-opus-4-8"]}]},
+            route="/v1/messages",
+            request=_messages_request("server-side-fallback-2026-07-01"),
+            llm_model_list=router.get_model_list(),
+            llm_router=router,
+        )

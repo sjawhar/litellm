@@ -5,10 +5,10 @@ This file contains common utils for anthropic calls.
 import copy
 import json
 import re
-from collections.abc import Mapping, MutableMapping, Sequence
+from collections.abc import Iterable, Mapping, MutableMapping, Sequence
 from datetime import datetime, timezone
 from types import MappingProxyType
-from typing import Any, ClassVar, Final, Literal, TypeVar, cast
+from typing import Any, ClassVar, Final, Literal, Protocol, TypeVar, runtime_checkable
 from urllib.parse import quote
 
 import httpx
@@ -1661,18 +1661,31 @@ def anthropic_request_errors_on_thinking_binding_mismatch(request_body: object) 
 _SERVER_SIDE_FALLBACK_BETA_PREFIX: Final = "server-side-fallback-"
 
 
+@runtime_checkable
+class _HeaderItems(Protocol):
+    """Any header mapping, read through items() so every line of a repeated header counts"""
+
+    def items(self) -> Iterable[tuple[object, object]]: ...
+
+
+def _header_text(value: object) -> str | None:
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("latin-1")
+    return value if isinstance(value, str) else None
+
+
 def anthropic_beta_opts_into_server_side_fallback(headers: object) -> bool:
-    """Whether ``headers`` carry a ``server-side-fallback-*`` token in ``anthropic-beta``"""
-    if not isinstance(headers, Mapping):
+    """Whether ``headers`` carry a ``server-side-fallback-*`` token in ``anthropic-beta``, matched as HTTP does"""
+    if not isinstance(headers, _HeaderItems):
         return False
-    header_items: Final = tuple(cast("Mapping[object, object]", headers).items())  # cast-ok: any header mapping
     beta_values: Final = tuple(
-        value
-        for name, value in header_items
-        if isinstance(name, str) and name.lower() == "anthropic-beta" and isinstance(value, str)
+        text
+        for name, value in headers.items()
+        if (_header_text(name) or "").lower() == "anthropic-beta" and (text := _header_text(value)) is not None
     )
     return any(
-        token.strip().startswith(_SERVER_SIDE_FALLBACK_BETA_PREFIX) for token in ",".join(beta_values).split(",")
+        token.strip().lower().startswith(_SERVER_SIDE_FALLBACK_BETA_PREFIX)
+        for token in ",".join(beta_values).split(",")
     )
 
 

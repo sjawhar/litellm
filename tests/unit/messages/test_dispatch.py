@@ -412,43 +412,25 @@ _FALLBACK_KWARGS: Final[Mapping[str, object]] = {
     [
         {"fallbacks": "default", "extra_headers": _SERVER_SIDE_FALLBACK_BETA},
         {"fallbacks": [{"model": "claude-opus-4-8"}], "extra_headers": _SERVER_SIDE_FALLBACK_BETA},
+        {"fallbacks": ["anthropic/claude-opus-4-8"]},
         {"thinking": {"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "error"}}},
     ],
-    ids=["fallbacks-default", "fallbacks-list", "thinking-pinned"],
+    ids=["anthropic-fallbacks-default", "anthropic-fallbacks-list", "litellm-fallbacks", "thinking-pinned"],
 )
-async def test_async_server_side_fallbacks_stay_on_python(extra: Mapping[str, object]) -> None:
+async def test_async_calls_with_fallbacks_or_a_thinking_pin_stay_on_python(extra: Mapping[str, object]) -> None:
     expected: Final = response()
 
     async def python(*args: object, **kwargs: object) -> AnthropicMessagesResponse:
         return expected
 
     async def native(request: NativeCall) -> AnthropicMessagesResponse:
-        pytest.fail("the native route drops `fallbacks` and pinned thinking blocks, so the call must stay on Python")
+        pytest.fail(
+            "the native route drops `fallbacks`, skips the log of a call with `fallbacks`, and drops pinned thinking"
+        )
 
     result: Final = await _ADISPATCH.arun(
         (),
         {**_FALLBACK_KWARGS, **extra},
-        python=python,
-        binding=amessages_binding(native),
-        native=lambda hook, request, args, kwargs: hook(request),
-        rules=RUST_RULES,
-    )
-    assert result is expected
-
-
-@pytest.mark.asyncio
-async def test_async_fallbacks_without_the_server_side_fallback_beta_keep_the_native_route() -> None:
-    expected: Final = response()
-
-    async def python(*args: object, **kwargs: object) -> AnthropicMessagesResponse:
-        pytest.fail("without the beta header `fallbacks` is LiteLLM's own list, which the native route may drop")
-
-    async def native(request: NativeCall) -> AnthropicMessagesResponse:
-        return expected
-
-    result: Final = await _ADISPATCH.arun(
-        (),
-        {**_FALLBACK_KWARGS, "fallbacks": [{"model": "claude-opus-4-8"}]},
         python=python,
         binding=amessages_binding(native),
         native=lambda hook, request, args, kwargs: hook(request),

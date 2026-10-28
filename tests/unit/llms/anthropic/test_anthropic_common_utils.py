@@ -4424,6 +4424,8 @@ def test_anthropic_error_frame_exception_classes_an_overloaded_frame_as_internal
             True,
             id="proxy-scoped-headers",
         ),
+        pytest.param({"headers": {b"anthropic-beta": b"server-side-fallback-2026-07-01"}}, True, id="bytes-headers"),
+        pytest.param({"extra_headers": {"anthropic-beta": "Server-Side-Fallback-2026-07-01"}}, True, id="token-case"),
         pytest.param({"extra_headers": {"anthropic-beta": "fallback-credit-2026-07-01"}}, False, id="other-beta"),
         pytest.param({"extra_headers": {"x-server-side-fallback-2026-07-01": "1"}}, False, id="other-header"),
         pytest.param({"fallbacks": "default"}, False, id="no-headers"),

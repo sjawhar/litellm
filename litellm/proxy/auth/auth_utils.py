@@ -32,6 +32,7 @@ from litellm.llms.azure.passthrough.transformation import azure_router_model_in_
 from litellm.llms.nvidia_nim.passthrough.transformation import nvidia_nim_model_group_in_path
 from litellm.proxy._types import *
 from litellm.proxy.common_utils.http_parsing_utils import extract_nested_form_metadata
+from litellm.router_utils.fallback_event_handlers import ROUTER_FALLBACKS_KWARG
 from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     LITELLM_PASS_THROUGH_ENDPOINT_MARKER,
 )
@@ -498,6 +499,7 @@ def _check_banned_params(
 
 _FALLBACK_FIELDS: Final[tuple[str, ...]] = (
     "fallbacks",
+    ROUTER_FALLBACKS_KWARG,
     "context_window_fallbacks",
     "content_policy_fallbacks",
 )

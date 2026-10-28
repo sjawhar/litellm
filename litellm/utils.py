@@ -1685,12 +1685,6 @@ def _is_litellm_router_call(kwargs: Mapping[str, object], *, is_async: bool) -> 
     return any(isinstance(bucket, Mapping) and "model_group" in bucket for bucket in metadata_buckets)
 
 
-def _anthropic_owns_fallbacks(kwargs: Mapping[str, object]) -> bool:
-    from litellm.llms.anthropic.common_utils import anthropic_owns_fallbacks
-
-    return anthropic_owns_fallbacks(kwargs)
-
-
 def client(original_function):
     from litellm.litellm_core_utils.core_helpers import max_retries_per_request_hit
 
@@ -2007,8 +2001,9 @@ def client(original_function):
             kwargs["litellm_call_id"] = str(uuid.uuid4())
 
         model: Final[str | None] = args[0] if len(args) > 0 else kwargs.get("model", None)
-        is_completion_with_fallbacks: Final = kwargs.get("fallbacks") is not None and not (
-            call_type == CallTypes.anthropic_messages.value and _anthropic_owns_fallbacks(kwargs)
+        # anthropic_messages has no completion_with_fallbacks parent call, so its own event is the only one to log
+        is_completion_with_fallbacks: Final = (
+            kwargs.get("fallbacks") is not None and call_type != CallTypes.anthropic_messages.value
         )
         kwargs.pop("_is_litellm_internal_call", None)  # discard if injected
         _is_litellm_internal_call: Final = is_internal_call.get()
