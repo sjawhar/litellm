@@ -37,7 +37,13 @@ from litellm.utils import ProviderConfigManager, client
 from ..adapters.handler import LiteLLMMessagesToCompletionTransformationHandler
 from ..responses_adapters.handler import LiteLLMMessagesToResponsesAPIHandler
 from .interceptors import get_messages_interceptors
-from .utils import AnthropicMessagesRequestUtils, mock_response, prepare_native_messages, thinking_pinned_after_drops
+from .utils import (
+    AnthropicMessagesRequestUtils,
+    mock_response,
+    prepare_native_messages,
+    sanitize_native_messages,
+    thinking_pinned_after_drops,
+)
 
 __all__ = ("anthropic_messages", "anthropic_messages_handler")
 
@@ -250,16 +256,7 @@ async def anthropic_messages(
 
     Runs the empty-content-block sanitizer before any backend dispatch.
     """
-    messages, system = prepare_native_messages(
-        messages,
-        system,
-        kwargs,
-        model=model,
-        custom_llm_provider=custom_llm_provider,
-        tools=tools,
-        api_base=api_base,
-        keep_thinking=True,
-    )
+    messages = sanitize_native_messages(messages, keep_thinking=True)  # rebind-ok: the hooks see sanitized messages
 
     original_stream: Final = stream or kwargs.get("_websearch_interception_converted_stream", False)
 
@@ -305,11 +302,21 @@ async def anthropic_messages(
     request_kwargs.pop("litellm_params", None)
     # Merge back any other modifications
     kwargs.update(request_kwargs)
-    # Thinking blocks wait for the pin a pre-request hook leaves: an unpinned request drops its empty unsigned ones.
-    dispatched_messages: Final = (
-        messages
-        if thinking_pinned_after_drops(thinking, kwargs.get("additional_drop_params"))
-        else strip_empty_content_blocks_from_anthropic_messages(messages)
+    # Thinking blocks wait for the pin a pre-request hook leaves: an unpinned request drops its empty unsigned ones,
+    # before cache-control injection, which then runs once on the messages that go out.
+    dispatched_messages, dispatched_system = prepare_native_messages(
+        (
+            messages
+            if thinking_pinned_after_drops(thinking, kwargs.get("additional_drop_params"))
+            else strip_empty_content_blocks_from_anthropic_messages(messages)
+        ),
+        system,
+        kwargs,
+        model=model,
+        custom_llm_provider=custom_llm_provider,
+        tools=tools,
+        api_base=api_base,
+        presanitized=True,
     )
 
     # Short-circuit web-search-only requests: detect the pattern, execute
@@ -344,7 +351,7 @@ async def anthropic_messages(
                 api_base=api_base,
                 metadata=metadata,
                 stop_sequences=stop_sequences,
-                system=system,
+                system=dispatched_system,
                 temperature=temperature,
                 thinking=thinking,
                 tool_choice=tool_choice,
@@ -364,7 +371,7 @@ async def anthropic_messages(
         metadata=metadata,
         stop_sequences=stop_sequences,
         stream=stream,
-        system=system,
+        system=dispatched_system,
         temperature=temperature,
         thinking=thinking,
         tool_choice=tool_choice,

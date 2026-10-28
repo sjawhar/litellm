@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import json
 import struct
 import uuid
@@ -1062,3 +1063,30 @@ async def test_router_aanthropic_messages_keeps_cache_control_injection_when_a_h
     first_user_content: Final = sent["messages"][0]["content"]
     assert isinstance(first_user_content, list)
     assert first_user_content[-1].get("cache_control") == {"type": "ephemeral"}
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefix_mismatch_behavior", ["error", "drop_block"])
+async def test_router_aanthropic_messages_wire_messages_match_the_autorouter_baseline_body(
+    respx_mock: respx.MockRouter, prefix_mismatch_behavior: str
+):
+    from litellm.llms.anthropic.prompt_cache_prediction import prepare_native_baseline_body
+
+    request: Final = {
+        "messages": [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": [{"type": "thinking", "thinking": ""}]},
+            {"role": "user", "content": "again"},
+        ],
+        "max_tokens": 100,
+        "thinking": {"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": prefix_mismatch_behavior}},
+        "cache_control_injection_points": [{"location": "message", "index": 2}],
+    }
+    route: Final = respx_mock.post(url__regex=_ANTHROPIC_URL).mock(
+        return_value=httpx.Response(200, json=_anthropic_body())
+    )
+    await _router(_ALIAS, _ANTHROPIC_MODEL).aanthropic_messages(model=_ALIAS, **copy.deepcopy(request))
+    baseline: Final = prepare_native_baseline_body({**request, "model": _ALIAS}, f"anthropic/{_ANTHROPIC_MODEL}")
+    assert baseline is not None
+    assert json.loads(route.calls.last.request.read())["messages"] == json.loads(json.dumps(baseline["messages"]))
