@@ -17,6 +17,7 @@ import litellm
 from litellm.litellm_core_utils.dot_notation_indexing import delete_nested_value
 from litellm.llms.anthropic.common_utils import (
     AnthropicModelInfo,
+    anthropic_request_errors_on_thinking_binding_mismatch,
     is_anthropic_oauth_key,
     strip_provider_specific_fields_from_anthropic_messages,
 )
@@ -647,6 +648,7 @@ def prepare_native_baseline_body(request: Mapping[str, object], model: str) -> M
             model=resolved_model,
             custom_llm_provider="anthropic",
             tools=_MESSAGES.validate_python(owned.get("tools") or []),
+            keep_thinking=anthropic_request_errors_on_thinking_binding_mismatch(owned),
         )
         options: Final = AnthropicMessagesRequestUtils.get_requested_anthropic_messages_optional_param(
             {**owned, "system": system},
