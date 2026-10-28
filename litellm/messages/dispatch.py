@@ -4,6 +4,7 @@ from typing import Final, TypeAlias, cast  # noqa: TID251  # native binding sele
 
 from litellm.exceptions import BadRequestError
 from litellm.litellm_core_utils.get_llm_provider_logic import get_llm_provider
+from litellm.llms.anthropic.common_utils import anthropic_request_errors_on_thinking_binding_mismatch
 from litellm.llms.anthropic.pass_through.messages import handler as main
 from litellm.rust_bridge.catalog import Route, RouteContext
 from litellm.rust_bridge.dispatch import PublicDispatch
@@ -80,23 +81,29 @@ def _context(request: NativeCall) -> RouteContext:
     )
 
 
-def _carries_server_side_fallbacks(request: NativeCall) -> bool:
-    """The native route neither forwards Anthropic's `fallbacks` nor logs such a call, so it stays on Python"""
-    return request.kwargs.get("fallbacks") is not None
+def _stays_on_python(request: NativeCall) -> bool:
+    """
+    The native route neither forwards Anthropic's `fallbacks` nor logs such a call, and it drops thinking blocks
+    that a `thinking.block_binding` "error" pin asks to keep, so both stay on Python
+    """
+    resolved: Final = request.resolved
+    return resolved.get("fallbacks") is not None or anthropic_request_errors_on_thinking_binding_mismatch(
+        {"thinking": resolved.get("thinking")}
+    )
 
 
 _DISPATCH: Final = PublicDispatch(
     route=Route.MESSAGES,
     request=lambda args, kwargs: _public_request(_MESSAGES, args, kwargs),
     context=_context,
-    bypass=lambda request: request.kwargs.get("is_async") is True or _carries_server_side_fallbacks(request),
+    bypass=lambda request: request.kwargs.get("is_async") is True or _stays_on_python(request),
 )
 
 _ADISPATCH: Final = PublicDispatch(
     route=Route.MESSAGES,
     request=lambda args, kwargs: _public_request(_AMESSAGES, args, kwargs),
     context=_context,
-    bypass=_carries_server_side_fallbacks,
+    bypass=_stays_on_python,
 )
 
 
