@@ -8777,3 +8777,18 @@ def test_anthropic_server_side_fallback_keeps_request_wide_and_served_attempt_ch
     assert cost == pytest.approx(
         single_attempt_cost(requested, 535, 0, {}) + single_attempt_cost(served, 412, 264, served_extras)
     )
+
+
+
+@pytest.mark.usefixtures("_local_model_cost_map")
+def test_anthropic_server_side_fallback_charges_a_fixed_margin_once(monkeypatch: pytest.MonkeyPatch):
+    requested: Final = "claude-fable-5"
+    served: Final = "claude-opus-4-8"
+    monkeypatch.setattr(litellm, "cost_margin_config", {"anthropic": {"fixed_amount": 0.01}})
+    cost: Final = completion_cost(
+        completion_response=_anthropic_fallback_response(requested, served),
+        model=f"anthropic/{requested}",
+        custom_llm_provider="anthropic",
+        call_type="anthropic_messages",
+    )
+    assert cost == pytest.approx(_price(requested, 535, 0) + _price(served, 412, 264) + 0.01)

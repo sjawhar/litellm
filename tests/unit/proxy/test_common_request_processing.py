@@ -49,6 +49,7 @@ from litellm.proxy.common_request_processing import (
     resolve_litellm_call_id,
     ttft_keepalive_interval,
     _override_openai_response_model,
+    _server_side_fallback_routed_model,
     _parse_event_data_for_error,
     _resolve_per_request_model_group_alias,
     should_return_raw_model_name,
@@ -2992,6 +2993,29 @@ class TestExtractErrorFromSSEChunk:
 
         assert error["message"] == "error occurred"
         # Other fields should be obtained from the original error object (if exists)
+
+
+@pytest.mark.parametrize(
+    ("request_data", "expected"),
+    [
+        pytest.param(
+            {"fallbacks": "default", "litellm_metadata": {"deployment": "anthropic/claude-fable-5"}},
+            "anthropic/claude-fable-5",
+            id="fallbacks-direct-anthropic",
+        ),
+        pytest.param({"litellm_metadata": {"deployment": "anthropic/claude-fable-5"}}, None, id="no-fallbacks"),
+        pytest.param(
+            {"fallbacks": "default", "litellm_metadata": {"deployment": "openai/gpt-4o"}}, None, id="not-anthropic"
+        ),
+        pytest.param(
+            {"fallbacks": "default", "litellm_metadata": {"deployment": "bedrock/us.anthropic.claude-sonnet-4-5"}},
+            None,
+            id="anthropic-on-bedrock",
+        ),
+    ],
+)
+def test_server_side_fallback_routed_model_only_for_fallbacks_to_direct_anthropic(request_data, expected):
+    assert _server_side_fallback_routed_model(request_data) == expected
 
 
 class TestOverrideOpenAIResponseModel:

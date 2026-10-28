@@ -1370,17 +1370,28 @@ def is_azure_model_router_request(model: str, hidden_params: Mapping[str, object
 _is_azure_model_router_request: Final = is_azure_model_router_request
 
 
+_DIRECT_ANTHROPIC_PREFIX: Final = "anthropic/"
+
+
 def _server_side_fallback_routed_model(request_data: Mapping[str, object]) -> str | None:
     """
     The routed deployment's provider model (litellm_params.model, recorded by the Router in the request metadata), on
-    a request that carries Anthropic's server-side `fallbacks`: the only request where the provider can answer with
-    another model. None for every other request, whose response model is restamped as always.
+    a request that carries Anthropic's server-side `fallbacks` to a direct Anthropic deployment: the only request
+    where the provider can answer with another model. None for every other request, whose response model is
+    restamped as always.
     """
     if request_data.get("fallbacks") is None:
         return None
     buckets: Final = (request_data.get(name) for name in ("litellm_metadata", "metadata"))
     deployments: Final = (bucket.get("deployment") for bucket in buckets if isinstance(bucket, Mapping))
-    return next((deployment for deployment in deployments if isinstance(deployment, str) and deployment), None)
+    return next(
+        (
+            deployment
+            for deployment in deployments
+            if isinstance(deployment, str) and deployment.startswith(_DIRECT_ANTHROPIC_PREFIX)
+        ),
+        None,
+    )
 
 
 def _override_openai_response_model(
@@ -1478,6 +1489,8 @@ def _override_openai_response_model(
         return
 
     downstream_model = getattr(response_obj, "model", None)
+    if not provider_model_is_routed(downstream_model, routed_model):
+        return
     if downstream_model != requested_model:
         verbose_proxy_logger.debug(
             "%s: response model mismatch - requested=%r downstream=%r. Overriding response.model to requested model.",
