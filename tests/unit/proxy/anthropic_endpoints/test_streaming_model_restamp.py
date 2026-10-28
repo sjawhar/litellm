@@ -110,6 +110,32 @@ async def test_sse_generator_keeps_provider_model_when_restamping_is_off():
     assert _model_from_frame(chunks[0]) == "claude-haiku-4-5-20251001"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_model", "client_model"),
+    [
+        pytest.param("claude-opus-4-8", "claude-opus-4-8", id="anthropic-fallback-model-kept"),
+        pytest.param("claude-fable-5", "fable-alias", id="routed-model-restamped"),
+        pytest.param("claude-fable-5-20260607", "fable-alias", id="routed-snapshot-restamped"),
+    ],
+)
+async def test_sse_generator_keeps_a_model_the_provider_fell_back_to(provider_model: str, client_model: str):
+    proxy_logging_obj = _proxy_logging_obj_streaming([_message_start_frame(provider_model)])
+
+    chunks = [
+        chunk
+        async for chunk in ProxyBaseLLMRequestProcessing.async_sse_data_generator(
+            response=MagicMock(),
+            user_api_key_dict=MagicMock(),
+            request_data={"model": "fable-alias", "litellm_metadata": {"deployment": "anthropic/claude-fable-5"}},
+            proxy_logging_obj=proxy_logging_obj,
+            restamp_model="fable-alias",
+        )
+    ]
+
+    assert _model_from_frame(chunks[0]) == client_model
+
+
 def test_restamps_message_start_split_across_transport_chunks():
     frame = _message_start_frame("claude-haiku-4-5-20251001")
     restamper = AnthropicStreamModelRestamper("claude-auto-1")

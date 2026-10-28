@@ -80,17 +80,23 @@ def _context(request: NativeCall) -> RouteContext:
     )
 
 
+def _carries_server_side_fallbacks(request: NativeCall) -> bool:
+    """The native route neither forwards Anthropic's `fallbacks` nor logs such a call, so it stays on Python"""
+    return request.kwargs.get("fallbacks") is not None
+
+
 _DISPATCH: Final = PublicDispatch(
     route=Route.MESSAGES,
     request=lambda args, kwargs: _public_request(_MESSAGES, args, kwargs),
     context=_context,
-    bypass=lambda request: request.kwargs.get("is_async") is True,
+    bypass=lambda request: request.kwargs.get("is_async") is True or _carries_server_side_fallbacks(request),
 )
 
 _ADISPATCH: Final = PublicDispatch(
     route=Route.MESSAGES,
     request=lambda args, kwargs: _public_request(_AMESSAGES, args, kwargs),
     context=_context,
+    bypass=_carries_server_side_fallbacks,
 )
 
 
