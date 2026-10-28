@@ -380,7 +380,10 @@ from litellm.proxy.auth.auth_utils import (
     warn_once_if_custom_auth_skips_common_checks,
 )
 from litellm.proxy.auth.fallback_budget import router_fallback_budget_check
-from litellm.proxy.auth.fallback_model_access import router_fallback_access_check
+from litellm.proxy.auth.fallback_model_access import (
+    fallback_target_credentials_allowed,
+    router_fallback_access_check,
+)
 from litellm.proxy.auth.handle_jwt import JWTHandler
 from litellm.proxy.auth.litellm_license import AUTO_ROUTER_LICENSE_REMEDY, LicenseCheck
 from litellm.proxy.auth.login_throttle import (
@@ -7259,6 +7262,7 @@ class ProxyConfig:
             fallback_access_check=router_fallback_access_check,
             fallback_budget_check=router_fallback_budget_check,
             auto_router_capability_limit=_license_check.auto_router_capability_limit,
+            fallback_target_credentials_allowed=fallback_target_credentials_allowed,
         )
 
         if redis_usage_cache is not None and router.cache.redis_cache is None:
@@ -7754,6 +7758,7 @@ class ProxyConfig:
                         fallback_access_check=router_fallback_access_check,
                         fallback_budget_check=router_fallback_budget_check,
                         auto_router_capability_limit=_license_check.auto_router_capability_limit,
+                        fallback_target_credentials_allowed=fallback_target_credentials_allowed,
                     )
                     verbose_proxy_logger.debug("updated llm_router: %s", llm_router)
             else:

@@ -11,6 +11,7 @@ If given, generate a unique model_id for the deployment.
 Ensures cooldowns are applied correctly.
 """
 
+from collections.abc import Mapping
 from typing import Final
 
 from litellm.types.utils import server_owned_wif_litellm_params
@@ -83,6 +84,24 @@ _ADMIN_CONFIG_FIELDS_TO_CLEAR_ON_BASE_OVERRIDE: Final = _admin_config_fields_to_
 CREDENTIAL_AND_ENDPOINT_FIELDS: Final = frozenset(
     (*clientside_credential_keys, *_ADMIN_CONFIG_FIELDS_TO_CLEAR_ON_BASE_OVERRIDE)
 )
+# Fields that swap in a caller's own credential or endpoint on a fallback hop: the credential and endpoint fields, and
+# the header carriers and stored-credential name a caller key rides in on the deployment's endpoint.
+FALLBACK_TARGET_CREDENTIAL_FIELDS: Final = CREDENTIAL_AND_ENDPOINT_FIELDS | frozenset(
+    {"headers", "provider_specific_header", "litellm_credential_name"}
+)
+
+
+def reject_fallback_target_credentials(target: Mapping[str, object]) -> None:
+    """
+    Raise ``ValueError`` if a fallback target carries a credential or endpoint field. A hop lays the target over the
+    deployment's own params, so any of them would run the hop under the deployment's identity.
+    """
+    carried: Final = sorted(field for field in target if field in FALLBACK_TARGET_CREDENTIAL_FIELDS)
+    if carried:
+        raise ValueError(
+            f"Rejected Request: a fallback target may not carry {', '.join(carried)}. "
+            "Clientside credentials on a fallback need `general_settings.allow_client_side_credentials = true`."
+        )
 
 
 def is_clientside_credential(request_kwargs: dict) -> bool:

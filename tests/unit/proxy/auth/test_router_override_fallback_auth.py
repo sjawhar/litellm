@@ -5,9 +5,11 @@ override is promoted to per-request kwargs after auth and lets a caller
 execute requests against models their API key cannot call.
 """
 
-from typing import List
+from dataclasses import dataclass
+from typing import Final, List
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from starlette.requests import Request
 
@@ -448,7 +450,6 @@ _ATTACKER_HOST = "https://attacker.example.test"
 _DEPLOYMENT_KEY = "sk-ant-deployment-secret"
 _CALLER_KEY = "sk-caller-key"
 _SERVER_SIDE_FALLBACK_BETA = "server-side-fallback-2026-07-01"
-_ENDPOINT_PARAMS = ("api_base", "base_url", "api_key")
 
 
 def _messages_reply(model: str) -> dict:
@@ -486,6 +487,11 @@ def _target_fields() -> tuple[str, ...]:
     return (*_list_fields(), "context_window_fallback_dict")
 
 
+# The header carriers and stored-credential name that swap in a caller's key on the deployment's own endpoint
+_REQUIRED_CREDENTIAL_PARAMS = ("headers", "provider_specific_header", "litellm_credential_name")
+_REQUIRED_MOCK_PARAMS = ("mock_response", "mock_tool_calls")
+
+
 def _credential_and_endpoint_params() -> tuple[str, ...]:
     from litellm.proxy.auth.auth_utils import _BANNED_REQUEST_BODY_PARAMS
     from litellm.router_utils import clientside_credential_handler as credentials
@@ -496,9 +502,16 @@ def _credential_and_endpoint_params() -> tuple[str, ...]:
                 *_BANNED_REQUEST_BODY_PARAMS,
                 *credentials.clientside_credential_keys,
                 *credentials._ADMIN_CONFIG_FIELDS_TO_CLEAR_ON_BASE_OVERRIDE,
+                *_REQUIRED_CREDENTIAL_PARAMS,
             }
         )
     )
+
+
+def _mock_params() -> tuple[str, ...]:
+    from litellm.proxy.route_llm_request import GATED_MOCK_PARAM_NAMES
+
+    return tuple(sorted({*GATED_MOCK_PARAM_NAMES, *_REQUIRED_MOCK_PARAMS}))
 
 
 class _Gateway:
@@ -513,7 +526,8 @@ class _Gateway:
         key_router_settings: dict | None = None,
         team_router_settings: dict | None = None,
         key_models: tuple[str, ...] = ("requested", "other"),
-    ):
+        credentials_allowed: bool = False,
+    ) -> "_GatewayResult":
         import httpx
         import respx
 
@@ -541,6 +555,7 @@ class _Gateway:
                 )
             ],
             num_retries=0,
+            **({"fallback_target_credentials_allowed": lambda: True} if credentials_allowed else {}),
         )
         cache = DualCache()
         team_id = "fallback-team" if team_router_settings is not None else None
@@ -602,7 +617,26 @@ class _Gateway:
             }
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://proxy.test") as client:
                 response = await client.post("/v1/messages", json=payload, headers=headers)
-        return response, {name: route.call_count for name, route in routes.items()}
+        return _GatewayResult(
+            response=response,
+            calls={name: route.call_count for name, route in routes.items()},
+            attacker_credentials=tuple(
+                value
+                for call in routes["attacker"].calls
+                for value in (call.request.headers.get("x-api-key"), call.request.headers.get("authorization"))
+                if value is not None
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _GatewayResult:
+    response: "httpx.Response"
+    calls: dict[str, int]
+    attacker_credentials: tuple[str, ...]
+
+    def deployment_key_reached_the_attacker(self) -> bool:
+        return any(_DEPLOYMENT_KEY in value for value in self.attacker_credentials)
 
 
 @pytest.fixture
@@ -630,11 +664,40 @@ def _placements(make_value):
     return (*body_rows, *override_rows)
 
 
-def _endpoint_target(param: str):
+_ENDPOINT_PARAMS = ("api_base", "base_url", "api_key", "headers", "provider_specific_header")
+_CALLER_SUPPLIED_KEY = "sk-caller-supplied"
+_PARAM_VALUES = {
+    "api_base": _ATTACKER_HOST,
+    "base_url": _ATTACKER_HOST,
+    "api_key": _CALLER_SUPPLIED_KEY,
+    "headers": {"x-api-key": _CALLER_SUPPLIED_KEY},
+    "provider_specific_header": {
+        "custom_llm_provider": "anthropic",
+        "extra_headers": {"x-api-key": _CALLER_SUPPLIED_KEY},
+    },
+}
+# A client-side target names one model; a Router-style chain names the failing group and its targets
+_SHAPES = ("flat", "chain")
+
+
+def _shaped(target: dict, shape: str) -> list:
+    return [target] if shape == "flat" else [{"requested": [target]}]
+
+
+def _endpoint_target(param: str, shape: str):
     def make(field: str):
         if field == "context_window_fallback_dict":
             return {"anthropic/claude-requested": _ATTACKER_HOST}
-        return [{"model": "other", param: _ATTACKER_HOST if param != "api_key" else "sk-caller-supplied"}]
+        return _shaped({"model": "other", param: _PARAM_VALUES[param]}, shape)
+
+    return make
+
+
+def _mock_target(shape: str):
+    def make(field: str):
+        if field == "context_window_fallback_dict":
+            return {"anthropic/claude-requested": "other"}
+        return _shaped({"model": "other", "mock_response": "served by a mock"}, shape)
 
     return make
 
@@ -646,9 +709,16 @@ def _forbidden_target(field: str):
 
 
 _ENDPOINT_ROWS = tuple(
-    pytest.param(kwargs, id=f"{row_id}-{param}")
+    pytest.param(kwargs, id=f"{row_id}-{param}-{shape}")
     for param in _ENDPOINT_PARAMS
-    for row_id, kwargs in _placements(_endpoint_target(param))
+    for shape in _SHAPES
+    for row_id, kwargs in _placements(_endpoint_target(param, shape))
+)
+_MOCK_ROWS = tuple(
+    pytest.param(kwargs, id=f"{row_id}-{shape}")
+    for shape in _SHAPES
+    for row_id, kwargs in _placements(_mock_target(shape))
+    if "context_window_fallback_dict" not in row_id
 )
 _FORBIDDEN_ROWS = tuple(pytest.param(kwargs, id=row_id) for row_id, kwargs in _placements(_forbidden_target))
 
@@ -656,32 +726,80 @@ _FORBIDDEN_ROWS = tuple(pytest.param(kwargs, id=row_id) for row_id, kwargs in _p
 @pytest.mark.asyncio
 @pytest.mark.parametrize("send_kwargs", _ENDPOINT_ROWS)
 async def test_a_caller_endpoint_or_credential_on_any_fallback_target_is_refused(gateway: _Gateway, send_kwargs):
-    response, calls = await gateway.send(**send_kwargs)
+    result = await gateway.send(**send_kwargs)
 
-    assert response.status_code in (400, 401, 403), response.text
-    assert calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+    assert not result.deployment_key_reached_the_attacker(), "the deployment key reached the attacker host"
+    assert result.attacker_credentials == (), "a request reached the attacker host"
+    assert result.response.status_code in (400, 401, 403), result.response.text
+    assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("send_kwargs", _MOCK_ROWS)
+async def test_a_mock_param_on_any_fallback_target_is_refused(gateway: _Gateway, send_kwargs):
+    result = await gateway.send(**send_kwargs)
+
+    assert result.response.status_code in (400, 401, 403), result.response.text
+    assert "served by a mock" not in result.response.text
+    assert result.calls["other"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("credentials_allowed", "leaks"),
+    [(False, False), (True, True)],
+    ids=["merge-point-refuses", "control-hop-allowed-credentials-leaks"],
+)
+async def test_a_fallback_kwarg_auth_never_sees_cannot_carry_a_credential_past_the_merge_point(
+    gateway: _Gateway, monkeypatch: pytest.MonkeyPatch, credentials_allowed: bool, leaks: bool
+):
+    """
+    A future Router change that reads its fallback list from a kwarg auth does not know (here `backup_models`) skips
+    every auth check, so the hop itself, where every target is laid over the deployment's params, refuses a
+    credential or endpoint. The control shows the same request leaks the deployment key when the hop allows one.
+    """
+    from litellm import router as router_module
+
+    reads_the_list_from: Final = router_module.request_fallbacks
+
+    def reads_backup_models(kwargs, router_fallbacks, *, anthropic_messages_call=False):
+        backup = kwargs.get("backup_models")
+        if isinstance(backup, list):
+            return backup
+        return reads_the_list_from(kwargs, router_fallbacks, anthropic_messages_call=anthropic_messages_call)
+
+    monkeypatch.setattr(router_module, "request_fallbacks", reads_backup_models)
+    result = await gateway.send(
+        {"backup_models": [{"requested": [{"model": "other", "api_base": _ATTACKER_HOST}]}]},
+        credentials_allowed=credentials_allowed,
+    )
+
+    assert result.calls["requested"] == 1
+    assert result.calls["other"] == 0
+    assert result.calls["attacker"] == (1 if leaks else 0)
+    assert result.deployment_key_reached_the_attacker() is leaks
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("send_kwargs", _FORBIDDEN_ROWS)
 async def test_every_fallback_target_must_be_a_model_the_key_may_call(gateway: _Gateway, send_kwargs):
-    response, calls = await gateway.send(**send_kwargs)
+    result = await gateway.send(**send_kwargs)
 
-    assert response.status_code in (401, 403), response.text
-    assert calls["forbidden"] == 0
-    assert calls["attacker"] == 0
+    assert result.response.status_code in (401, 403), result.response.text
+    assert result.calls["forbidden"] == 0
+    assert result.calls["attacker"] == 0
 
 
 @pytest.mark.asyncio
 async def test_an_all_team_models_key_gets_its_fallback_targets_checked_against_the_team(gateway: _Gateway):
-    response, calls = await gateway.send(
+    result = await gateway.send(
         {"fallbacks": [{"requested": ["forbidden"]}]},
         team_router_settings={},
         key_models=("all-team-models",),
     )
 
-    assert response.status_code in (401, 403), response.text
-    assert calls["forbidden"] == 0
+    assert result.response.status_code in (401, 403), result.response.text
+    assert result.calls["forbidden"] == 0
 
 
 @pytest.mark.asyncio
@@ -704,10 +822,10 @@ async def test_an_all_team_models_key_gets_its_fallback_targets_checked_against_
     ],
 )
 async def test_an_allowed_plain_fallback_target_still_serves_the_request(gateway: _Gateway, send_kwargs):
-    response, calls = await gateway.send(**send_kwargs)
+    result = await gateway.send(**send_kwargs)
 
-    assert response.status_code == 200, response.text
-    assert calls == {"requested": 1, "other": 1, "forbidden": 0, "attacker": 0}
+    assert result.response.status_code == 200, result.response.text
+    assert result.calls == {"requested": 1, "other": 1, "forbidden": 0, "attacker": 0}
 
 
 @pytest.mark.asyncio
@@ -715,19 +833,17 @@ async def test_an_allowed_plain_fallback_target_still_serves_the_request(gateway
 async def test_a_client_router_settings_override_carries_no_litellm_fallbacks_under_the_beta(
     gateway: _Gateway, beta: bool, other_calls: int
 ):
-    response, calls = await gateway.send(
-        {"router_settings_override": {"fallbacks": [{"requested": ["other"]}]}}, beta=beta
-    )
+    result = await gateway.send({"router_settings_override": {"fallbacks": [{"requested": ["other"]}]}}, beta=beta)
 
-    assert calls == {"requested": 1, "other": other_calls, "forbidden": 0, "attacker": 0}, response.text
+    assert result.calls == {"requested": 1, "other": other_calls, "forbidden": 0, "attacker": 0}, result.response.text
 
 
 @pytest.mark.parametrize("field", _target_fields())
-def test_every_credential_or_endpoint_param_on_a_fallback_target_is_refused(field: str):
+def test_every_credential_endpoint_or_mock_param_on_a_fallback_target_is_refused(field: str):
     from litellm.proxy.auth.auth_utils import is_request_body_safe
 
     router = _router_without_fallback_group()
-    params = _credential_and_endpoint_params()
+    params = (*_credential_and_endpoint_params(), *_mock_params())
     if field == "context_window_fallback_dict":
         assert not _body_is_accepted(is_request_body_safe, router, {field: {"anthropic/x": "https://attacker"}})
         return
@@ -752,9 +868,11 @@ def _body_is_accepted(is_request_body_safe, router: Router, extra: dict) -> bool
 
 def test_the_router_reads_no_fallback_kwarg_that_auth_does_not_check():
     """
-    Every kwarg the Router (and the SDK wrapper it calls) reads a fallback target from must be a field auth checks, so
-    a rebase that adds one fails here instead of opening a path auth never sees. Control kwargs that carry no model or
-    endpoint are listed with why they are safe.
+    Every kwarg the Router, the proxy request path and the SDK wrapper read a fallback target from must be a field auth
+    checks, so a rebase that adds one fails here instead of opening a path auth never sees. A static scan cannot see
+    every read (an aliased dict, a computed key), so it is the second guard: the hop's own refusal at the merge point
+    (test_a_fallback_kwarg_auth_never_sees_cannot_carry_a_credential_past_the_merge_point) is the one that holds for
+    any field. Control kwargs that carry no model or endpoint are listed with why they are safe.
     """
     import ast
     import importlib
@@ -770,6 +888,9 @@ def test_the_router_reads_no_fallback_kwarg_that_auth_does_not_check():
         "litellm.proxy.route_llm_request": root / "proxy" / "route_llm_request.py",
         "litellm.utils": root / "utils.py",
         "litellm.main": root / "main.py",
+        "litellm.proxy.litellm_pre_call_utils": root / "proxy" / "litellm_pre_call_utils.py",
+        "litellm.proxy.common_request_processing": root / "proxy" / "common_request_processing.py",
+        "litellm.messages.dispatch": root / "messages" / "dispatch.py",
         **{
             f"litellm.router_utils.{path.stem}": path
             for path in (root / "router_utils").glob("*.py")
@@ -780,6 +901,7 @@ def test_the_router_reads_no_fallback_kwarg_that_auth_does_not_check():
     stripped_router_state = frozenset({"fallback_depth", "fallback_model_group", "_mid_stream_fallback_controls"})
     caller_flags = frozenset({"disable_fallbacks", "_disable_fallbacks", "max_fallbacks", "include_fallback_errors"})
     not_a_kwarg = frozenset({"_ageneric_api_call_with_fallbacks"})
+    hop_counters = frozenset({"attempted_fallbacks"})
 
     from litellm.proxy.auth import auth_utils
 
@@ -787,7 +909,7 @@ def test_the_router_reads_no_fallback_kwarg_that_auth_does_not_check():
         (*auth_utils._FALLBACK_FIELDS, getattr(auth_utils, "CONTEXT_WINDOW_FALLBACK_DICT_FIELD", ""))
     )
     assert stripped_router_state <= frozenset(_UNTRUSTED_ROOT_CONTROL_FIELDS)
-    unchecked = read - auth_checked - stripped_router_state - caller_flags - not_a_kwarg
+    unchecked = read - auth_checked - stripped_router_state - caller_flags - not_a_kwarg - hop_counters
     assert unchecked - frozenset(GATED_MOCK_PARAM_NAMES) == frozenset()
     assert "router_fallbacks" in read
 
