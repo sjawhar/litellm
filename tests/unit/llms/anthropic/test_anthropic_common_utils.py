@@ -2018,7 +2018,7 @@ class TestAnthropicThinkingSignatureSelfHeal:
             (
                 {"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "error"}},
                 _NULL_SIGNATURE_ERROR,
-                True,
+                False,
             ),
             (
                 {"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "drop_block"}},

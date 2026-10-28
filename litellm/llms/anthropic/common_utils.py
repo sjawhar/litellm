@@ -1649,14 +1649,9 @@ def is_anthropic_invalid_thinking_block_error(error_text: str) -> bool:
     return "must contain thinking" in lower
 
 
-def is_anthropic_thinking_binding_mismatch_error(error_text: str) -> bool:
-    """messages.N.content.M: Invalid `signature` in `thinking` block. The block is bound to a different conversation."""
-    return "bound to a different conversation" in error_text.lower()
-
-
 def anthropic_request_errors_on_thinking_binding_mismatch(request_body: object) -> bool:
     """``thinking.block_binding.prefix_mismatch_behavior: error`` is the caller asking
-    for the 400, so a retry that strips thinking must not override it."""
+    for Anthropic's 400, so LiteLLM never strips that request's thinking."""
     body: Final = validated_object_mapping(request_body)
     thinking: Final = validated_object_mapping(body.get("thinking")) if body is not None else None
     binding: Final = validated_object_mapping(thinking.get("block_binding")) if thinking is not None else None
@@ -1722,6 +1717,8 @@ def strip_thinking_blocks_from_anthropic_messages_request_dict(
     Mutate an Anthropic Messages-style request dict: strip thinking blocks from
     ``messages`` and remove the top-level ``thinking`` extended-thinking param.
     """
+    if anthropic_request_errors_on_thinking_binding_mismatch(data):
+        return
     msgs: Final = data.get("messages")
     if isinstance(msgs, list):
         data["messages"] = strip_thinking_blocks_from_anthropic_messages(msgs)
