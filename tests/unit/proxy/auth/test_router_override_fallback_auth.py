@@ -6,7 +6,7 @@ execute requests against models their API key cannot call.
 """
 
 from typing import List
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from starlette.requests import Request
@@ -415,3 +415,525 @@ async def test_body_router_fallbacks_need_key_model_access():
             llm_model_list=router.get_model_list(),
             llm_router=router,
         )
+
+
+@pytest.mark.asyncio
+async def test_client_router_settings_override_fallbacks_are_checked_when_anthropic_owns_the_body_field():
+    router = _router_without_fallback_group()
+    with pytest.raises(Exception, match="claude-opus-4-8"):
+        await enforce_key_and_fallback_model_access(
+            valid_token=_key_with_models(["primary"]),
+            request_data={
+                "model": "primary",
+                "fallbacks": "default",
+                "router_settings_override": {"fallbacks": [{"primary": ["claude-opus-4-8"]}]},
+            },
+            route="/v1/messages",
+            request=_messages_request("server-side-fallback-2026-07-01"),
+            llm_model_list=router.get_model_list(),
+            llm_router=router,
+        )
+
+
+# ── Every fallback field, end to end through a proxy with a mock upstream ────
+#
+# One in-process proxy app (real auth, real pre-call processing, real Router) with three upstream hosts: the
+# requested deployment answers 500, so the request falls back; `other` is a model the key may call; the attacker
+# host is where a caller's endpoint param would send the deployment's API key.
+
+_REQUESTED_HOST = "https://requested.upstream.test"
+_OTHER_HOST = "https://other.upstream.test"
+_FORBIDDEN_HOST = "https://forbidden.upstream.test"
+_ATTACKER_HOST = "https://attacker.example.test"
+_DEPLOYMENT_KEY = "sk-ant-deployment-secret"
+_CALLER_KEY = "sk-caller-key"
+_SERVER_SIDE_FALLBACK_BETA = "server-side-fallback-2026-07-01"
+_ENDPOINT_PARAMS = ("api_base", "base_url", "api_key")
+
+
+def _messages_reply(model: str) -> dict:
+    return {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [{"type": "text", "text": "hi"}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+
+
+# The fields a fallback target can arrive in, stated once here so each is tested even if a list in the code drops it
+_REQUIRED_LIST_FIELDS = (
+    "fallbacks",
+    "router_fallbacks",
+    "context_window_fallbacks",
+    "content_policy_fallbacks",
+    "default_fallbacks",
+)
+
+
+def _list_fields() -> tuple[str, ...]:
+    """The fallback list fields: the ones auth checks, and the ones this suite requires it to check."""
+    from litellm.proxy.auth import auth_utils
+
+    return tuple(dict.fromkeys((*auth_utils._FALLBACK_FIELDS, *_REQUIRED_LIST_FIELDS)))
+
+
+def _target_fields() -> tuple[str, ...]:
+    """Every request field a fallback target can come from: the list a rebase must keep the Router's reads inside."""
+    return (*_list_fields(), "context_window_fallback_dict")
+
+
+def _credential_and_endpoint_params() -> tuple[str, ...]:
+    from litellm.proxy.auth.auth_utils import _BANNED_REQUEST_BODY_PARAMS
+    from litellm.router_utils import clientside_credential_handler as credentials
+
+    return tuple(
+        sorted(
+            {
+                *_BANNED_REQUEST_BODY_PARAMS,
+                *credentials.clientside_credential_keys,
+                *credentials._ADMIN_CONFIG_FIELDS_TO_CLEAR_ON_BASE_OVERRIDE,
+            }
+        )
+    )
+
+
+class _Gateway:
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._monkeypatch = monkeypatch
+
+    async def send(
+        self,
+        body_fields: dict,
+        *,
+        beta: bool = False,
+        key_router_settings: dict | None = None,
+        team_router_settings: dict | None = None,
+        key_models: tuple[str, ...] = ("requested", "other"),
+    ):
+        import httpx
+        import respx
+
+        import litellm
+        from litellm.caching.dual_cache import DualCache
+        from litellm.proxy import proxy_server
+        from litellm.proxy._types import LiteLLM_TeamTableCachedObj
+        from litellm.proxy.proxy_server import app, hash_token
+        from litellm.proxy.utils import ProxyLogging
+
+        router = Router(
+            model_list=[
+                {
+                    "model_name": name,
+                    "litellm_params": {
+                        "model": f"anthropic/claude-{name}",
+                        "api_key": _DEPLOYMENT_KEY,
+                        "api_base": host,
+                    },
+                }
+                for name, host in (
+                    ("requested", _REQUESTED_HOST),
+                    ("other", _OTHER_HOST),
+                    ("forbidden", _FORBIDDEN_HOST),
+                )
+            ],
+            num_retries=0,
+        )
+        cache = DualCache()
+        team_id = "fallback-team" if team_router_settings is not None else None
+        token = UserAPIKeyAuth(
+            api_key=_CALLER_KEY,
+            token=hash_token(_CALLER_KEY),
+            user_role=LitellmUserRoles.INTERNAL_USER,
+            models=list(key_models),
+            team_id=team_id,
+            team_models=["requested", "other"] if team_id else [],
+            router_settings=key_router_settings,
+        )
+        await cache.async_set_cache(key=hash_token(_CALLER_KEY), value=token)
+        if team_id is not None:
+            await cache.async_set_cache(
+                key=f"team_id:{team_id}",
+                value=LiteLLM_TeamTableCachedObj(
+                    team_id=team_id, models=["requested", "other"], router_settings=team_router_settings
+                ),
+            )
+        for name, value in {
+            "master_key": "sk-master",
+            "prisma_client": MagicMock(),
+            "user_api_key_cache": cache,
+            "llm_router": router,
+            "llm_model_list": router.get_model_list(),
+            "general_settings": {},
+            "user_custom_auth": None,
+            "proxy_logging_obj": ProxyLogging(user_api_key_cache=cache),
+        }.items():
+            self._monkeypatch.setattr(proxy_server, name, value)
+        self._monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+        payload = {
+            "model": "requested",
+            "max_tokens": 5,
+            "messages": [{"role": "user", "content": "hi"}],
+            **body_fields,
+        }
+        headers = {
+            "Authorization": f"Bearer {_CALLER_KEY}",
+            **({"anthropic-beta": _SERVER_SIDE_FALLBACK_BETA} if beta else {}),
+        }
+        with respx.mock(assert_all_called=False) as upstream:
+            routes = {
+                "requested": upstream.post(url__startswith=_REQUESTED_HOST).mock(
+                    return_value=httpx.Response(
+                        500, json={"type": "error", "error": {"type": "api_error", "message": "x"}}
+                    )
+                ),
+                "other": upstream.post(url__startswith=_OTHER_HOST).mock(
+                    return_value=httpx.Response(200, json=_messages_reply("claude-other"))
+                ),
+                "forbidden": upstream.post(url__startswith=_FORBIDDEN_HOST).mock(
+                    return_value=httpx.Response(200, json=_messages_reply("claude-forbidden"))
+                ),
+                "attacker": upstream.post(url__startswith=_ATTACKER_HOST).mock(
+                    return_value=httpx.Response(200, json=_messages_reply("attacker"))
+                ),
+            }
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://proxy.test") as client:
+                response = await client.post("/v1/messages", json=payload, headers=headers)
+        return response, {name: route.call_count for name, route in routes.items()}
+
+
+@pytest.fixture
+def gateway(monkeypatch: pytest.MonkeyPatch) -> _Gateway:
+    return _Gateway(monkeypatch)
+
+
+def _placements(make_value):
+    """Every place a fallback target can enter a /v1/messages request: (id, send kwargs)."""
+    body_rows = tuple(
+        (f"body.{field}{'+beta' if beta else ''}", {"body_fields": {field: make_value(field)}, "beta": beta})
+        for field in _target_fields()
+        for beta in (False, True)
+    )
+    override_rows = tuple(
+        (
+            f"{source}.router_settings.{field}",
+            {"body_fields": {"router_settings_override": {field: make_value(field)}}, "beta": True}
+            if source == "body"
+            else {f"{source}_router_settings": {field: make_value(field)}, "body_fields": {}, "beta": True},
+        )
+        for source in ("body", "key", "team")
+        for field in _list_fields()
+    )
+    return (*body_rows, *override_rows)
+
+
+def _endpoint_target(param: str):
+    def make(field: str):
+        if field == "context_window_fallback_dict":
+            return {"anthropic/claude-requested": _ATTACKER_HOST}
+        return [{"model": "other", param: _ATTACKER_HOST if param != "api_key" else "sk-caller-supplied"}]
+
+    return make
+
+
+def _forbidden_target(field: str):
+    if field == "context_window_fallback_dict":
+        return {"anthropic/claude-requested": "forbidden"}
+    return [{"requested": ["forbidden"]}]
+
+
+_ENDPOINT_ROWS = tuple(
+    pytest.param(kwargs, id=f"{row_id}-{param}")
+    for param in _ENDPOINT_PARAMS
+    for row_id, kwargs in _placements(_endpoint_target(param))
+)
+_FORBIDDEN_ROWS = tuple(pytest.param(kwargs, id=row_id) for row_id, kwargs in _placements(_forbidden_target))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("send_kwargs", _ENDPOINT_ROWS)
+async def test_a_caller_endpoint_or_credential_on_any_fallback_target_is_refused(gateway: _Gateway, send_kwargs):
+    response, calls = await gateway.send(**send_kwargs)
+
+    assert response.status_code in (400, 401, 403), response.text
+    assert calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("send_kwargs", _FORBIDDEN_ROWS)
+async def test_every_fallback_target_must_be_a_model_the_key_may_call(gateway: _Gateway, send_kwargs):
+    response, calls = await gateway.send(**send_kwargs)
+
+    assert response.status_code in (401, 403), response.text
+    assert calls["forbidden"] == 0
+    assert calls["attacker"] == 0
+
+
+@pytest.mark.asyncio
+async def test_an_all_team_models_key_gets_its_fallback_targets_checked_against_the_team(gateway: _Gateway):
+    response, calls = await gateway.send(
+        {"fallbacks": [{"requested": ["forbidden"]}]},
+        team_router_settings={},
+        key_models=("all-team-models",),
+    )
+
+    assert response.status_code in (401, 403), response.text
+    assert calls["forbidden"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "send_kwargs",
+    [
+        pytest.param({"body_fields": {"fallbacks": [{"requested": ["other"]}]}}, id="body-fallbacks"),
+        pytest.param(
+            {
+                "body_fields": {"fallbacks": "default"},
+                "beta": True,
+                "key_router_settings": {"fallbacks": [{"requested": ["other"]}]},
+            },
+            id="key-router-settings-beside-anthropic-fallbacks",
+        ),
+        pytest.param(
+            {"body_fields": {}, "team_router_settings": {"fallbacks": [{"requested": ["other"]}]}},
+            id="team-router-settings",
+        ),
+    ],
+)
+async def test_an_allowed_plain_fallback_target_still_serves_the_request(gateway: _Gateway, send_kwargs):
+    response, calls = await gateway.send(**send_kwargs)
+
+    assert response.status_code == 200, response.text
+    assert calls == {"requested": 1, "other": 1, "forbidden": 0, "attacker": 0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("beta", "other_calls"), [(True, 0), (False, 1)], ids=["beta", "no-beta"])
+async def test_a_client_router_settings_override_carries_no_litellm_fallbacks_under_the_beta(
+    gateway: _Gateway, beta: bool, other_calls: int
+):
+    response, calls = await gateway.send(
+        {"router_settings_override": {"fallbacks": [{"requested": ["other"]}]}}, beta=beta
+    )
+
+    assert calls == {"requested": 1, "other": other_calls, "forbidden": 0, "attacker": 0}, response.text
+
+
+@pytest.mark.parametrize("field", _target_fields())
+def test_every_credential_or_endpoint_param_on_a_fallback_target_is_refused(field: str):
+    from litellm.proxy.auth.auth_utils import is_request_body_safe
+
+    router = _router_without_fallback_group()
+    params = _credential_and_endpoint_params()
+    if field == "context_window_fallback_dict":
+        assert not _body_is_accepted(is_request_body_safe, router, {field: {"anthropic/x": "https://attacker"}})
+        return
+    accepted = tuple(
+        param
+        for param in params
+        if _body_is_accepted(is_request_body_safe, router, {field: [{"model": "primary", param: "x"}]})
+        or _body_is_accepted(
+            is_request_body_safe, router, {"router_settings_override": {field: [{"model": "primary", param: "x"}]}}
+        )
+    )
+    assert accepted == ()
+
+
+def _body_is_accepted(is_request_body_safe, router: Router, extra: dict) -> bool:
+    try:
+        is_request_body_safe({"model": "primary", **extra}, {}, router, "primary")
+    except ValueError:
+        return False
+    return True
+
+
+def test_the_router_reads_no_fallback_kwarg_that_auth_does_not_check():
+    """
+    Every kwarg the Router (and the SDK wrapper it calls) reads a fallback target from must be a field auth checks, so
+    a rebase that adds one fails here instead of opening a path auth never sees. Control kwargs that carry no model or
+    endpoint are listed with why they are safe.
+    """
+    import ast
+    import importlib
+    from pathlib import Path
+
+    import litellm
+    from litellm.proxy.litellm_pre_call_utils import _UNTRUSTED_ROOT_CONTROL_FIELDS
+    from litellm.proxy.route_llm_request import GATED_MOCK_PARAM_NAMES
+
+    root = Path(litellm.__file__).parent
+    modules = {
+        "litellm.router": root / "router.py",
+        "litellm.proxy.route_llm_request": root / "proxy" / "route_llm_request.py",
+        "litellm.utils": root / "utils.py",
+        "litellm.main": root / "main.py",
+        **{
+            f"litellm.router_utils.{path.stem}": path
+            for path in (root / "router_utils").glob("*.py")
+            if path.stem != "__init__"
+        },
+    }
+    read = frozenset().union(*(_fallback_keys_read(name, path, importlib, ast) for name, path in modules.items()))
+    stripped_router_state = frozenset({"fallback_depth", "fallback_model_group", "_mid_stream_fallback_controls"})
+    caller_flags = frozenset({"disable_fallbacks", "_disable_fallbacks", "max_fallbacks", "include_fallback_errors"})
+    not_a_kwarg = frozenset({"_ageneric_api_call_with_fallbacks"})
+
+    from litellm.proxy.auth import auth_utils
+
+    auth_checked = frozenset(
+        (*auth_utils._FALLBACK_FIELDS, getattr(auth_utils, "CONTEXT_WINDOW_FALLBACK_DICT_FIELD", ""))
+    )
+    assert stripped_router_state <= frozenset(_UNTRUSTED_ROOT_CONTROL_FIELDS)
+    unchecked = read - auth_checked - stripped_router_state - caller_flags - not_a_kwarg
+    assert unchecked - frozenset(GATED_MOCK_PARAM_NAMES) == frozenset()
+    assert "router_fallbacks" in read
+
+
+def _fallback_keys_read(module_name: str, path, importlib, ast) -> frozenset[str]:
+    tree = ast.parse(path.read_text())
+
+    def resolve(node) -> str | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.Name):
+            value = getattr(importlib.import_module(module_name), node.id, None)
+            return value if isinstance(value, str) else None
+        return None
+
+    def kwargs_key(node) -> str | None:
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.args:
+            owner = node.func.value
+            if node.func.attr in ("get", "pop", "setdefault") and isinstance(owner, ast.Name) and "kwargs" in owner.id:
+                return resolve(node.args[0])
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and "kwargs" in node.value.id:
+            return resolve(node.slice)
+        return None
+
+    def literal_keys(node) -> tuple[str | None, ...]:
+        if isinstance(node, (ast.Tuple, ast.List, ast.Set)) and all(
+            isinstance(element, (ast.Constant, ast.Name)) for element in node.elts
+        ):
+            return tuple(resolve(element) for element in node.elts)
+        return ()
+
+    module_constants = tuple(
+        node.value.value
+        for node in tree.body
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    )
+    candidates = (
+        *(kwargs_key(node) for node in ast.walk(tree)),
+        *(key for node in ast.walk(tree) for key in literal_keys(node)),
+        *module_constants,
+    )
+    return frozenset(key for key in candidates if isinstance(key, str) and "fallback" in key and key.isidentifier())
+
+
+class _ProbeUpstream:
+    """The probe's three real HTTP upstreams (gate780a probe_exfil.py): requested fails, other and attacker answer."""
+
+    def __init__(self) -> None:
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        self.seen: list[tuple[str, str | None]] = []
+        upstream = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                import json
+
+                sent = json.loads(self.rfile.read(int(self.headers["content-length"])))
+                name = self.server.upstream_name  # pyright: ignore[reportAttributeAccessIssue]  # set below
+                upstream.seen.append((name, self.headers.get("x-api-key")))
+                status = 500 if name == "requested" else 200
+                reply = (
+                    {"type": "error", "error": {"type": "api_error", "message": "mock outage"}}
+                    if status == 500
+                    else _messages_reply(sent.get("model", ""))
+                )
+                self.send_response(status)
+                self.send_header("content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(reply).encode())
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        self._servers = tuple(ThreadingHTTPServer(("127.0.0.1", 0), Handler) for _ in range(3))
+        for server, name in zip(self._servers, ("requested", "other", "attacker")):
+            server.upstream_name = name  # pyright: ignore[reportAttributeAccessIssue]  # read by the handler
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.requested, self.other, self.attacker = (f"http://127.0.0.1:{s.server_address[1]}" for s in self._servers)
+
+    def close(self) -> None:
+        for server in self._servers:
+            server.shutdown()
+            server.server_close()
+
+
+@pytest.mark.asyncio
+async def test_probe_exfil_router_fallbacks_api_base_never_gets_the_deployment_key(monkeypatch: pytest.MonkeyPatch):
+    from unittest.mock import MagicMock as _MagicMock
+
+    import litellm
+    from litellm.proxy.auth.auth_utils import is_request_body_safe
+    from litellm.proxy.litellm_pre_call_utils import add_litellm_data_to_request
+    from litellm.proxy.route_llm_request import route_request
+
+    upstream = _ProbeUpstream()
+    try:
+        monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+        router = Router(
+            model_list=[
+                {
+                    "model_name": name,
+                    "litellm_params": {
+                        "model": f"anthropic/claude-{name}",
+                        "api_key": _DEPLOYMENT_KEY,
+                        "api_base": host,
+                    },
+                }
+                for name, host in (("requested", upstream.requested), ("other", upstream.other))
+            ],
+            num_retries=0,
+        )
+        body = {
+            "model": "requested",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 5,
+            "router_fallbacks": [{"model": "other", "api_base": upstream.attacker}],
+        }
+        for field in ("fallbacks", "router_fallbacks"):
+            probe_body = {**{k: v for k, v in body.items() if k != "router_fallbacks"}, field: body["router_fallbacks"]}
+            with pytest.raises(ValueError, match="api_base"):
+                is_request_body_safe(request_body=probe_body, general_settings={}, llm_router=router, model="requested")
+
+        request = _MagicMock(spec=Request)
+        request.url = _MagicMock()
+        request.url.path = "/v1/messages"
+        request.url.__str__.return_value = "http://proxy.test/v1/messages"
+        request.method = "POST"
+        request.query_params = {}
+        request.headers = {"anthropic-beta": _SERVER_SIDE_FALLBACK_BETA}
+        request.client = _MagicMock()
+        request.client.host = "127.0.0.1"
+        data = await add_litellm_data_to_request(
+            data=dict(body),
+            request=request,
+            user_api_key_dict=UserAPIKeyAuth(api_key="hashed-key"),
+            proxy_config=_MagicMock(),
+            general_settings={},
+            version="test",
+        )
+        with pytest.raises(litellm.InternalServerError):
+            await (await route_request(data=data, llm_router=router, user_model=None, route_type="anthropic_messages"))
+    finally:
+        upstream.close()
+
+    assert upstream.seen == [("requested", _DEPLOYMENT_KEY)]

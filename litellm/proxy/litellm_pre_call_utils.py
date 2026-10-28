@@ -216,7 +216,7 @@ def sanitize_for_log(value: object) -> str:
 
 
 from litellm.router import Router
-from litellm.router_utils.fallback_event_handlers import ROUTER_FALLBACKS_KWARG
+from litellm.router_utils.fallback_event_handlers import MID_STREAM_FALLBACK_CONTROLS_KEY, ROUTER_FALLBACKS_KWARG
 from litellm.secret_managers.main import get_secret_bool
 from litellm.types.llms.anthropic import ANTHROPIC_API_HEADERS
 from litellm.types.services import ServiceTypes
@@ -349,9 +349,12 @@ _UNTRUSTED_ROOT_CONTROL_FIELDS: Final = (
     # protection on a real deployment failure or force a false "not caller-controlled"
     # reading that lets its own bad timeout cool down deployments other tenants rely on.
     "client_side_timeout",
-    # Set only by route_request from the key/team router_settings override; a client value would skip every
-    # fallback check and replace the admin's fallback list.
+    # Set only by route_request, from the key/team router_settings (a client's own router_settings_override loses its
+    # fallbacks under the server-side-fallback beta). A body value would skip every fallback check.
     ROUTER_FALLBACKS_KWARG,
+    # Router-internal fallback state, never a caller's to set.
+    "fallback_model_group",
+    MID_STREAM_FALLBACK_CONTROLS_KEY,
 )
 
 _UNTRUSTED_METADATA_CONTROL_FIELDS: Final = (

@@ -32,6 +32,7 @@ from litellm.llms.azure.passthrough.transformation import azure_router_model_in_
 from litellm.llms.nvidia_nim.passthrough.transformation import nvidia_nim_model_group_in_path
 from litellm.proxy._types import *
 from litellm.proxy.common_utils.http_parsing_utils import extract_nested_form_metadata
+from litellm.router_utils.clientside_credential_handler import CREDENTIAL_AND_ENDPOINT_FIELDS
 from litellm.router_utils.fallback_event_handlers import ROUTER_FALLBACKS_KWARG
 from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     LITELLM_PASS_THROUGH_ENDPOINT_MARKER,
@@ -497,11 +498,15 @@ def _check_banned_params(
         )
 
 
+# The client wrapper swaps a model for this mapping's value on a context-window error (litellm/utils.py)
+CONTEXT_WINDOW_FALLBACK_DICT_FIELD: Final = "context_window_fallback_dict"
 _FALLBACK_FIELDS: Final[tuple[str, ...]] = (
     "fallbacks",
     ROUTER_FALLBACKS_KWARG,
     "context_window_fallbacks",
     "content_policy_fallbacks",
+    # A Router init setting, never read per request; checked so a body copy can never carry a target past auth.
+    "default_fallbacks",
 )
 
 
@@ -512,6 +517,9 @@ def _iter_fallback_field_values(request_body: Mapping[str, object], skip_body_fa
             for field in _FALLBACK_FIELDS:
                 if not (skip_body_fallbacks and source is request_body and field == "fallbacks"):
                     yield source.get(field)
+    context_window_swaps: Final = request_body.get(CONTEXT_WINDOW_FALLBACK_DICT_FIELD)
+    if isinstance(context_window_swaps, Mapping):
+        yield list(context_window_swaps.values())
 
 
 def _iter_fallback_targets(value: object, depth: int) -> Iterator[str | Mapping[str, object]]:
@@ -568,6 +576,21 @@ def anthropic_fallback_model_names(request_body: Mapping[str, object]) -> tuple[
     return _target_model_names(_iter_fallback_targets(request_body.get("fallbacks"), 0))
 
 
+def _reject_fallback_target_credentials(target: Mapping[str, object], allows_client_credentials: bool) -> None:
+    """
+    A fallback hop runs with the target's params laid over the deployment's, so a caller credential or endpoint on a
+    target would run under the deployment's identity. Only the proxy-wide client-credential opt-in allows one.
+    """
+    if allows_client_credentials:
+        return
+    carried: Final = sorted(field for field in target if field in CREDENTIAL_AND_ENDPOINT_FIELDS)
+    if carried:
+        raise ValueError(
+            f"Rejected Request: a fallback target may not carry {', '.join(carried)}. "
+            "Clientside credentials need `general_settings.allow_client_side_credentials = true`."
+        )
+
+
 def _reject_url_valued_fallback_target(value: str) -> None:
     allowed_hosts: Final = getattr(litellm, "provider_url_destination_allowed_hosts", []) or []
     for candidate in provider_url_destination_candidates(value):
@@ -583,7 +606,7 @@ def _reject_url_valued_fallback_target(value: str) -> None:
 
 
 def is_request_body_safe(
-    request_body: dict,
+    request_body: dict[str, object],
     general_settings: dict,
     llm_router: Router | None,
     model: str,
@@ -618,6 +641,7 @@ def is_request_body_safe(
     if "model_list" in request_body:
         raise ValueError("Rejected Request: model_list is not allowed in the request body.")
     manages_deployments: Final = route_manages_deployments(route)
+    allows_client_credentials: Final[bool] = general_settings.get("allow_client_side_credentials") is True
     _check_banned_params(request_body, general_settings, llm_router, model, manages_deployments=manages_deployments)
     for nested_key in _NESTED_CONFIG_KEYS:
         nested = _coerce_metadata_to_dict(request_body.get(nested_key))
@@ -638,10 +662,12 @@ def is_request_body_safe(
     for target in iter_request_fallback_targets(request_body):
         if isinstance(target, dict):
             _check_banned_params(target, general_settings, llm_router, model, manages_deployments=manages_deployments)
+        if isinstance(target, Mapping):
+            _reject_fallback_target_credentials(target, allows_client_credentials)
             target_model = target.get("model")
             if isinstance(target_model, str):
                 _reject_url_valued_fallback_target(target_model)
-        elif isinstance(target, str):
+        else:
             _reject_url_valued_fallback_target(target)
     litellm_params: Final = _coerce_metadata_to_dict(request_body.get("litellm_params"))
     if litellm_params is not None:

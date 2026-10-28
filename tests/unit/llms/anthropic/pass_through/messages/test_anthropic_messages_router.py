@@ -764,6 +764,26 @@ async def test_router_aanthropic_messages_rejects_litellm_fallbacks_that_are_not
     assert route.call_count == 0
 
 
+_MISTRAL_URL: Final = r".*api\.mistral\.ai/v1/chat/completions.*"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fallbacks", ["default", {"model": "mistral/mistral-large-latest"}])
+async def test_sdk_anthropic_messages_rejects_litellm_fallbacks_that_are_not_a_list_on_the_chat_adapter(
+    respx_mock: respx.MockRouter, fallbacks: object
+):
+    route: Final = respx_mock.post(url__regex=_MISTRAL_URL).mock(return_value=httpx.Response(200, json={}))
+    with pytest.raises(litellm.BadRequestError, match="must be a list"):
+        await litellm.anthropic_messages(
+            model="mistral/mistral-small-latest",
+            api_key="fake-key",
+            messages=[{"role": "user", "content": _PROMPT}],
+            max_tokens=100,
+            fallbacks=fallbacks,
+        )
+    assert route.call_count == 0
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("model", "url", "body"),

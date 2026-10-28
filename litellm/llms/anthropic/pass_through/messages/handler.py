@@ -27,6 +27,7 @@ from litellm.llms.base_llm.anthropic_messages.transformation import (
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.llms.custom_httpx.llm_http_handler import BaseLLMHTTPHandler
+from litellm.router_utils.fallback_event_handlers import reject_non_list_litellm_fallbacks
 from litellm.types.llms.anthropic_messages.anthropic_request import AnthropicMetadata
 from litellm.types.llms.anthropic_messages.anthropic_response import (
     AnthropicMessagesResponse,
@@ -579,6 +580,8 @@ def anthropic_messages_handler(
         # fallback, where LiteLLM's list would only suppress the success log. litellm.acompletion runs LiteLLM's list.
         if routes_to_responses_api or anthropic_owns_fallbacks(kwargs):
             kwargs.pop("fallbacks", None)
+        litellm_fallbacks: Final = cast(dict[str, object], kwargs).get("fallbacks")  # cast-ok: untyped **kwargs
+        reject_non_list_litellm_fallbacks(litellm_fallbacks, original_model)
         if routes_to_responses_api:
             return LiteLLMMessagesToResponsesAPIHandler.anthropic_messages_handler(
                 max_tokens=max_tokens,

@@ -2207,6 +2207,7 @@ class ProxyBaseLLMRequestProcessing:
         # group -- model-level guardrails, per-model budgets and rate limits,
         # the logging object -- sees the group that will actually serve.
         if llm_router is not None and proxy_config is not None:
+            from litellm.proxy.auth.user_api_key_auth import enforce_router_settings_fallback_access
             from litellm.proxy.proxy_server import prisma_client
 
             router_settings: Final = await proxy_config._get_hierarchical_router_settings(
@@ -2220,6 +2221,12 @@ class ProxyBaseLLMRequestProcessing:
             # This avoids expensive Router instantiation on each request
             if router_settings is not None:
                 self.data["router_settings_override"] = router_settings
+                await enforce_router_settings_fallback_access(
+                    request_data=self.data,
+                    valid_token=user_api_key_dict,
+                    general_settings=general_settings,
+                    llm_router=llm_router,
+                )
                 try:
                     self.data["_router_weights"] = validate_router_weights(router_settings.get("weights"))
                 except ValidationError:
@@ -2235,6 +2242,12 @@ class ProxyBaseLLMRequestProcessing:
                 )
                 if alias_target is not None:
                     self.data["model"] = alias_target
+            elif route_type == "anthropic_messages" and anthropic_owns_fallbacks(self.data):
+                # Under the beta a client sends no LiteLLM fallback list of its own: its body `fallbacks` goes to
+                # Anthropic, so its own router_settings_override may not carry one to the Router either.
+                client_override: Final = self.data.get("router_settings_override")
+                if isinstance(client_override, dict):
+                    client_override.pop("fallbacks", None)
 
         self.data["litellm_call_id"] = resolve_litellm_call_id(request.headers.get("x-litellm-call-id"))
         DDSpanTagger.tag_call_id(self.data.get("litellm_call_id"))
