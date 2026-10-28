@@ -938,3 +938,53 @@ async def test_router_aanthropic_messages_sends_a_pinned_replay_with_every_think
         else [{"type": "text", "text": "answer"}]
     )
     assert assistant_content == expected
+
+
+
+@pytest.mark.asyncio
+async def test_router_aanthropic_messages_treats_a_pin_the_deployment_drops_as_no_pin(respx_mock: respx.MockRouter):
+    unsigned_empty: Final = {"type": "thinking", "thinking": ""}
+    signed: Final = {"type": "thinking", "thinking": "plan", "signature": "sig"}
+
+    def _anthropic(request: httpx.Request) -> httpx.Response:
+        sent = json.loads(request.read())
+        if unsigned_empty in sent["messages"][1]["content"]:
+            return httpx.Response(
+                400,
+                json={
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "messages.1.content.0.thinking: each thinking block must contain thinking",
+                    },
+                },
+            )
+        return httpx.Response(200, json=_anthropic_body())
+
+    route: Final = respx_mock.post(url__regex=_ANTHROPIC_URL).mock(side_effect=_anthropic)
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": _ALIAS,
+                "litellm_params": {
+                    "model": f"anthropic/{_ANTHROPIC_MODEL}",
+                    "api_key": "fake-key",
+                    "additional_drop_params": ["thinking.block_binding"],
+                },
+            }
+        ],
+        num_retries=0,
+    )
+    await router.aanthropic_messages(
+        messages=[
+            {"role": "user", "content": _PROMPT},
+            {"role": "assistant", "content": [unsigned_empty, signed, {"type": "text", "text": "answer"}]},
+            {"role": "user", "content": "again"},
+        ],
+        model=_ALIAS,
+        max_tokens=100,
+        thinking={"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "error"}},
+    )
+    sent: Final = json.loads(route.calls.last.request.read())
+    assert route.call_count == 1
+    assert sent["messages"][1]["content"] == [signed, {"type": "text", "text": "answer"}]
