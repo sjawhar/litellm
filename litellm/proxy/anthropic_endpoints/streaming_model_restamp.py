@@ -14,6 +14,8 @@ from typing import Final
 
 from pydantic import TypeAdapter, ValidationError
 
+from litellm.cost_calculator import is_model_or_dated_snapshot
+
 _MESSAGE_START_EVENT: Final = "message_start"
 _MESSAGE_START_MARKER: Final = b"message_start"
 _SSE_DATA_FIELD: Final = "data:"
@@ -32,8 +34,7 @@ def provider_model_is_routed(provider_model: object, routed_model: str | None) -
     """
     if routed_model is None or not isinstance(provider_model, str):
         return True
-    routed: Final = routed_model.split("/", 1)[-1]
-    return provider_model == routed or re.fullmatch(re.escape(routed) + r"-\d{8}", provider_model) is not None
+    return is_model_or_dated_snapshot(provider_model, routed_model.split("/", 1)[-1])
 
 
 def _restamped_event(
