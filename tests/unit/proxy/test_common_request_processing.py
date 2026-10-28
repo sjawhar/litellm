@@ -2995,22 +2995,41 @@ class TestExtractErrorFromSSEChunk:
         # Other fields should be obtained from the original error object (if exists)
 
 
+def _fallback_request(provider: str, deployment: str, **extra: object) -> dict:
+    return {
+        "litellm_logging_obj": SimpleNamespace(model_call_details={"custom_llm_provider": provider}),
+        "litellm_metadata": {"deployment": deployment},
+        **extra,
+    }
+
+
 @pytest.mark.parametrize(
     ("request_data", "expected"),
     [
         pytest.param(
-            {"fallbacks": "default", "litellm_metadata": {"deployment": "anthropic/claude-fable-5"}},
+            _fallback_request("anthropic", "anthropic/claude-fable-5", fallbacks="default"),
             "anthropic/claude-fable-5",
             id="fallbacks-direct-anthropic",
         ),
-        pytest.param({"litellm_metadata": {"deployment": "anthropic/claude-fable-5"}}, None, id="no-fallbacks"),
         pytest.param(
-            {"fallbacks": "default", "litellm_metadata": {"deployment": "openai/gpt-4o"}}, None, id="not-anthropic"
+            _fallback_request("anthropic", "claude-fable-5", fallbacks="default"),
+            "claude-fable-5",
+            id="fallbacks-direct-anthropic-without-prefix",
         ),
+        pytest.param(_fallback_request("anthropic", "anthropic/claude-fable-5"), None, id="no-fallbacks"),
+        pytest.param(_fallback_request("openai", "openai/gpt-4o", fallbacks="default"), None, id="not-anthropic"),
         pytest.param(
-            {"fallbacks": "default", "litellm_metadata": {"deployment": "bedrock/us.anthropic.claude-sonnet-4-5"}},
+            _fallback_request("bedrock", "bedrock/us.anthropic.claude-sonnet-4-5", fallbacks="default"),
             None,
             id="anthropic-on-bedrock",
+        ),
+        pytest.param(
+            {
+                **_fallback_request("bedrock", "bedrock/us.anthropic.claude-sonnet-4-5", fallbacks="default"),
+                "metadata": {"deployment": "anthropic/x"},
+            },
+            None,
+            id="client-metadata-ignored",
         ),
     ],
 )

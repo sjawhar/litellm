@@ -3,6 +3,7 @@ Tests for restamping the public model on Anthropic Messages streaming chunks.
 """
 
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -127,6 +128,7 @@ async def test_sse_generator_keeps_a_model_the_provider_fell_back_to(
     request_data = {
         "model": "fable-alias",
         "litellm_metadata": {"deployment": "anthropic/claude-fable-5"},
+        "litellm_logging_obj": SimpleNamespace(model_call_details={"custom_llm_provider": "anthropic"}),
         **({"fallbacks": fallbacks} if fallbacks is not None else {}),
     }
 

@@ -8792,3 +8792,31 @@ def test_anthropic_server_side_fallback_charges_a_fixed_margin_once(monkeypatch:
         call_type="anthropic_messages",
     )
     assert cost == pytest.approx(_price(requested, 535, 0) + _price(served, 412, 264) + 0.01)
+
+
+
+@pytest.mark.usefixtures("_local_model_cost_map")
+def test_anthropic_server_side_fallback_stores_one_breakdown_for_all_attempts():
+    requested: Final = "claude-fable-5"
+    served: Final = "claude-opus-4-8"
+    logging_obj: Final = Logging(
+        model=f"anthropic/{requested}",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=False,
+        call_type="anthropic_messages",
+        start_time=datetime.datetime(2026, 10, 28, 12, 0, 0),
+        litellm_call_id="server-side-fallback-breakdown",
+        function_id="f",
+    )
+    cost: Final = completion_cost(
+        completion_response=_anthropic_fallback_response(requested, served),
+        model=f"anthropic/{requested}",
+        custom_llm_provider="anthropic",
+        call_type="anthropic_messages",
+        litellm_logging_obj=logging_obj,
+    )
+    breakdown: Final = logging_obj.cost_breakdown
+    assert breakdown is not None
+    assert breakdown["total_cost"] == pytest.approx(cost)
+    assert breakdown["input_cost"] + breakdown["output_cost"] == pytest.approx(cost)
+    assert breakdown["original_cost"] == pytest.approx(cost)
