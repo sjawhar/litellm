@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
@@ -185,22 +185,17 @@ class BaseAnthropicMessagesConfig(ABC):
         """
         When True, async_anthropic_messages_handler will transform the request body
         and issue one more attempt (bounded by max_retry_on_anthropic_messages_http_error).
-        A binding-mismatch 400 is not retried when the body's ``thinking.block_binding``
-        asked for it, since the retry would strip the very blocks the caller pinned.
+        A body whose ``thinking.block_binding`` asks for the error is never retried, since
+        every retry here strips the thinking blocks the caller pinned.
         """
         from litellm.llms.anthropic.common_utils import (
             anthropic_request_errors_on_thinking_binding_mismatch,
             is_anthropic_invalid_thinking_block_error,
-            is_anthropic_thinking_binding_mismatch_error,
         )
 
-        if e.response.status_code != 400:
+        if e.response.status_code != 400 or anthropic_request_errors_on_thinking_binding_mismatch(request_body):
             return False
-        error_text: Final[str] = e.response.text
-        caller_asked_for_this_error: Final = anthropic_request_errors_on_thinking_binding_mismatch(
-            request_body
-        ) and is_anthropic_thinking_binding_mismatch_error(error_text)
-        return not caller_asked_for_this_error and is_anthropic_invalid_thinking_block_error(error_text)
+        return is_anthropic_invalid_thinking_block_error(e.response.text)
 
     def transform_anthropic_messages_request_on_http_error(self, e: httpx.HTTPStatusError, request_data: dict) -> dict:
         """
