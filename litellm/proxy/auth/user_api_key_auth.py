@@ -11,7 +11,7 @@ import asyncio
 import fnmatch
 import re
 import secrets
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Final, NamedTuple, Protocol, Union, cast
 
@@ -101,12 +101,14 @@ from litellm.proxy.auth.auth_utils import (
     get_request_route,
     get_request_route_template,
     is_invalid_virtual_key_error,
+    is_request_body_safe,
     iter_request_fallback_targets,
     log_model_access_denial,
     normalize_request_route,
     pre_db_read_auth_checks,
     request_dispatched_to_pass_through_endpoint,
     request_dispatched_to_provider_pass_through,
+    request_fallback_model_names,
     route_in_additonal_public_routes,
 )
 from litellm.proxy.auth.handle_jwt import JWTAuthManager, JWTHandler
@@ -3801,7 +3803,7 @@ async def enforce_key_and_fallback_model_access(
     request_data: dict,
     route: str,
     request: Request | None,
-    llm_model_list: list | None,
+    llm_model_list: Sequence[object] | None,
     llm_router: litellm.Router | None,
 ) -> None:
     """
@@ -3816,9 +3818,8 @@ async def enforce_key_and_fallback_model_access(
         model_list: Final = config.get("model_list", [])
         new_model_list: Final = model_list
         verbose_proxy_logger.debug("\n new llm router model list %s", new_model_list)
-    elif isinstance(valid_token.models, list) and "all-team-models" in valid_token.models:
-        pass
-    else:
+        return
+    if not (isinstance(valid_token.models, list) and "all-team-models" in valid_token.models):
         model: Final = _get_model_from_request_context(
             request_data=request_data,
             route=route,
@@ -3835,38 +3836,69 @@ async def enforce_key_and_fallback_model_access(
                 llm_router=llm_router,
             )
 
-        anthropic_owns_body_fallbacks: Final = (
-            route.endswith("/v1/messages")
-            and request is not None
-            and anthropic_beta_opts_into_server_side_fallback(request.headers)
+    # Fallback targets are checked for an all-team-models key too: can_key_call_model reads the team's models, and
+    # nothing else checks a fallback target against them.
+    anthropic_owns_body_fallbacks: Final = (
+        route.endswith("/v1/messages")
+        and request is not None
+        and anthropic_beta_opts_into_server_side_fallback(request.headers)
+    )
+    fallback_names: Final = tuple(
+        name
+        for target in iter_request_fallback_targets(request_data, skip_body_fallbacks=anthropic_owns_body_fallbacks)
+        if (name := fallback_target_model_name(target)) is not None
+    )
+
+    for _name in dict.fromkeys(fallback_names):  # dedupe, preserve order
+        await can_key_call_model(
+            model=_name,
+            llm_model_list=llm_model_list,
+            valid_token=valid_token,
+            llm_router=llm_router,
         )
-        fallback_names: Final = tuple(
-            name
-            for target in iter_request_fallback_targets(request_data, skip_body_fallbacks=anthropic_owns_body_fallbacks)
-            if (name := fallback_target_model_name(target)) is not None
+        await is_valid_fallback_model(
+            model=_name,
+            llm_router=llm_router,
+            user_model=None,
         )
 
-        for _name in dict.fromkeys(fallback_names):  # dedupe, preserve order
-            await can_key_call_model(
-                model=_name,
-                llm_model_list=llm_model_list,
-                valid_token=valid_token,
-                llm_router=llm_router,
-            )
-            await is_valid_fallback_model(
-                model=_name,
-                llm_router=llm_router,
-                user_model=None,
-            )
+    # Anthropic serves its own fallback models, so they need only the key's model access, not a Router group
+    for _name in anthropic_fallback_model_names(request_data) if anthropic_owns_body_fallbacks else ():
+        await can_key_call_model(
+            model=_name,
+            llm_model_list=llm_model_list,
+            valid_token=valid_token,
+            llm_router=llm_router,
+        )
 
-        # Anthropic serves its own fallback models, so they need only the key's model access, not a Router group
-        for _name in anthropic_fallback_model_names(request_data) if anthropic_owns_body_fallbacks else ():
-            await can_key_call_model(
-                model=_name,
-                llm_model_list=llm_model_list,
-                valid_token=valid_token,
-                llm_router=llm_router,
-            )
+
+async def enforce_router_settings_fallback_access(
+    *,
+    request_data: Mapping[str, object],
+    valid_token: UserAPIKeyAuth,
+    general_settings: dict[str, object],
+    llm_router: litellm.Router | None,
+) -> None:
+    """
+    The checks a body fallback list gets, for the key or team router_settings_override the proxy applies after auth:
+    no credential or endpoint param on a target, and every target a model the key may call.
+    """
+    model: Final = request_data.get("model")
+    settings_request: Final = {"router_settings_override": request_data.get("router_settings_override")}
+    try:
+        is_request_body_safe(settings_request, general_settings, llm_router, model if isinstance(model, str) else "")
+    except ValueError as e:
+        raise ProxyException(
+            message=f"Key or team router_settings: {e}",
+            type=ProxyErrorTypes.bad_request_error,
+            param="router_settings",
+            code=status.HTTP_400_BAD_REQUEST,
+        ) from e
+    target_names: Final = request_fallback_model_names(settings_request)
+    if not target_names or valid_token.config != {}:
+        return
+    for _name in target_names:
+        await can_key_call_model(model=_name, llm_model_list=None, valid_token=valid_token, llm_router=llm_router)
 
 
 _enforce_key_and_fallback_model_access: Final = enforce_key_and_fallback_model_access

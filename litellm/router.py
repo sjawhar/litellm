@@ -7939,12 +7939,6 @@ class Router:
             kwargs,
             cast("list[object] | None", self.fallbacks),  # cast-ok: untyped router attribute
         )
-        if fallbacks is not None and not isinstance(fallbacks, list):
-            raise litellm.BadRequestError(
-                message=f"LiteLLM fallbacks must be a list of model groups, got {type(fallbacks).__name__}",
-                model=model_group or "",
-                llm_provider="",
-            )
         context_window_fallbacks: list | None = kwargs.get("context_window_fallbacks", self.context_window_fallbacks)
         content_policy_fallbacks: list | None = kwargs.get("content_policy_fallbacks", self.content_policy_fallbacks)
 

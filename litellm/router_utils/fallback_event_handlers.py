@@ -335,22 +335,32 @@ def _router_fallbacks_key(kwargs: Mapping[str, object], anthropic_messages_call:
     )
 
 
+def reject_non_list_litellm_fallbacks(fallbacks: object, model: object) -> None:
+    """LiteLLM's own fallbacks list model groups; any other value would be read one character at a time"""
+    if fallbacks is not None and not isinstance(fallbacks, list):
+        raise litellm.BadRequestError(
+            message=f"LiteLLM fallbacks must be a list of model groups, got {type(fallbacks).__name__}",
+            model=model if isinstance(model, str) else "",
+            llm_provider="",
+        )
+
+
 def request_fallbacks(
     kwargs: Mapping[str, object], router_fallbacks: list[object] | None, *, anthropic_messages_call: bool = False
 ) -> list[object] | None:
     """The Router's fallback list for this request: the per-request override, else the Router's own"""
-    return cast(  # cast-ok: same type as the router attribute
-        "list[object] | None", kwargs.get(_router_fallbacks_key(kwargs, anthropic_messages_call), router_fallbacks)
-    )
+    fallbacks: Final = kwargs.get(_router_fallbacks_key(kwargs, anthropic_messages_call), router_fallbacks)
+    reject_non_list_litellm_fallbacks(fallbacks, kwargs.get("model"))
+    return cast("list[object] | None", fallbacks)  # cast-ok: checked a list or None above
 
 
 def pop_request_fallbacks(
     kwargs: dict[str, object],  # mutable-ok: async_function_with_retries pops its controls before the attempt runs
     router_fallbacks: list[object] | None,
 ) -> list[object] | None:
-    return cast(  # cast-ok: same type as the router attribute
-        "list[object] | None", kwargs.pop(_router_fallbacks_key(kwargs, False), router_fallbacks)
-    )
+    fallbacks: Final = kwargs.pop(_router_fallbacks_key(kwargs, False), router_fallbacks)
+    reject_non_list_litellm_fallbacks(fallbacks, kwargs.get("model"))
+    return cast("list[object] | None", fallbacks)  # cast-ok: checked a list or None above
 
 
 @dataclass(frozen=True, slots=True)
