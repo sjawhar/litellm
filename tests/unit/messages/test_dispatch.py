@@ -397,6 +397,7 @@ def test_internal_is_async_marker_bypasses_native() -> None:
     assert response is expected
 
 
+_SERVER_SIDE_FALLBACK_BETA: Final = {"anthropic-beta": "server-side-fallback-2026-07-01"}
 _FALLBACK_KWARGS: Final[Mapping[str, object]] = {
     "model": "claude-test",
     "messages": MESSAGES,
@@ -409,8 +410,8 @@ _FALLBACK_KWARGS: Final[Mapping[str, object]] = {
 @pytest.mark.parametrize(
     "extra",
     [
-        {"fallbacks": "default"},
-        {"fallbacks": [{"model": "claude-opus-4-8"}]},
+        {"fallbacks": "default", "extra_headers": _SERVER_SIDE_FALLBACK_BETA},
+        {"fallbacks": [{"model": "claude-opus-4-8"}], "extra_headers": _SERVER_SIDE_FALLBACK_BETA},
         {"thinking": {"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "error"}}},
     ],
     ids=["fallbacks-default", "fallbacks-list", "thinking-pinned"],
@@ -427,6 +428,27 @@ async def test_async_server_side_fallbacks_stay_on_python(extra: Mapping[str, ob
     result: Final = await _ADISPATCH.arun(
         (),
         {**_FALLBACK_KWARGS, **extra},
+        python=python,
+        binding=amessages_binding(native),
+        native=lambda hook, request, args, kwargs: hook(request),
+        rules=RUST_RULES,
+    )
+    assert result is expected
+
+
+@pytest.mark.asyncio
+async def test_async_fallbacks_without_the_server_side_fallback_beta_keep_the_native_route() -> None:
+    expected: Final = response()
+
+    async def python(*args: object, **kwargs: object) -> AnthropicMessagesResponse:
+        pytest.fail("without the beta header `fallbacks` is LiteLLM's own list, which the native route may drop")
+
+    async def native(request: NativeCall) -> AnthropicMessagesResponse:
+        return expected
+
+    result: Final = await _ADISPATCH.arun(
+        (),
+        {**_FALLBACK_KWARGS, "fallbacks": [{"model": "claude-opus-4-8"}]},
         python=python,
         binding=amessages_binding(native),
         native=lambda hook, request, args, kwargs: hook(request),

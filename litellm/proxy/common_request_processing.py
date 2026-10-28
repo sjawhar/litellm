@@ -232,6 +232,7 @@ ProxyRouteType: TypeAlias = Literal[
     "adelete_run",
 ]
 from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+from litellm.llms.anthropic.common_utils import anthropic_owns_fallbacks
 
 # Type alias for streaming chunk serializer (chunk after hooks + cost injection -> wire format)
 StreamChunkSerializer = Callable[[object], str]
@@ -1379,11 +1380,16 @@ def _resolved_provider(request_data: Mapping[str, object]) -> object:
 def _server_side_fallback_routed_model(request_data: Mapping[str, object]) -> str | None:
     """
     The routed deployment's provider model (litellm_params.model, recorded by the Router in its own request metadata
-    bucket), on a request that carries Anthropic's server-side `fallbacks` to the direct Anthropic provider: the only
-    request where the provider can answer with another model. The provider is the resolved one, the value the
-    request filter forwards `fallbacks` on. None for every other request, whose response model is restamped as always.
+    bucket), on a request that carries Anthropic's server-side `fallbacks` (its anthropic-beta header opts in) to the
+    direct Anthropic provider: the only request where the provider can answer with another model. The provider is the
+    resolved one, the value the request filter forwards `fallbacks` on. None for every other request, whose response
+    model is restamped as always.
     """
-    if request_data.get("fallbacks") is None or _resolved_provider(request_data) != "anthropic":
+    if (
+        request_data.get("fallbacks") is None
+        or not anthropic_owns_fallbacks(request_data)
+        or _resolved_provider(request_data) != "anthropic"
+    ):
         return None
     router_bucket: Final = request_data.get("litellm_metadata")
     deployment: Final = router_bucket.get("deployment") if isinstance(router_bucket, Mapping) else None

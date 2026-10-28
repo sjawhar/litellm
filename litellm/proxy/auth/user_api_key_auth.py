@@ -39,6 +39,7 @@ from litellm.integrations.otel.model.config import is_otel_v2_enabled
 from litellm.integrations.otel.runtime import phase_event, phase_span, seed_request_identity
 from litellm.litellm_core_utils.dd_tracing import tracer
 from litellm.litellm_core_utils.dot_notation_indexing import get_nested_value
+from litellm.llms.anthropic.common_utils import anthropic_beta_opts_into_server_side_fallback
 from litellm.proxy._types import *
 from litellm.proxy.agent_endpoints.auth.agent_caller import agent_caller_from_headers
 from litellm.proxy.auth.auth_checks import (  # noqa: F401  # legacy module exports
@@ -93,6 +94,7 @@ from litellm.proxy.auth.auth_object_prefetch import (
 )
 from litellm.proxy.auth.auth_utils import (
     abbreviate_api_key,
+    anthropic_fallback_model_names,
     fallback_target_model_name,
     get_end_user_id_from_request_body,
     get_model_from_request,
@@ -3833,9 +3835,14 @@ async def enforce_key_and_fallback_model_access(
                 llm_router=llm_router,
             )
 
+        anthropic_owns_body_fallbacks: Final = (
+            route.endswith("/v1/messages")
+            and request is not None
+            and anthropic_beta_opts_into_server_side_fallback(request.headers)
+        )
         fallback_names: Final = tuple(
             name
-            for target in iter_request_fallback_targets(request_data)
+            for target in iter_request_fallback_targets(request_data, skip_body_fallbacks=anthropic_owns_body_fallbacks)
             if (name := fallback_target_model_name(target)) is not None
         )
 
@@ -3850,6 +3857,15 @@ async def enforce_key_and_fallback_model_access(
                 model=_name,
                 llm_router=llm_router,
                 user_model=None,
+            )
+
+        # Anthropic serves its own fallback models, so they need only the key's model access, not a Router group
+        for _name in anthropic_fallback_model_names(request_data) if anthropic_owns_body_fallbacks else ():
+            await can_key_call_model(
+                model=_name,
+                llm_model_list=llm_model_list,
+                valid_token=valid_token,
+                llm_router=llm_router,
             )
 
 

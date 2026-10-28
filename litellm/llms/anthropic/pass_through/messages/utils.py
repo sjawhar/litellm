@@ -7,6 +7,7 @@ from pydantic import JsonValue
 from litellm.integrations.anthropic_cache_control_hook import AnthropicCacheControlHook
 from litellm.litellm_core_utils.dot_notation_indexing import delete_nested_value
 from litellm.llms.anthropic.common_utils import (
+    anthropic_owns_fallbacks,
     anthropic_request_errors_on_thinking_binding_mismatch,
     flatten_unencrypted_web_search_results_in_anthropic_messages,
     sanitize_tool_use_ids_in_anthropic_messages,
@@ -224,14 +225,15 @@ class AnthropicMessagesRequestUtils:
             params: Dictionary of parameters to filter
             model: Resolved model id; when set, unsupported params may be dropped
             drop_params: Per-request drop_params flag (also respects litellm.drop_params)
-            custom_llm_provider: Routed provider; fast mode and server-side fallbacks are gated to direct Anthropic
+            custom_llm_provider: Routed provider; fast mode is gated to direct Anthropic, and server-side
+                fallbacks to direct Anthropic on a request whose anthropic-beta header opts in
 
         Returns:
             AnthropicMessagesRequestOptionalParams instance with only the valid parameters
         """
         valid_keys: Final = (
             anthropic_messages_optional_param_keys()
-            if custom_llm_provider == "anthropic"
+            if custom_llm_provider == "anthropic" and anthropic_owns_fallbacks(params)
             else anthropic_messages_optional_param_keys() - _DIRECT_ANTHROPIC_ONLY_PARAMS
         )
         filtered_params: Final = {k: v for k, v in params.items() if k in valid_keys and v is not None}

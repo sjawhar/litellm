@@ -9,7 +9,9 @@ from typing import List
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from starlette.requests import Request
 
+from litellm import Router
 from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.auth.auth_utils import fallback_target_model_name, iter_request_fallback_targets
 from litellm.proxy.auth.user_api_key_auth import enforce_key_and_fallback_model_access
@@ -337,3 +339,53 @@ async def test_router_override_without_fallbacks_does_not_break_auth():
         )
 
     assert seen == ["gpt-3.5-turbo"]
+
+
+# ── Anthropic's server-side `fallbacks` on /v1/messages ──────────────────────
+
+
+def _messages_request(anthropic_beta: str) -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/messages",
+            "headers": [(b"anthropic-beta", anthropic_beta.encode())],
+        }
+    )
+
+
+def _router_without_fallback_group() -> Router:
+    return Router(
+        model_list=[
+            {"model_name": "primary", "litellm_params": {"model": "anthropic/claude-fable-5", "api_key": "fake"}}
+        ]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("anthropic_beta", "key_models", "allowed"),
+    [
+        pytest.param("server-side-fallback-2026-07-01", ["primary", "claude-opus-4-8"], True, id="beta-key-allows"),
+        pytest.param("server-side-fallback-2026-07-01", ["primary"], False, id="beta-key-denies"),
+        pytest.param("context-management-2025-06-27", ["primary", "claude-opus-4-8"], False, id="no-beta-needs-group"),
+    ],
+)
+async def test_anthropic_server_side_fallbacks_need_key_access_but_no_router_group(
+    anthropic_beta: str, key_models: list[str], allowed: bool
+):
+    router = _router_without_fallback_group()
+    check = enforce_key_and_fallback_model_access(
+        valid_token=_key_with_models(key_models),
+        request_data={"model": "primary", "fallbacks": [{"model": "claude-opus-4-8"}]},
+        route="/v1/messages",
+        request=_messages_request(anthropic_beta),
+        llm_model_list=router.get_model_list(),
+        llm_router=router,
+    )
+    if allowed:
+        await check
+    else:
+        with pytest.raises(Exception, match="claude-opus-4-8"):
+            await check

@@ -9,8 +9,10 @@ from fastapi import HTTPException, status
 from pydantic import TypeAdapter, ValidationError
 
 import litellm
+from litellm.llms.anthropic.common_utils import anthropic_owns_fallbacks
 from litellm.proxy._types import ProxyException, UserAPIKeyAuth
 from litellm.router_utils.common_utils import is_proxy_admin_request
+from litellm.router_utils.fallback_event_handlers import ROUTER_FALLBACKS_KWARG
 
 # Client-supplied params that make the router or the call path fabricate a
 # failure or a delay instead of calling the provider. The ``mock_testing_*``
@@ -680,13 +682,20 @@ async def _route_request_single_attempt(  # noqa: ANN202  # returns unawaited pr
             "enable_tag_filtering",
         ]
 
-        # On /v1/messages the request's `fallbacks` is Anthropic's server-side fallback parameter
-        provider_owned: Final[frozenset[str]] = (
-            frozenset({"fallbacks"}) if route_type == "anthropic_messages" else frozenset()
+        # A /v1/messages request whose anthropic-beta header opts into server-side fallback sends its `fallbacks` to
+        # Anthropic, so the key/team fallback list reaches the Router under its own name
+        settings_destination: Final = MappingProxyType(
+            {"fallbacks": ROUTER_FALLBACKS_KWARG}
+            if llm_router is not None and route_type == "anthropic_messages" and anthropic_owns_fallbacks(data)
+            else {}
         )
-        for key in per_request_settings:
-            if override_settings.get(key) is not None and key not in data and key not in provider_owned:
-                data[key] = override_settings[key]
+        data.update(
+            {
+                settings_destination.get(key, key): override_settings[key]
+                for key in per_request_settings
+                if override_settings.get(key) is not None and settings_destination.get(key, key) not in data
+            }
+        )
 
         # Use main router with overridden kwargs
         if llm_router is not None:

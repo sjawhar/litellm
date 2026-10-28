@@ -474,13 +474,37 @@ async def test_route_request_with_router_settings_override_preserves_existing():
     assert call_kwargs["timeout"] == 30
 
 
+_KEY_FALLBACKS = [{"claude-group": ["other-group"]}]
+
+
 @pytest.mark.asyncio
-async def test_route_request_router_settings_override_keeps_key_fallbacks_out_of_anthropic_messages_body():
+@pytest.mark.parametrize(
+    ("request_fields", "expected_fallbacks", "expected_router_fallbacks"),
+    [
+        pytest.param({}, _KEY_FALLBACKS, None, id="no-beta-key-fallbacks-are-the-request-fallbacks"),
+        pytest.param(
+            {
+                "fallbacks": "default",
+                "provider_specific_header": {
+                    "custom_llm_provider": "anthropic",
+                    "extra_headers": {"anthropic-beta": "server-side-fallback-2026-07-01"},
+                },
+            },
+            "default",
+            _KEY_FALLBACKS,
+            id="beta-key-fallbacks-reach-the-router-beside-anthropic-fallbacks",
+        ),
+    ],
+)
+async def test_route_request_router_settings_override_fallbacks_on_anthropic_messages(
+    request_fields: dict[str, object], expected_fallbacks: object, expected_router_fallbacks: object
+):
     data = {
         "model": "claude-group",
         "messages": [{"role": "user", "content": "Hello"}],
         "max_tokens": 10,
-        "router_settings_override": {"fallbacks": [{"claude-group": ["other-group"]}], "num_retries": 3},
+        "router_settings_override": {"fallbacks": _KEY_FALLBACKS, "num_retries": 3},
+        **request_fields,
     }
     llm_router = MagicMock()
     llm_router.anthropic_messages.return_value = "success"
@@ -489,7 +513,8 @@ async def test_route_request_router_settings_override_keeps_key_fallbacks_out_of
 
     assert response == "success"
     call_kwargs = llm_router.anthropic_messages.call_args[1]
-    assert "fallbacks" not in call_kwargs
+    assert call_kwargs.get("fallbacks") == expected_fallbacks
+    assert call_kwargs.get("router_fallbacks") == expected_router_fallbacks
     assert call_kwargs["num_retries"] == 3
 
 

@@ -2995,10 +2995,17 @@ class TestExtractErrorFromSSEChunk:
         # Other fields should be obtained from the original error object (if exists)
 
 
+_SERVER_SIDE_FALLBACK_HEADER = {
+    "custom_llm_provider": "anthropic,bedrock",
+    "extra_headers": {"anthropic-beta": "server-side-fallback-2026-07-01"},
+}
+
+
 def _fallback_request(provider: str, deployment: str, **extra: object) -> dict:
     return {
         "litellm_logging_obj": SimpleNamespace(model_call_details={"custom_llm_provider": provider}),
         "litellm_metadata": {"deployment": deployment},
+        "provider_specific_header": _SERVER_SIDE_FALLBACK_HEADER,
         **extra,
     }
 
@@ -3017,6 +3024,13 @@ def _fallback_request(provider: str, deployment: str, **extra: object) -> dict:
             id="fallbacks-direct-anthropic-without-prefix",
         ),
         pytest.param(_fallback_request("anthropic", "anthropic/claude-fable-5"), None, id="no-fallbacks"),
+        pytest.param(
+            _fallback_request(
+                "anthropic", "anthropic/claude-fable-5", fallbacks=[{"group": ["other"]}], provider_specific_header=None
+            ),
+            None,
+            id="fallbacks-without-the-beta-are-litellm-fallbacks",
+        ),
         pytest.param(_fallback_request("openai", "openai/gpt-4o", fallbacks="default"), None, id="not-anthropic"),
         pytest.param(
             _fallback_request("bedrock", "bedrock/us.anthropic.claude-sonnet-4-5", fallbacks="default"),
