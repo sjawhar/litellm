@@ -988,3 +988,50 @@ async def test_router_aanthropic_messages_treats_a_pin_the_deployment_drops_as_n
     sent: Final = json.loads(route.calls.last.request.read())
     assert route.call_count == 1
     assert sent["messages"][1]["content"] == [signed, {"type": "text", "text": "answer"}]
+
+
+
+class _ThinkingRewriteHook(CustomLogger):
+    def __init__(self, thinking: Mapping[str, object]) -> None:
+        super().__init__()
+        self._thinking: Final = thinking
+
+    async def async_pre_request_hook(
+        self, model: str, messages: list, kwargs: dict[str, object]
+    ) -> dict[str, object]:  # mutable-ok: the hook contract returns the request kwargs dict
+        return {**kwargs, "thinking": dict(self._thinking)}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("caller", "hook", "empty_block_sent"),
+    [("error", "drop_block", False), ("drop_block", "error", True)],
+    ids=["hook-unpins", "hook-pins"],
+)
+async def test_router_aanthropic_messages_sanitizes_under_the_pin_a_pre_request_hook_leaves(
+    respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch, caller: str, hook: str, empty_block_sent: bool
+):
+    unsigned_empty: Final = {"type": "thinking", "thinking": ""}
+    signed: Final = {"type": "thinking", "thinking": "plan", "signature": "sig"}
+    monkeypatch.setattr(
+        litellm,
+        "callbacks",
+        [_ThinkingRewriteHook({"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": hook}})],
+    )
+    route: Final = respx_mock.post(url__regex=_ANTHROPIC_URL).mock(
+        return_value=httpx.Response(200, json=_anthropic_body())
+    )
+    await _router(_ALIAS, _ANTHROPIC_MODEL).aanthropic_messages(
+        messages=[
+            {"role": "user", "content": _PROMPT},
+            {"role": "assistant", "content": [unsigned_empty, signed, {"type": "text", "text": "answer"}]},
+            {"role": "user", "content": "again"},
+        ],
+        model=_ALIAS,
+        max_tokens=100,
+        thinking={"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": caller}},
+    )
+    sent: Final = json.loads(route.calls.last.request.read())
+    assert route.call_count == 1
+    assert (unsigned_empty in sent["messages"][1]["content"]) is empty_block_sent
+    assert signed in sent["messages"][1]["content"]
