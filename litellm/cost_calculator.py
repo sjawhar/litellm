@@ -117,6 +117,7 @@ from litellm.types.llms.openai import (
 from litellm.types.rerank import RerankBilledUnits, RerankResponse
 from litellm.types.utils import (
     CallTypesLiteral,
+    CostBreakdown,
     LiteLLMRealtimeStreamLoggingObject,
     LlmProviders,
     LlmProvidersSet,
@@ -1452,11 +1453,11 @@ def _split_anthropic_fallback_iterations(
                 "usage": {
                     "cache_creation_input_tokens": 0,
                     "cache_read_input_tokens": 0,
+                    **request_wide,
+                    **(served_only if entry.get("type") == "fallback_message" else {}),
                     **{
                         key: value for key, value in entry.items() if key not in ("type", "model") and value is not None
                     },
-                    **request_wide,
-                    **(served_only if entry.get("type") == "fallback_message" else {}),
                 },
             },
         )
@@ -1467,6 +1468,54 @@ def _split_anthropic_fallback_iterations(
 def _is_same_model(attempt_model: str, routed_model: str) -> bool:
     """Whether an attempt ran on the routed model or on its dated snapshot"""
     return attempt_model == routed_model or re.fullmatch(re.escape(routed_model) + r"-\d{8}", attempt_model) is not None
+
+
+def _summed_breakdown(breakdowns: Sequence[CostBreakdown], field: str) -> float | None:
+    values: Final = tuple(value for breakdown in breakdowns if isinstance(value := breakdown.get(field), (int, float)))
+    return sum(values) if values else None
+
+
+def _sum_attempt_costs(
+    priced_attempts: Sequence[tuple[float, CostBreakdown | None]],
+    litellm_logging_obj: "LitellmLoggingObject | None",
+    custom_llm_provider: str | None,
+) -> float:
+    """
+    Add up the attempts of one request. Each attempt was priced as a whole request, so a fixed per-request margin is
+    taken off all but one, and the logging object gets one breakdown that adds the attempts up instead of the last
+    attempt's alone.
+    """
+    fixed_margin: Final = (
+        _apply_cost_margin(base_cost=0.0, custom_llm_provider=custom_llm_provider)[2]
+        if litellm.cost_margin_config
+        else 0.0
+    )
+    duplicated_fixed_margin: Final = fixed_margin * (len(priced_attempts) - 1)
+    total_cost: Final = sum(cost for cost, _ in priced_attempts) - duplicated_fixed_margin
+    breakdowns: Final = tuple(breakdown for _, breakdown in priced_attempts if breakdown is not None)
+    if litellm_logging_obj is None or not breakdowns or len(breakdowns) != len(priced_attempts):
+        return total_cost
+    first: Final = breakdowns[0]
+    summed_margin_total: Final = _summed_breakdown(breakdowns, "margin_total_amount")
+    litellm_logging_obj.set_cost_breakdown(
+        input_cost=_summed_breakdown(breakdowns, "input_cost") or 0.0,
+        output_cost=_summed_breakdown(breakdowns, "output_cost") or 0.0,
+        total_cost=total_cost,
+        cost_for_built_in_tools_cost_usd_dollar=_summed_breakdown(breakdowns, "tool_usage_cost") or 0.0,
+        original_cost=_summed_breakdown(breakdowns, "original_cost"),
+        discount_percent=first.get("discount_percent"),
+        discount_amount=_summed_breakdown(breakdowns, "discount_amount"),
+        margin_percent=first.get("margin_percent"),
+        margin_fixed_amount=first.get("margin_fixed_amount"),
+        margin_total_amount=None if summed_margin_total is None else summed_margin_total - duplicated_fixed_margin,
+        cache_read_cost=_summed_breakdown(breakdowns, "cache_read_cost"),
+        cache_creation_cost=_summed_breakdown(breakdowns, "cache_creation_cost"),
+        reasoning_cost=_summed_breakdown(breakdowns, "reasoning_cost"),
+        service_tier=first.get("service_tier"),
+        data_residency=first.get("data_residency"),
+        vertex_location=first.get("vertex_location"),
+    )
+    return total_cost
 
 
 def _response_time_ms_for_cost(
@@ -1585,33 +1634,37 @@ def completion_cost(
         fallback_parts: Final = _split_anthropic_fallback_iterations(completion_response)
         if fallback_parts is not None:
             routed_model: Final = (litellm_model_name or model or "").split("/", 1)[-1]
-            return sum(
-                completion_cost(
-                    completion_response=part,
-                    call_type=call_type,
-                    custom_llm_provider=custom_llm_provider,
-                    region_name=region_name,
-                    optional_params=optional_params,
-                    standard_built_in_tools_params=standard_built_in_tools_params,
-                    litellm_logging_obj=litellm_logging_obj,
-                    service_tier=service_tier,
-                    data_residency=data_residency,
-                    vertex_location=vertex_location,
-                    **(
-                        {
-                            "model": model,
-                            "custom_cost_per_token": custom_cost_per_token,
-                            "custom_pricing": custom_pricing,
-                            "base_model": base_model,
-                            "litellm_model_name": litellm_model_name,
-                            "router_model_id": router_model_id,
-                        }
-                        if attempt_model is None or _is_same_model(attempt_model, routed_model)
-                        else {"model": f"anthropic/{attempt_model}"}
+            priced_attempts: Final = tuple(
+                (
+                    completion_cost(
+                        completion_response=part,
+                        call_type=call_type,
+                        custom_llm_provider=custom_llm_provider,
+                        region_name=region_name,
+                        optional_params=optional_params,
+                        standard_built_in_tools_params=standard_built_in_tools_params,
+                        litellm_logging_obj=litellm_logging_obj,
+                        service_tier=service_tier,
+                        data_residency=data_residency,
+                        vertex_location=vertex_location,
+                        **(
+                            {
+                                "model": model,
+                                "custom_cost_per_token": custom_cost_per_token,
+                                "custom_pricing": custom_pricing,
+                                "base_model": base_model,
+                                "litellm_model_name": litellm_model_name,
+                                "router_model_id": router_model_id,
+                            }
+                            if attempt_model is None or _is_same_model(attempt_model, routed_model)
+                            else {"model": f"anthropic/{attempt_model}"}
+                        ),
                     ),
+                    litellm_logging_obj.cost_breakdown if litellm_logging_obj is not None else None,
                 )
                 for attempt_model, part in fallback_parts
             )
+            return _sum_attempt_costs(priced_attempts, litellm_logging_obj, custom_llm_provider)
 
         if (
             (call_type == "aimage_generation" or call_type == "image_generation")
