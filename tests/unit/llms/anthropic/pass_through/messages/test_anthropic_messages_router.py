@@ -849,3 +849,60 @@ async def test_router_aanthropic_messages_logs_each_fallback_attempt_at_its_own_
         for _, model, tokens_in, tokens_out in attempts
     )
     assert recorder.payloads[0]["response_cost"] == pytest.approx(expected)
+
+
+
+@pytest.mark.asyncio
+async def test_router_aanthropic_messages_logs_each_streamed_fallback_attempt_at_its_own_model(
+    respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+):
+    attempts: Final = (("message", _ANTHROPIC_MODEL, 535, 0), ("fallback_message", _FALLBACK_TARGET, 412, 264))
+    tokens: Final = {"cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+    events: Final = (
+        {
+            "type": "message_start",
+            "message": {
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": _FALLBACK_TARGET,
+                "content": [],
+                "usage": {"input_tokens": 412, "output_tokens": 1, **tokens},
+            },
+        },
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": _JOKE}},
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": {
+                "input_tokens": 412,
+                "output_tokens": 264,
+                **tokens,
+                "iterations": [
+                    {"type": kind, "model": model, "input_tokens": tokens_in, "output_tokens": tokens_out, **tokens}
+                    for kind, model, tokens_in, tokens_out in attempts
+                ],
+            },
+        },
+        {"type": "message_stop"},
+    )
+    sse: Final = "".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events).encode()
+    messages: Final = _unique_messages()
+    recorder: Final = _RecordingLogger(messages)
+    monkeypatch.setattr(litellm, "callbacks", [recorder])
+    respx_mock.post(url__regex=_ANTHROPIC_URL).mock(
+        return_value=httpx.Response(200, content=sse, headers={"content-type": "text/event-stream"})
+    )
+    stream: Final = await _router(_ALIAS, _ANTHROPIC_MODEL).aanthropic_messages(
+        messages=messages, model=_ALIAS, max_tokens=100, stream=True, fallbacks="default"
+    )
+    await _stream_events(stream)
+    await _wait_for_payload(recorder)
+    expected: Final = sum(
+        tokens_in * litellm.model_cost[model]["input_cost_per_token"]
+        + tokens_out * litellm.model_cost[model]["output_cost_per_token"]
+        for _, model, tokens_in, tokens_out in attempts
+    )
+    assert recorder.payloads[0]["response_cost"] == pytest.approx(expected)

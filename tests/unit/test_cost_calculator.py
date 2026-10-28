@@ -8736,3 +8736,44 @@ def test_anthropic_server_side_fallback_prices_each_attempt_at_its_own_model():
         call_type="anthropic_messages",
     )
     assert cost == pytest.approx(_price(requested, 535, 0) + _price(served, 412, 264))
+
+
+
+@pytest.mark.usefixtures("_local_model_cost_map")
+def test_anthropic_server_side_fallback_keeps_request_wide_and_served_attempt_charges():
+    requested: Final = "claude-fable-5"
+    served: Final = "claude-opus-4-8"
+    request_wide: Final = {"inference_geo": "us", "speed": "fast"}
+    served_extras: Final = {"server_tool_use": {"web_search_requests": 3}}
+    response: Final = _anthropic_fallback_response(requested, served)
+    usage: Final = cast(Mapping[str, object], response["usage"])
+    fallback_response: Final = {**response, "usage": {**usage, **request_wide, **served_extras}}
+
+    def single_attempt_cost(model: str, tokens_in: int, tokens_out: int, extras: Mapping[str, object]) -> float:
+        return completion_cost(
+            completion_response={
+                **response,
+                "model": model,
+                "usage": {
+                    "input_tokens": tokens_in,
+                    "output_tokens": tokens_out,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    **request_wide,
+                    **extras,
+                },
+            },
+            model=f"anthropic/{model}",
+            custom_llm_provider="anthropic",
+            call_type="anthropic_messages",
+        )
+
+    cost: Final = completion_cost(
+        completion_response=fallback_response,
+        model=f"anthropic/{requested}",
+        custom_llm_provider="anthropic",
+        call_type="anthropic_messages",
+    )
+    assert cost == pytest.approx(
+        single_attempt_cost(requested, 535, 0, {}) + single_attempt_cost(served, 412, 264, served_extras)
+    )

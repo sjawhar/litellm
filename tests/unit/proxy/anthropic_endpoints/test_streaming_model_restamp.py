@@ -112,22 +112,30 @@ async def test_sse_generator_keeps_provider_model_when_restamping_is_off():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("provider_model", "client_model"),
+    ("provider_model", "fallbacks", "client_model"),
     [
-        pytest.param("claude-opus-4-8", "claude-opus-4-8", id="anthropic-fallback-model-kept"),
-        pytest.param("claude-fable-5", "fable-alias", id="routed-model-restamped"),
-        pytest.param("claude-fable-5-20260607", "fable-alias", id="routed-snapshot-restamped"),
+        pytest.param("claude-opus-4-8", "default", "claude-opus-4-8", id="anthropic-fallback-model-kept"),
+        pytest.param("claude-fable-5", "default", "fable-alias", id="routed-model-restamped"),
+        pytest.param("claude-fable-5-20260607", "default", "fable-alias", id="routed-snapshot-restamped"),
+        pytest.param("claude-opus-4-8", None, "fable-alias", id="no-fallbacks-always-restamped"),
     ],
 )
-async def test_sse_generator_keeps_a_model_the_provider_fell_back_to(provider_model: str, client_model: str):
+async def test_sse_generator_keeps_a_model_the_provider_fell_back_to(
+    provider_model: str, fallbacks: str | None, client_model: str
+):
     proxy_logging_obj = _proxy_logging_obj_streaming([_message_start_frame(provider_model)])
+    request_data = {
+        "model": "fable-alias",
+        "litellm_metadata": {"deployment": "anthropic/claude-fable-5"},
+        **({"fallbacks": fallbacks} if fallbacks is not None else {}),
+    }
 
     chunks = [
         chunk
         async for chunk in ProxyBaseLLMRequestProcessing.async_sse_data_generator(
             response=MagicMock(),
             user_api_key_dict=MagicMock(),
-            request_data={"model": "fable-alias", "litellm_metadata": {"deployment": "anthropic/claude-fable-5"}},
+            request_data=request_data,
             proxy_logging_obj=proxy_logging_obj,
             restamp_model="fable-alias",
         )

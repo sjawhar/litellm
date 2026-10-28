@@ -1370,8 +1370,14 @@ def is_azure_model_router_request(model: str, hidden_params: Mapping[str, object
 _is_azure_model_router_request: Final = is_azure_model_router_request
 
 
-def _routed_deployment_model(request_data: Mapping[str, object]) -> str | None:
-    """The routed deployment's provider model (litellm_params.model), which the Router records in the request metadata"""
+def _server_side_fallback_routed_model(request_data: Mapping[str, object]) -> str | None:
+    """
+    The routed deployment's provider model (litellm_params.model, recorded by the Router in the request metadata), on
+    a request that carries Anthropic's server-side `fallbacks`: the only request where the provider can answer with
+    another model. None for every other request, whose response model is restamped as always.
+    """
+    if request_data.get("fallbacks") is None:
+        return None
     buckets: Final = (request_data.get(name) for name in ("litellm_metadata", "metadata"))
     deployments: Final = (bucket.get("deployment") for bucket in buckets if isinstance(bucket, Mapping))
     return next((deployment for deployment in deployments if isinstance(deployment, str) and deployment), None)
@@ -3003,7 +3009,9 @@ class ProxyBaseLLMRequestProcessing:
                 requested_model=requested_model_from_client,
                 log_context=f"litellm_call_id={logging_obj.litellm_call_id}",
                 return_raw_model_name=should_return_raw_model_name(self.data),
-                routed_model=_routed_deployment_model(self.data) if route_type == "anthropic_messages" else None,
+                routed_model=(
+                    _server_side_fallback_routed_model(self.data) if route_type == "anthropic_messages" else None
+                ),
             )
 
         fastapi_response.headers.update(
@@ -4121,7 +4129,7 @@ class ProxyBaseLLMRequestProcessing:
         response reports.
         """
         restamper: Final = (
-            AnthropicStreamModelRestamper(restamp_model, routed_model=_routed_deployment_model(request_data))
+            AnthropicStreamModelRestamper(restamp_model, routed_model=_server_side_fallback_routed_model(request_data))
             if restamp_model
             else None
         )
