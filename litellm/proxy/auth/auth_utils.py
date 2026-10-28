@@ -32,7 +32,7 @@ from litellm.llms.azure.passthrough.transformation import azure_router_model_in_
 from litellm.llms.nvidia_nim.passthrough.transformation import nvidia_nim_model_group_in_path
 from litellm.proxy._types import *
 from litellm.proxy.common_utils.http_parsing_utils import extract_nested_form_metadata
-from litellm.router_utils.clientside_credential_handler import CREDENTIAL_AND_ENDPOINT_FIELDS
+from litellm.router_utils.clientside_credential_handler import reject_fallback_target_credentials
 from litellm.router_utils.fallback_event_handlers import ROUTER_FALLBACKS_KWARG
 from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     LITELLM_PASS_THROUGH_ENDPOINT_MARKER,
@@ -500,6 +500,19 @@ def _check_banned_params(
 
 # The client wrapper swaps a model for this mapping's value on a context-window error (litellm/utils.py)
 CONTEXT_WINDOW_FALLBACK_DICT_FIELD: Final = "context_window_fallback_dict"
+# A mock param on a target would make the hop answer without the gate that stops a top-level one
+_FALLBACK_TARGET_MOCK_FIELDS: Final = frozenset(
+    {
+        "mock_response",
+        "mock_tool_calls",
+        "mock_testing_fallbacks",
+        "mock_testing_context_fallbacks",
+        "mock_testing_content_policy_fallbacks",
+        "mock_testing_rate_limit_error",
+        "mock_timeout",
+        "mock_delay",
+    }
+)
 _FALLBACK_FIELDS: Final[tuple[str, ...]] = (
     "fallbacks",
     ROUTER_FALLBACKS_KWARG,
@@ -577,18 +590,12 @@ def anthropic_fallback_model_names(request_body: Mapping[str, object]) -> tuple[
 
 
 def _reject_fallback_target_credentials(target: Mapping[str, object], allows_client_credentials: bool) -> None:
-    """
-    A fallback hop runs with the target's params laid over the deployment's, so a caller credential or endpoint on a
-    target would run under the deployment's identity. Only the proxy-wide client-credential opt-in allows one.
-    """
-    if allows_client_credentials:
-        return
-    carried: Final = sorted(field for field in target if field in CREDENTIAL_AND_ENDPOINT_FIELDS)
-    if carried:
-        raise ValueError(
-            f"Rejected Request: a fallback target may not carry {', '.join(carried)}. "
-            "Clientside credentials need `general_settings.allow_client_side_credentials = true`."
-        )
+    """A caller credential, endpoint or mock param never rides on a fallback target; the opt-in admits only the first two"""
+    mocked: Final = sorted(field for field in target if field in _FALLBACK_TARGET_MOCK_FIELDS)
+    if mocked:
+        raise ValueError(f"Rejected Request: a fallback target may not carry {', '.join(mocked)}.")
+    if not allows_client_credentials:
+        reject_fallback_target_credentials(target)
 
 
 def _reject_url_valued_fallback_target(value: str) -> None:

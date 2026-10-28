@@ -82,6 +82,13 @@ def _user_api_key_auth_from_request(request_kwargs: Mapping[str, object]) -> Use
     )
 
 
+def fallback_target_credentials_allowed() -> bool:
+    """The proxy-wide client-credential opt-in, the one setting that lets a fallback target carry a credential"""
+    from litellm.proxy.proxy_server import general_settings
+
+    return general_settings.get("allow_client_side_credentials") is True
+
+
 def _enforced_by_general_settings() -> bool:
     from litellm.proxy.proxy_server import general_settings
 

@@ -19,6 +19,7 @@ from litellm.router_utils.add_retry_fallback_headers import (
     get_fallback_error_info,
 )
 from litellm.router_utils.batch_utils import get_router_metadata_variable_name
+from litellm.router_utils.clientside_credential_handler import reject_fallback_target_credentials
 from litellm.router_utils.cooldown_handlers import (
     _first_present,  # pyright: ignore[reportPrivateUsage] - shared internal helper, used across router_utils
     cast_exception_status_to_int,
@@ -787,13 +788,19 @@ async def run_async_fallback(
     failed_model_group: Final = get_pre_routing_selection(kwargs) or original_model_group
     attempted.record(failed_model_group)
 
-    # A dict target is merged straight into kwargs below, and kwargs win over the deployment's own
-    # params, so a stored key/team/global fallback could otherwise set a federation field that the
-    # request itself is forbidden to carry. Checked here rather than at the merge: inside the loop
-    # the refusal would be caught as a per-target failure and quietly skipped to the next one.
+    # A dict target is merged straight into kwargs below, and kwargs win over the deployment's own params, so a target
+    # could otherwise set a federation field, or a credential, endpoint or header that runs the hop under the
+    # deployment's identity, whichever request field or setting the list came from. Checked here rather than at the
+    # merge: inside the loop the refusal would be caught as a per-target failure and quietly skipped to the next one.
+    credentials_allowed: Final[Callable[[], bool] | None] = getattr(
+        litellm_router, "fallback_target_credentials_allowed", None
+    )
+    refuses_credentials: Final = credentials_allowed is None or not credentials_allowed()
     for target in fallback_model_group:
         if isinstance(target, dict):
             reject_server_owned_wif_params(target)
+            if refuses_credentials:
+                reject_fallback_target_credentials(target)
 
     for mg in fallback_model_group:
         if mg == failed_model_group:
