@@ -20,7 +20,8 @@ from litellm import Router
 from litellm.caching.caching import DualCache
 from litellm.caching.in_memory_cache import InMemoryCache
 from litellm.constants import INTERNAL_CALL_ORIGIN_METADATA_KEY
-from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy._types import LiteLLM_TeamTable, UserAPIKeyAuth
+from litellm.proxy.auth.team_grants import team_grants
 from litellm.proxy.common_utils.proxy_rate_limit_error import ProxyRateLimitError
 from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.proxy.hooks.parallel_request_limiter_v3 import (
@@ -4341,6 +4342,93 @@ async def test_success_event_releases_parallel_slot_v3(monkeypatch):
         data={"model": "gpt-3.5-turbo"},
         call_type="",
     )
+
+
+_TEAM_SLOT_TEAM_ID: Final = "team-signed-in-by-token"
+
+
+def _token_caller_of_team(max_parallel_requests: int) -> UserAPIKeyAuth:
+    team: Final = LiteLLM_TeamTable(team_id=_TEAM_SLOT_TEAM_ID, max_parallel_requests=max_parallel_requests)
+    return UserAPIKeyAuth(api_key=None, team_id=team.team_id, **team_grants(team, None, None))
+
+
+async def _admit_on(
+    pod: _PROXY_MaxParallelRequestsHandler, caller: UserAPIKeyAuth, call_id: str
+) -> RequestRateLimiterStash:
+    _request_stash.set(None)
+    await pod.async_pre_call_hook(
+        user_api_key_dict=caller,
+        cache=pod.internal_usage_cache.dual_cache,
+        data={"model": "gpt-4o", "litellm_call_id": call_id},
+        call_type="",
+    )
+    stash: Final = get_request_stash()
+    assert stash is not None and stash.parallel_slot is not None
+    return stash
+
+
+async def _refusal_on(pod: _PROXY_MaxParallelRequestsHandler, caller: UserAPIKeyAuth) -> HTTPException:
+    _request_stash.set(None)
+    with pytest.raises(HTTPException) as refused:
+        await pod.async_pre_call_hook(
+            user_api_key_dict=caller,
+            cache=pod.internal_usage_cache.dual_cache,
+            data={"model": "gpt-4o", "litellm_call_id": "refused-" + str(time.monotonic_ns())},
+            call_type="",
+        )
+    return refused.value
+
+
+async def _end_request(
+    ending: str,
+    pod: _PROXY_MaxParallelRequestsHandler,
+    caller: UserAPIKeyAuth,
+    stash: RequestRateLimiterStash,
+) -> None:
+    _request_stash.set(stash)
+    kwargs: Final = {
+        "litellm_call_id": stash.owner_litellm_call_id,
+        "standard_logging_object": {"metadata": {"user_api_key_team_id": _TEAM_SLOT_TEAM_ID}},
+    }
+    if ending == "success":
+        await pod.async_log_success_event(
+            kwargs=kwargs,
+            response_obj=ModelResponse(usage=Usage(prompt_tokens=5, completion_tokens=5, total_tokens=10)),
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+        )
+    elif ending == "failure":
+        await pod.async_log_failure_event(kwargs=kwargs, response_obj=None, start_time=None, end_time=None)
+    else:
+        await pod.async_release_max_parallel_requests_on_disconnect(caller)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["success", "failure", "disconnect"])
+async def test_team_parallel_limit_spans_limiter_instances_for_a_token_caller_v3(ending: str) -> None:
+    """A caller that signs in with a token has no key, so the team's max_parallel_requests is its only
+    concurrency limit. Three limiter instances sharing one counter store stand in for three pods: the team's
+    third call in flight is refused wherever it lands, and each way a call can end frees exactly its slot."""
+    store: Final = DualCache()
+    pods: Final = tuple(
+        _PROXY_MaxParallelRequestsHandler(internal_usage_cache=InternalUsageCache(store)) for _ in range(3)
+    )
+    caller: Final = _token_caller_of_team(max_parallel_requests=2)
+    team_gauge: Final = f"{{team:{_TEAM_SLOT_TEAM_ID}}}:max_parallel_requests"
+
+    first: Final = await _admit_on(pods[0], caller, "team-call-1")
+    await _admit_on(pods[1], caller, "team-call-2")
+    assert first.parallel_slot is not None and first.parallel_slot["counter_keys"] == [team_gauge]
+
+    refused: Final = await _refusal_on(pods[2], caller)
+    assert refused.status_code == 429
+    assert f"team: {_TEAM_SLOT_TEAM_ID}." in refused.detail and "Limit type: max_parallel_requests." in refused.detail
+
+    await _end_request(ending, pods[0], caller, first)
+    assert pods[2]._gauge_in_flight_from_cache_value(await store.async_get_cache(key=team_gauge)) == 1
+
+    await _admit_on(pods[2], caller, "team-call-3")
+    assert (await _refusal_on(pods[0], caller)).status_code == 429
 
 
 @pytest.mark.asyncio
