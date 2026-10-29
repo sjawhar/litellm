@@ -8,13 +8,16 @@ import asyncio
 import os
 import time
 from datetime import datetime, timedelta
+from itertools import chain
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from prometheus_client import REGISTRY
 
 
 import litellm
 from litellm import DualCache, Router
+from litellm.integrations.prometheus import PrometheusLogger
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.hooks.dynamic_rate_limiter_v3 import (
     PROXY_DynamicRateLimitHandlerV3 as DynamicRateLimitHandler,
@@ -37,6 +40,11 @@ def time_controller(monkeypatch):
     controller = TimeController()
     monkeypatch.setattr(time, "time", lambda: controller.now().timestamp())
     return controller
+
+
+def _clear_prometheus_registry() -> None:
+    for collector in list(REGISTRY._collector_to_names):
+        REGISTRY.unregister(collector)
 
 
 @pytest.mark.asyncio
@@ -1582,6 +1590,214 @@ async def test_saturation_check_cache_ttl_configuration(monkeypatch):
     finally:
         # Restore original TTL
         litellm.priority_reservation_settings.saturation_check_cache_ttl = original_ttl
+
+
+def _saturation_handler(model: str, rpm: int = 100) -> DynamicRateLimitHandler:
+    handler = DynamicRateLimitHandler(internal_usage_cache=DualCache())
+    handler.update_variables(
+        llm_router=Router(
+            model_list=[
+                {
+                    "model_name": model,
+                    "litellm_params": {
+                        "model": "gpt-3.5-turbo",
+                        "api_key": "test-key",
+                        "api_base": "test-base",
+                        "rpm": rpm,
+                        "tpm": 1000,
+                    },
+                }
+            ]
+        )
+    )
+    return handler
+
+
+async def _seed_saturation_window(handler: DynamicRateLimitHandler, model: str, requests: int, tokens: int) -> None:
+    for rate_limit_type, value in (("requests", requests), ("tokens", tokens)):
+        await handler.internal_usage_cache.async_set_cache(
+            key=handler.v3_limiter.create_rate_limit_keys(
+                key="model_saturation_check",
+                value=model,
+                rate_limit_type=rate_limit_type,
+            ),
+            value=value,
+            litellm_parent_otel_span=None,
+        )
+
+
+def _priority_request_data(
+    model: str,
+    trusted_metadata_key: str,
+    team_priority: str | None,
+    requester_priority: str | None,
+    key_priority: str | None,
+) -> dict:
+    caller_metadata = {"priority": requester_priority} if requester_priority is not None else {}
+    trusted_metadata = {
+        "user_api_key_metadata": {"priority": key_priority} if key_priority is not None else {},
+        "user_api_key_team_metadata": {"priority": team_priority} if team_priority is not None else {},
+    }
+    if trusted_metadata_key == "metadata":
+        return {"model": model, "metadata": {**caller_metadata, **trusted_metadata}}
+    return {
+        "model": model,
+        "metadata": caller_metadata,
+        "litellm_metadata": trusted_metadata,
+    }
+
+
+def _saturation_samples() -> list:
+    return [
+        sample
+        for sample in chain.from_iterable(metric.samples for metric in REGISTRY.collect())
+        if sample.name == "litellm_model_group_saturation_ratio"
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "trusted_metadata_key",
+    (pytest.param("metadata", id="chat_completions"), pytest.param("litellm_metadata", id="messages")),
+)
+@pytest.mark.parametrize(
+    ("team_priority", "requester_priority", "key_priority", "expected_priority"),
+    (
+        ("high", None, None, "high"),
+        (None, "high", None, ""),
+        (None, None, "high", ""),
+        ("high", "forged-requester", "forged-key", "high"),
+    ),
+)
+async def test_pre_call_emits_model_group_saturation_from_limiter_window(
+    monkeypatch: pytest.MonkeyPatch,
+    trusted_metadata_key: str,
+    team_priority: str | None,
+    requester_priority: str | None,
+    key_priority: str | None,
+    expected_priority: str,
+):
+    _clear_prometheus_registry()
+    try:
+        monkeypatch.setattr(litellm, "callbacks", [PrometheusLogger()])
+        model = "saturated-model"
+        handler = _saturation_handler(model)
+        await _seed_saturation_window(handler, model, requests=75, tokens=500)
+        model_group_info = handler.llm_router.get_model_group_info(model_group=model)
+        assert model_group_info is not None
+        saturation = await handler._check_model_saturation(model=model, model_group_info=model_group_info)
+        assert saturation == 0.75
+
+        await handler.async_pre_call_hook(
+            user_api_key_dict=UserAPIKeyAuth(
+                metadata={"priority": key_priority} if key_priority is not None else {},
+                team_metadata={"priority": team_priority} if team_priority is not None else {},
+            ),
+            cache=handler.internal_usage_cache,
+            data=_priority_request_data(model, trusted_metadata_key, team_priority, requester_priority, key_priority),
+            call_type="completion",
+        )
+
+        samples = _saturation_samples()
+        assert len(samples) == 1
+        assert samples[0].labels == {"model_group": model, "priority": expected_priority}
+        assert samples[0].value == saturation
+    finally:
+        _clear_prometheus_registry()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("requests", "tokens", "expected_saturation"),
+    ((75, 600, 0.75), (60, 750, 0.75)),
+    ids=("rpm_dominant", "tpm_dominant"),
+)
+async def test_pre_call_saturation_gauge_uses_larger_of_rpm_and_tpm(
+    monkeypatch: pytest.MonkeyPatch, requests: int, tokens: int, expected_saturation: float
+):
+    _clear_prometheus_registry()
+    try:
+        monkeypatch.setattr(litellm, "callbacks", [PrometheusLogger()])
+        model = "max-saturation-model"
+        handler = _saturation_handler(model)
+        await _seed_saturation_window(handler, model, requests=requests, tokens=tokens)
+
+        await handler.async_pre_call_hook(
+            user_api_key_dict=UserAPIKeyAuth(),
+            cache=handler.internal_usage_cache,
+            data=_priority_request_data(model, "metadata", "high", None, None),
+            call_type="completion",
+        )
+
+        samples = _saturation_samples()
+        assert len(samples) == 1
+        assert samples[0].value == expected_saturation
+    finally:
+        _clear_prometheus_registry()
+
+
+@pytest.mark.asyncio
+async def test_pre_call_saturation_gauge_is_capped_at_one_when_the_window_is_over_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _clear_prometheus_registry()
+    try:
+        monkeypatch.setattr(litellm, "callbacks", [PrometheusLogger()])
+        model = "over-capacity-model"
+        handler = _saturation_handler(model)
+        await _seed_saturation_window(handler, model, requests=150, tokens=0)
+
+        await handler.async_pre_call_hook(
+            user_api_key_dict=UserAPIKeyAuth(),
+            cache=handler.internal_usage_cache,
+            data=_priority_request_data(model, "metadata", "high", None, None),
+            call_type="completion",
+        )
+
+        samples = _saturation_samples()
+        assert len(samples) == 1
+        assert samples[0].labels == {"model_group": model, "priority": "high"}
+        assert samples[0].value == 1.0
+    finally:
+        _clear_prometheus_registry()
+
+
+class _FailingSaturationPrometheusLogger(PrometheusLogger):
+    def __init__(self) -> None:
+        pass
+
+    def set_model_group_saturation_ratio(self, model_group: str, saturation: float, litellm_params: object) -> None:
+        raise RuntimeError("metrics backend unavailable")
+
+
+@pytest.mark.asyncio
+async def test_pre_call_still_enforces_model_capacity_when_saturation_metric_emission_fails(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from fastapi import HTTPException
+
+    model = "metric-failure-model"
+    handler = _saturation_handler(model, rpm=1)
+    monkeypatch.setattr(litellm, "callbacks", [_FailingSaturationPrometheusLogger()])
+
+    assert (
+        await handler.async_pre_call_hook(
+            user_api_key_dict=UserAPIKeyAuth(),
+            cache=handler.internal_usage_cache,
+            data={"model": model},
+            call_type="completion",
+        )
+        is None
+    )
+    with pytest.raises(HTTPException) as blocked:
+        await handler.async_pre_call_hook(
+            user_api_key_dict=UserAPIKeyAuth(),
+            cache=handler.internal_usage_cache,
+            data={"model": model},
+            call_type="completion",
+        )
+
+    assert blocked.value.status_code == 429
 
 
 @pytest.mark.asyncio
