@@ -1474,6 +1474,7 @@ class TeamMemberEntry(BaseModel):
 
 class TeamMetadata(BaseModel):
     disable_global_guardrails: bool | None = None
+    priority: str | None = None
 
 
 class TeamNewBody(BaseModel):

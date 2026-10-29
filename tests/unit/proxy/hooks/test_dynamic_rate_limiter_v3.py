@@ -7,12 +7,15 @@ Core tests to validate that priority weights are respected (0.9/0.1) instead of 
 import asyncio
 import os
 import time
+from collections.abc import Mapping
 from datetime import datetime, timedelta
 from itertools import chain
+from typing import Final, Literal
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from prometheus_client import REGISTRY
+from prometheus_client.samples import Sample
 
 
 import litellm
@@ -87,7 +90,7 @@ async def test_priority_weight_allocation(monkeypatch):
 
     # Test high priority allocation
     high_priority_user = UserAPIKeyAuth()
-    high_priority_user.metadata = {"priority": "high"}
+    high_priority_user.team_metadata = {"priority": "high"}
 
     high_descriptors = handler._create_priority_based_descriptors(
         model=model,
@@ -107,7 +110,7 @@ async def test_priority_weight_allocation(monkeypatch):
 
     # Test low priority allocation
     low_priority_user = UserAPIKeyAuth()
-    low_priority_user.metadata = {"priority": "low"}
+    low_priority_user.team_metadata = {"priority": "low"}
 
     low_descriptors = handler._create_priority_based_descriptors(
         model=model,
@@ -174,13 +177,13 @@ async def test_concurrent_priority_requests(monkeypatch):
 
     for i in range(3):  # 3 high priority users
         user = UserAPIKeyAuth()
-        user.metadata = {"priority": "high"}
+        user.team_metadata = {"priority": "high"}
         user.user_id = f"high_user_{i}"
         high_priority_users.append(user)
 
     for i in range(2):  # 2 low priority users
         user = UserAPIKeyAuth()
-        user.metadata = {"priority": "low"}
+        user.team_metadata = {"priority": "low"}
         user.user_id = f"low_user_{i}"
         low_priority_users.append(user)
 
@@ -265,14 +268,14 @@ async def test_100_concurrent_priority_requests(time_controller, monkeypatch):
     # 70 high priority users
     for i in range(70):
         user = UserAPIKeyAuth()
-        user.metadata = {"priority": "high"}
+        user.team_metadata = {"priority": "high"}
         user.user_id = f"high_stress_user_{i}"
         all_users.append((user, "high", 900, 450))  # expected TPM, expected RPM
 
     # 30 low priority users
     for i in range(30):
         user = UserAPIKeyAuth()
-        user.metadata = {"priority": "low"}
+        user.team_metadata = {"priority": "low"}
         user.user_id = f"low_stress_user_{i}"
         all_users.append((user, "low", 100, 50))  # expected TPM, expected RPM
 
@@ -525,13 +528,13 @@ async def test_concurrent_pre_call_hooks_stress(monkeypatch):
 
     for i in range(30):
         user = UserAPIKeyAuth()
-        user.metadata = {"priority": "premium"}
+        user.team_metadata = {"priority": "premium"}
         user.user_id = f"premium_hook_user_{i}"
         users.append((user, "premium"))
 
     for i in range(20):
         user = UserAPIKeyAuth()
-        user.metadata = {"priority": "standard"}
+        user.team_metadata = {"priority": "standard"}
         user.user_id = f"standard_hook_user_{i}"
         users.append((user, "standard"))
 
@@ -684,11 +687,11 @@ async def test_fake_calls_case_1_no_rate_limiting_at_capacity(monkeypatch):
 
     # Create users
     key_a_user = UserAPIKeyAuth()
-    key_a_user.metadata = {"priority": "key_a"}
+    key_a_user.team_metadata = {"priority": "key_a"}
     key_a_user.user_id = "key_a_user"
 
     key_b_user = UserAPIKeyAuth()
-    key_b_user.metadata = {"priority": "key_b"}
+    key_b_user.team_metadata = {"priority": "key_b"}
     key_b_user.user_id = "key_b_user"
 
     # Track results
@@ -806,11 +809,11 @@ async def test_fake_calls_case_2_priority_queue_during_saturation(monkeypatch):
 
     # Create users
     key_a_user = UserAPIKeyAuth()
-    key_a_user.metadata = {"priority": "key_a"}
+    key_a_user.team_metadata = {"priority": "key_a"}
     key_a_user.user_id = "key_a_user"
 
     key_b_user = UserAPIKeyAuth()
-    key_b_user.metadata = {"priority": "key_b"}
+    key_b_user.team_metadata = {"priority": "key_b"}
     key_b_user.user_id = "key_b_user"
 
     # Track results
@@ -940,7 +943,7 @@ async def test_fake_calls_case_3_spillover_capacity_default_keys(monkeypatch):
 
     # Create users
     key_a_user = UserAPIKeyAuth()
-    key_a_user.metadata = {"priority": "key_a"}
+    key_a_user.team_metadata = {"priority": "key_a"}
     key_a_user.user_id = "key_a_user"
 
     key_b_user = UserAPIKeyAuth()
@@ -1075,11 +1078,11 @@ async def test_fake_calls_case_4_over_allocated_with_normalization(monkeypatch):
 
     # Create users
     key_a_user = UserAPIKeyAuth()
-    key_a_user.metadata = {"priority": "key_a"}
+    key_a_user.team_metadata = {"priority": "key_a"}
     key_a_user.user_id = "key_a_user"
 
     key_b_user = UserAPIKeyAuth()
-    key_b_user.metadata = {"priority": "key_b"}
+    key_b_user.team_metadata = {"priority": "key_b"}
     key_b_user.user_id = "key_b_user"
 
     # Track results
@@ -1210,15 +1213,15 @@ async def test_fake_calls_case_5_default_value_priority_reservation(monkeypatch)
 
     # Create users
     key_a_user = UserAPIKeyAuth()
-    key_a_user.metadata = {"priority": "key_a"}
+    key_a_user.team_metadata = {"priority": "key_a"}
     key_a_user.user_id = "key_a_user"
 
     key_b_user = UserAPIKeyAuth()
-    key_b_user.metadata = {"priority": "key_b"}
+    key_b_user.team_metadata = {"priority": "key_b"}
     key_b_user.user_id = "key_b_user"
 
     key_c_user = UserAPIKeyAuth()
-    key_c_user.metadata = {"priority": "key_c"}
+    key_c_user.team_metadata = {"priority": "key_c"}
     key_c_user.user_id = "key_c_user"
 
     key_d_user = UserAPIKeyAuth()
@@ -1372,7 +1375,7 @@ async def test_default_priority_shared_pool(monkeypatch):
 
     # Verify explicit priority uses different pool
     user_prod = UserAPIKeyAuth()
-    user_prod.metadata = {"priority": "prod"}
+    user_prod.team_metadata = {"priority": "prod"}
     desc_prod = handler._create_priority_based_descriptors(
         model=model, user_api_key_dict=user_prod, priority="prod"
     )
@@ -1443,29 +1446,19 @@ async def test_async_log_success_event_increments_by_actual_tokens(monkeypatch):
     mock_response.usage.completion_tokens = 50
     mock_response.usage.total_tokens = 60
 
-    # Create kwargs with priority in user_api_key_auth_metadata
     kwargs = {
-        "standard_logging_object": {
-            "metadata": {
-                "user_api_key_auth_metadata": {"priority": "dev"},
-            },
-            "model_group": model,
-        },
+        "standard_logging_object": {"model_group": model},
         "litellm_params": {
-            "metadata": {"model_group": model},
+            "metadata": {"model_group": model, "user_api_key_team_metadata": {"priority": "dev"}},
         },
     }
 
-    with patch(
-        "litellm.proxy.common_utils.callback_utils.get_model_group_from_litellm_kwargs",
-        return_value=model,
-    ):
-        await handler.async_log_success_event(
-            kwargs=kwargs,
-            response_obj=mock_response,
-            start_time=None,
-            end_time=None,
-        )
+    await handler.async_log_success_event(
+        kwargs=kwargs,
+        response_obj=mock_response,
+        start_time=None,
+        end_time=None,
+    )
 
     # Verify increments happened with actual token count (60 total tokens)
     assert (
@@ -1592,8 +1585,8 @@ async def test_saturation_check_cache_ttl_configuration(monkeypatch):
         litellm.priority_reservation_settings.saturation_check_cache_ttl = original_ttl
 
 
-def _saturation_handler(model: str, rpm: int = 100) -> DynamicRateLimitHandler:
-    handler = DynamicRateLimitHandler(internal_usage_cache=DualCache())
+def _saturation_handler(model: str, rpm: int = 10, cache: DualCache | None = None) -> DynamicRateLimitHandler:
+    handler = DynamicRateLimitHandler(internal_usage_cache=cache or DualCache())
     handler.update_variables(
         llm_router=Router(
             model_list=[
@@ -1613,28 +1606,16 @@ def _saturation_handler(model: str, rpm: int = 100) -> DynamicRateLimitHandler:
     return handler
 
 
-async def _seed_saturation_window(handler: DynamicRateLimitHandler, model: str, requests: int, tokens: int) -> None:
-    for rate_limit_type, value in (("requests", requests), ("tokens", tokens)):
-        await handler.internal_usage_cache.async_set_cache(
-            key=handler.v3_limiter.create_rate_limit_keys(
-                key="model_saturation_check",
-                value=model,
-                rate_limit_type=rate_limit_type,
-            ),
-            value=value,
-            litellm_parent_otel_span=None,
-        )
-
-
 def _priority_request_data(
     model: str,
-    trusted_metadata_key: str,
+    trusted_metadata_key: Literal["metadata", "litellm_metadata"],
     team_priority: str | None,
     requester_priority: str | None,
     key_priority: str | None,
-) -> dict:
+) -> dict[str, object]:
     caller_metadata = {"priority": requester_priority} if requester_priority is not None else {}
     trusted_metadata = {
+        "model_group": model,
         "user_api_key_metadata": {"priority": key_priority} if key_priority is not None else {},
         "user_api_key_team_metadata": {"priority": team_priority} if team_priority is not None else {},
     }
@@ -1647,7 +1628,47 @@ def _priority_request_data(
     }
 
 
-def _saturation_samples() -> list:
+def _team_user(team_priority: str | None, key_priority: str | None = None) -> UserAPIKeyAuth:
+    return UserAPIKeyAuth(
+        metadata={"priority": key_priority} if key_priority is not None else {},
+        team_metadata={"priority": team_priority} if team_priority is not None else {},
+    )
+
+
+async def _admit(handler: DynamicRateLimitHandler, user: UserAPIKeyAuth, data: Mapping[str, object]) -> None:
+    await handler.async_pre_call_hook(
+        user_api_key_dict=user, cache=handler.internal_usage_cache, data=dict(data), call_type="completion"
+    )
+
+
+async def _record_tokens(
+    handler: DynamicRateLimitHandler,
+    data: Mapping[str, object],
+    total_tokens: int,
+    stream: bool = False,
+    key_priority: str | None = None,
+) -> None:
+    from litellm.types.utils import ModelResponse, Usage
+
+    key_metadata: Final = {"priority": key_priority} if key_priority is not None else {}
+    await handler.async_log_success_event(
+        kwargs={
+            "stream": stream,
+            "litellm_params": {key: value for key, value in data.items() if key != "model"},
+            "standard_logging_object": {
+                "metadata": {"user_api_key_auth_metadata": key_metadata, "requester_metadata": key_metadata}
+            },
+        },
+        response_obj=ModelResponse(
+            model=data["model"],
+            usage=Usage(prompt_tokens=0, completion_tokens=total_tokens, total_tokens=total_tokens),
+        ),
+        start_time=None,
+        end_time=None,
+    )
+
+
+def _saturation_samples() -> list[Sample]:
     return [
         sample
         for sample in chain.from_iterable(metric.samples for metric in REGISTRY.collect())
@@ -1671,7 +1692,7 @@ def _saturation_samples() -> list:
 )
 async def test_pre_call_emits_model_group_saturation_from_limiter_window(
     monkeypatch: pytest.MonkeyPatch,
-    trusted_metadata_key: str,
+    trusted_metadata_key: Literal["metadata", "litellm_metadata"],
     team_priority: str | None,
     requester_priority: str | None,
     key_priority: str | None,
@@ -1682,56 +1703,50 @@ async def test_pre_call_emits_model_group_saturation_from_limiter_window(
         monkeypatch.setattr(litellm, "callbacks", [PrometheusLogger()])
         model = "saturated-model"
         handler = _saturation_handler(model)
-        await _seed_saturation_window(handler, model, requests=75, tokens=500)
+        data = _priority_request_data(model, trusted_metadata_key, team_priority, requester_priority, key_priority)
+        user = _team_user(team_priority, key_priority)
+
+        await _admit(handler, user, data)
+        await _record_tokens(handler, data, total_tokens=500)
+        await _admit(handler, user, data)
+
         model_group_info = handler.llm_router.get_model_group_info(model_group=model)
         assert model_group_info is not None
-        saturation = await handler._check_model_saturation(model=model, model_group_info=model_group_info)
-        assert saturation == 0.75
-
-        await handler.async_pre_call_hook(
-            user_api_key_dict=UserAPIKeyAuth(
-                metadata={"priority": key_priority} if key_priority is not None else {},
-                team_metadata={"priority": team_priority} if team_priority is not None else {},
-            ),
-            cache=handler.internal_usage_cache,
-            data=_priority_request_data(model, trusted_metadata_key, team_priority, requester_priority, key_priority),
-            call_type="completion",
-        )
-
+        window_saturation = await handler._check_model_saturation(model=model, model_group_info=model_group_info)
+        assert window_saturation == max(2 / 10, 500 / 1000)
         samples = _saturation_samples()
         assert len(samples) == 1
         assert samples[0].labels == {"model_group": model, "priority": expected_priority}
-        assert samples[0].value == saturation
+        assert samples[0].value == window_saturation
     finally:
         _clear_prometheus_registry()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("requests", "tokens", "expected_saturation"),
-    ((75, 600, 0.75), (60, 750, 0.75)),
+    ("admitted_before", "tokens", "expected_saturation"),
+    ((5, 100, 6 / 10), (1, 700, 700 / 1000)),
     ids=("rpm_dominant", "tpm_dominant"),
 )
-async def test_pre_call_saturation_gauge_uses_larger_of_rpm_and_tpm(
-    monkeypatch: pytest.MonkeyPatch, requests: int, tokens: int, expected_saturation: float
+async def test_pre_call_saturation_gauge_uses_larger_of_rpm_and_tpm_after_admission(
+    monkeypatch: pytest.MonkeyPatch, admitted_before: int, tokens: int, expected_saturation: float
 ):
     _clear_prometheus_registry()
     try:
         monkeypatch.setattr(litellm, "callbacks", [PrometheusLogger()])
         model = "max-saturation-model"
         handler = _saturation_handler(model)
-        await _seed_saturation_window(handler, model, requests=requests, tokens=tokens)
+        data = _priority_request_data(model, "metadata", "high", None, None)
+        user = _team_user("high")
+        for _ in range(admitted_before):
+            await _admit(handler, user, data)
+        await _record_tokens(handler, data, total_tokens=tokens)
 
-        await handler.async_pre_call_hook(
-            user_api_key_dict=UserAPIKeyAuth(),
-            cache=handler.internal_usage_cache,
-            data=_priority_request_data(model, "metadata", "high", None, None),
-            call_type="completion",
-        )
+        await _admit(handler, user, data)
 
         samples = _saturation_samples()
         assert len(samples) == 1
-        assert samples[0].value == expected_saturation
+        assert samples[0].value == pytest.approx(expected_saturation)
     finally:
         _clear_prometheus_registry()
 
@@ -1740,24 +1755,186 @@ async def test_pre_call_saturation_gauge_uses_larger_of_rpm_and_tpm(
 async def test_pre_call_saturation_gauge_is_capped_at_one_when_the_window_is_over_capacity(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    from fastapi import HTTPException
+
     _clear_prometheus_registry()
     try:
         monkeypatch.setattr(litellm, "callbacks", [PrometheusLogger()])
         model = "over-capacity-model"
         handler = _saturation_handler(model)
-        await _seed_saturation_window(handler, model, requests=150, tokens=0)
+        data = _priority_request_data(model, "metadata", "high", None, None)
+        user = _team_user("high")
+        await _admit(handler, user, data)
+        await _record_tokens(handler, data, total_tokens=5000)
 
-        await handler.async_pre_call_hook(
-            user_api_key_dict=UserAPIKeyAuth(),
-            cache=handler.internal_usage_cache,
-            data=_priority_request_data(model, "metadata", "high", None, None),
-            call_type="completion",
-        )
+        with pytest.raises(HTTPException) as blocked:
+            await _admit(handler, user, data)
 
+        assert blocked.value.status_code == 429
         samples = _saturation_samples()
         assert len(samples) == 1
         assert samples[0].labels == {"model_group": model, "priority": "high"}
         assert samples[0].value == 1.0
+    finally:
+        _clear_prometheus_registry()
+
+
+def _priority_pool_key(
+    handler: DynamicRateLimitHandler, model: str, pool: str, rate_limit_type: Literal["requests", "tokens"]
+) -> str:
+    return handler.v3_limiter.create_rate_limit_keys(
+        key="priority_model", value=f"{model}:{pool}", rate_limit_type=rate_limit_type
+    )
+
+
+async def _pool_counter(
+    handler: DynamicRateLimitHandler, model: str, pool: str, rate_limit_type: Literal["requests", "tokens"]
+) -> int:
+    value = await handler.internal_usage_cache.async_get_cache(
+        key=_priority_pool_key(handler, model, pool, rate_limit_type), litellm_parent_otel_span=None
+    )
+    return 0 if value is None else int(value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "trusted_metadata_key",
+    (pytest.param("metadata", id="chat_completions"), pytest.param("litellm_metadata", id="messages")),
+)
+async def test_success_accounting_charges_the_team_class_across_pods_for_whole_and_streamed_calls(
+    monkeypatch: pytest.MonkeyPatch, trusted_metadata_key: Literal["metadata", "litellm_metadata"]
+):
+    monkeypatch.setenv("LITELLM_LICENSE", "test-license-key")
+    monkeypatch.setattr(litellm, "priority_reservation", {"high": 0.8, "low": 0.2})
+    model = "accounting-model"
+    shared_cache = DualCache()
+    first_pod = _saturation_handler(model, cache=shared_cache)
+    second_pod = _saturation_handler(model, cache=shared_cache)
+    data = _priority_request_data(model, trusted_metadata_key, "high", "low", "low")
+
+    await _record_tokens(first_pod, data, total_tokens=120, key_priority="low")
+    await _record_tokens(second_pod, data, total_tokens=80, stream=True, key_priority="low")
+
+    assert await _pool_counter(first_pod, model, "high", "tokens") == 200
+    assert await _pool_counter(second_pod, model, "low", "tokens") == 0
+    assert await _pool_counter(second_pod, model, "default_pool", "tokens") == 0
+
+
+@pytest.mark.asyncio
+async def test_success_accounting_charges_a_team_without_class_to_the_default_pool_whatever_the_key_says(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("LITELLM_LICENSE", "test-license-key")
+    monkeypatch.setattr(litellm, "priority_reservation", {"high": 0.8, "low": 0.2})
+    model = "default-accounting-model"
+    handler = _saturation_handler(model)
+    data = _priority_request_data(model, "metadata", None, "high", "high")
+
+    await _record_tokens(handler, data, total_tokens=50, key_priority="high")
+
+    assert await _pool_counter(handler, model, "default_pool", "tokens") == 50
+    assert await _pool_counter(handler, model, "high", "tokens") == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("team_priority", "key_priority", "charged_pool", "uncharged_pool"),
+    (("low", "high", "low", "high"), (None, "high", "default_pool", "high")),
+)
+async def test_admission_charges_the_team_class_and_ignores_key_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    team_priority: str | None,
+    key_priority: str,
+    charged_pool: str,
+    uncharged_pool: str,
+):
+    monkeypatch.setenv("LITELLM_LICENSE", "test-license-key")
+    monkeypatch.setattr(litellm, "priority_reservation", {"high": 0.8, "low": 0.2})
+    model = "admission-model"
+    handler = _saturation_handler(model)
+
+    await _admit(
+        handler,
+        _team_user(team_priority, key_priority),
+        _priority_request_data(model, "metadata", team_priority, None, key_priority),
+    )
+
+    assert await _pool_counter(handler, model, charged_pool, "requests") == 1
+    assert await _pool_counter(handler, model, uncharged_pool, "requests") == 0
+
+
+@pytest.mark.asyncio
+async def test_team_class_missing_from_reservations_is_charged_to_the_default_pool(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("LITELLM_LICENSE", "test-license-key")
+    monkeypatch.setattr(litellm, "priority_reservation", {"high": 0.8, "low": 0.2})
+    model = "unknown-class-model"
+    handler = _saturation_handler(model)
+    data = _priority_request_data(model, "metadata", "unlisted", None, None)
+
+    await _admit(handler, _team_user("unlisted"), data)
+    default_tokens_after_admission = await _pool_counter(handler, model, "default_pool", "tokens")
+    await _record_tokens(handler, data, total_tokens=30)
+
+    assert await _pool_counter(handler, model, "default_pool", "requests") == 1
+    assert await _pool_counter(handler, model, "default_pool", "tokens") == default_tokens_after_admission + 30
+    assert await _pool_counter(handler, model, "unlisted", "requests") == 0
+    assert await _pool_counter(handler, model, "unlisted", "tokens") == 0
+
+
+@pytest.mark.asyncio
+async def test_non_string_team_priority_keeps_model_capacity_enforced_and_labels_no_class(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from fastapi import HTTPException
+
+    monkeypatch.setenv("LITELLM_LICENSE", "test-license-key")
+    monkeypatch.setattr(litellm, "priority_reservation", {"high": 0.8, "low": 0.2})
+    _clear_prometheus_registry()
+    try:
+        monkeypatch.setattr(litellm, "callbacks", [PrometheusLogger()])
+        model = "list-priority-model"
+        handler = _saturation_handler(model, rpm=1)
+        user = UserAPIKeyAuth(team_metadata={"priority": ["high"]})
+        data = {"model": model, "metadata": {"model_group": model, "user_api_key_team_metadata": {"priority": ["high"]}}}
+
+        await _admit(handler, user, data)
+        with pytest.raises(HTTPException) as blocked:
+            await _admit(handler, user, data)
+
+        assert blocked.value.status_code == 429
+        assert {sample.labels["priority"] for sample in _saturation_samples()} == {""}
+    finally:
+        _clear_prometheus_registry()
+
+
+@pytest.mark.asyncio
+async def test_saturation_gauge_reports_the_model_window_not_the_priority_pool(monkeypatch: pytest.MonkeyPatch):
+    from fastapi import HTTPException
+
+    monkeypatch.setenv("LITELLM_LICENSE", "test-license-key")
+    monkeypatch.setattr(litellm, "priority_reservation", {"high": 0.5, "low": 0.5})
+    monkeypatch.setattr(litellm.priority_reservation_settings, "saturation_threshold", 0.4)
+    _clear_prometheus_registry()
+    try:
+        monkeypatch.setattr(litellm, "callbacks", [PrometheusLogger()])
+        model = "pool-vs-model"
+        handler = _saturation_handler(model)
+        high_data = _priority_request_data(model, "metadata", "high", None, None)
+        high_user = _team_user("high")
+        for _ in range(4):
+            await _admit(handler, high_user, high_data)
+        await _record_tokens(handler, _priority_request_data(model, "metadata", "low", None, None), total_tokens=500)
+
+        await _admit(handler, high_user, high_data)
+        admitted_values = [sample.value for sample in _saturation_samples()]
+        with pytest.raises(HTTPException) as blocked:
+            await _admit(handler, high_user, high_data)
+        refused_values = [sample.value for sample in _saturation_samples()]
+
+        assert admitted_values == [pytest.approx(max(5 / 10, 500 / 1000))]
+        assert blocked.value.status_code == 429
+        assert "Priority-based rate limit exceeded" in blocked.value.detail["error"]
+        assert refused_values == [pytest.approx(max(5 / 10, 500 / 1000))]
     finally:
         _clear_prometheus_registry()
 
@@ -1801,96 +1978,58 @@ async def test_pre_call_still_enforces_model_capacity_when_saturation_metric_emi
 
 
 @pytest.mark.asyncio
-async def test_async_log_success_event_uses_team_priority_from_auth_metadata(monkeypatch):
-    """
-    Test that async_log_success_event correctly retrieves priority from user_api_key_auth_metadata.
-
-    This validates the fix where priority is retrieved from standard_logging_metadata.user_api_key_auth_metadata
-    instead of just standard_logging_metadata.priority. This is important for team-based priority inheritance.
-    """
-    from unittest.mock import MagicMock
-
-    from litellm.types.utils import ModelResponse, Usage
-
+async def test_messages_success_accounting_charges_the_routed_model_group_not_the_caller_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+):
     monkeypatch.setenv("LITELLM_LICENSE", "test-license-key")
-    litellm.priority_reservation = {"team_priority": 0.8, "default": 0.2}
-
-    dual_cache = DualCache()
-    handler = DynamicRateLimitHandler(internal_usage_cache=dual_cache)
-
-    model = "test-team-priority"
-    llm_router = Router(
-        model_list=[
-            {
-                "model_name": model,
-                "litellm_params": {
-                    "model": "gpt-3.5-turbo",
-                    "api_key": "test-key",
-                    "api_base": "test-base",
-                    "tpm": 1000,
-                },
-            }
-        ]
-    )
-    handler.update_variables(llm_router=llm_router)
-
-    # Track incremented keys to verify priority is used correctly
-    incremented_keys = []
-
-    async def mock_increment(pipeline_operations, parent_otel_span=None):
-        for op in pipeline_operations:
-            incremented_keys.append(op["key"])
-
-    handler.v3_limiter.async_increment_tokens_with_ttl_preservation = mock_increment
-
-    # Create mock response
-    mock_response = MagicMock(spec=ModelResponse)
-    mock_response.usage = MagicMock(spec=Usage)
-    mock_response.usage.prompt_tokens = 10
-    mock_response.usage.completion_tokens = 20
-    mock_response.usage.total_tokens = 30
-
-    # Simulate team metadata inheritance: priority is in user_api_key_auth_metadata
-    # This is how the proxy passes team metadata to the callback
-    kwargs = {
-        "standard_logging_object": {
-            "metadata": {
-                # Priority NOT at top level (this would fail before the fix)
-                # Priority IS in user_api_key_auth_metadata (team inheritance)
-                "user_api_key_auth_metadata": {"priority": "team_priority"},
-            },
-            "model_group": model,
-        },
-        "litellm_params": {
-            "metadata": {"model_group": model},
-        },
+    monkeypatch.setattr(litellm, "priority_reservation", {"high": 0.8, "low": 0.2})
+    model = "routed-messages-model"
+    caller_named_model = "caller-named-model"
+    handler = _saturation_handler(model)
+    data = {
+        **_priority_request_data(model, "litellm_metadata", "high", None, None),
+        "metadata": {"user_id": "caller", "model_group": caller_named_model},
     }
 
-    with patch(
-        "litellm.proxy.common_utils.callback_utils.get_model_group_from_litellm_kwargs",
-        return_value=model,
-    ):
-        await handler.async_log_success_event(
-            kwargs=kwargs,
-            response_obj=mock_response,
-            start_time=None,
-            end_time=None,
-        )
+    await _record_tokens(handler, data, total_tokens=40)
 
-    # Verify the priority_model key uses 'team_priority' (not 'default_pool')
-    priority_keys = [k for k in incremented_keys if "priority_model" in k]
-    assert (
-        len(priority_keys) == 1
-    ), f"Expected 1 priority_model key, got {len(priority_keys)}"
-
-    # The key should contain 'team_priority', not 'default_pool'
-    assert "team_priority" in priority_keys[0], (
-        f"Expected priority key to use 'team_priority' from user_api_key_auth_metadata, "
-        f"got key: {priority_keys[0]}"
+    model_tokens = await handler.internal_usage_cache.async_get_cache(
+        key=handler.v3_limiter.create_rate_limit_keys(
+            key="model_saturation_check", value=model, rate_limit_type="tokens"
+        ),
+        litellm_parent_otel_span=None,
     )
-    assert (
-        "default_pool" not in priority_keys[0]
-    ), f"Priority key should NOT use 'default_pool', should use team's priority. Got: {priority_keys[0]}"
+    assert model_tokens is not None and int(model_tokens) == 40
+    assert await _pool_counter(handler, model, "high", "tokens") == 40
+    assert await _pool_counter(handler, caller_named_model, "high", "tokens") == 0
+
+
+@pytest.mark.asyncio
+async def test_pre_call_records_no_saturation_when_the_limiter_cannot_verify_its_counters(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from fastapi import HTTPException
+
+    from litellm.proxy.hooks.parallel_request_limiter_v3 import RateLimitUnverifiableError
+
+    _clear_prometheus_registry()
+    try:
+        monkeypatch.setattr(litellm, "callbacks", [PrometheusLogger()])
+        model = "unverifiable-model"
+        handler = _saturation_handler(model)
+
+        with patch.object(
+            handler.v3_limiter,
+            "atomic_check_and_increment_by_n",
+            new=AsyncMock(side_effect=RateLimitUnverifiableError()),
+        ):
+            with pytest.raises(HTTPException) as rejected:
+                await _admit(handler, _team_user("high"), _priority_request_data(model, "metadata", "high", None, None))
+
+        assert rejected.value.status_code == 503
+        assert _saturation_samples() == []
+    finally:
+        _clear_prometheus_registry()
 
 
 @pytest.mark.asyncio
@@ -1935,7 +2074,7 @@ async def test_priority_429_includes_model_name_and_configured_limits(monkeypatc
     handler.update_variables(llm_router=llm_router)
 
     user = UserAPIKeyAuth()
-    user.metadata = {"priority": "prod"}
+    user.team_metadata = {"priority": "prod"}
     user.user_id = "prod_user"
 
     model_group_info = handler.llm_router.get_model_group_info(model_group=model)
@@ -2026,17 +2165,17 @@ async def test_tpm_only_model_enforces_priority_and_model_capacity(monkeypatch):
     handler.update_variables(llm_router=llm_router)
 
     dev_user = UserAPIKeyAuth()
-    dev_user.metadata = {"priority": "dev"}
+    dev_user.team_metadata = {"priority": "dev"}
     prod_user = UserAPIKeyAuth()
-    prod_user.metadata = {"priority": "prod"}
+    prod_user.team_metadata = {"priority": "prod"}
 
     async def record_usage(priority: str, total_tokens: int) -> None:
         await handler.async_log_success_event(
             kwargs={
-                "standard_logging_object": {
-                    "metadata": {"user_api_key_auth_metadata": {"priority": priority}},
+                "standard_logging_object": {},
+                "litellm_params": {
+                    "metadata": {"model_group": model, "user_api_key_team_metadata": {"priority": priority}}
                 },
-                "litellm_params": {"metadata": {"model_group": model}},
             },
             response_obj=ModelResponse(
                 model=model,
@@ -2110,7 +2249,7 @@ async def test_post_call_success_hook_attaches_priority_headers_to_dict_response
 
     await handler.async_post_call_success_hook(
         data={"model": "anthropic-haiku"},
-        user_api_key_dict=UserAPIKeyAuth(metadata={"priority": "premium"}),
+        user_api_key_dict=UserAPIKeyAuth(team_metadata={"priority": "premium"}),
         response=response,
     )
 
@@ -2129,7 +2268,7 @@ async def test_post_call_success_hook_leaves_raw_provider_dict_untouched():
 
     await handler.async_post_call_success_hook(
         data={"model": "anthropic-haiku"},
-        user_api_key_dict=UserAPIKeyAuth(metadata={"priority": "premium"}),
+        user_api_key_dict=UserAPIKeyAuth(team_metadata={"priority": "premium"}),
         response=response,
     )
 

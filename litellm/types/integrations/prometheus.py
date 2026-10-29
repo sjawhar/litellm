@@ -177,6 +177,29 @@ def get_input_sequence_length_bucket(prompt_tokens: object) -> str:
     return next(label for upper, label in INPUT_SEQUENCE_LENGTH_BUCKETS if prompt_tokens < upper)
 
 
+def team_priority_label(litellm_params: object) -> str:
+    """The calling team's ``metadata.priority``, read only from the team metadata the proxy stores.
+
+    ``/v1/messages`` keeps it in ``litellm_metadata``, every other route in ``metadata``; a caller's own
+    request metadata and a key's metadata never set it. ``""`` when the team has no class.
+    """
+    match litellm_params:
+        case {"litellm_metadata": {"user_api_key_team_metadata": team_metadata}}:
+            return priority_of_team_metadata(team_metadata)
+        case {"metadata": {"user_api_key_team_metadata": team_metadata}}:
+            return priority_of_team_metadata(team_metadata)
+        case _:
+            return ""
+
+
+def priority_of_team_metadata(team_metadata: object) -> str:
+    match team_metadata:
+        case {"priority": str() as priority}:
+            return priority
+        case _:
+            return ""
+
+
 # Batch jobs can run for minutes to hours; buckets span 1 min → 24 h.
 BATCH_DURATION_BUCKETS: Final = (
     60.0,
@@ -1110,7 +1133,7 @@ class UserAPIKeyLabelValues:
     mcp_server_name: str | None = None
     service_tier: str | None = None
     input_sequence_length: str | None = None
-    priority: str | None = None
+    priority: str = ""
 
     # Added for test compatibility.
     def __init__(self, **kwargs: Any) -> None:

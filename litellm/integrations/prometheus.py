@@ -67,6 +67,7 @@ from litellm.types.integrations.prometheus import *
 from litellm.types.integrations.prometheus import (
     sanitize_prometheus_label_name,
     sanitize_prometheus_label_value,
+    team_priority_label,
     validate_prometheus_deployment_and_latency_caller_identity,
 )
 from litellm.types.proxy.carried_budget_state import (
@@ -3262,7 +3263,7 @@ class PrometheusLogger(CustomLogger):
                 supported_enum_labels=self.get_labels_for_metric("litellm_model_group_saturation_ratio"),
                 enum_values=UserAPIKeyLabelValues(
                     model_group=model_group,
-                    priority=_team_priority_label(litellm_params),
+                    priority=team_priority_label(litellm_params),
                 ),
             )
             self.litellm_model_group_saturation_ratio.labels(**labels).set(min(max(saturation, 0.0), 1.0))
@@ -4997,30 +4998,10 @@ def get_custom_labels_from_metadata(metadata: dict) -> dict[str, str]:
     return result
 
 
-def _team_priority_label(litellm_params: object) -> str:
-    match litellm_params:
-        case {"litellm_metadata": {"user_api_key_team_metadata": team_metadata}}:
-            return _priority_from_team_metadata(team_metadata)
-        case {"metadata": {"user_api_key_team_metadata": team_metadata}}:
-            return _priority_from_team_metadata(team_metadata)
-        case _:
-            return ""
-
-
-def _priority_from_team_metadata(team_metadata: object) -> str:
-    match team_metadata:
-        case {"priority": str() as priority}:
-            return priority
-        case _:
-            return ""
-
-
 def _with_team_priority_label(custom_labels: Mapping[str, str], litellm_params: object) -> Mapping[str, str]:
     if UserAPIKeyLabelNames.PRIORITY.value not in litellm.custom_prometheus_metadata_labels:
         return custom_labels
-    return MappingProxyType(
-        {**custom_labels, UserAPIKeyLabelNames.PRIORITY.value: _team_priority_label(litellm_params)}
-    )
+    return MappingProxyType({**custom_labels, UserAPIKeyLabelNames.PRIORITY.value: team_priority_label(litellm_params)})
 
 
 def _get_combined_custom_metadata_from_standard_logging_payload(
