@@ -10,6 +10,7 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from hashlib import sha256
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -2710,11 +2711,11 @@ def _openai_upstream(request: Request) -> Reply:
     return Reply(body=_chat_completion_body("control-reply"))
 
 
-def _post_half_of_the_body_then_hang_up(gateway: Gateway, path: str, body: bytes) -> None:
+def _post_half_of_the_body_then_hang_up(gateway: Gateway, key: str, path: str, body: bytes) -> None:
     address: Final = urlsplit(str(gateway.client.base_url))
     assert address.hostname is not None and address.port is not None, address
     head: Final = (
-        f"POST {path} HTTP/1.1\r\nHost: {address.netloc}\r\nAuthorization: Bearer {gateway.key}\r\n"
+        f"POST {path} HTTP/1.1\r\nHost: {address.netloc}\r\nAuthorization: Bearer {key}\r\n"
         f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n"
     ).encode()
     with socket.create_connection((address.hostname, address.port)) as connection:
@@ -2748,10 +2749,14 @@ def test_client_disconnect_during_the_body_upload_runs_no_endpoint_and_writes_no
         owned.gateway.scenario() as scenario,
     ):
         model: Final = scenario.model(api_base=upstream.url + "/v1", api_key="synthetic-openai-key")
-        _post_half_of_the_body_then_hang_up(owned.gateway, path, body.replace(b"MODEL", model.encode()))
-        control: Final = owned.gateway.chat(model)
+        key: Final = scenario.key()
+        _post_half_of_the_body_then_hang_up(owned.gateway, key, path, body.replace(b"MODEL", model.encode()))
+        control: Final = owned.gateway.chat(model, key=key)
         rows: Final = eventually(
-            lambda: owned.gateway.rows('SELECT request_id, call_type, status FROM "LiteLLM_SpendLogs"', ()),
+            lambda: read_rows(
+                'SELECT request_id, call_type, status FROM "LiteLLM_SpendLogs" WHERE api_key = %s',
+                (sha256(key.encode()).hexdigest(),),
+            ),
             lambda values: any(row["request_id"] == control["id"] for row in values),
             seconds=70,
         )
