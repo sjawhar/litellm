@@ -5,9 +5,13 @@ override is promoted to per-request kwargs after auth and lets a caller
 execute requests against models their API key cannot call.
 """
 
-from collections.abc import Callable, Mapping, MutableMapping
+import ast
+import importlib
+import sys
+from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping
 from dataclasses import dataclass
-from types import MappingProxyType
+from pathlib import Path
+from types import MappingProxyType, ModuleType
 from typing import Final
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -492,6 +496,19 @@ def _target_fields() -> tuple[str, ...]:
     return (*_list_fields(), "context_window_fallback_dict")
 
 
+@pytest.mark.parametrize("fallback_field", ("context_window_fallbacks", "content_policy_fallbacks"))
+def test_auth_rejects_non_list_error_fallbacks(fallback_field: str):
+    from litellm.proxy.auth.auth_utils import is_request_body_safe
+
+    with pytest.raises(ValueError, match=f"{fallback_field} must be a list"):
+        is_request_body_safe(
+            {"model": "primary", fallback_field: {"forbidden": []}},
+            {},
+            _router_without_fallback_group(),
+            "primary",
+        )
+
+
 # The header carriers and stored-credential name that swap in a caller's key on the deployment's own endpoint
 _REQUIRED_CREDENTIAL_PARAMS = ("headers", "provider_specific_header", "litellm_credential_name")
 _REQUIRED_MOCK_PARAMS = ("mock_response", "mock_tool_calls")
@@ -890,12 +907,31 @@ async def test_a_fallback_field_the_proxy_renames_after_auth_still_stops_at_the_
     assert result.deployment_key_reached_the_attacker() is leaks
 
 
+def _has_non_list_error_fallback(send_kwargs: Mapping[str, object]) -> bool:
+    sources = (
+        send_kwargs.get("body_fields"),
+        send_kwargs.get("key_router_settings"),
+        send_kwargs.get("team_router_settings"),
+    )
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        for field in ("context_window_fallbacks", "content_policy_fallbacks"):
+            if field in source and not isinstance(source[field], list):
+                return True
+    return False
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("send_kwargs", _FORBIDDEN_ROWS)
 async def test_every_fallback_target_must_be_a_model_the_key_may_call(gateway: _Gateway, send_kwargs):
     result = await gateway.send(**send_kwargs)
+    rejects_non_list_value = _has_non_list_error_fallback(send_kwargs)
+    expected_statuses = (400, 401) if rejects_non_list_value else (401, 403)
 
-    assert result.response.status_code in (401, 403), result.response.text
+    assert result.response.status_code in expected_statuses, result.response.text
+    if rejects_non_list_value:
+        assert "must be a list" in result.response.text
     assert result.calls["forbidden"] == 0
     assert result.calls["attacker"] == 0
 
@@ -1002,24 +1038,35 @@ def _body_is_accepted(is_request_body_safe, router: Router, extra: dict) -> bool
     return True
 
 
+def test_fallback_key_scan_covers_renamed_router_inputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """The scan must catch M2's renamed key, M3's helper parameter, and M4's proxy rename."""
+    module_name: Final = "fallback_key_scan_fixture"
+    monkeypatch.setitem(sys.modules, module_name, ModuleType(module_name))
+    router_source = tmp_path / "router_source.py"
+    router_source.write_text('def request_fallbacks(request_data):\n    return request_data.get("spare_models")\n')
+    proxy_source = tmp_path / "proxy_source.py"
+    proxy_source.write_text('def transform(data):\n    data["fallbacks"] = data.pop("backup_fallbacks")\n')
+
+    read = _fallback_keys_read(module_name, router_source)
+
+    assert read == frozenset({"spare_models"})
+    assert _proxy_renamed_fallback_input_fields((proxy_source,), read | frozenset({"fallbacks"})) == frozenset(
+        {"backup_fallbacks"}
+    )
+
+
 def test_the_router_reads_no_fallback_kwarg_that_auth_does_not_check():
     """
-    Every kwarg the Router, the proxy request path and the SDK wrapper read a fallback target from must be a field auth
-    checks, so a rebase that adds one fails here instead of opening a path auth never sees. A static scan cannot see
-    every read (an aliased dict, a computed key), so it is the second guard: the hop's own refusal at the merge point
-    (test_a_fallback_kwarg_auth_never_sees_cannot_carry_a_credential_past_the_merge_point) is the one that holds for
-    any field. Control kwargs that carry no model or endpoint are listed with why they are safe.
+    Every kwarg the Router or proxy promotes into a fallback target must be a field auth checks, so a rebase cannot
+    open a path auth misses. The merge-point test covers aliased or computed keys that this static scan cannot see.
     """
-    import ast
-    import importlib
-    from pathlib import Path
 
     import litellm
     from litellm.proxy.litellm_pre_call_utils import _UNTRUSTED_ROOT_CONTROL_FIELDS
     from litellm.proxy.route_llm_request import GATED_MOCK_PARAM_NAMES
 
     root = Path(litellm.__file__).parent
-    modules = {
+    modules: dict[str, Path] = {
         "litellm.router": root / "router.py",
         "litellm.proxy.route_llm_request": root / "proxy" / "route_llm_request.py",
         "litellm.utils": root / "utils.py",
@@ -1033,7 +1080,9 @@ def test_the_router_reads_no_fallback_kwarg_that_auth_does_not_check():
             if path.stem != "__init__"
         },
     }
-    read = frozenset().union(*(_fallback_keys_read(name, path, importlib, ast) for name, path in modules.items()))
+    router_keys: frozenset[str] = frozenset().union(
+        *(_fallback_keys_read(name, path) for name, path in modules.items())
+    )
     stripped_router_state = frozenset({"fallback_depth", "fallback_model_group", "_mid_stream_fallback_controls"})
     caller_flags = frozenset({"disable_fallbacks", "_disable_fallbacks", "max_fallbacks", "include_fallback_errors"})
     not_a_kwarg = frozenset({"_ageneric_api_call_with_fallbacks"})
@@ -1044,52 +1093,116 @@ def test_the_router_reads_no_fallback_kwarg_that_auth_does_not_check():
     auth_checked = frozenset(
         (*auth_utils._FALLBACK_FIELDS, getattr(auth_utils, "CONTEXT_WINDOW_FALLBACK_DICT_FIELD", ""))
     )
+    proxy_renamed_keys = _proxy_renamed_fallback_input_fields(
+        (root / "proxy").rglob("*.py"), router_keys | auth_checked
+    )
+    read = router_keys | proxy_renamed_keys
     assert stripped_router_state <= frozenset(_UNTRUSTED_ROOT_CONTROL_FIELDS)
     unchecked = read - auth_checked - stripped_router_state - caller_flags - not_a_kwarg - hop_counters
     assert unchecked - frozenset(GATED_MOCK_PARAM_NAMES) == frozenset()
     assert "router_fallbacks" in read
 
 
-def _fallback_keys_read(module_name: str, path, importlib, ast) -> frozenset[str]:
+def _fallback_keys_read(module_name: str, path: Path) -> frozenset[str]:
     tree = ast.parse(path.read_text())
+    module_constants = {
+        target.id: node.value.value
+        for node in tree.body
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        for target in (node.targets if isinstance(node, ast.Assign) else (node.target,))
+        if isinstance(target, ast.Name) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
+    }
 
-    def resolve(node) -> str | None:
+    def resolve(node: ast.expr) -> str | None:
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             return node.value
         if isinstance(node, ast.Name):
-            value = getattr(importlib.import_module(module_name), node.id, None)
+            value = module_constants.get(node.id, getattr(importlib.import_module(module_name), node.id, None))
             return value if isinstance(value, str) else None
         return None
 
-    def kwargs_key(node) -> str | None:
+    def mapping_key(node: ast.AST, parameter_names: frozenset[str]) -> str | None:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.args:
             owner = node.func.value
-            if node.func.attr in ("get", "pop", "setdefault") and isinstance(owner, ast.Name) and "kwargs" in owner.id:
-                return resolve(node.args[0])
-        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and "kwargs" in node.value.id:
+            if node.func.attr in ("get", "pop", "setdefault") and isinstance(owner, ast.Name):
+                if owner.id in parameter_names:
+                    return resolve(node.args[0])
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and node.value.id in parameter_names:
             return resolve(node.slice)
         return None
 
-    def literal_keys(node) -> tuple[str | None, ...]:
-        if isinstance(node, (ast.Tuple, ast.List, ast.Set)) and all(
-            isinstance(element, (ast.Constant, ast.Name)) for element in node.elts
-        ):
-            return tuple(resolve(element) for element in node.elts)
-        return ()
+    def output_values(function: ast.FunctionDef | ast.AsyncFunctionDef) -> Iterator[ast.expr]:
+        for node in ast.walk(function):
+            if isinstance(node, ast.Return) and node.value is not None:
+                yield node.value
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
+                if any(isinstance(target, ast.Name) and "fallback" in target.id.lower() for target in targets):
+                    yield node.value
 
-    module_constants = tuple(
-        node.value.value
-        for node in tree.body
-        if isinstance(node, (ast.Assign, ast.AnnAssign))
-        and isinstance(node.value, ast.Constant)
-        and isinstance(node.value.value, str)
+    def function_keys(function: ast.FunctionDef | ast.AsyncFunctionDef) -> frozenset[str]:
+        arguments = (*function.args.posonlyargs, *function.args.args, *function.args.kwonlyargs)
+        parameter_names = frozenset(argument.arg for argument in arguments)
+
+        def output_keys() -> Iterator[str]:
+            for value in output_values(function):
+                for node in ast.walk(value):
+                    key = mapping_key(node, parameter_names)
+                    if key is not None:
+                        yield key
+
+        return frozenset(output_keys())
+
+    fallback_function_keys = tuple(
+        function_keys(node)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and "fallback" in node.name.lower()
     )
-    candidates = (
-        *(kwargs_key(node) for node in ast.walk(tree)),
-        *(key for node in ast.walk(tree) for key in literal_keys(node)),
-        *module_constants,
+    literal_keys = (
+        resolve(element)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Tuple, ast.List, ast.Set))
+        for element in node.elts
+        if isinstance(element, (ast.Constant, ast.Name))
     )
-    return frozenset(key for key in candidates if isinstance(key, str) and "fallback" in key and key.isidentifier())
+    named_module_constants = (value for name, value in module_constants.items() if "fallback" in name.lower())
+    named_keys = frozenset(
+        key
+        for key in (*literal_keys, *named_module_constants)
+        if isinstance(key, str) and "fallback" in key and key.isidentifier()
+    )
+    return named_keys | frozenset().union(*fallback_function_keys)
+
+
+def _proxy_renamed_fallback_input_fields(paths: Iterable[Path], fallback_fields: frozenset[str]) -> frozenset[str]:
+    def literal_key(node: ast.AST) -> str | None:
+        return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+    def source_key(value: ast.expr) -> str | None:
+        if isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute) and value.args:
+            if value.func.attr in ("get", "pop", "setdefault"):
+                return literal_key(value.args[0])
+        return None
+
+    def renamed_keys(path: Path) -> frozenset[str]:
+        tree = ast.parse(path.read_text())
+
+        def assignment_keys() -> Iterator[str]:
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    continue
+                targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
+                for target in targets:
+                    if not isinstance(target, ast.Subscript):
+                        continue
+                    target_key = literal_key(target.slice)
+                    renamed_key = source_key(node.value)
+                    if target_key in fallback_fields and renamed_key is not None:
+                        yield renamed_key
+
+        return frozenset(assignment_keys())
+
+    return frozenset().union(*(renamed_keys(path) for path in paths))
 
 
 class _ProbeUpstream:
