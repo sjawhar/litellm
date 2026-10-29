@@ -580,8 +580,8 @@ class _Gateway:
                 )
             ],
             num_retries=0,
-            fallback_target_credentials_allowed=(lambda: True) if credentials_allowed else None,
         )
+        router.fallback_target_credentials_allowed = (lambda: True) if credentials_allowed else None
         cache = DualCache()
         team_id = "fallback-team" if team_router_settings is not None else None
         token = UserAPIKeyAuth(
