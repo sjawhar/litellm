@@ -626,10 +626,22 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
             verbose_proxy_logger.debug("No model group info for %s, allowing request", model)
             return None
 
+        # STEP 1: Check current saturation level
+        saturation: Final = await self._check_model_saturation(model, model_group_info)
         try:
-            # STEP 1: Check current saturation level
-            saturation: Final = await self._check_model_saturation(model, model_group_info)
+            from litellm.integrations.prometheus import PrometheusLogger
 
+            prometheus_logger: Final = PrometheusLogger.get_instance()
+            if prometheus_logger is not None:
+                prometheus_logger.set_model_group_saturation_ratio(
+                    model_group=model,
+                    saturation=saturation,
+                    litellm_params=data,
+                )
+        except Exception as e:  # noqa: BLE001  # a metrics failure must never change rate-limit enforcement
+            verbose_proxy_logger.debug("Error recording model group saturation metric: %s", e)
+
+        try:
             saturation_threshold: Final = _get_priority_settings().saturation_threshold
 
             verbose_proxy_logger.debug(
