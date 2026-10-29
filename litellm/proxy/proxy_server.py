@@ -7262,7 +7262,9 @@ class ProxyConfig:
             fallback_access_check=router_fallback_access_check,
             fallback_budget_check=router_fallback_budget_check,
             auto_router_capability_limit=_license_check.auto_router_capability_limit,
-            fallback_target_credentials_allowed=fallback_target_credentials_allowed,
+        )
+        router.fallback_target_credentials_allowed = (  # rebind-ok: config router_settings must not set this predicate
+            fallback_target_credentials_allowed
         )
 
         if redis_usage_cache is not None and router.cache.redis_cache is None:
@@ -7758,8 +7760,8 @@ class ProxyConfig:
                         fallback_access_check=router_fallback_access_check,
                         fallback_budget_check=router_fallback_budget_check,
                         auto_router_capability_limit=_license_check.auto_router_capability_limit,
-                        fallback_target_credentials_allowed=fallback_target_credentials_allowed,
                     )
+                    llm_router.fallback_target_credentials_allowed = fallback_target_credentials_allowed
                     verbose_proxy_logger.debug("updated llm_router: %s", llm_router)
             else:
                 verbose_proxy_logger.debug("len new_models: %s", len(models_list))
