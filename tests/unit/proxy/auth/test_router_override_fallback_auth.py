@@ -5,8 +5,10 @@ override is promoted to per-request kwargs after auth and lets a caller
 execute requests against models their API key cannot call.
 """
 
+from collections.abc import Callable, Mapping, MutableMapping
 from dataclasses import dataclass
-from typing import Final, List
+from types import MappingProxyType
+from typing import Final
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -28,7 +30,7 @@ def _fallback_model_names(fallbacks):
     ]
 
 
-def _key_with_models(models: List[str]) -> UserAPIKeyAuth:
+def _key_with_models(models: list[str]) -> UserAPIKeyAuth:
     return UserAPIKeyAuth(
         api_key="hashed",
         user_id="caller",
@@ -42,9 +44,11 @@ def _key_with_models(models: List[str]) -> UserAPIKeyAuth:
 
 def test_fallback_model_names_router_config_shape():
     """Router-config shape: ``[{primary: [fallback_list]}]``."""
-    assert _fallback_model_names(
-        [{"gpt-3.5-turbo": ["gpt-4", "claude-3"]}, {"gpt-4o": ["o1"]}]
-    ) == ["gpt-4", "claude-3", "o1"]
+    assert _fallback_model_names([{"gpt-3.5-turbo": ["gpt-4", "claude-3"]}, {"gpt-4o": ["o1"]}]) == [
+        "gpt-4",
+        "claude-3",
+        "o1",
+    ]
 
 
 def test_fallback_model_names_simple_string_shape():
@@ -62,9 +66,10 @@ def test_fallback_model_names_client_side_shape():
 
 def test_fallback_model_names_nested_deployment_fallbacks():
     """A deployment target's own nested fallback field is unrolled too."""
-    assert _fallback_model_names(
-        [{"primary": [{"model": "gpt-4", "fallbacks": [{"gpt-4": ["deepseek-chat"]}]}]}]
-    ) == ["gpt-4", "deepseek-chat"]
+    assert _fallback_model_names([{"primary": [{"model": "gpt-4", "fallbacks": [{"gpt-4": ["deepseek-chat"]}]}]}]) == [
+        "gpt-4",
+        "deepseek-chat",
+    ]
 
 
 def test_fallback_model_names_empty_or_none():
@@ -89,7 +94,7 @@ async def test_router_override_fallbacks_validated_against_key_allowlist():
         },
     }
 
-    seen_models: List[str] = []
+    seen_models: list[str] = []
 
     async def fake_can_key_call_model(model, llm_model_list, valid_token, llm_router):
         seen_models.append(model)
@@ -140,7 +145,7 @@ async def test_router_override_all_fallback_fields_validated(fallback_field):
         },
     }
 
-    seen: List[str] = []
+    seen: list[str] = []
 
     async def fake_can_key_call_model(model, llm_model_list, valid_token, llm_router):
         seen.append(model)
@@ -187,7 +192,7 @@ async def test_top_level_fallback_fields_validated(fallback_field):
         fallback_field: [{"gpt-3.5-turbo": ["top-level-smuggled"]}],
     }
 
-    seen: List[str] = []
+    seen: list[str] = []
 
     async def fake_can_key_call_model(model, llm_model_list, valid_token, llm_router):
         seen.append(model)
@@ -233,7 +238,7 @@ async def test_nested_deployment_fallback_inner_model_validated():
         ],
     }
 
-    seen: List[str] = []
+    seen: list[str] = []
 
     async def fake_can_key_call_model(model, llm_model_list, valid_token, llm_router):
         seen.append(model)
@@ -278,7 +283,7 @@ async def test_model_less_fallback_dict_is_skipped_never_passed_as_none():
         ],
     }
 
-    seen: List[str] = []
+    seen: list[str] = []
 
     async def fake_can_key_call_model(model, llm_model_list, valid_token, llm_router):
         seen.append(model)
@@ -316,7 +321,7 @@ async def test_router_override_without_fallbacks_does_not_break_auth():
         "router_settings_override": {"num_retries": 3, "timeout": 30},
     }
 
-    seen: List[str] = []
+    seen: list[str] = []
 
     async def fake_can_key_call_model(model, llm_model_list, valid_token, llm_router):
         seen.append(model)
@@ -515,16 +520,19 @@ def _mock_params() -> tuple[str, ...]:
 
 
 class _Gateway:
-    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def __init__(
+        self, monkeypatch: pytest.MonkeyPatch, requested_error: tuple[int, str, str] = (500, "api_error", "x")
+    ) -> None:
         self._monkeypatch = monkeypatch
+        self._requested_error = requested_error
 
     async def send(
         self,
-        body_fields: dict,
+        body_fields: dict[str, object],
         *,
         beta: bool = False,
-        key_router_settings: dict | None = None,
-        team_router_settings: dict | None = None,
+        key_router_settings: dict[str, object] | None = None,
+        team_router_settings: dict[str, object] | None = None,
         key_models: tuple[str, ...] = ("requested", "other"),
         credentials_allowed: bool = False,
     ) -> "_GatewayResult":
@@ -555,7 +563,7 @@ class _Gateway:
                 )
             ],
             num_retries=0,
-            **({"fallback_target_credentials_allowed": lambda: True} if credentials_allowed else {}),
+            fallback_target_credentials_allowed=(lambda: True) if credentials_allowed else None,
         )
         cache = DualCache()
         team_id = "fallback-team" if team_router_settings is not None else None
@@ -602,7 +610,11 @@ class _Gateway:
             routes = {
                 "requested": upstream.post(url__startswith=_REQUESTED_HOST).mock(
                     return_value=httpx.Response(
-                        500, json={"type": "error", "error": {"type": "api_error", "message": "x"}}
+                        self._requested_error[0],
+                        json={
+                            "type": "error",
+                            "error": {"type": self._requested_error[1], "message": self._requested_error[2]},
+                        },
                     )
                 ),
                 "other": upstream.post(url__startswith=_OTHER_HOST).mock(
@@ -702,10 +714,26 @@ def _mock_target(shape: str):
     return make
 
 
-def _forbidden_target(field: str):
-    if field == "context_window_fallback_dict":
-        return {"anthropic/claude-requested": "forbidden"}
-    return [{"requested": ["forbidden"]}]
+# The Router iterates whatever value a field carries, so a mapping serves its keys and a chain serves its lists
+_FORBIDDEN_SHAPES: Final[Mapping[str, object]] = MappingProxyType[str, object](
+    {
+        "chain": [{"requested": ["forbidden"]}],
+        "list": ["forbidden"],
+        "client-target": [{"model": "forbidden"}],
+        "dict-key": {"forbidden": []},
+        "dict-chain": {"requested": ["forbidden"]},
+        "chain-of-dict": [{"requested": {"forbidden": []}}],
+    }
+)
+
+
+def _forbidden_target(shape: str) -> Callable[[str], object]:
+    def make(field: str) -> object:
+        if field == "context_window_fallback_dict":
+            return {"anthropic/claude-requested": "forbidden"}
+        return _FORBIDDEN_SHAPES[shape]
+
+    return make
 
 
 _ENDPOINT_ROWS = tuple(
@@ -720,7 +748,12 @@ _MOCK_ROWS = tuple(
     for row_id, kwargs in _placements(_mock_target(shape))
     if "context_window_fallback_dict" not in row_id
 )
-_FORBIDDEN_ROWS = tuple(pytest.param(kwargs, id=row_id) for row_id, kwargs in _placements(_forbidden_target))
+_FORBIDDEN_ROWS = tuple(
+    pytest.param(kwargs, id=f"{row_id}-{shape}")
+    for shape in _FORBIDDEN_SHAPES
+    for row_id, kwargs in _placements(_forbidden_target(shape))
+    if shape == "chain" or "context_window_fallback_dict" not in row_id
+)
 
 
 @pytest.mark.asyncio
@@ -758,6 +791,19 @@ async def test_a_fallback_kwarg_auth_never_sees_cannot_carry_a_credential_past_t
     every auth check, so the hop itself, where every target is laid over the deployment's params, refuses a
     credential or endpoint. The control shows the same request leaks the deployment key when the hop allows one.
     """
+    _router_reads_fallbacks_from_backup_models(monkeypatch)
+    result = await gateway.send(
+        {"backup_models": [{"requested": [{"model": "other", "api_base": _ATTACKER_HOST}]}]},
+        credentials_allowed=credentials_allowed,
+    )
+
+    assert result.calls["requested"] == 1
+    assert result.calls["other"] == 0
+    assert result.calls["attacker"] == (1 if leaks else 0)
+    assert result.deployment_key_reached_the_attacker() is leaks
+
+
+def _router_reads_fallbacks_from_backup_models(monkeypatch: pytest.MonkeyPatch) -> None:
     from litellm import router as router_module
 
     reads_the_list_from: Final = router_module.request_fallbacks
@@ -769,12 +815,76 @@ async def test_a_fallback_kwarg_auth_never_sees_cannot_carry_a_credential_past_t
         return reads_the_list_from(kwargs, router_fallbacks, anthropic_messages_call=anthropic_messages_call)
 
     monkeypatch.setattr(router_module, "request_fallbacks", reads_backup_models)
+
+
+# Each is neither a credential nor an endpoint, yet picks where or how the deployment's key is sent: the provider (and
+# so its default host), a LiteLLM proxy host, a deployment by id, the deployment identity, a file-id map, a request
+# path, the no-deployment passthrough, the TLS check, or a token endpoint and its token.
+_INDIRECT_ROUTING_VALUES: Final = MappingProxyType[str, object](
+    {
+        "custom_llm_provider": "openai",
+        "azure": True,
+        "use_litellm_proxy": True,
+        "specific_deployment": True,
+        "model_info": {"id": "forbidden-deployment"},
+        "model_file_id_mapping": {"file-1": {"forbidden-deployment": "file-2"}},
+        "endpoint": "/v1/other",
+        "passthrough_on_no_deployment": True,
+        "ssl_verify": False,
+        "gigachat_auth_url": _ATTACKER_HOST,
+        "gigachat_access_token": _CALLER_SUPPLIED_KEY,
+        "gigachat_scope": "GIGACHAT_API_CORP",
+        "use_xai_oauth": True,
+    }
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("layer", ["auth", "merge-point"])
+@pytest.mark.parametrize("field", sorted(_INDIRECT_ROUTING_VALUES))
+async def test_a_field_that_steers_the_deployment_key_indirectly_is_refused_on_a_fallback_target(
+    gateway: _Gateway, monkeypatch: pytest.MonkeyPatch, field: str, layer: str
+):
+    chain: Final = [{"requested": [{"model": "other", field: _INDIRECT_ROUTING_VALUES[field]}]}]
+    if layer == "auth":
+        result = await gateway.send({"fallbacks": chain})
+        assert result.response.status_code in (400, 401, 403), result.response.text
+        assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+        return
+    _router_reads_fallbacks_from_backup_models(monkeypatch)
+    result = await gateway.send({"backup_models": chain})
+    assert result.calls == {"requested": 1, "other": 0, "forbidden": 0, "attacker": 0}, result.response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("credentials_allowed", "leaks"),
+    [(False, False), (True, True)],
+    ids=["merge-point-refuses", "control-hop-allowed-credentials-leaks"],
+)
+async def test_a_fallback_field_the_proxy_renames_after_auth_still_stops_at_the_merge_point(
+    gateway: _Gateway, monkeypatch: pytest.MonkeyPatch, credentials_allowed: bool, leaks: bool
+):
+    """
+    A mutant proxy step that runs after auth renames a field auth does not read into a fallback field the Router does,
+    so auth never sees the target. The hop still refuses its endpoint, and the control proves the mutant reaches it.
+    """
+    from litellm.proxy import common_request_processing
+
+    snapshots_the_body: Final = common_request_processing.refresh_proxy_server_request_body_snapshot
+
+    def renames_then_snapshots(data: MutableMapping[str, object], *, guardrails_applied: bool = False) -> None:
+        if "backup_models" in data:
+            data["fallbacks"] = data.pop("backup_models")
+        snapshots_the_body(data, guardrails_applied=guardrails_applied)
+
+    monkeypatch.setattr(common_request_processing, "refresh_proxy_server_request_body_snapshot", renames_then_snapshots)
     result = await gateway.send(
         {"backup_models": [{"requested": [{"model": "other", "api_base": _ATTACKER_HOST}]}]},
         credentials_allowed=credentials_allowed,
     )
 
-    assert result.calls["requested"] == 1
+    assert result.calls["requested"] == 1, result.response.text
     assert result.calls["other"] == 0
     assert result.calls["attacker"] == (1 if leaks else 0)
     assert result.deployment_key_reached_the_attacker() is leaks
@@ -788,6 +898,32 @@ async def test_every_fallback_target_must_be_a_model_the_key_may_call(gateway: _
     assert result.response.status_code in (401, 403), result.response.text
     assert result.calls["forbidden"] == 0
     assert result.calls["attacker"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "requested_error"),
+    [
+        pytest.param(
+            "context_window_fallbacks",
+            (400, "invalid_request_error", "prompt is too long: 300000 tokens > 200000 maximum"),
+            id="context-window",
+        ),
+        pytest.param(
+            "content_policy_fallbacks",
+            (400, "invalid_request_error", "Output blocked by content filtering policy"),
+            id="content-policy",
+        ),
+    ],
+)
+@pytest.mark.parametrize("shape", ["dict-key", "dict-chain", "chain-of-dict", "list"])
+async def test_a_fallback_the_upstream_error_triggers_never_reaches_a_model_the_key_may_not_call(
+    monkeypatch: pytest.MonkeyPatch, field: str, requested_error: tuple[int, str, str], shape: str
+):
+    result = await _Gateway(monkeypatch, requested_error).send({field: _FORBIDDEN_SHAPES[shape]})
+
+    assert result.response.status_code in (401, 403), result.response.text
+    assert result.calls["forbidden"] == 0
 
 
 @pytest.mark.asyncio

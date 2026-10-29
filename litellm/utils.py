@@ -291,7 +291,7 @@ except (ImportError, AttributeError, TypeError):
 claude_json_str = json.dumps(json_data)
 import importlib.metadata
 from collections.abc import AsyncIterator, Callable, Collection, Iterable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, TypeVar, cast, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, Final, Literal, Protocol, TypeVar, cast, runtime_checkable
 
 from typing_extensions import assert_never
 
@@ -3294,7 +3294,7 @@ class _RegisteredPricingFields:
     registered on so a replaced catalog starts without them, as the entries they describe do."""
 
     cost_map: object = None
-    fields: dict[str, dict[str, object]] = {}  # mutable-ok: rebuilt whenever litellm.model_cost is replaced
+    fields: ClassVar[dict[str, dict[str, object]]] = {}  # mutable-ok: rebuilt whenever litellm.model_cost is replaced
 
 
 def _registered_pricing_fields() -> dict[str, dict[str, object]]:

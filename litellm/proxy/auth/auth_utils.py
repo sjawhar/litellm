@@ -9,6 +9,7 @@ from typing import Any, Final, Protocol
 
 from fastapi import HTTPException, Request, status
 from pydantic import PositiveInt, TypeAdapter, ValidationError
+from typing_extensions import TypeIs  # noqa: TID251  # TypeIs reaches typing only on 3.13
 
 import litellm
 from litellm import Router, constants, provider_list
@@ -32,7 +33,10 @@ from litellm.llms.azure.passthrough.transformation import azure_router_model_in_
 from litellm.llms.nvidia_nim.passthrough.transformation import nvidia_nim_model_group_in_path
 from litellm.proxy._types import *
 from litellm.proxy.common_utils.http_parsing_utils import extract_nested_form_metadata
-from litellm.router_utils.clientside_credential_handler import reject_fallback_target_credentials
+from litellm.router_utils.clientside_credential_handler import (
+    reject_fallback_target_credentials,
+    reject_fallback_target_routing,
+)
 from litellm.router_utils.fallback_event_handlers import ROUTER_FALLBACKS_KWARG
 from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     LITELLM_PASS_THROUGH_ENDPOINT_MARKER,
@@ -523,21 +527,31 @@ _FALLBACK_FIELDS: Final[tuple[str, ...]] = (
 )
 
 
+def _is_mapping(value: object) -> TypeIs[Mapping[object, object]]:  # guard-ok: isinstance cannot type a mapping's keys
+    return isinstance(value, Mapping)
+
+
 def _iter_fallback_field_values(request_body: Mapping[str, object], skip_body_fallbacks: bool) -> Iterator[object]:
     override: Final = request_body.get("router_settings_override")
     for source in (request_body, override):
-        if isinstance(source, Mapping):
+        if _is_mapping(source):
             for field in _FALLBACK_FIELDS:
                 if not (skip_body_fallbacks and source is request_body and field == "fallbacks"):
                     yield source.get(field)
     context_window_swaps: Final = request_body.get(CONTEXT_WINDOW_FALLBACK_DICT_FIELD)
-    if isinstance(context_window_swaps, Mapping):
+    if _is_mapping(context_window_swaps):
         yield list(context_window_swaps.values())
 
 
 def _iter_fallback_targets(value: object, depth: int) -> Iterator[str | Mapping[str, object]]:
     if depth > 2 * litellm.ROUTER_MAX_FALLBACKS:
         raise ValueError("Rejected Request: fallback nesting exceeds the allowed validation depth.")
+    if _is_mapping(value):
+        # The Router iterates a fallback list, and iterating a mapping walks its keys, so each key is a target
+        yield from (key for key in value if isinstance(key, str))
+        for target_list in value.values():
+            yield from _iter_fallback_targets(target_list, depth + 1)
+        return
     if not isinstance(value, list):
         return
     for item in value:
@@ -594,6 +608,7 @@ def _reject_fallback_target_credentials(target: Mapping[str, object], allows_cli
     mocked: Final = sorted(field for field in target if field in _FALLBACK_TARGET_MOCK_FIELDS)
     if mocked:
         raise ValueError(f"Rejected Request: a fallback target may not carry {', '.join(mocked)}.")
+    reject_fallback_target_routing(target)
     if not allows_client_credentials:
         reject_fallback_target_credentials(target)
 
@@ -841,8 +856,6 @@ def get_request_route(request: Request) -> str:
             return str(request.url.path)
         raw_path: Final[str] = str(scope.get("path", request.url.path))
         root_path: Final[str] = str(scope.get("app_root_path", scope.get("root_path", ""))).rstrip("/")
-        if not isinstance(raw_path, str):
-            return str(request.url.path)
         # Strip root_path only when it matches whole path segments — guarding
         # against sibling paths like "/apifoo" being truncated under
         # root_path="/api". Trailing slashes on root_path are stripped above,

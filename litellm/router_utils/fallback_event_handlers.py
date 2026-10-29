@@ -19,7 +19,10 @@ from litellm.router_utils.add_retry_fallback_headers import (
     get_fallback_error_info,
 )
 from litellm.router_utils.batch_utils import get_router_metadata_variable_name
-from litellm.router_utils.clientside_credential_handler import reject_fallback_target_credentials
+from litellm.router_utils.clientside_credential_handler import (
+    reject_fallback_target_credentials,
+    reject_fallback_target_routing,
+)
 from litellm.router_utils.cooldown_handlers import (
     _first_present,  # pyright: ignore[reportPrivateUsage] - shared internal helper, used across router_utils
     cast_exception_status_to_int,
@@ -799,6 +802,7 @@ async def run_async_fallback(
     for target in fallback_model_group:
         if isinstance(target, dict):
             reject_server_owned_wif_params(target)
+            reject_fallback_target_routing(target)
             if refuses_credentials:
                 reject_fallback_target_credentials(target)
 
