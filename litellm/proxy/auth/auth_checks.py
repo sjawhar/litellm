@@ -21,7 +21,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Generic, Literal, Optional, Protocol, TypeAlias
 
 from fastapi import HTTPException, Request, status
-from pydantic import BaseModel, TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 from typing_extensions import NotRequired, ReadOnly, Required, TypedDict, Unpack
 
 import litellm
@@ -113,6 +113,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     UserApiKeyCache,
     end_user_cache_key,
     end_user_restricted_registry_cache_key,
+    forget_last_good,
     get_management_object_ttl,
     model_access_group_cache_key,
     model_access_group_registry_cache_key,
@@ -120,10 +121,15 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     object_permission_cache_key,
     project_cache_key,
     project_spend_counter_key,
+    recall_last_good,
+    remember_last_good,
     tag_cache_key,
     tag_registry_cache_key,
     team_membership_auth_cache_key,
     team_membership_reservation_cache_key,
+)
+from litellm.proxy.common_utils.user_api_key_cache import (
+    T as _LastGoodT,
 )
 from litellm.proxy.db.db_lookup_gate import bounded_db_lookup, db_lookup_gate
 from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
@@ -2913,6 +2919,28 @@ async def _cache_management_object(
     )
 
 
+class _TeamAliasTarget(BaseModel):
+    """The team an alias resolved to when the database last answered for it."""
+
+    model_config = ConfigDict(frozen=True)
+
+    team_id: str
+
+
+async def recall_last_good_after(
+    error: Exception, user_api_key_cache: DualCache, cache_key: str, model_type: type[_LastGoodT]
+) -> _LastGoodT | None:
+    """The last good entry for ``cache_key`` when ``error`` says the database could not be reached, else None."""
+    if not PrismaDBExceptionHandler.is_database_unreachable_error(error):
+        return None
+    found: Final = await recall_last_good(user_api_key_cache, cache_key, model_type)
+    if found is not None:
+        verbose_proxy_logger.warning(
+            "The database is unreachable (%s); found the last good %s entry", type(error).__name__, model_type.__name__
+        )
+    return found
+
+
 @with_service_target(AUTH_OBJECTS_TARGET)
 async def cache_team_object(
     team_id: str,
@@ -2939,6 +2967,7 @@ async def cache_team_object(
         proxy_logging_obj=proxy_logging_obj,
         model_type=LiteLLM_TeamTableCachedObj,
     )
+    await remember_last_good(user_api_key_cache, key, team_table)
 
     # Invalidate the alias-keyed cache so the JWT auth path with
     # `team_alias_jwt_field` (which reads via `get_team_object_by_alias`)
@@ -3121,6 +3150,8 @@ async def delete_cache_team_object(
     team_alias: str | None,
     user_api_key_cache: UserApiKeyCache,
     proxy_logging_obj: ProxyLogging | None,
+    *,
+    revoked: bool = False,
 ) -> None:
     """
     Evict both keys `_cache_team_object` writes.
@@ -3134,6 +3165,9 @@ async def delete_cache_team_object(
     Eviction is best-effort, matching `_cache_team_object`. `delete_team` calls this after the team
     rows are already gone, so letting an unreachable cache backend raise here would fail a request
     whose delete has committed.
+
+    `revoked` is for a delete or a block: it tombstones the team's last good entries, so a read that was in
+    flight when the row changed cannot store them again.
     """
     keys: Final = (f"team_id:{team_id}", *((f"team_alias:{team_alias}",) if team_alias else ()))
 
@@ -3151,6 +3185,7 @@ async def delete_cache_team_object(
                 key,
                 e,
             )
+        await forget_last_good(user_api_key_cache, key, tombstone=revoked)
         await publish_auth_cache_invalidation(cache_key=key)
 
 
@@ -3183,6 +3218,8 @@ async def delete_cache_key_object(
     hashed_token: str,
     user_api_key_cache: UserApiKeyCache,
     proxy_logging_obj: ProxyLogging | None,
+    *,
+    revoked: bool = False,
 ) -> None:
     """
     Evict one key object, best-effort, matching `delete_cache_team_object` and
@@ -3197,6 +3234,9 @@ async def delete_cache_key_object(
     cache-first with no freshness check, so a worker that never receives the broadcast keeps
     admitting requests against the pre-mutation object (e.g. a just-reset spend) until its own
     copy's TTL expires.
+
+    `revoked` is for a delete or a block: it tombstones the key's last good entry, so a read that was in
+    flight when the row changed cannot store it again.
     """
     key: Final = hashed_token
 
@@ -3213,6 +3253,7 @@ async def delete_cache_key_object(
             e,
         )
 
+    await forget_last_good(user_api_key_cache, key, tombstone=revoked)
     await publish_auth_cache_invalidation(cache_key=key)
 
 
@@ -3223,6 +3264,8 @@ async def delete_cache_key_objects(
     hashed_tokens: Sequence[str],
     user_api_key_cache: UserApiKeyCache,
     proxy_logging_obj: ProxyLogging | None,
+    *,
+    revoked: bool = False,
 ) -> None:
     """
     Evict a batch of key objects, for callers that delete keys in bulk rather than through
@@ -3242,6 +3285,7 @@ async def delete_cache_key_objects(
                 hashed_token=hashed_token,
                 user_api_key_cache=user_api_key_cache,
                 proxy_logging_obj=proxy_logging_obj,
+                revoked=revoked,
             )
             for hashed_token in hashed_tokens
         ),
@@ -3450,8 +3494,16 @@ async def get_team_object(
             use_writer=bool(check_db_only),
         )
     except TeamNotFoundError:
+        await forget_last_good(user_api_key_cache, key)
         raise
-    except Exception:
+    except Exception as e:
+        served: Final = (
+            None
+            if check_db_only
+            else await recall_last_good_after(e, user_api_key_cache, key, LiteLLM_TeamTableCachedObj)
+        )
+        if served is not None:
+            return served
         raise HTTPException(
             status_code=404,
             detail={"error": f"Team doesn't exist in db. Team={team_id}. Create team via `/team/new` call."},
@@ -3607,28 +3659,37 @@ async def get_team_object_by_alias(
     if cached_team_obj is not None:
         return cached_team_obj
 
-    # Query database by team_alias
     try:
         teams: Final = await _team_table(TeamRepository(prisma_client)).find_many(
             where={"team_alias": team_alias}, include=_TEAM_GRANT_RELATIONS
         )
+    except Exception as e:
+        served: Final = await _last_good_team_for_alias(e, team_alias, user_api_key_cache)
+        if served is not None:
+            return served
+        verbose_proxy_logger.exception("Error looking up team by alias: %s", team_alias)
+        raise HTTPException(
+            status_code=500,
+            detail={"error": f"Error looking up team by alias '{team_alias}': {e}"},
+        ) from e
 
-        if not teams:
-            raise HTTPException(
-                status_code=404,
-                detail={
-                    "error": f"Team with alias '{team_alias}' doesn't exist in db. Create team via `/team/new` call."
-                },
-            )
+    if not teams:
+        await forget_last_good(user_api_key_cache, cache_key)
+        raise HTTPException(
+            status_code=404,
+            detail={"error": f"Team with alias '{team_alias}' doesn't exist in db. Create team via `/team/new` call."},
+        )
 
-        if len(teams) > 1:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "error": f"Multiple teams found with alias '{team_alias}'. Please use team_id_jwt_field instead or ensure team aliases are unique."
-                },
-            )
+    if len(teams) > 1:
+        await forget_last_good(user_api_key_cache, cache_key)
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": f"Multiple teams found with alias '{team_alias}'. Please use team_id_jwt_field instead or ensure team aliases are unique."
+            },
+        )
 
+    try:
         team: Final = teams[0]
         team_obj: Final = LiteLLM_TeamTableCachedObj.model_validate(team.model_dump())
 
@@ -3650,32 +3711,44 @@ async def get_team_object_by_alias(
                     e,
                 )
 
-        # Cache the result by both alias and team_id
-        await user_api_key_cache.async_set_cache(
+        # The id entry first: writing it evicts the alias entry, which is written from this verified single row next.
+        await cache_team_object(
+            team_id=team_obj.team_id,
+            team_table=team_obj,
+            user_api_key_cache=user_api_key_cache,
+            proxy_logging_obj=proxy_logging_obj,
+        )
+        await _cache_management_object(
             key=cache_key,
             value=team_obj,
+            user_api_key_cache=user_api_key_cache,
+            proxy_logging_obj=proxy_logging_obj,
             model_type=LiteLLM_TeamTableCachedObj,
-            ttl=DEFAULT_IN_MEMORY_TTL,
         )
-        # Also cache by team_id for consistency
-        team_id_cache_key: Final = f"team_id:{team_obj.team_id}"
-        await user_api_key_cache.async_set_cache(
-            key=team_id_cache_key,
-            value=team_obj,
-            model_type=LiteLLM_TeamTableCachedObj,
-            ttl=DEFAULT_IN_MEMORY_TTL,
-        )
+        await remember_last_good(user_api_key_cache, cache_key, _TeamAliasTarget(team_id=team_obj.team_id))
 
         return team_obj
 
-    except HTTPException:
-        raise
     except Exception as e:
         verbose_proxy_logger.exception("Error looking up team by alias: %s", team_alias)
         raise HTTPException(
             status_code=500,
             detail={"error": f"Error looking up team by alias '{team_alias}': {e}"},
         )
+
+
+async def _last_good_team_for_alias(
+    error: Exception, team_alias: str, user_api_key_cache: UserApiKeyCache
+) -> LiteLLM_TeamTableCachedObj | None:
+    """The last good team ``team_alias`` named, read through the team's own entry so a later update, rename or
+    delete of the team wins over the alias it once had."""
+    target: Final = await recall_last_good_after(
+        error, user_api_key_cache, f"team_alias:{team_alias}", _TeamAliasTarget
+    )
+    if target is None:
+        return None
+    team: Final = await recall_last_good(user_api_key_cache, f"team_id:{target.team_id}", LiteLLM_TeamTableCachedObj)
+    return team if team is not None and team.team_alias == team_alias else None
 
 
 @log_db_metrics
@@ -4072,15 +4145,24 @@ async def get_key_object(
         raise Exception(f"Key doesn't exist in cache + check_cache_only=True. key={key}.")
 
     # else, check db
-    _valid_token: Final[BaseModel | None] = await fetch_key_object_from_db_with_reconnect(
-        hashed_token=hashed_token,
-        prisma_client=prisma_client,
-        parent_otel_span=parent_otel_span,
-        proxy_logging_obj=proxy_logging_obj,
-        check_db_only=check_db_only,
-    )
+    try:
+        _valid_token: Final[BaseModel | None] = await fetch_key_object_from_db_with_reconnect(
+            hashed_token=hashed_token,
+            prisma_client=prisma_client,
+            parent_otel_span=parent_otel_span,
+            proxy_logging_obj=proxy_logging_obj,
+            check_db_only=check_db_only,
+        )
+    except Exception as e:
+        served: Final = (
+            None if check_db_only else await recall_last_good_after(e, user_api_key_cache, hashed_token, UserAPIKeyAuth)
+        )
+        if served is None:
+            raise
+        return served
 
     if _valid_token is None:
+        await forget_last_good(user_api_key_cache, hashed_token)
         raise ProxyException(
             message=f"Authentication Error, Invalid proxy server token passed. key={hashed_token}, not found in db. Create key via `/key/generate` call.",
             type=ProxyErrorTypes.token_not_found_in_db,
@@ -4120,6 +4202,7 @@ async def get_key_object(
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
     )
+    await remember_last_good(user_api_key_cache, hashed_token, copy_user_api_key_auth_for_cache(_response))
 
     return _response
 

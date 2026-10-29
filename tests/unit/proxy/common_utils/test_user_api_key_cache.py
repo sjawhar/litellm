@@ -8,14 +8,20 @@ from litellm.caching.dual_cache import DualCache
 from litellm.caching.in_memory_cache import InMemoryCache
 from litellm.caching.redis_cache import RedisCache
 from litellm.constants import DEFAULT_MANAGEMENT_OBJECT_IN_MEMORY_CACHE_TTL
+from litellm.models.team import LiteLLM_TeamTableCachedObj
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.common_utils.user_api_key_cache import (
+    LastGoodMemory,
     UserApiKeyCache,
     end_user_cache_key,
+    forget_last_good,
     get_management_object_ttl,
     is_user_key_cache_key,
+    recall_last_good,
+    remember_last_good,
 )
 from litellm.proxy.proxy_server import UserAPIKeyCacheTTLEnum
+from tests.unit.caching.fake_redis_cache import fake_redis_cache
 
 HASHED_TOKEN = hashlib.sha256(b"sk-lit7563-hot-key").hexdigest()
 
@@ -30,6 +36,25 @@ class CapturingInMemoryCache(InMemoryCache):
     def set_cache(self, key, value, **kwargs):  # type: ignore[override]
         self.last_ttl = kwargs.get("ttl")
         super().set_cache(key, value, **kwargs)
+
+
+class _DeleteLandsDuringWrite(RedisCache):
+    """The reading pod's Redis: another pod's delete lands just before this pod's entry write reaches Redis."""
+
+    def __init__(self, redis: RedisCache, deleting_pod: UserApiKeyCache) -> None:  # noqa: super().__init__ skipped intentionally
+        self._redis = redis
+        self._deleting_pod = deleting_pod
+
+    async def async_get_cache_or_raise(self, key: str) -> object:
+        return await self._redis.async_get_cache_or_raise(key)
+
+    async def async_set_cache_or_raise(self, key: str, value: object, ttl: int | None = None) -> None:
+        if key.startswith("last_good:"):
+            await forget_last_good(self._deleting_pod, key.removeprefix("last_good:"), tombstone=True)
+        await self._redis.async_set_cache_or_raise(key, value, ttl=ttl)
+
+    async def async_delete_cache(self, key: str) -> None:
+        await self._redis.async_delete_cache(key)
 
 
 class FakeRedisCache(RedisCache):
@@ -485,3 +510,154 @@ class TestManagementObjectTTL:
         )
 
         assert mem.last_ttl == 300
+
+
+class TestLastGoodEntries:
+    """The last good team or key entry: Redis with no expiry first, this pod's memory when Redis cannot answer."""
+
+    @staticmethod
+    def _team(team_id: str, alias: str = "alias") -> LiteLLM_TeamTableCachedObj:
+        return LiteLLM_TeamTableCachedObj(team_id=team_id, team_alias=alias, models=["claude-opus-5-5"])
+
+    @pytest.mark.asyncio
+    async def test_remembered_entry_lives_in_redis_without_expiry(self):
+        redis = fake_redis_cache()
+        cache = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+
+        await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        client = redis.cache.init_async_client()
+        assert await client.ttl("last_good:team_id:t1") == -1
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) == self._team("t1")
+
+    @pytest.mark.asyncio
+    async def test_memory_line_answers_while_redis_is_away(self):
+        redis = fake_redis_cache()
+        cache = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+        await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        redis.server.connected = False
+
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) == self._team("t1")
+
+    @pytest.mark.asyncio
+    async def test_a_redis_that_answers_without_the_entry_wins_over_this_pods_memory(self):
+        """Another pod forgot the entry (a delete or a block): Redis answers that it is gone, so the memory copy
+        this pod still holds, because the broadcast has not reached it yet, is not served."""
+        redis = fake_redis_cache()
+        cache = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+        await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        await redis.cache.init_async_client().delete("last_good:team_id:t1")
+
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
+
+    @pytest.mark.asyncio
+    async def test_forget_removes_the_entry_from_redis_and_memory(self):
+        redis = fake_redis_cache()
+        cache = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+        await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        await forget_last_good(cache, "team_id:t1")
+
+        assert await redis.cache.init_async_client().get("last_good:team_id:t1") is None
+        redis.server.connected = False
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
+
+    @pytest.mark.asyncio
+    async def test_forget_with_redis_away_still_clears_memory_and_does_not_raise(self):
+        redis = fake_redis_cache()
+        cache = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+        await remember_last_good(cache, "team_id:t1", self._team("t1"))
+        redis.server.connected = False
+
+        await forget_last_good(cache, "team_id:t1")
+
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
+
+    @pytest.mark.asyncio
+    async def test_remember_with_redis_away_keeps_the_memory_line(self):
+        redis = fake_redis_cache()
+        cache = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+        redis.server.connected = False
+
+        await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) == self._team("t1")
+
+    @pytest.mark.asyncio
+    async def test_without_redis_the_memory_line_is_the_only_line(self):
+        cache = UserApiKeyCache(serve_last_good_entries=True)
+        await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) == self._team("t1")
+        await forget_last_good(cache, "team_id:t1")
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
+
+    @pytest.mark.asyncio
+    async def test_recalled_entry_is_a_fresh_object_each_time(self):
+        cache = UserApiKeyCache(serve_last_good_entries=True)
+        await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        first = await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj)
+        assert first is not None
+        first.models.append("leaked")
+
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) == self._team("t1")
+
+    def test_memory_line_drops_the_least_recently_written_entry_first(self):
+        memory = LastGoodMemory(max_entries=2)
+        memory.set("a", {"v": 1})
+        memory.set("b", {"v": 2})
+        memory.set("a", {"v": 3})
+        memory.set("c", {"v": 4})
+
+        assert (memory.get("a"), memory.get("b"), memory.get("c")) == ({"v": 3}, None, {"v": 4})
+
+    @pytest.mark.asyncio
+    async def test_a_tombstone_refuses_to_store_the_entry_again(self):
+        cache = UserApiKeyCache(serve_last_good_entries=True)
+        await forget_last_good(cache, "team_id:t1", tombstone=True)
+
+        await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
+
+    @pytest.mark.asyncio
+    async def test_another_pods_tombstone_refuses_the_entry_in_redis_and_in_this_pods_memory(self):
+        redis = fake_redis_cache()
+        deleting_pod = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+        reading_pod = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+        await forget_last_good(deleting_pod, "team_id:t1", tombstone=True)
+
+        await remember_last_good(reading_pod, "team_id:t1", self._team("t1"))
+
+        assert await redis.cache.init_async_client().get("last_good:team_id:t1") is None
+        redis.server.connected = False
+        assert await recall_last_good(reading_pod, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
+
+    @pytest.mark.asyncio
+    async def test_a_write_that_lands_as_the_tombstone_appears_is_undone(self):
+        """The delete runs between the read's tombstone check and its write: the read checks again after
+        writing and takes its write back."""
+        redis = fake_redis_cache()
+        deleting_pod = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+        reading_pod = UserApiKeyCache(
+            redis_cache=_DeleteLandsDuringWrite(redis.cache, deleting_pod), serve_last_good_entries=True
+        )
+
+        await remember_last_good(reading_pod, "team_id:t1", self._team("t1"))
+
+        assert await redis.cache.init_async_client().get("last_good:team_id:t1") is None
+        assert await recall_last_good(reading_pod, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
+
+    def test_a_tombstone_lapses(self):
+        now = [100.0]
+        memory = LastGoodMemory(max_entries=10, clock=lambda: now[0])
+        memory.tombstone("a", ttl_seconds=600)
+        assert memory.set("a", {"v": 1}) is False
+
+        now[0] += 601
+
+        assert memory.set("a", {"v": 1}) is True
+        assert memory.get("a") == {"v": 1}

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import Sequence
+import time
+from collections import OrderedDict
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, Final, TypeVar, cast, overload
 
 from pydantic import BaseModel
@@ -11,7 +13,11 @@ from litellm._logging import verbose_proxy_logger
 from litellm.caching.dual_cache import DualCache
 from litellm.caching.in_memory_cache import InMemoryCache
 from litellm.caching.redis_cache import RedisCache
-from litellm.constants import DEFAULT_MANAGEMENT_OBJECT_IN_MEMORY_CACHE_TTL
+from litellm.constants import (
+    DEFAULT_MANAGEMENT_OBJECT_IN_MEMORY_CACHE_TTL,
+    LAST_GOOD_AUTH_ENTRIES_IN_MEMORY,
+    LAST_GOOD_TOMBSTONE_TTL_SECONDS,
+)
 from litellm.proxy.common_utils.cache_pydantic_utils import CacheCodec
 
 if TYPE_CHECKING:
@@ -32,6 +38,51 @@ def is_user_key_cache_key(key: str) -> bool:
 
 
 _PIPELINED_SET_OPTIONS: Final = frozenset(("ttl",))
+
+
+class LastGoodMemory:
+    """A pod's own copy of the last good team and key entries: no expiry, bounded, and the least recently
+    written entry goes first. Holds the JSON payload, so every read builds a fresh object. A tombstone, written
+    when a key or team is deleted or blocked, refuses every write of that entry until it lapses."""
+
+    __slots__ = ("_clock", "_entries", "_max_entries", "_tombstones")
+
+    def __init__(self, max_entries: int, clock: Callable[[], float] = time.monotonic) -> None:
+        self._entries: Final[OrderedDict[str, object]] = OrderedDict()  # mutable-ok: bounded LRU every read updates
+        self._tombstones: Final[OrderedDict[str, float]] = OrderedDict()  # mutable-ok: bounded, lapses by clock
+        self._max_entries: Final = max_entries
+        self._clock: Final = clock
+
+    def set(self, key: str, payload: object) -> bool:
+        if self.tombstoned(key):
+            return False
+        _ = self._entries.pop(key, None)
+        self._entries[key] = payload
+        while len(self._entries) > self._max_entries:
+            _ = self._entries.popitem(last=False)
+        return True
+
+    def get(self, key: str) -> object:
+        return self._entries.get(key)
+
+    def delete(self, key: str) -> None:
+        _ = self._entries.pop(key, None)
+
+    def tombstone(self, key: str, ttl_seconds: float) -> None:
+        self.delete(key)
+        _ = self._tombstones.pop(key, None)
+        self._tombstones[key] = self._clock() + ttl_seconds
+        while len(self._tombstones) > self._max_entries:
+            _ = self._tombstones.popitem(last=False)
+
+    def tombstoned(self, key: str) -> bool:
+        until: Final = self._tombstones.get(key)
+        if until is None:
+            return False
+        if until > self._clock():
+            return True
+        _ = self._tombstones.pop(key, None)
+        return False
 
 
 class UserApiKeyCache(DualCache):
@@ -70,6 +121,7 @@ class UserApiKeyCache(DualCache):
         default_in_memory_ttl: float | None = None,
         default_redis_ttl: float | None = None,
         key_object_in_memory_cache: InMemoryCache | None = None,
+        serve_last_good_entries: bool = False,
     ) -> None:
         super().__init__(
             in_memory_cache=in_memory_cache,
@@ -83,6 +135,8 @@ class UserApiKeyCache(DualCache):
             default_in_memory_ttl=default_in_memory_ttl,
             default_redis_ttl=default_redis_ttl,
         )
+        self.last_good_memory: Final = LastGoodMemory(max_entries=LAST_GOOD_AUTH_ENTRIES_IN_MEMORY)
+        self.serve_last_good_entries = serve_last_good_entries
 
     def in_memory_cache_for(self, key: str) -> InMemoryCache:
         return self.key_object_cache.in_memory_cache if is_user_key_cache_key(key) else self.in_memory_cache
@@ -412,3 +466,100 @@ def get_management_object_ttl(cache: DualCache) -> float:
     if configured is not None:
         return configured
     return DEFAULT_MANAGEMENT_OBJECT_IN_MEMORY_CACHE_TTL
+
+
+def _last_good_redis_key(cache_key: str) -> str:
+    return f"last_good:{cache_key}"
+
+
+def _last_good_tombstone_key(cache_key: str) -> str:
+    return f"last_good_tombstone:{cache_key}"
+
+
+def _last_good_store(cache: DualCache) -> UserApiKeyCache | None:
+    """The last good entries are a ``UserApiKeyCache`` partition; any other cache keeps none."""
+    return cache if isinstance(cache, UserApiKeyCache) else None
+
+
+async def _store_in_redis_unless_tombstoned(redis: RedisCache, cache_key: str, payload: object) -> bool:
+    """True when Redis keeps the entry, False when a tombstone refuses it; raises when Redis cannot answer.
+
+    The tombstone is read again after the write and the write is undone if one appeared. A forget writes its
+    tombstone before it deletes the entry, so either this second read sees the tombstone or the forget's
+    delete comes after this write: a read that was in flight when the key was deleted never leaves it behind.
+    """
+    entry: Final = _last_good_redis_key(cache_key)
+    tombstone: Final = _last_good_tombstone_key(cache_key)
+    if await redis.async_get_cache_or_raise(tombstone) is not None:
+        return False
+    await redis.async_set_cache_or_raise(entry, payload)
+    if await redis.async_get_cache_or_raise(tombstone) is None:
+        return True
+    _ = await redis.async_delete_cache(entry)
+    return False
+
+
+async def remember_last_good(cache: DualCache, cache_key: str, value: BaseModel) -> None:
+    """Keep ``value`` as the last good entry for ``cache_key``: in Redis with no expiry, so every pod can serve it,
+    and in this pod's memory for when Redis cannot answer. Only an entry the database just returned belongs here,
+    and a tombstone left by a delete or a block refuses it. Best effort: a failed write must not fail the read
+    that produced it."""
+    store: Final = _last_good_store(cache)
+    if store is None or not store.serve_last_good_entries or store.last_good_memory.tombstoned(cache_key):
+        return
+    payload: Final = CacheCodec.serialize(value)
+    if store.redis_cache is not None:
+        try:
+            stored: Final = await _store_in_redis_unless_tombstoned(store.redis_cache, cache_key, payload)
+        except Exception as e:  # noqa: BLE001  # the memory line still holds the entry; the read must not fail on Redis
+            verbose_proxy_logger.warning("Could not keep the last good auth entry %s in Redis: %s", cache_key, e)
+        else:
+            if not stored:
+                return
+    _ = store.last_good_memory.set(cache_key, payload)
+
+
+async def recall_last_good(cache: DualCache, cache_key: str, model_type: type[T]) -> T | None:
+    """The last good entry for ``cache_key``. Redis answers first, and its miss is final, because another pod may
+    have forgotten the entry before this pod heard of it; this pod's memory answers only when Redis cannot."""
+    store: Final = _last_good_store(cache)
+    if store is None or not store.serve_last_good_entries:
+        return None
+    if store.redis_cache is not None:
+        try:
+            return CacheCodec.deserialize(
+                await store.redis_cache.async_get_cache_or_raise(_last_good_redis_key(cache_key)), model_type
+            )
+        except Exception as e:  # noqa: BLE001  # Redis away: the memory line answers
+            verbose_proxy_logger.warning("Redis could not answer for the last good auth entry %s: %s", cache_key, e)
+    return CacheCodec.deserialize(store.last_good_memory.get(cache_key), model_type)
+
+
+async def forget_last_good(cache: DualCache, cache_key: str, *, tombstone: bool = False) -> None:
+    """Drop the last good entry for ``cache_key`` from Redis and this pod's memory. Other pods drop their memory
+    copy when the caller's auth cache invalidation broadcast for the same key reaches them.
+
+    ``tombstone`` is for a delete or a block: for ``LAST_GOOD_TOMBSTONE_TTL_SECONDS``, longer than any database
+    read takes, no read may store the entry again, so a read that was in flight when the row changed cannot bring
+    the old entry back."""
+    store: Final = _last_good_store(cache)
+    if store is None:
+        return
+    if tombstone:
+        store.last_good_memory.tombstone(cache_key, LAST_GOOD_TOMBSTONE_TTL_SECONDS)
+    else:
+        store.last_good_memory.delete(cache_key)
+    if store.redis_cache is None:
+        return
+    try:
+        if tombstone:
+            await store.redis_cache.async_set_cache_or_raise(
+                _last_good_tombstone_key(cache_key), 1, ttl=LAST_GOOD_TOMBSTONE_TTL_SECONDS
+            )
+        _ = await store.redis_cache.async_delete_cache(_last_good_redis_key(cache_key))
+    except Exception as e:  # noqa: BLE001  # best effort, like every auth cache eviction after a committed write
+        verbose_proxy_logger.warning(
+            "Could not drop the last good auth entry %s from Redis, so it stays until the database answers for it: %s",
+            cache_key,
+            e,
+        )

@@ -2940,6 +2940,15 @@ class ConfigGeneralSettings(LiteLLMPydanticObjectBase):
             "lookups keep hitting the DB"
         ),
     )
+    serve_last_good_auth_entries: bool = Field(
+        False,
+        description=(
+            "keep the last team and key entry each database read returned, in Redis with no expiry and in each "
+            "worker's memory, and serve it while the database is unreachable, so a database failover does not refuse "
+            "callers that were just served. A team or key the database reported missing, or that was deleted or "
+            "blocked, is still refused"
+        ),
+    )
     max_request_size_mb: int | None = Field(
         None,
         description="max request size in MB, if a request is larger than this size it will be rejected",

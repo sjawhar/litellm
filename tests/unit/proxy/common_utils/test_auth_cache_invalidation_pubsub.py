@@ -17,7 +17,7 @@ from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import (
     evict_and_broadcast,
     publish_auth_cache_invalidation,
 )
-from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, recall_last_good, remember_last_good
 
 
 class _RecordingRedisClient(Redis):
@@ -224,6 +224,31 @@ async def test_subscriber_deletes_additional_in_memory_cache_entry_on_message() 
         await subscriber.stop()
 
     assert spend_counter_in_memory_cache.get_cache("spend:team_member:u-1:t-1") is None
+
+
+@pytest.mark.asyncio
+async def test_subscriber_drops_this_pods_last_good_entry_on_message() -> None:
+    """A key deleted or blocked on another pod must not stay in this pod's memory line, which serves while
+    the database and Redis are both away."""
+    hashed_token = hashlib.sha256(b"sk-deleted-on-another-pod").hexdigest()
+    cache = UserApiKeyCache(serve_last_good_entries=True)
+    await remember_last_good(cache, hashed_token, UserAPIKeyAuth(token=hashed_token))
+
+    pubsub = _QueuePubSub(initial_messages=[_invalidation_message(hashed_token)])
+    subscriber = AuthCacheInvalidationSubscriber(
+        redis_cache=_FakeRedisCache(client=_ScriptedPubSubRedisClient(pubsubs=[pubsub])),
+        user_api_key_cache=cache,
+    )
+    subscriber.start()
+    try:
+        for _ in range(200):
+            if await recall_last_good(cache, hashed_token, UserAPIKeyAuth) is None:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        await subscriber.stop()
+
+    assert await recall_last_good(cache, hashed_token, UserAPIKeyAuth) is None
 
 
 @pytest.mark.asyncio

@@ -468,6 +468,23 @@ class PrismaDBExceptionHandler:
         return PrismaDBExceptionHandler.find_database_service_unavailable_error_in_chain(e) is not None
 
     @staticmethod
+    def is_database_unreachable_error(e: BaseException) -> bool:
+        """True when the database client could not reach the database at all: a connection, timeout or transport
+        failure, or prisma's engine crashing on the malformed reply of a torn-down connection, anywhere in the
+        ``__cause__`` / ``__context__`` chain. A database that answered, whatever it answered, is not unreachable,
+        and neither is a query engine that will not come back by itself."""
+        return any(
+            isinstance(link, Exception)
+            and (
+                PrismaDBExceptionHandler.is_database_connection_error(link)
+                or PrismaDBExceptionHandler.is_database_transport_error(link)
+                or PrismaDBExceptionHandler.is_prisma_engine_internal_error(link)
+                or isinstance(link, (ConnectionError, TimeoutError))
+            )
+            for link in _exception_chain(e)
+        )
+
+    @staticmethod
     def handle_db_exception(e: Exception):
         """
         Primary handler for `allow_requests_on_db_unavailable` flag. Decides whether to raise a DB Exception or not based on the flag.

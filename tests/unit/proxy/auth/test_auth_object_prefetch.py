@@ -344,6 +344,23 @@ async def test_no_redis_goes_straight_to_one_query():
 
 
 @pytest.mark.asyncio
+async def test_team_row_the_prefetch_read_is_served_while_the_database_is_unreachable():
+    """The prefetch is the database read for a key's team on most calls, so it must leave the team's last good
+    entry behind: once the cached row has outlived its life, a stopped database still serves the team."""
+    import httpx
+
+    prisma = _prisma()
+    cache = UserApiKeyCache(in_memory_cache=InMemoryCache(), serve_last_good_entries=True)
+    await prefetch_auth_objects(refs=_refs(), user_api_key_cache=cache, prisma_client=prisma)
+    await cache.async_delete_cache(f"team_id:{TEAM_ID}")
+    prisma.db.litellm_teamtable.find_unique = AsyncMock(side_effect=httpx.ConnectError("All connection attempts failed"))
+
+    team = await get_team_object(team_id=TEAM_ID, prisma_client=prisma, user_api_key_cache=cache)
+
+    assert (team.team_id, team.max_budget, team.blocked) == (TEAM_ID, 500.0, False)
+
+
+@pytest.mark.asyncio
 async def test_identity_prefetch_warms_the_end_user_so_its_getter_needs_neither_redis_nor_the_database():
     end_user_key = end_user_cache_key("eu-1")
     redis = CountingRedis({end_user_key: json.dumps({"user_id": "eu-1", "blocked": False, "spend": 0.0})})

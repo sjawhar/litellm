@@ -48,6 +48,7 @@ from litellm.proxy._types import (
 from litellm.proxy.auth.auth_checks import (  # noqa: F401  # legacy module exports
     _delete_cache_key_object,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
     delete_cache_key_object,
+    delete_cache_team_object,
 )
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_broadcast
@@ -1056,6 +1057,7 @@ async def _set_user_keys_blocked(user_id: str, blocked: bool) -> int:
             hashed_token=key_row.token,
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
+            revoked=blocked,
         )
 
     verbose_proxy_logger.info(
@@ -2918,6 +2920,20 @@ async def _apply_group_patch_updates(group_id: str, update_data: dict[str, objec
     return await TeamRepository(prisma_client).table.find_unique(where={"team_id": group_id})
 
 
+async def _evict_patched_team(team_id: str, old_alias: str | None, new_alias: object) -> None:
+    """Evict the team a group patch rewrote, by id and by both its aliases, its last good entries included."""
+    from litellm.proxy.proxy_server import proxy_logging_obj, user_api_key_cache
+
+    aliases: Final = tuple(dict.fromkeys(alias for alias in (old_alias, new_alias) if isinstance(alias, str) and alias))
+    for alias in aliases or (None,):
+        await delete_cache_team_object(
+            team_id=team_id,
+            team_alias=alias,
+            user_api_key_cache=user_api_key_cache,
+            proxy_logging_obj=proxy_logging_obj,
+        )
+
+
 async def _handle_group_membership_changes(group_id: str, current_members: set[str], final_members: set[str]) -> None:
     """Reconcile the group roster, attempting every member before reporting failures.
 
@@ -3000,6 +3016,8 @@ async def patch_group(
 
         # Apply the metadata/displayName updates to the database
         updated_team = await _apply_group_patch_updates(group_id, update_data, prisma_client)
+        if update_data:
+            await _evict_patched_team(group_id, existing_team.team_alias, update_data.get("team_alias"))
 
         refreshed_team: Final = await _table(TeamRepository(prisma_client)).find_unique(where={"team_id": group_id})
         refreshed_current: Final = (
