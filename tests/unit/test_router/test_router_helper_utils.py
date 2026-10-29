@@ -321,6 +321,22 @@ async def test_router_function_with_retries(model_list, sync_mode):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fallback_field", ("context_window_fallbacks", "content_policy_fallbacks"))
+async def test_router_retries_reject_non_list_error_fallbacks(model_list, fallback_field: str):
+    router = Router(model_list=model_list)
+
+    with pytest.raises(litellm.BadRequestError, match=f"{fallback_field} must be a list"):
+        await router.async_function_with_retries(
+            original_function=router._acompletion,
+            model="gpt-5-mini",
+            messages=[{"role": "user", "content": "Hello, how are you?"}],
+            max_tokens=5,
+            mock_response="unused",
+            **{fallback_field: {"forbidden": []}},
+        )
+
+
+@pytest.mark.asyncio
 async def test_router_make_call(model_list):
     """Test if the router 'make_call' function is working correctly"""
 

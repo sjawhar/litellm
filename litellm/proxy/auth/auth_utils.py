@@ -526,6 +526,19 @@ _FALLBACK_FIELDS: Final[tuple[str, ...]] = (
     "default_fallbacks",
 )
 
+_ERROR_FALLBACK_FIELDS: Final[tuple[str, ...]] = ("context_window_fallbacks", "content_policy_fallbacks")
+
+
+def _reject_non_list_error_fallbacks(request_body: Mapping[str, object]) -> None:
+    override: Final = request_body.get("router_settings_override")
+    for source in (request_body, override):
+        if not _is_mapping(source):
+            continue
+        for field in _ERROR_FALLBACK_FIELDS:
+            value = source.get(field)
+            if value is not None and not isinstance(value, list):
+                raise ValueError(f"Rejected Request: {field} must be a list of model groups.")
+
 
 def _is_mapping(value: object) -> TypeIs[Mapping[object, object]]:  # guard-ok: isinstance cannot type a mapping's keys
     return isinstance(value, Mapping)
@@ -664,6 +677,7 @@ def is_request_body_safe(
         raise ValueError("Rejected Request: model_list is not allowed in the request body.")
     manages_deployments: Final = route_manages_deployments(route)
     allows_client_credentials: Final[bool] = general_settings.get("allow_client_side_credentials") is True
+    _reject_non_list_error_fallbacks(request_body)
     _check_banned_params(request_body, general_settings, llm_router, model, manages_deployments=manages_deployments)
     for nested_key in _NESTED_CONFIG_KEYS:
         nested = _coerce_metadata_to_dict(request_body.get(nested_key))

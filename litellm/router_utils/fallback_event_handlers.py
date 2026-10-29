@@ -339,11 +339,11 @@ def _router_fallbacks_key(kwargs: Mapping[str, object], anthropic_messages_call:
     )
 
 
-def reject_non_list_litellm_fallbacks(fallbacks: object, model: object) -> None:
-    """LiteLLM's own fallbacks list model groups; any other value would be read one character at a time"""
+def reject_non_list_litellm_fallbacks(fallbacks: object, model: object, *, field: str = "fallbacks") -> None:
+    """LiteLLM fallback fields hold lists of model groups."""
     if fallbacks is not None and not isinstance(fallbacks, list):
         raise litellm.BadRequestError(
-            message=f"LiteLLM fallbacks must be a list of model groups, got {type(fallbacks).__name__}",
+            message=f"LiteLLM {field} must be a list of model groups, got {type(fallbacks).__name__}",
             model=model if isinstance(model, str) else "",
             llm_provider="",
         )
