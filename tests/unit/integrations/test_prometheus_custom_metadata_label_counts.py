@@ -248,6 +248,41 @@ async def test_priority_label_uses_team_metadata_for_success_and_virtual_key_met
         assert {sample.labels["priority"] for sample in samples} == {expected_priority}, metric_name
 
 
+@pytest.mark.parametrize("team_priority", ("high", None))
+def test_priority_label_on_gauges_without_a_request_is_empty(monkeypatch: pytest.MonkeyPatch, team_priority: str | None):
+    from litellm.proxy._types import LiteLLM_TeamTable
+
+    monkeypatch.setattr(litellm, "custom_prometheus_metadata_labels", ["priority"])
+    _clear_prometheus_registry()
+    prometheus_logger = PrometheusLogger()
+    team_metadata = {"priority": team_priority} if team_priority is not None else {}
+
+    prometheus_logger._set_team_budget_metrics(
+        LiteLLM_TeamTable(team_id="team-1", metadata=team_metadata, max_budget=10.0, spend=1.0)
+    )
+    prometheus_logger._set_key_budget_metrics(
+        UserAPIKeyAuth(token="hashed-key", key_alias="key-1", team_metadata=team_metadata, max_budget=5.0, spend=1.0)
+    )
+    prometheus_logger._set_deployment_tpm_rpm_limit_metrics(
+        model_info={"tpm": 100, "rpm": 10},
+        litellm_params={},
+        litellm_model_name="gpt-4o-mini",
+        model_id="model-123",
+        api_base="https://api.openai.com",
+        llm_provider="openai",
+        model_group="gpt-4o-mini",
+    )
+
+    for metric_name in (
+        "litellm_remaining_team_budget_metric",
+        "litellm_remaining_api_key_budget_metric",
+        "litellm_deployment_tpm_limit",
+        "litellm_deployment_rpm_limit",
+    ):
+        samples = _metric_samples(metric_name)
+        assert [sample.labels["priority"] for sample in samples] == [""], metric_name
+
+
 def test_virtual_key_rate_limit_metrics_accept_custom_metadata_labels(
     monkeypatch: pytest.MonkeyPatch,
 ):

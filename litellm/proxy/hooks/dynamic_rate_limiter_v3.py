@@ -3,7 +3,7 @@ Dynamic rate limiter v3 - Saturation-aware priority-based rate limiting
 """
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime
 from typing import TYPE_CHECKING, Final, Literal
 
@@ -38,6 +38,7 @@ from litellm.router_utils.add_retry_fallback_headers import (
     ensure_response_additional_headers,
     response_has_hidden_params,
 )
+from litellm.types.integrations.prometheus import priority_of_team_metadata, team_priority_label
 from litellm.types.router import ModelGroupInfo
 from litellm.types.utils import CallTypesLiteral, LLMResponseTypes
 
@@ -63,6 +64,65 @@ def _get_priority_settings() -> "PriorityReservationSettings":
 
 def _is_latin1_encodable(value: object) -> bool:
     return all(ord(char) < 256 for char in str(value))
+
+
+def _model_window_saturation(rate_limit_response: RateLimitResponse, pre_read_saturation: float) -> float:
+    return max(
+        (
+            (status["current_limit"] - status["limit_remaining"]) / status["current_limit"]
+            for status in rate_limit_response["statuses"]
+            if status["descriptor_key"] == "model_saturation_check" and status["current_limit"] > 0
+        ),
+        default=pre_read_saturation,
+    )
+
+
+def _record_model_group_saturation(
+    model: str,
+    pre_read_saturation: float,
+    admission: RateLimitResponse | None,
+    data: Mapping[str, object],
+) -> None:
+    try:
+        from litellm.integrations.prometheus import PrometheusLogger
+
+        prometheus_logger: Final = PrometheusLogger.get_instance()
+        if prometheus_logger is None:
+            return
+        prometheus_logger.set_model_group_saturation_ratio(
+            model_group=model,
+            saturation=(
+                pre_read_saturation if admission is None else _model_window_saturation(admission, pre_read_saturation)
+            ),
+            litellm_params=data,
+        )
+    except Exception as e:  # noqa: BLE001  # a metrics failure must never change rate-limit enforcement
+        verbose_proxy_logger.debug("Error recording model group saturation metric: %s", e)
+
+
+def _reserved_priority(priority: str | None) -> str | None:
+    if priority is None or litellm.priority_reservation is None or priority not in litellm.priority_reservation:
+        return None
+    return priority
+
+
+def _priority_pool_key(model: str, priority: str | None) -> str:
+    reserved_priority: Final = _reserved_priority(priority)
+    return f"{model}:default_pool" if reserved_priority is None else f"{model}:{reserved_priority}"
+
+
+def _routed_model_group(litellm_params: object) -> str | None:
+    match litellm_params:
+        case {"litellm_metadata": {"model_group": str() as model_group}} if model_group:
+            return model_group
+        case {"metadata": {"model_group": str() as model_group}} if model_group:
+            return model_group
+        case _:
+            return None
+
+
+class _ModelCapacityRateLimitError(ProxyRateLimitError):
+    """The model's own limit refused the request, so its window is full."""
 
 
 class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
@@ -141,28 +201,8 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
         return weight
 
     def _get_priority_from_user_api_key_dict(self, user_api_key_dict: UserAPIKeyAuth) -> str | None:
-        """
-        Get priority from user_api_key_dict.
-
-        Checks team metadata first (takes precedence), then falls back to key metadata.
-
-        Args:
-            user_api_key_dict: User authentication info
-
-        Returns:
-            Priority string if found, None otherwise
-        """
-        priority: str | None = None
-
-        # Check team metadata first (takes precedence)
-        if user_api_key_dict.team_metadata is not None:
-            priority = user_api_key_dict.team_metadata.get("priority", None)
-
-        # Fall back to key metadata
-        if priority is None:
-            priority = user_api_key_dict.metadata.get("priority", None)
-
-        return priority
+        """The calling team's ``metadata.priority``. A key's own metadata never sets the class."""
+        return priority_of_team_metadata(user_api_key_dict.team_metadata) or None
 
     def _normalize_priority_weights(self, model_info: ModelGroupInfo) -> dict[str, float]:
         """
@@ -210,25 +250,14 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
         Returns:
             tuple: (priority_weight, priority_key)
         """
-        # Check if this key has an explicit priority in litellm.priority_reservation
-        has_explicit_priority: Final = (
-            priority is not None
-            and litellm.priority_reservation is not None
-            and priority in litellm.priority_reservation
+        reserved_priority: Final = _reserved_priority(priority)
+        if reserved_priority is None:
+            return _get_priority_settings().default_priority, _priority_pool_key(model, priority)
+        normalized_weight: Final = normalized_weights.get(reserved_priority)
+        priority_weight: Final = (
+            self._get_priority_weight(reserved_priority, model_info) if normalized_weight is None else normalized_weight
         )
-
-        if has_explicit_priority and priority is not None:
-            # Explicit priority: get its specific allocation
-            priority_weight = normalized_weights.get(priority, self._get_priority_weight(priority, model_info))
-            # Use unique key per priority level
-            priority_key = f"{model}:{priority}"
-        else:
-            # No explicit priority: share the default_priority pool with ALL other default keys
-            priority_weight = _get_priority_settings().default_priority
-            # Use shared key for all default-priority requests
-            priority_key = f"{model}:default_pool"
-
-        return priority_weight, priority_key
+        return priority_weight, _priority_pool_key(model, priority)
 
     async def _check_model_saturation(
         self,
@@ -387,7 +416,7 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
         user_api_key_dict: UserAPIKeyAuth,
         priority: str | None,
         saturation: float,
-    ) -> None:
+    ) -> RateLimitResponse:
         """
         Check rate limits using THREE-PHASE approach to prevent partial increments.
 
@@ -475,7 +504,7 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
                     continue
                 descriptor_key = status["descriptor_key"]
                 if descriptor_key == "model_saturation_check":
-                    raise ProxyRateLimitError(
+                    raise _ModelCapacityRateLimitError(
                         detail={
                             "error": f"Model capacity reached for {model}. "
                             f"Priority: {priority}, "
@@ -570,6 +599,7 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
             )
         else:
             get_or_create_request_stash().rate_limit_response = atomic_response
+        return atomic_response
 
     @with_service_target("rate_limits")
     async def async_pre_call_hook(
@@ -628,18 +658,6 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
 
         # STEP 1: Check current saturation level
         saturation: Final = await self._check_model_saturation(model, model_group_info)
-        try:
-            from litellm.integrations.prometheus import PrometheusLogger
-
-            prometheus_logger: Final = PrometheusLogger.get_instance()
-            if prometheus_logger is not None:
-                prometheus_logger.set_model_group_saturation_ratio(
-                    model_group=model,
-                    saturation=saturation,
-                    litellm_params=data,
-                )
-        except Exception as e:  # noqa: BLE001  # a metrics failure must never change rate-limit enforcement
-            verbose_proxy_logger.debug("Error recording model group saturation metric: %s", e)
 
         try:
             saturation_threshold: Final = _get_priority_settings().saturation_threshold
@@ -654,7 +672,7 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
             # Phase 2: Decide which limits to enforce (based on saturation)
             # Phase 3: Increment ALL counters only if request will be allowed
             # This prevents partial increments and ensures accurate tracking
-            await self._check_rate_limits(
+            atomic_response: Final = await self._check_rate_limits(
                 model=model,
                 model_group_info=model_group_info,
                 user_api_key_dict=user_api_key_dict,
@@ -662,13 +680,25 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
                 saturation=saturation,
             )
 
+        except _ModelCapacityRateLimitError:
+            _record_model_group_saturation(
+                model=model, pre_read_saturation=max(saturation, 1.0), admission=None, data=data
+            )
+            raise
+        except ProxyRateLimitError:
+            _record_model_group_saturation(model=model, pre_read_saturation=saturation, admission=None, data=data)
+            raise
         except HTTPException:
             raise
         except Exception as e:
             verbose_proxy_logger.error("Error in dynamic rate limiter: %s, allowing request", e)
+            _record_model_group_saturation(model=model, pre_read_saturation=saturation, admission=None, data=data)
             # Fail open on unexpected errors
             return None
 
+        _record_model_group_saturation(
+            model=model, pre_read_saturation=saturation, admission=atomic_response, data=data
+        )
         return None
 
     @with_service_target("rate_limits")
@@ -715,9 +745,6 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
         from litellm.litellm_core_utils.core_helpers import (
             get_parent_otel_span_from_kwargs,
         )
-        from litellm.proxy.common_utils.callback_utils import (
-            get_model_group_from_litellm_kwargs,
-        )
         from litellm.types.caching import RedisPipelineIncrementOperation
         from litellm.types.utils import Usage
 
@@ -726,19 +753,12 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
 
             litellm_parent_otel_span: Final = get_parent_otel_span_from_kwargs(kwargs)
 
-            # Get metadata from standard_logging_object
-            standard_logging_object: Final = kwargs.get("standard_logging_object") or {}
-            standard_logging_metadata: Final = standard_logging_object.get("metadata") or {}
-
             # Get model and priority
-            model_group: Final = get_model_group_from_litellm_kwargs(kwargs)
+            model_group: Final = _routed_model_group(kwargs.get("litellm_params"))
             if not model_group:
                 return
 
-            # Get priority from user_api_key_auth_metadata in standard_logging_metadata
-            # This is where user_api_key_dict.metadata is stored during pre-call
-            user_api_key_auth_metadata: Final = standard_logging_metadata.get("user_api_key_auth_metadata") or {}
-            key_priority: Final[str | None] = user_api_key_auth_metadata.get("priority")
+            priority: Final = team_priority_label(kwargs.get("litellm_params")) or None
 
             # Get total tokens from response
             total_tokens = 0
@@ -774,22 +794,9 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
                 )
             )
 
-            # Priority-specific token tracking (priority_model)
-            # Determine priority key (same logic as _get_priority_allocation)
-            has_explicit_priority: Final = (
-                key_priority is not None
-                and litellm.priority_reservation is not None
-                and key_priority in litellm.priority_reservation
-            )
-
-            if has_explicit_priority and key_priority is not None:
-                priority_key = f"{model_group}:{key_priority}"
-            else:
-                priority_key = f"{model_group}:default_pool"
-
             priority_token_key: Final = self.v3_limiter.create_rate_limit_keys(
                 key="priority_model",
-                value=priority_key,
+                value=_priority_pool_key(model_group, priority),
                 rate_limit_type="tokens",
             )
             pipeline_operations.append(
@@ -809,7 +816,7 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
 
                 # Only log 'priority' if it's known safe; otherwise, redact.
                 SAFE_PRIORITIES: Final = {"low", "medium", "high", "default"}
-                logged_priority: Final = key_priority if key_priority in SAFE_PRIORITIES else "REDACTED"
+                logged_priority: Final = priority if priority in SAFE_PRIORITIES else "REDACTED"
                 verbose_proxy_logger.debug(
                     "[Dynamic Rate Limiter] Incremented tokens by %s for model=%s, priority=%s",
                     total_tokens,

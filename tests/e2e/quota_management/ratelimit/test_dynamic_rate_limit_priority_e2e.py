@@ -4,11 +4,11 @@ Covers quota_management.ratelimit.priority_generous / priority_strict: with
 `dynamic_rate_limiter_v3` enabled, a model's TPM capacity is split into priority
 reservations, but a reservation is only enforced once the model is saturated.
 
-- Generous mode (recorded usage below the saturation threshold): a key whose
+- Generous mode (recorded usage below the saturation threshold): a team whose
   priority reserves 25% of capacity keeps serving past its reservation,
   borrowing the idle capacity (priority_generous.picks_under_tpm)
-- Strict mode (recorded usage at/over the threshold): the over-reservation key
-  is blocked with the priority-flavored 429 while a key of a different priority,
+- Strict mode (recorded usage at/over the threshold): the over-reservation team
+  is blocked with the priority-flavored 429 while a team of a different priority,
   still inside its own reservation, is served (priority_strict.picks_under_tpm)
 
 The proxy under test must run with this config (and LITELLM_LICENSE set, since
@@ -48,7 +48,7 @@ from e2e_config import unique_marker
 from e2e_http import StreamingResponse, require_successful_call
 from e2e_metadata import Domain, Mode, Provider, Subject, meta
 from lifecycle import ResourceManager
-from models import KeyGenerateBody, KeyMetadata, LiteLLMParamsBody
+from models import KeyGenerateBody, LiteLLMParamsBody, TeamMetadata, TeamNewBody
 from quota_client import QuotaClient
 
 pytestmark = pytest.mark.e2e
@@ -106,10 +106,18 @@ def _dynamic_limited_model(client: QuotaClient, resources: ResourceManager, labe
     resources.defer(lambda: client.proxy.delete_model(model_id))
 
     def _priority_key(priority: str) -> str:
+        team_id = client.proxy.create_team(
+            TeamNewBody(
+                team_alias=f"e2e-dynpri-{label}-{priority}-{unique_marker()}",
+                models=[model],
+                metadata=TeamMetadata(priority=priority),
+            )
+        )
+        resources.defer(lambda: client.proxy.delete_team(team_id))
         key = client.proxy.generate_key(
             KeyGenerateBody(
                 models=[model],
-                metadata=KeyMetadata(priority=priority),
+                team_id=team_id,
                 key_alias=f"e2e-dynpri-{label}-{priority}-{unique_marker()}",
             )
         )
