@@ -114,7 +114,10 @@ from litellm.proxy.auth.auth_utils import (
     enforce_output_token_estimates_are_admin_only,
 )
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
-from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_broadcast
+from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import (
+    evict_and_broadcast,
+    publish_auth_cache_invalidation,
+)
 from litellm.proxy.common_utils.callback_utils import encrypt_callback_vars
 from litellm.proxy.common_utils.json_merge_patch import apply_json_merge_patch
 from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
@@ -480,14 +483,19 @@ async def refresh_cached_team(
     `team_row` is the Prisma row returned by `update`/`find_unique` on
     `litellm_teamtable`. It is converted to `LiteLLM_TeamTableCachedObj`
     via `model_dump()` to match the cache shape `_cache_team_object`
-    expects.
+    expects. That write also replaces the team's last good entry, and the
+    broadcast drops every other pod's copies of the team, by id and by alias.
     """
+    team_table: Final = LiteLLM_TeamTableCachedObj.model_validate(team_row.model_dump())
     await cache_team_object(
         team_id=team_row.team_id,
-        team_table=LiteLLM_TeamTableCachedObj.model_validate(team_row.model_dump()),
+        team_table=team_table,
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
     )
+    alias_keys: Final = (f"team_alias:{team_table.team_alias}",) if team_table.team_alias else ()
+    for cache_key in (f"team_id:{team_row.team_id}", *alias_keys):
+        await publish_auth_cache_invalidation(cache_key=cache_key)
 
 
 _refresh_cached_team: Final = refresh_cached_team
@@ -2577,6 +2585,10 @@ async def update_team(
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
         )
+        if existing_team.team_alias and data.team_alias is not None and data.team_alias != existing_team.team_alias:
+            await evict_and_broadcast(
+                cache_keys=(f"team_alias:{existing_team.team_alias}",), user_api_key_cache=user_api_key_cache
+            )
 
         if is_audit_logging_enabled():
             await _create_team_update_audit_log(
@@ -3769,6 +3781,7 @@ async def _team_member_delete(
         hashed_tokens=tuple(key.token for key in keys_to_delete),
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
+        revoked=True,
     )
     await evict_and_broadcast(cache_keys=jwt_mapping_cache_keys, user_api_key_cache=user_api_key_cache)
     await evict_and_broadcast(cache_keys=tuple(sorted(user_ids_to_delete)), user_api_key_cache=user_api_key_cache)
@@ -4589,6 +4602,7 @@ async def _invalidate_deleted_key_cache(
         hashed_tokens=tuple(key.token for key in keys),
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
+        revoked=True,
     )
 
 
@@ -4604,6 +4618,7 @@ async def _invalidate_deleted_team_cache(
                 team_alias=team.team_alias,
                 user_api_key_cache=user_api_key_cache,
                 proxy_logging_obj=proxy_logging_obj,
+                revoked=True,
             )
             for team in teams
         )
@@ -5183,30 +5198,7 @@ async def block_team(
 
 
     """
-    from litellm.proxy.proxy_server import prisma_client
-
-    if prisma_client is None:
-        raise Exception("No DB Connected.")
-
-    existing_team: Final = await _team_db(prisma_client).find_unique(where={"team_id": data.team_id})
-    if existing_team is None:
-        raise HTTPException(
-            status_code=404,
-            detail={"error": f"Team not found, passed team_id={data.team_id}"},
-        )
-
-    # Verify caller has access to manage this team
-    if not await get_team_access().allows(
-        user_api_key_dict, LiteLLM_TeamTable.model_validate(existing_team.model_dump()), TEAM_OR_ORG_ADMIN
-    ):
-        team_access_denied()
-
-    record: Final = await _team_db(prisma_client).update(
-        where={"team_id": data.team_id},
-        data={"blocked": True},
-    )
-
-    return record
+    return await _set_team_blocked(team_id=data.team_id, user_api_key_dict=user_api_key_dict, blocked=True)
 
 
 @router.post("/team/unblock", tags=["team management"], dependencies=[Depends(user_api_key_auth)])
@@ -5232,16 +5224,24 @@ async def unblock_team(
     }'
     ```
     """
+    return await _set_team_blocked(team_id=data.team_id, user_api_key_dict=user_api_key_dict, blocked=False)
+
+
+async def _set_team_blocked(
+    team_id: str, user_api_key_dict: UserAPIKeyAuth, blocked: bool
+) -> "prisma_models.LiteLLM_TeamTable | None":
+    """Write the team's ``blocked`` flag, then evict the team everywhere it is cached, its last good entry
+    included, so neither a live pod nor a later database outage serves the team as it was."""
     from litellm.proxy.proxy_server import prisma_client
 
     if prisma_client is None:
         raise Exception("No DB Connected.")
 
-    existing_team: Final = await _team_db(prisma_client).find_unique(where={"team_id": data.team_id})
+    existing_team: Final = await _team_db(prisma_client).find_unique(where={"team_id": team_id})
     if existing_team is None:
         raise HTTPException(
             status_code=404,
-            detail={"error": f"Team not found, passed team_id={data.team_id}"},
+            detail={"error": f"Team not found, passed team_id={team_id}"},
         )
 
     # Verify caller has access to manage this team
@@ -5250,11 +5250,8 @@ async def unblock_team(
     ):
         team_access_denied()
 
-    record: Final = await _team_db(prisma_client).update(
-        where={"team_id": data.team_id},
-        data={"blocked": False},
-    )
-
+    record: Final = await _team_db(prisma_client).update(where={"team_id": team_id}, data={"blocked": blocked})
+    await _evict_cached_teams(((team_id, existing_team.team_alias),), revoked=blocked)
     return record
 
 
@@ -6402,6 +6399,7 @@ async def update_team_member_permissions(
             detail={"error": f"Team not found, passed team_id={data.team_id}"},
         )
 
+    await _evict_cached_teams(((data.team_id, complete_team_data.team_alias),))
     return updated_team  # pyright: ignore[reportReturnType]  # prisma row, coerced by this route's response_model
 
 
@@ -6471,7 +6469,7 @@ async def _compute_and_batch_updates(
     prisma_client, teams: "Sequence[prisma_models.LiteLLM_TeamTable]", permissions_to_add: set
 ) -> int:
     """Compute merged permissions and batch-write updates. Returns count of teams updated."""
-    updates: Final = []
+    updates: Final[list[tuple[str, list[str]]]] = []  # mutable-ok: legacy batch accumulator
     for team in teams:
         existing = set(team.team_member_permissions or [])
         if permissions_to_add <= existing:
@@ -6487,8 +6485,23 @@ async def _compute_and_batch_updates(
                 data={"team_member_permissions": merged_perms},
             )
         await batcher.commit()
+        aliases: Final = {team.team_id: team.team_alias for team in teams}
+        await _evict_cached_teams(tuple((team_id, aliases.get(team_id)) for team_id, _ in updates))
 
     return len(updates)
+
+
+async def _evict_cached_teams(teams: Sequence[tuple[str, str | None]], *, revoked: bool = False) -> None:
+    from litellm.proxy.proxy_server import proxy_logging_obj, user_api_key_cache
+
+    for team_id, team_alias in teams:
+        await delete_cache_team_object(
+            team_id=team_id,
+            team_alias=team_alias,
+            user_api_key_cache=user_api_key_cache,
+            proxy_logging_obj=proxy_logging_obj,
+            revoked=revoked,
+        )
 
 
 async def _append_permissions_to_specific_teams(

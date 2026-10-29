@@ -1086,6 +1086,7 @@ async def _delete_organization_keys(
         hashed_tokens=hashed_tokens_to_delete,
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
+        revoked=True,
     )
     await evict_and_broadcast(cache_keys=jwt_mapping_cache_keys, user_api_key_cache=user_api_key_cache)
 

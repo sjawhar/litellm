@@ -6969,6 +6969,20 @@ class ProxyConfig:
                     default_redis_ttl=ttl,
                 )
 
+            ### LAST GOOD AUTH ENTRIES (served while the database is unreachable) ###
+            user_api_key_cache.serve_last_good_entries = ConfigGeneralSettings.model_validate(
+                MappingProxyType(
+                    {"serve_last_good_auth_entries": typed_general_settings.get("serve_last_good_auth_entries", False)}
+                )
+            ).serve_last_good_auth_entries
+            verbose_proxy_logger.info(
+                "general_settings.serve_last_good_auth_entries=%s: the last good team and key entries are %s",
+                user_api_key_cache.serve_last_good_entries,
+                "served while the database is unreachable"
+                if user_api_key_cache.serve_last_good_entries
+                else "not kept, so a database outage refuses every caller whose cached entry has expired",
+            )
+
             ### USER API KEY CACHE MAX SIZE (in-memory tier shared by keys, teams, users, end users, ...) ###
             if "user_api_key_cache_max_size" in general_settings:
                 user_api_key_cache.update_in_memory_max_size(

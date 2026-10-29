@@ -99,6 +99,7 @@ async def revoke_ui_session_keys(
             hashed_tokens=revoked_tokens,
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
+            revoked=True,
         )
         verbose_proxy_logger.info(
             "Revoked %s UI session key(s) for user_id=%s after password change",
@@ -166,6 +167,7 @@ async def session_logout(
             hashed_tokens=(hashed_token,),
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
+            revoked=True,
         )
 
     # The server set this cookie at login (set_session_token_cookie); clear it

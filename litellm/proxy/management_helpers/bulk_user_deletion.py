@@ -344,6 +344,7 @@ async def bulk_remove_team_members(
         hashed_tokens=removal.deleted_key_tokens,
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
+        revoked=True,
     )
     await evict_and_broadcast(cache_keys=removal.jwt_mapping_cache_keys, user_api_key_cache=user_api_key_cache)
     _emit_team_members_metric(removal.team)
@@ -489,6 +490,7 @@ async def _delete_users(
         hashed_tokens=deletion.deleted_key_tokens,
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
+        revoked=True,
     )
     await evict_and_broadcast(cache_keys=deletion.jwt_mapping_cache_keys, user_api_key_cache=user_api_key_cache)
     await evict_and_broadcast(cache_keys=sorted(user_ids), user_api_key_cache=user_api_key_cache)

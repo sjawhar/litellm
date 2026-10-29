@@ -16,6 +16,7 @@ from litellm.proxy.auth.auth_checks import (  # noqa: F401  # legacy module expo
     copy_user_api_key_auth_for_cache,
     fetch_key_object_from_db_with_reconnect,
     get_object_permission,
+    recall_last_good_after,
 )
 from litellm.proxy.auth.auth_method import AuthMethod
 from litellm.proxy.auth.network import NetworkContext
@@ -36,7 +37,7 @@ from litellm.proxy.auth.resolvers.models import (
     UserIdentity,
 )
 from litellm.proxy.auth.roles import TeamRole, map_role, team_role
-from litellm.proxy.common_utils.user_api_key_cache import AUTH_OBJECTS_TARGET
+from litellm.proxy.common_utils.user_api_key_cache import AUTH_OBJECTS_TARGET, forget_last_good, remember_last_good
 
 if TYPE_CHECKING:
     from litellm.caching.caching import DualCache
@@ -116,15 +117,21 @@ class IdentityStore:
         if self._check_cache_only:
             raise KeyNotInCacheError(hashed_token)
 
-        from_db: Final[BaseModel | None] = await fetch_key_object_from_db_with_reconnect(
-            hashed_token=hashed_token,
-            prisma_client=self._prisma,
-            parent_otel_span=self._parent_otel_span,
-            proxy_logging_obj=self._proxy_logging_obj,
-        )
+        try:
+            from_db: Final[BaseModel | None] = await fetch_key_object_from_db_with_reconnect(
+                hashed_token=hashed_token,
+                prisma_client=self._prisma,
+                parent_otel_span=self._parent_otel_span,
+                proxy_logging_obj=self._proxy_logging_obj,
+            )
+        except Exception as e:
+            served: Final = await recall_last_good_after(e, self._cache, hashed_token, UserAPIKeyAuth)
+            if served is None:
+                raise
+            return served
         if from_db is None:
+            await forget_last_good(self._cache, hashed_token)
             raise KeyNotFoundError(hashed_token)
-
         key: Final = UserAPIKeyAuth.model_validate(from_db.model_dump(exclude_none=True))
 
         if key.object_permission_id and not key.object_permission:
@@ -149,6 +156,7 @@ class IdentityStore:
             user_api_key_cache=self._cache,
             proxy_logging_obj=self._proxy_logging_obj,
         )
+        await remember_last_good(self._cache, hashed_token, copy_user_api_key_auth_for_cache(user_api_key_obj=key))
         return key
 
     @staticmethod

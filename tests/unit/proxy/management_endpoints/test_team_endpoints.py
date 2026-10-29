@@ -16852,3 +16852,88 @@ def test_aggregated_date_range_error_accepts_canonical_dates_and_keeps_range_che
     assert aggregated_date_range_error("2026-09-24", "2026-09-26") is None
     assert aggregated_date_range_error("2026-09-26", "2026-09-24") == "end_date must be on or after start_date"
     assert aggregated_date_range_error("2020-01-01", "2026-12-31") == "Date range must be at most 400 days"
+
+
+class _BlockableTeamRows:
+    def __init__(self, team: LiteLLM_TeamTable) -> None:
+        self.team = team
+
+    async def find_unique(self, where: dict[str, str], **kwargs: object) -> LiteLLM_TeamTable:
+        return self.team
+
+    async def update(self, where: dict[str, str], data: dict[str, bool], **kwargs: object) -> LiteLLM_TeamTable:
+        self.team = self.team.model_copy(update=data)
+        return self.team
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_after", [True, False], ids=["block", "unblock"])
+async def test_team_block_and_unblock_drop_the_cached_team_and_its_last_good_entry(monkeypatch, blocked_after: bool):
+    """A blocked team must be refused even when the database stops right after the block, and an unblocked one
+    must not keep its blocked copy, so both endpoints evict the cached team and forget its last good entry."""
+    from fastapi import Request
+
+    from litellm.models.team import LiteLLM_TeamTableCachedObj
+    from litellm.proxy._types import BlockTeamRequest
+    from litellm.proxy.auth.auth_checks import cache_team_object, get_team_object_from_cache
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, recall_last_good
+    from litellm.proxy.management_endpoints.team_endpoints import block_team, unblock_team
+
+    team: Final = LiteLLM_TeamTable(team_id="t1", team_alias="lanes", blocked=not blocked_after)
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    await cache_team_object(
+        team_id="t1",
+        team_table=LiteLLM_TeamTableCachedObj.model_validate(team.model_dump()),
+        user_api_key_cache=cache,
+        proxy_logging_obj=None,
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.proxy_server.prisma_client", SimpleNamespace(db=SimpleNamespace(litellm_teamtable=_BlockableTeamRows(team)))
+    )
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
+    assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) is not None
+
+    endpoint: Final = block_team if blocked_after else unblock_team
+    record: Final = await endpoint(
+        data=BlockTeamRequest(team_id="t1"),
+        http_request=MagicMock(spec=Request),
+        user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN, user_id="admin"),
+    )
+
+    assert record.blocked is blocked_after
+    assert await get_team_object_from_cache(key="team_id:t1", user_api_key_cache=cache, parent_otel_span=None) is None
+    assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_cached_team_overwrites_the_last_good_entry_and_tells_every_pod(monkeypatch):
+    from litellm.models.team import LiteLLM_TeamTableCachedObj
+    from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import AUTH_CACHE_INVALIDATION_CHANNEL
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, recall_last_good, remember_last_good
+    from litellm.proxy.management_endpoints.team_endpoints import refresh_cached_team
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis: Final = fake_redis_cache()
+    cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+    await remember_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj(team_id="t1", models=["claude-opus-4-8"]))
+    pubsub: Final = redis.cache.init_async_client().pubsub()
+    await pubsub.subscribe(AUTH_CACHE_INVALIDATION_CHANNEL)
+    monkeypatch.setattr(
+        "litellm.proxy.common_utils.auth_cache_invalidation_pubsub.coordination_redis_cache", lambda: redis.cache
+    )
+
+    await refresh_cached_team(
+        team_row=LiteLLM_TeamTable(team_id="t1", models=["claude-opus-5-5"]),
+        user_api_key_cache=cache,
+        proxy_logging_obj=None,  # pyright: ignore[reportArgumentType]  # no usage cache to clear in this test
+    )
+
+    refreshed: Final = await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj)
+    assert refreshed is not None and refreshed.models == ["claude-opus-5-5"]
+    published: Final = [
+        message
+        for _ in range(200)
+        if (message := await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.01)) is not None
+    ]
+    assert [json.loads(message["data"])["cache_key"] for message in published] == ["team_id:t1"]
+    await pubsub.aclose()

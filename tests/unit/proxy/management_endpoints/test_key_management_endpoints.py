@@ -5604,6 +5604,64 @@ async def test_delete_verification_tokens_evicts_jwt_key_mapping_cache(monkeypat
     )
 
 
+async def _next_invalidation(pubsub) -> str:
+    for _ in range(200):
+        message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.01)
+        if message is not None:
+            return json.loads(message["data"])["cache_key"]
+    raise AssertionError("no auth cache invalidation was published")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("passed_as", ["hashed_token", "raw_key"])
+async def test_delete_verification_tokens_forgets_the_last_good_entry_here_and_on_every_pod(monkeypatch, passed_as):
+    """A deleted key is refused even when the database stops right after the delete: its cached object and last
+    good entry go from Redis and this pod's memory, and the eviction is broadcast so every other pod drops its
+    copy. Both are stored under the hashed token, whichever form /key/delete was given."""
+    from litellm.proxy._types import hash_token
+    from litellm.proxy.auth.auth_checks import cache_key_object
+    from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import AUTH_CACHE_INVALIDATION_CHANNEL
+    from litellm.proxy.common_utils.user_api_key_cache import recall_last_good, remember_last_good
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    raw_key = "sk-lane-key-1"
+    hashed = hash_token(raw_key)
+    redis = fake_redis_cache()
+    cache = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+    await cache_key_object(
+        hashed_token=hashed, user_api_key_obj=UserAPIKeyAuth(token=hashed), user_api_key_cache=cache, proxy_logging_obj=None
+    )
+    await remember_last_good(cache, hashed, UserAPIKeyAuth(token=hashed))
+    pubsub = redis.cache.init_async_client().pubsub()
+    await pubsub.subscribe(AUTH_CACHE_INVALIDATION_CHANNEL)
+
+    mock_prisma_client = AsyncMock()
+    mock_prisma_client.db.litellm_verificationtoken.find_many = AsyncMock(
+        return_value=[LiteLLM_VerificationToken(token=hashed, key_alias="lane")]
+    )
+    mock_prisma_client.db.litellm_jwtkeymapping = _CascadingJWTMappingTable([])
+    mock_prisma_client.db.litellm_deletedverificationtoken.create_many = AsyncMock()
+    mock_prisma_client.delete_data = AsyncMock(return_value=[hashed])
+    monkeypatch.setattr(
+        "litellm.proxy.common_utils.auth_cache_invalidation_pubsub.coordination_redis_cache", lambda: redis.cache
+    )
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", mock_prisma_client)
+
+    await delete_verification_tokens(
+        tokens=[hashed if passed_as == "hashed_token" else raw_key],
+        user_api_key_cache=cache,
+        user_api_key_dict=UserAPIKeyAuth(user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN.value),
+    )
+
+    assert await cache.async_get_cache(key=hashed, model_type=UserAPIKeyAuth) is None
+    assert await recall_last_good(cache, hashed, UserAPIKeyAuth) is None
+    redis.server.connected = False
+    assert await recall_last_good(cache, hashed, UserAPIKeyAuth) is None
+    redis.server.connected = True
+    assert await _next_invalidation(pubsub) == hashed
+    await pubsub.aclose()
+
+
 @pytest.mark.asyncio
 async def test_delete_key_fn_persists_deleted_keys(monkeypatch):
     from litellm.proxy._types import KeyRequest
