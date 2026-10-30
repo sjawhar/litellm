@@ -602,7 +602,10 @@ from litellm.proxy.hooks.model_max_budget_limiter import (  # noqa: F401, RUF100
     PROXY_VirtualKeyModelMaxBudgetLimiter,
     _PROXY_VirtualKeyModelMaxBudgetLimiter,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
 )
-from litellm.proxy.hooks.parallel_request_limiter_v3 import fail_closed_rate_limit_enforcement_enabled
+from litellm.proxy.hooks.parallel_request_limiter_v3 import (
+    fail_closed_rate_limit_enforcement_enabled,
+    warn_rate_limits_are_per_worker,
+)
 from litellm.proxy.hooks.prompt_injection_detection import (  # noqa: F401, RUF100  # legacy module exports
     OPTIONAL_PromptInjectionDetection,
     _OPTIONAL_PromptInjectionDetection,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
@@ -6911,6 +6914,7 @@ class ProxyConfig:
 
         if os.getenv("NUM_WORKERS", "1") != "1" and redis_usage_cache is None:
             warn_login_counters_are_per_worker(os.getenv("NUM_WORKERS", "1"))
+            warn_rate_limits_are_per_worker(os.getenv("NUM_WORKERS", "1"))
         if declared_proxy_ranges(general_settings) is None:
             warn_source_login_limit_is_off()
 
