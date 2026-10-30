@@ -2,6 +2,7 @@ import datetime
 import logging
 import sys
 from itertools import chain
+from typing import Final
 
 import pytest
 from prometheus_client import REGISTRY
@@ -356,6 +357,51 @@ async def test_auth_gate_rejection_labels_every_failure_series_with_the_key_team
         "litellm_llm_api_failed_requests_metric_total",
     } <= labels_by_metric.keys()
     assert {name: {expected_priority} for name in labels_by_metric} == labels_by_metric
+
+
+def _client_labels_by_metric() -> dict[str, set[tuple[str, str]]]:
+    samples: Final = chain.from_iterable(metric.samples for metric in REGISTRY.collect())
+    labelled: Final = [
+        sample for sample in samples if "client_ip" in sample.labels and not sample.name.endswith("_created")
+    ]
+    return {
+        name: {(sample.labels["client_ip"], sample.labels["user_agent"]) for sample in labelled if sample.name == name}
+        for name in {sample.name for sample in labelled}
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("proxy_bucket", ("metadata", "litellm_metadata"))
+async def test_client_failure_ip_and_agent_labels_come_from_the_bucket_the_proxy_stamped(proxy_bucket: str):
+    """Routes such as /v1/messages keep the proxy's own metadata under litellm_metadata and leave the caller's
+    provider metadata at the top level, so reading the two client labels from metadata would take the caller's
+    strings on a post-auth failure and mint one series each."""
+
+    _clear_prometheus_registry()
+    prometheus_logger: Final = PrometheusLogger()
+    stamped: Final = {
+        "user_api_key_auth": UserAPIKeyAuth(token="hashed-key"),
+        "requester_ip_address": "10.1.2.3",
+        "user_agent": "real-client/1.0",
+    }
+    forged: Final = {"requester_ip_address": "9.9.9.9", "user_agent": "forged-agent"}
+    request_data: Final = {
+        "model": "gpt-4o-mini",
+        proxy_bucket: stamped,
+        **({"metadata": forged} if proxy_bucket == "litellm_metadata" else {}),
+    }
+
+    await prometheus_logger.async_post_call_failure_hook(
+        request_data=request_data,
+        original_exception=litellm.BudgetExceededError(current_cost=2.0, max_budget=1.0),
+        user_api_key_dict=UserAPIKeyAuth(token="hashed-key"),
+    )
+
+    expected: Final = {("10.1.2.3", "real-client/1.0")}
+    assert _client_labels_by_metric() == {
+        name: expected
+        for name in ("litellm_proxy_failed_requests_metric_total", "litellm_proxy_total_requests_metric_total")
+    }
 
 
 def test_virtual_key_rate_limit_metrics_accept_custom_metadata_labels(

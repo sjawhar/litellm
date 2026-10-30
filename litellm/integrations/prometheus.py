@@ -2887,6 +2887,7 @@ class PrometheusLogger(CustomLogger):
             StandardLoggingPayloadSetup,
         )
         from litellm.proxy.litellm_pre_call_utils import LiteLLMProxyRequestSetup
+        from litellm.proxy.utils import proxy_stamped_metadata_bucket
 
         status_code: Final = self._extract_status_code(exception=original_exception)
 
@@ -2896,6 +2897,7 @@ class PrometheusLogger(CustomLogger):
                 proxy_server_request=request_data.get("proxy_server_request", {}),
             )
             _metadata: Final = request_data.get("metadata", {}) or {}
+            _client_context: Final = proxy_stamped_metadata_bucket(request_data) or _metadata
             model_id: Final = _metadata.get("model_info", {}).get("id") or request_data.get("model_info", {}).get("id")
             rate_limit_category, rate_limit_type = self._extract_rate_limit_labels(original_exception)
             api_provider: Final = self._extract_api_provider_from_request_data(
@@ -2921,8 +2923,8 @@ class PrometheusLogger(CustomLogger):
                 rate_limit_type=rate_limit_type,
                 tags=_tags,
                 route=user_api_key_dict.request_route,
-                client_ip=_metadata.get("requester_ip_address"),
-                user_agent=_metadata.get("user_agent"),
+                client_ip=_client_context.get("requester_ip_address"),
+                user_agent=_client_context.get("user_agent"),
                 model_id=model_id,
                 api_provider=api_provider,
                 stream=(str(request_data.get("stream")) if litellm.prometheus_emit_stream_label else None),
