@@ -4496,7 +4496,7 @@ class ProxyLogging:
         user_api_key_dict: UserAPIKeyAuth,
     ) -> None:
         """
-        Release the api-key max_parallel_requests slot when a streaming
+        Release the max_parallel_requests slots (key and team) when a streaming
         response is cancelled mid-flight (client disconnect) and no logging
         callback fired for it. Neither the success nor failure callback runs on
         the resulting CancelledError / GeneratorExit, so the pre-call +1 would

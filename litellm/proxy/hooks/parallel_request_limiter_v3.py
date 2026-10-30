@@ -5284,7 +5284,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         user_api_key_dict: UserAPIKeyAuth,
     ) -> None:
         """
-        Release the api-key ``max_parallel_requests`` slot that
+        Release the ``max_parallel_requests`` slots (key and team) that
         ``async_pre_call_hook`` acquired, for a request that ended without
         either logging callback firing.
 
