@@ -14,5 +14,5 @@ def mark_admission_refusal(exception: BaseException) -> None:
     setattr(exception, _ADMISSION_REFUSAL_ATTR, True)
 
 
-def is_admission_refusal(exception: BaseException | None) -> bool:
+def is_admission_refusal(exception: BaseException) -> bool:
     return getattr(exception, _ADMISSION_REFUSAL_ATTR, False) is True

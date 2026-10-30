@@ -181,6 +181,7 @@ from litellm.types.vector_stores import (
     VectorStoreSearchResponse,
 )
 from litellm.types.videos.main import VideoObject
+from litellm.types.workload_identity import ANTHROPIC_WIF_KWARGS_KEYS
 from litellm.utils import (
     CustomStreamWrapper,
     ImageResponse,
@@ -2266,6 +2267,7 @@ class BaseLLMHTTPHandler:
                 "preset_cache_key": None,
                 "stream_response": {},
                 "model_info": kwargs.get("model_info"),
+                **{key: kwargs[key] for key in ANTHROPIC_WIF_KWARGS_KEYS if key in kwargs},
                 **vertex_location_params,
                 **anthropic_messages_optional_request_params,
             },
