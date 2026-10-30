@@ -19,7 +19,7 @@ from integration._support.wire import Reply, Request, wire_server
 pytestmark: Final = pytest.mark.timeout(6 * graceful_stop_seconds() + 120)
 
 KEY_ID: Final = "integration-team-parallel-signing-key"
-TEAM_LIMIT: Final = 2
+TEAM_LIMIT: Final = 3
 
 
 def _frame(identity: str, delta: dict[str, str], *, finish: str | None = None) -> bytes:
@@ -59,6 +59,9 @@ class Upstream:
         return gate
 
     def respond(self, request: Request) -> Reply:
+        if request.method == "GET":
+            assert request.target == "/v1/models", request
+            return Reply(body=b'{"object":"list","data":[]}')
         assert request.target == "/v1/chat/completions", request
         body: Final = json.loads(request.body)
         assert body["stream"] is True, body
@@ -155,9 +158,9 @@ def _jwks_reply(private_key: rsa.RSAPrivateKey) -> Reply:
 
 def test_team_parallel_limit_holds_across_pods_and_each_ending_frees_a_slot(gateway: Gateway, tmp_path: Path) -> None:
     """Three proxies share one Redis. A team caller signed in with a token has no key, so its team's
-    max_parallel_requests is its only concurrency limit: the team's third call in flight is refused on any pod, a key
-    on the same team counts against the same limit, and a stream that completes, one that fails mid-stream and one
-    the client abandons each free their slot for the next call"""
+    max_parallel_requests is its only concurrency limit. With a stream open on each pod, the team's next call is refused
+    on any pod, a key on the same team counts against the same limit, and a stream that completes, one that fails
+    mid-stream and one the client abandons each free exactly one slot"""
     private_key: Final = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     jwks_reply: Final = _jwks_reply(private_key)
     upstream_double: Final = Upstream()
@@ -190,7 +193,12 @@ def test_team_parallel_limit_holds_across_pods_and_each_ending_frees_a_slot(gate
         ):
             completing: Final = _open(first_pod, model, token, upstream_double, "success")
             failing: Final = _open(second_pod, model, team_key, upstream_double, "failure", fail=True)
-            assert isinstance(completing, Held) and isinstance(failing, Held), (completing, failing)
+            abandoned: Final = _open(third_pod, model, token, upstream_double, "abandoned")
+            assert isinstance(completing, Held) and isinstance(failing, Held) and isinstance(abandoned, Held), (
+                completing,
+                failing,
+                abandoned,
+            )
 
             for pod, credential in ((third_pod, token), (first_pod, team_key)):
                 refused = _refusal(pod, model, credential).text
@@ -198,17 +206,17 @@ def test_team_parallel_limit_holds_across_pods_and_each_ending_frees_a_slot(gate
 
             completing.gate.set()
             assert "data: [DONE]" in _read_to_end(completing)
-            abandoned: Final = _admitted(third_pod, model, token, upstream_double, "after-success")
-            _refusal(first_pod, model, token)
+            after_success: Final = _admitted(second_pod, model, token, upstream_double, "after-success")
+            _refusal(third_pod, model, token)
 
             failing.gate.set()
             assert "data: [DONE]" not in _read_to_end(failing)
-            last: Final = _admitted(first_pod, model, token, upstream_double, "after-failure")
-            _refusal(second_pod, model, token)
+            after_failure: Final = _admitted(third_pod, model, token, upstream_double, "after-failure")
+            _refusal(first_pod, model, token)
 
             abandoned.response.close()
-            after_disconnect: Final = _admitted(second_pod, model, token, upstream_double, "after-disconnect")
-            _refusal(third_pod, model, team_key)
+            after_disconnect: Final = _admitted(first_pod, model, token, upstream_double, "after-disconnect")
+            _refusal(second_pod, model, team_key)
 
-            for held in (last, after_disconnect):
+            for held in (after_success, after_failure, after_disconnect):
                 held.response.close()

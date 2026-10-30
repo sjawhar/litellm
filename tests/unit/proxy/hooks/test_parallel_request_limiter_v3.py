@@ -6,6 +6,7 @@ import asyncio
 import logging
 import sys
 import time
+import uuid
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -4373,7 +4374,7 @@ async def _refusal_on(pod: _PROXY_MaxParallelRequestsHandler, caller: UserAPIKey
         await pod.async_pre_call_hook(
             user_api_key_dict=caller,
             cache=pod.internal_usage_cache.dual_cache,
-            data={"model": "gpt-4o", "litellm_call_id": "refused-" + str(time.monotonic_ns())},
+            data={"model": "gpt-4o", "litellm_call_id": "refused-" + uuid.uuid4().hex},
             call_type="",
         )
     return refused.value
@@ -4386,10 +4387,7 @@ async def _end_request(
     stash: RequestRateLimiterStash,
 ) -> None:
     _request_stash.set(stash)
-    kwargs: Final = {
-        "litellm_call_id": stash.owner_litellm_call_id,
-        "standard_logging_object": {"metadata": {"user_api_key_team_id": _TEAM_SLOT_TEAM_ID}},
-    }
+    kwargs: Final = {"litellm_call_id": stash.owner_litellm_call_id}
     if ending == "success":
         await pod.async_log_success_event(
             kwargs=kwargs,
