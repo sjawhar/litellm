@@ -130,12 +130,13 @@ async def publish_auth_cache_invalidation(
 @with_service_target(AUTH_OBJECTS_TARGET)
 async def evict_and_broadcast(cache_keys: Sequence[str], user_api_key_cache: "UserApiKeyCache") -> None:
     """
-    Drop cached management objects here and on every other worker.
+    Drop cached management objects, and their last good entries, here and on every other worker.
 
     Every endpoint that mutates a cached object must call this: auth serves those objects
     cache-first with no freshness check, so a mutation that leaves the entry in place keeps the
-    stale object enforced until its TTL expires (LIT-3803). Best-effort: the DB write has already
-    committed, so a cache backend error must not fail the endpoint.
+    stale object enforced until its TTL expires (LIT-3803), and a last good entry, which never
+    expires, would serve it during every later database outage. Best-effort: the DB write has
+    already committed, so a cache backend error must not fail the endpoint.
     """
     for cache_key in cache_keys:
         try:
@@ -146,6 +147,7 @@ async def evict_and_broadcast(cache_keys: Sequence[str], user_api_key_cache: "Us
                 cache_key,
                 e,
             )
+        await forget_last_good(user_api_key_cache, cache_key)
         await publish_auth_cache_invalidation(cache_key=cache_key)
 
 

@@ -40,6 +40,7 @@ from litellm.proxy.auth.auth_checks import (
     delete_cache_team_object,
     get_jwt_key_mapping_cache_keys_for_tokens,
     get_user_object,
+    organization_cache_keys,
     team_cache_keys,
 )
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
@@ -714,7 +715,7 @@ async def update_organization(
     """
     Update an organization
     """
-    from litellm.proxy.proxy_server import prisma_client
+    from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
 
     if prisma_client is None:
         raise HTTPException(
@@ -821,6 +822,9 @@ async def update_organization(
         data=updated_organization_row,
         include={"members": True, "teams": True, "litellm_budget_table": True},
     )
+    await evict_and_broadcast(
+        cache_keys=organization_cache_keys(data.organization_id), user_api_key_cache=user_api_key_cache
+    )
 
     return response
 
@@ -873,7 +877,7 @@ async def update_organization_v2(
     Validation failures return 422; the object-permission upsert, budget-row write, and
     org-row write are one transaction.
     """
-    from litellm.proxy.proxy_server import prisma_client
+    from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
 
     if prisma_client is None:
         raise HTTPException(
@@ -1011,6 +1015,10 @@ async def update_organization_v2(
             include={"members": True, "teams": True, "litellm_budget_table": True},
         )
 
+    await evict_and_broadcast(
+        cache_keys=organization_cache_keys(organization_id), user_api_key_cache=user_api_key_cache
+    )
+
     return response
 
 
@@ -1074,6 +1082,9 @@ async def delete_organization(
                 detail={"error": f"Organization={organization_id} not found"},
             )
         deleted_orgs.append(deleted_org)
+        await evict_and_broadcast(
+            cache_keys=organization_cache_keys(organization_id), user_api_key_cache=user_api_key_cache
+        )
 
     return deleted_orgs
 

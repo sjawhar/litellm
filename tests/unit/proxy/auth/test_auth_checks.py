@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest, litellm
 import httpx
 from prisma import Prisma
+from pydantic import BaseModel
 from litellm._service_logger import ServiceTypes
 from litellm.proxy._types import LiteLLM_OrganizationTable, UserAPIKeyAuth
 from litellm.proxy.auth.auth_checks import get_org_object, get_user_object
@@ -39,6 +40,7 @@ from litellm.proxy.auth.auth_checks import (
 from litellm.proxy.utils import ProxyLogging
 from litellm.proxy.utils import CallInfo
 from tests.unit.caching.fake_redis_cache import fake_redis_cache
+from tests.unit.proxy.db.cancelled_statements import CancelReason, cancelled_statement
 from litellm.proxy.common_utils.user_api_key_cache import remember_last_good
 
 
@@ -1642,35 +1644,42 @@ def test_is_model_cost_zero_judges_an_alias_chain_by_the_deployment_its_entry_ro
 
 
 class _TeamRows:
-    def __init__(self, database: "_Database") -> None:
+    def __init__(self, database: "_Database", *, writer: bool = False) -> None:
         self._database = database
+        self._writer = writer
 
     async def find_unique(self, where: dict[str, str], include: object = None) -> LiteLLM_TeamTable | None:
-        self._database.answer()
+        self._database.answer(writer=self._writer)
         return self._database.teams.get(where["team_id"])
 
     async def find_many(self, where: dict[str, str], include: object = None) -> list[LiteLLM_TeamTable]:
-        self._database.answer()
+        self._database.answer(writer=self._writer)
         return [team for team in self._database.teams.values() if team.team_alias == where["team_alias"]]
 
 
 class _Database:
-    """Answers team and key reads from its rows, or fails every read with ``stopped_with`` once stopped."""
+    """Answers team and key reads from its rows, on the reader or the writer, or fails every read with
+    ``stopped_with`` once stopped."""
 
     def __init__(self) -> None:
         self.teams: dict[str, LiteLLM_TeamTable] = {}
         self.keys: dict[str, UserAPIKeyAuth] = {}
         self.stopped_with: Exception | None = None
         self.reads = 0
+        self.writer_reads = 0
         self.db = SimpleNamespace(litellm_teamtable=_TeamRows(self))
+        self.writer_db = SimpleNamespace(litellm_teamtable=_TeamRows(self, writer=True))
 
-    def answer(self) -> None:
+    def answer(self, *, writer: bool = False) -> None:
         self.reads += 1
+        self.writer_reads += writer
         if self.stopped_with is not None:
             raise self.stopped_with
 
-    async def get_data(self, token: str, table_name: str, parent_otel_span: object, proxy_logging_obj: object):
-        self.answer()
+    async def get_data(
+        self, token: str, table_name: str, parent_otel_span: object, proxy_logging_obj: object, use_writer: bool = False
+    ):
+        self.answer(writer=use_writer)
         return self.keys.get(token)
 
     async def attempt_db_reconnect(self, *, reason: str, timeout_seconds: float, lock_timeout_seconds: float) -> bool:
@@ -1704,8 +1713,10 @@ class _HeldDatabase(_Database):
         await self.release.wait()
         return row
 
-    async def get_data(self, token: str, table_name: str, parent_otel_span: object, proxy_logging_obj: object):
-        self.answer()
+    async def get_data(
+        self, token: str, table_name: str, parent_otel_span: object, proxy_logging_obj: object, use_writer: bool = False
+    ):
+        self.answer(writer=use_writer)
         return await self.held(self.keys.get(token))
 
 
@@ -1839,22 +1850,51 @@ class TestLastGoodEntryWhileTheDatabaseIsUnreachable:
 
     @pytest.mark.asyncio
     async def test_authoritative_team_read_is_never_served_a_last_good_entry(self):
+        """``check_db_only`` is the authoritative read behind team admin checks: it reads the writer, and a writer
+        that cannot be reached refuses rather than answering from the last good entry the cached read serves."""
         from fastapi import HTTPException
         from litellm.proxy.auth.auth_checks import get_team_object
 
         database = _Database()
-        database.teams["t1"] = LiteLLM_TeamTable(team_id="t1", models=["claude-opus-5-5"])
+        database.teams["t-authoritative"] = LiteLLM_TeamTable(team_id="t-authoritative", models=["claude-opus-5-5"])
         cache = _serving_cache()
-        await self._team(database, cache, "t1")
+        await self._team(database, cache, "t-authoritative")
+        await self._expire(cache, "team_id:t-authoritative")
         database.stopped_with = _STOPPED
+        assert (await self._team(database, cache, "t-authoritative")).models == ["claude-opus-5-5"]
 
-        with pytest.raises(HTTPException):
+        with pytest.raises(HTTPException) as refused:
             await get_team_object(
-                team_id="t1",
+                team_id="t-authoritative",
                 prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
                 user_api_key_cache=cache,
                 check_db_only=True,
             )
+
+        assert refused.value.status_code == 404
+        assert database.writer_reads == 1
+
+    @pytest.mark.asyncio
+    async def test_authoritative_key_read_is_never_served_a_last_good_entry(self):
+        from litellm.proxy.auth.auth_checks import get_key_object
+
+        database = _Database()
+        database.keys["k-authoritative"] = UserAPIKeyAuth(token="k-authoritative", models=["claude-opus-5-5"])
+        cache = _serving_cache()
+        await self._key(database, cache, "k-authoritative")
+        await self._expire(cache, "k-authoritative")
+        database.stopped_with = _STOPPED
+        assert (await self._key(database, cache, "k-authoritative")).token == "k-authoritative"
+
+        with pytest.raises(httpx.ConnectError):
+            await get_key_object(
+                hashed_token="k-authoritative",
+                prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+                user_api_key_cache=cache,
+                check_db_only=True,
+            )
+
+        assert database.writer_reads == 1
 
     @pytest.mark.asyncio
     async def test_memory_line_serves_the_team_while_redis_is_away_too(self):
@@ -2098,6 +2138,35 @@ class TestLastGoodEntryWhileTheDatabaseIsUnreachable:
             await self._team(database, cache, "t1")
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("raw", [False, True], ids=["model_query", "raw_query"])
+    @pytest.mark.parametrize("reason", ["statement timeout", "user request", "lock timeout"])
+    async def test_a_statement_the_database_cancelled_is_not_covered(self, reason: CancelReason, raw: bool):
+        """A healthy database under load cancels statements. Only a database the gateway cannot reach is covered:
+        the same team and key are served when the connection fails, and refused when the statement is cancelled."""
+        from fastapi import HTTPException
+
+        database = _Database()
+        database.teams["t-cancelled"] = LiteLLM_TeamTable(team_id="t-cancelled", models=["claude-opus-5-5"])
+        database.keys["k-cancelled"] = UserAPIKeyAuth(token="k-cancelled", models=["claude-opus-5-5"])
+        cache = _serving_cache()
+        await self._team(database, cache, "t-cancelled")
+        await self._key(database, cache, "k-cancelled")
+        await self._expire(cache, "team_id:t-cancelled", "k-cancelled")
+        database.stopped_with = _STOPPED
+        assert (await self._team(database, cache, "t-cancelled")).team_id == "t-cancelled"
+        assert (await self._key(database, cache, "k-cancelled")).token == "k-cancelled"
+
+        cancelled: Final = cancelled_statement(reason, raw=raw)
+        database.stopped_with = cancelled
+
+        with pytest.raises(HTTPException) as team_refused:
+            await self._team(database, cache, "t-cancelled")
+        with pytest.raises(type(cancelled)) as key_refused:
+            await self._key(database, cache, "k-cancelled")
+        assert team_refused.value.status_code == 404
+        assert key_refused.value is cancelled
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("pods", ["one_pod", "two_pods"])
     async def test_a_read_that_finishes_after_the_delete_does_not_bring_the_key_back(self, pods: str):
         from litellm.proxy.auth.auth_checks import delete_cache_key_object
@@ -2144,3 +2213,532 @@ class TestLastGoodEntryWhileTheDatabaseIsUnreachable:
 
         with pytest.raises(HTTPException):
             await self._team(database, cache, "t1")
+
+
+class _LimitRows:
+    """One table of ``_LimitsDatabase``, answering by its key column. ``find_many`` answers a batch read by that column,
+    a registry read with no filter with every row, and the restricted-customer registry filter with the blocked rows."""
+
+    def __init__(self, database: "_LimitsDatabase", key: str) -> None:
+        self._database = database
+        self._key = key
+        self.rows: dict[str, BaseModel] = {}
+
+    async def find_unique(self, where: dict[str, str], include: object = None) -> BaseModel | None:
+        self._database.answer()
+        return self.rows.get(where[self._key])
+
+    async def find_many(
+        self, where: dict[str, object] | None = None, take: int | None = None, include: object = None
+    ) -> list[BaseModel]:
+        self._database.answer()
+        if where is None:
+            return list(self.rows.values())
+        batch = where.get(self._key)
+        if isinstance(batch, dict):
+            return [row for name, row in self.rows.items() if name in batch["in"]]
+        return [row for row in self.rows.values() if getattr(row, "blocked", False)]
+
+
+class _LimitsDatabase:
+    """Answers project, organization, user, customer and budget reads, or fails every read with ``stopped_with``."""
+
+    def __init__(self) -> None:
+        self.stopped_with: Exception | None = None
+        self.projects = _LimitRows(self, "project_id")
+        self.organizations = _LimitRows(self, "organization_id")
+        self.users = _LimitRows(self, "user_id")
+        self.customers = _LimitRows(self, "user_id")
+        self.budgets = _LimitRows(self, "budget_id")
+        self.tags = _LimitRows(self, "tag_name")
+        self.access_groups = _LimitRows(self, "access_group_name")
+        self.db = SimpleNamespace(
+            litellm_projecttable=self.projects,
+            litellm_organizationtable=self.organizations,
+            litellm_usertable=self.users,
+            litellm_endusertable=self.customers,
+            litellm_budgettable=self.budgets,
+            litellm_tagtable=self.tags,
+            litellm_modelaccessgroupbudgettable=self.access_groups,
+        )
+        self.writer_db = self.db
+
+    def answer(self) -> None:
+        if self.stopped_with is not None:
+            raise self.stopped_with
+
+
+def _limits_proxy_logging() -> MagicMock:
+    proxy_logging = MagicMock()
+    proxy_logging.budget_alerts = AsyncMock()
+    return proxy_logging
+
+
+class TestLastGoodLimitsWhileTheDatabaseIsUnreachable:
+    """While the database is unreachable, the project, organization, user and customer a request is checked against
+    come from the last good entry the database returned, and a request whose limits have no entry is refused: an
+    absent object reads as one that limits nothing."""
+
+    @staticmethod
+    async def _expire(cache: UserApiKeyCache, *keys: str) -> None:
+        for key in keys:
+            await cache.async_delete_cache(key)
+
+    @staticmethod
+    async def _project(database: _LimitsDatabase, cache: UserApiKeyCache, project_id: str):
+        from litellm.proxy.auth.auth_checks import get_project_object
+
+        return await get_project_object(
+            project_id=project_id,
+            prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+            user_api_key_cache=cache,
+        )
+
+    @staticmethod
+    async def _user(database: _LimitsDatabase, cache: UserApiKeyCache, user_id: str, check_db_only: bool = False):
+        return await get_user_object(
+            user_id=user_id,
+            prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+            user_api_key_cache=cache,
+            user_id_upsert=False,
+            check_db_only=check_db_only,
+        )
+
+    @staticmethod
+    async def _customer(database: _LimitsDatabase, cache: UserApiKeyCache, end_user_id: str):
+        return await get_end_user_object(
+            end_user_id=end_user_id,
+            prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+            user_api_key_cache=cache,
+        )
+
+    @staticmethod
+    async def _org_budget_check(database: _LimitsDatabase, cache: UserApiKeyCache, org_id: str) -> None:
+        from litellm.proxy.auth.auth_checks import organization_max_budget_check
+
+        await organization_max_budget_check(
+            valid_token=UserAPIKeyAuth(token="k-org", org_id=org_id),
+            team_object=None,
+            prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+            user_api_key_cache=cache,
+            proxy_logging_obj=_limits_proxy_logging(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_blocked_project_stays_blocked(self):
+        from litellm.proxy._types import LiteLLM_ProjectTableCachedObj
+        from litellm.proxy.auth.auth_checks import _run_project_checks
+        from litellm.proxy.common_utils.user_api_key_cache import project_cache_key
+
+        database = _LimitsDatabase()
+        database.projects.rows["p-blocked"] = LiteLLM_ProjectTableCachedObj(project_id="p-blocked", blocked=True)
+        cache = _serving_cache()
+        await self._project(database, cache, "p-blocked")
+        await self._expire(cache, project_cache_key("p-blocked"))
+        database.stopped_with = _STOPPED
+
+        served = await self._project(database, cache, "p-blocked")
+
+        with pytest.raises(Exception, match="Project=p-blocked is blocked"):
+            await _run_project_checks(
+                project_object=served,
+                _model=None,
+                llm_router=None,
+                skip_budget_checks=True,
+                valid_token=None,
+                proxy_logging_obj=_limits_proxy_logging(),
+            )
+
+    @pytest.mark.asyncio
+    async def test_project_never_read_refuses_the_request(self):
+        from litellm.proxy.auth.auth_checks import LastGoodEntryMissing
+        from litellm.proxy.auth.user_api_key_auth import _safe_fetch
+
+        database = _LimitsDatabase()
+        database.stopped_with = _STOPPED
+
+        with pytest.raises(LastGoodEntryMissing) as refused:
+            await _safe_fetch("project", self._project(database, _serving_cache(), "p-unknown"))
+        assert refused.value.code == "503"
+
+    @pytest.mark.asyncio
+    async def test_project_the_database_reported_missing_refuses_the_request(self):
+        from litellm.proxy._types import LiteLLM_ProjectTableCachedObj
+        from litellm.proxy.auth.auth_checks import LastGoodEntryMissing
+        from litellm.proxy.common_utils.user_api_key_cache import project_cache_key
+
+        database = _LimitsDatabase()
+        database.projects.rows["p-gone"] = LiteLLM_ProjectTableCachedObj(project_id="p-gone", blocked=True)
+        cache = _serving_cache()
+        await self._project(database, cache, "p-gone")
+        del database.projects.rows["p-gone"]
+        await self._expire(cache, project_cache_key("p-gone"))
+        assert await self._project(database, cache, "p-gone") is None
+        database.stopped_with = _STOPPED
+
+        with pytest.raises(LastGoodEntryMissing):
+            await self._project(database, cache, "p-gone")
+
+    @pytest.mark.asyncio
+    async def test_nothing_changes_while_the_setting_is_off(self):
+        """With the setting off, an unreachable database still surfaces as the error it was, which the auth path
+        treats exactly as before."""
+        from litellm.proxy._types import LiteLLM_ProjectTableCachedObj
+        from litellm.proxy.auth.user_api_key_auth import _safe_fetch
+        from litellm.proxy.common_utils.user_api_key_cache import project_cache_key
+
+        database = _LimitsDatabase()
+        database.projects.rows["p-off"] = LiteLLM_ProjectTableCachedObj(project_id="p-off", blocked=True)
+        cache = UserApiKeyCache()
+        await self._project(database, cache, "p-off")
+        await self._expire(cache, project_cache_key("p-off"))
+        database.stopped_with = _STOPPED
+
+        assert await _safe_fetch("project", self._project(database, cache, "p-off")) is None
+        assert await _safe_fetch("user", self._user(database, cache, "u-off")) is None
+        await self._org_budget_check(database, cache, "o-off")
+
+    @pytest.mark.asyncio
+    async def test_over_budget_organization_stays_over_budget(self):
+        from litellm.proxy._types import LiteLLM_BudgetTable
+
+        database = _LimitsDatabase()
+        database.organizations.rows["o-spent"] = LiteLLM_OrganizationTable(
+            organization_id="o-spent",
+            budget_id="b-spent",
+            created_by="admin",
+            updated_by="admin",
+            spend=50.0,
+            litellm_budget_table=LiteLLM_BudgetTable(budget_id="b-spent", max_budget=10.0),
+        )
+        cache = _serving_cache()
+        with pytest.raises(litellm.BudgetExceededError):
+            await self._org_budget_check(database, cache, "o-spent")
+        await self._expire(cache, "org_id:o-spent:with_budget")
+        database.stopped_with = _STOPPED
+
+        with pytest.raises(litellm.BudgetExceededError):
+            await self._org_budget_check(database, cache, "o-spent")
+
+    @pytest.mark.asyncio
+    async def test_organization_never_read_refuses_the_request(self, monkeypatch):
+        """``organization_max_budget_check`` used to skip the organization's budget on any lookup error, and the
+        organization lookup of a request let ``allow_requests_on_db_unavailable`` drop its limits."""
+        from litellm.proxy import proxy_server
+        from litellm.proxy.auth.auth_checks import LastGoodEntryMissing, get_org_object_for_request
+
+        database = _LimitsDatabase()
+        database.stopped_with = _STOPPED
+        cache = _serving_cache()
+        monkeypatch.setitem(proxy_server.general_settings, "allow_requests_on_db_unavailable", True)
+
+        with pytest.raises(LastGoodEntryMissing):
+            await self._org_budget_check(database, cache, "o-unknown")
+        with pytest.raises(LastGoodEntryMissing):
+            await get_org_object_for_request(
+                org_id="o-unknown",
+                prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+                user_api_key_cache=cache,
+                parent_otel_span=None,
+                proxy_logging_obj=None,
+            )
+
+    @pytest.mark.asyncio
+    async def test_user_budget_comes_from_the_last_good_entry(self):
+        from litellm.proxy._types import LiteLLM_UserTable
+        from litellm.proxy.auth.user_api_key_auth import _safe_fetch
+
+        database = _LimitsDatabase()
+        database.users.rows["u-budget"] = LiteLLM_UserTable(user_id="u-budget", max_budget=10.0, spend=50.0)
+        cache = _serving_cache()
+        await self._user(database, cache, "u-budget")
+        await self._expire(cache, "u-budget")
+        database.stopped_with = _STOPPED
+
+        served = await _safe_fetch("user", self._user(database, cache, "u-budget"))
+
+        assert served is not None
+        assert (served.user_id, served.max_budget, served.spend) == ("u-budget", 10.0, 50.0)
+
+    @pytest.mark.asyncio
+    async def test_user_never_read_refuses_the_request(self):
+        from litellm.proxy.auth.auth_checks import LastGoodEntryMissing
+        from litellm.proxy.auth.user_api_key_auth import _safe_fetch
+
+        database = _LimitsDatabase()
+        database.stopped_with = _STOPPED
+
+        with pytest.raises(LastGoodEntryMissing):
+            await _safe_fetch("user", self._user(database, _serving_cache(), "u-unknown"))
+
+    @pytest.mark.asyncio
+    async def test_authoritative_user_read_is_never_served_a_last_good_entry(self):
+        from litellm.proxy._types import LiteLLM_UserTable
+
+        database = _LimitsDatabase()
+        database.users.rows["u-authoritative"] = LiteLLM_UserTable(user_id="u-authoritative", user_role="proxy_admin")
+        cache = _serving_cache()
+        await self._user(database, cache, "u-authoritative")
+        await self._expire(cache, "u-authoritative")
+        database.stopped_with = _STOPPED
+        assert (await self._user(database, cache, "u-authoritative")).user_role == "proxy_admin"
+
+        with pytest.raises(httpx.ConnectError):
+            await self._user(database, cache, "u-authoritative", check_db_only=True)
+
+    @pytest.mark.asyncio
+    async def test_customer_budget_comes_from_the_last_good_entry(self):
+        from litellm.proxy._types import LiteLLM_BudgetTable, LiteLLM_EndUserTable
+        from litellm.proxy.common_utils.user_api_key_cache import end_user_cache_key
+
+        database = _LimitsDatabase()
+        database.customers.rows["c-budget"] = LiteLLM_EndUserTable(
+            user_id="c-budget",
+            blocked=True,
+            budget_id="b-customer",
+            spend=50.0,
+            litellm_budget_table=LiteLLM_BudgetTable(budget_id="b-customer", max_budget=10.0),
+        )
+        cache = _serving_cache()
+        await self._customer(database, cache, "c-budget")
+        await self._expire(cache, end_user_cache_key("c-budget"), "end_user_restricted_registry")
+        database.stopped_with = _STOPPED
+
+        served = await self._customer(database, cache, "c-budget")
+
+        assert served is not None
+        assert (served.blocked, served.litellm_budget_table.max_budget) == (True, 10.0)
+
+    @pytest.mark.asyncio
+    async def test_customer_the_last_good_registry_proves_unrestricted_is_not_refused(self):
+        """A customer outside the last good restricted registry restricted nothing when the database last answered,
+        so it is not refused for having no entry of its own."""
+        from litellm.proxy._types import LiteLLM_EndUserTable
+        from litellm.proxy.auth.auth_checks import LastGoodEntryMissing
+
+        database = _LimitsDatabase()
+        database.customers.rows["c-restricted"] = LiteLLM_EndUserTable(user_id="c-restricted", blocked=True)
+        cache = _serving_cache()
+        assert await self._customer(database, cache, "c-free") is None
+        await self._expire(cache, "end_user_restricted_registry")
+        database.stopped_with = _STOPPED
+
+        assert await self._customer(database, cache, "c-free") is None
+        await self._expire(cache, "end_user_restricted_registry")
+        with pytest.raises(LastGoodEntryMissing):
+            await self._customer(database, cache, "c-restricted")
+
+    @pytest.mark.asyncio
+    async def test_a_registry_read_that_hangs_is_answered_by_the_last_good_registry(self, monkeypatch):
+        """A database that stops answering parks the restricted-customer registry query: the lookup deadline ends
+        it, and the last good registry answers instead of every request that names a customer waiting for ever."""
+        from litellm.proxy._types import LiteLLM_EndUserTable
+
+        database = _LimitsDatabase()
+        database.customers.rows["c-restricted"] = LiteLLM_EndUserTable(user_id="c-restricted", blocked=True)
+        cache = _serving_cache()
+        assert await self._customer(database, cache, "c-free") is None
+        await self._expire(cache, "end_user_restricted_registry")
+        never: Final = asyncio.Event()
+
+        async def parked(where: object = None, take: int | None = None) -> list[BaseModel]:
+            await never.wait()
+            return []
+
+        database.customers.find_many = parked
+        monkeypatch.setattr("litellm.proxy.db.db_lookup_gate.PROXY_DB_LOOKUP_DEADLINE_SECONDS", 0.05)
+
+        assert await asyncio.wait_for(self._customer(database, cache, "c-free"), timeout=5) is None
+
+    @pytest.mark.asyncio
+    async def test_blocked_customer_stays_blocked_in_the_blocked_customer_hook(self):
+        from fastapi import HTTPException
+        from litellm.proxy._types import LiteLLM_EndUserTable
+        from litellm.proxy.common_utils.user_api_key_cache import end_user_cache_key
+
+        from enterprise.enterprise_hooks.blocked_user_list import ENTERPRISE_BlockedUserList
+
+        database = _LimitsDatabase()
+        database.customers.rows["c-blocked"] = LiteLLM_EndUserTable(user_id="c-blocked", blocked=True)
+        cache = _serving_cache()
+        await self._customer(database, cache, "c-blocked")
+        await self._expire(cache, end_user_cache_key("c-blocked"), "end_user_restricted_registry")
+        database.stopped_with = _STOPPED
+        hook = ENTERPRISE_BlockedUserList(prisma_client=database)  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+
+        async def call(user: str) -> None:
+            await hook.async_pre_call_hook(
+                user_api_key_dict=UserAPIKeyAuth(), cache=cache, data={"user": user}, call_type="completion"
+            )
+
+        with pytest.raises(HTTPException) as blocked:
+            await call("c-blocked")
+        assert blocked.value.status_code == 400
+        await call("c-free")
+        await self._expire(cache, "end_user_restricted_registry")
+        cache.last_good_memory.clear()
+        with pytest.raises(HTTPException) as refused:
+            await call("c-free")
+        assert refused.value.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_default_customer_budget_comes_from_the_last_good_entry(self, monkeypatch):
+        from litellm.proxy._types import LiteLLM_BudgetTable
+        from litellm.proxy.auth.auth_checks import LastGoodEntryMissing, get_default_end_user_budget
+
+        monkeypatch.setattr(litellm, "max_end_user_budget_id", "b-default")
+        database = _LimitsDatabase()
+        database.budgets.rows["b-default"] = LiteLLM_BudgetTable(budget_id="b-default", max_budget=10.0)
+        cache = _serving_cache()
+
+        async def default_budget() -> LiteLLM_BudgetTable | None:
+            return await get_default_end_user_budget(prisma_client=database, user_api_key_cache=cache)  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+
+        await default_budget()
+        await self._expire(cache, "default_end_user_budget:b-default")
+        database.stopped_with = _STOPPED
+        assert (await default_budget()).max_budget == 10.0
+
+        await self._expire(cache, "default_end_user_budget:b-default")
+        cache.last_good_memory.clear()
+        with pytest.raises(LastGoodEntryMissing):
+            await default_budget()
+
+    @pytest.mark.asyncio
+    async def test_team_member_default_budget_comes_from_the_last_good_entry(self):
+        from litellm.proxy._types import LiteLLM_BudgetTable
+        from litellm.proxy.auth.auth_checks import LastGoodEntryMissing, get_team_member_default_budget
+
+        database = _LimitsDatabase()
+        database.budgets.rows["b-member"] = LiteLLM_BudgetTable(budget_id="b-member", max_budget=10.0)
+        cache = _serving_cache()
+
+        async def member_budget(budget_id: str) -> LiteLLM_BudgetTable | None:
+            return await get_team_member_default_budget(budget_id=budget_id, prisma_client=database, user_api_key_cache=cache)  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+
+        await member_budget("b-member")
+        await self._expire(cache, "team_member_default_budget:b-member")
+        database.stopped_with = _STOPPED
+        assert (await member_budget("b-member")).max_budget == 10.0
+        with pytest.raises(LastGoodEntryMissing):
+            await member_budget("b-unknown")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "cache_key",
+        [
+            "project_id:p-mutated",
+            "u-mutated",
+            "end_user_id:c-mutated",
+            "end_user_restricted_registry",
+            "tag:t-mutated",
+            "tag_registry",
+        ],
+    )
+    async def test_a_mutation_that_evicts_the_cached_object_drops_its_last_good_entry(self, cache_key: str):
+        from litellm.proxy._types import LiteLLM_UserTable
+        from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_broadcast
+        from litellm.proxy.common_utils.user_api_key_cache import recall_last_good
+
+        redis = fake_redis_cache()
+        cache = _serving_cache(redis_cache=redis.cache)
+        await remember_last_good(cache, cache_key, LiteLLM_UserTable(user_id="u-mutated"))
+
+        await evict_and_broadcast(cache_keys=(cache_key,), user_api_key_cache=cache)
+
+        assert await recall_last_good(cache, cache_key, LiteLLM_UserTable) is None
+        assert await redis.cache.init_async_client().keys("last_good:*") == []
+
+    @staticmethod
+    async def _tag_budget_check(database: _LimitsDatabase, cache: UserApiKeyCache, tags: tuple[str, ...]) -> None:
+        from litellm.proxy.auth.auth_checks import tag_max_budget_check_for_tags
+
+        await tag_max_budget_check_for_tags(
+            tags=tags,
+            prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+            user_api_key_cache=cache,
+            proxy_logging_obj=_limits_proxy_logging(),
+            valid_token=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_over_budget_tag_stays_over_budget(self):
+        from litellm.proxy._types import LiteLLM_BudgetTable, LiteLLM_TagTable
+        from litellm.proxy.common_utils.user_api_key_cache import tag_cache_key, tag_registry_cache_key
+
+        database = _LimitsDatabase()
+        database.tags.rows["t-spent"] = LiteLLM_TagTable(
+            tag_name="t-spent", spend=50.0, litellm_budget_table=LiteLLM_BudgetTable(max_budget=10.0)
+        )
+        cache = _serving_cache()
+        with pytest.raises(litellm.BudgetExceededError):
+            await self._tag_budget_check(database, cache, ("t-spent", "t-free"))
+        await self._expire(cache, tag_cache_key("t-spent"), tag_registry_cache_key())
+        database.stopped_with = _STOPPED
+
+        with pytest.raises(litellm.BudgetExceededError):
+            await self._tag_budget_check(database, cache, ("t-spent", "t-free"))
+
+    @pytest.mark.asyncio
+    async def test_tag_never_read_refuses_the_request(self):
+        from litellm.proxy.auth.auth_checks import LastGoodEntryMissing
+
+        database = _LimitsDatabase()
+        database.stopped_with = _STOPPED
+
+        with pytest.raises(LastGoodEntryMissing):
+            await self._tag_budget_check(database, _serving_cache(), ("t-unknown",))
+
+    @pytest.mark.asyncio
+    async def test_model_access_group_budget_comes_from_the_last_good_entry(self):
+        from litellm.proxy.auth.auth_checks import LastGoodEntryMissing, get_model_access_group_budgets_batch
+        from litellm.proxy.common_utils.user_api_key_cache import model_access_group_cache_key
+
+        database = _LimitsDatabase()
+        database.access_groups.rows["g-budget"] = SimpleNamespace(  # pyright: ignore[reportArgumentType]  # a prisma row needs only these fields
+            access_group_name="g-budget", spend=50.0, litellm_budget_table=SimpleNamespace(max_budget=10.0)
+        )
+        cache = _serving_cache()
+
+        async def budgets(*groups: str):
+            return await get_model_access_group_budgets_batch(
+                access_group_names=groups,
+                prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+                user_api_key_cache=cache,
+            )
+
+        await budgets("g-budget")
+        await self._expire(cache, model_access_group_cache_key("g-budget"))
+        database.stopped_with = _STOPPED
+
+        served = (await budgets("g-budget"))["g-budget"]
+
+        assert (served.spend, served.max_budget) == (50.0, 10.0)
+        with pytest.raises(LastGoodEntryMissing):
+            await budgets("g-unknown")
+
+    @pytest.mark.asyncio
+    async def test_global_proxy_spend_comes_from_the_last_good_entry(self):
+        from litellm.constants import GLOBAL_PROXY_SPEND_CACHE_KEY, LITELLM_PROXY_BUDGET_NAME
+        from litellm.proxy._types import LiteLLM_UserTable
+        from litellm.proxy.auth.auth_checks import LastGoodEntryMissing
+        from litellm.proxy.auth.user_api_key_auth import fetch_global_spend_with_event_coordination
+
+        database = _LimitsDatabase()
+        database.users.rows[LITELLM_PROXY_BUDGET_NAME] = LiteLLM_UserTable(user_id=LITELLM_PROXY_BUDGET_NAME, spend=99.0)
+        cache = _serving_cache()
+
+        async def global_spend(cache: UserApiKeyCache) -> float | None:
+            return await fetch_global_spend_with_event_coordination(
+                cache_key=GLOBAL_PROXY_SPEND_CACHE_KEY,
+                user_api_key_cache=cache,
+                prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+            )
+
+        assert await global_spend(cache) == 99.0
+        await self._expire(cache, GLOBAL_PROXY_SPEND_CACHE_KEY)
+        database.stopped_with = _STOPPED
+
+        assert await global_spend(cache) == 99.0
+        with pytest.raises(LastGoodEntryMissing):
+            await global_spend(_serving_cache())

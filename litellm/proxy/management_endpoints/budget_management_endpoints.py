@@ -12,8 +12,10 @@ All /budget management endpoints
 """
 
 #### BUDGET TABLE MANAGEMENT ####
+import asyncio
 import math
 from collections.abc import Mapping
+from itertools import chain
 from types import MappingProxyType
 from typing import Final
 
@@ -23,6 +25,14 @@ from litellm._logging import verbose_proxy_logger
 from litellm.proxy._types import *
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.timezone_utils import get_budget_reset_time
+from litellm.proxy.common_utils.user_api_key_cache import (
+    default_end_user_budget_cache_key,
+    end_user_cache_key,
+    model_access_group_cache_key,
+    project_cache_key,
+    tag_cache_key,
+    team_member_default_budget_cache_key,
+)
 from litellm.proxy.management_endpoints.common_utils import (  # noqa: F401  # legacy module exports
     _user_has_admin_view,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
     user_api_key_has_admin_view,
@@ -30,7 +40,14 @@ from litellm.proxy.management_endpoints.common_utils import (  # noqa: F401  # l
 )
 from litellm.proxy.utils import jsonify_object
 from litellm.repositories.budget_repository import BudgetRepository
-from litellm.repositories.table_repositories import TeamMembershipRepository
+from litellm.repositories.organization_repository import OrganizationRepository
+from litellm.repositories.project_repository import ProjectRepository
+from litellm.repositories.table_repositories import (
+    EndUserRepository,
+    ModelAccessGroupBudgetRepository,
+    TagRepository,
+    TeamMembershipRepository,
+)
 
 router: Final = APIRouter()
 
@@ -201,30 +218,49 @@ async def update_budget(
         where={"budget_id": budget_obj.budget_id},
         data=budget_obj_jsonified,
     )
-    await _evict_memberships_on_budget(budget_obj.budget_id)
+    await _evict_budget_holders(budget_obj.budget_id)
 
     return response
 
 
-async def _evict_memberships_on_budget(budget_id: str) -> None:
-    """A team membership carries its budget row, so every cached copy of a membership on this budget, its last good
-    entry included, is evicted once the budget changes. Best effort, like every eviction after a committed write."""
-    from litellm.proxy.auth.auth_checks import invalidate_team_member_spend_state
+async def _evict_budget_holders(budget_id: str) -> None:
+    """Team memberships, organizations, projects, customers, tags and model access groups carry their budget row, and
+    the default customer and team-member budgets are cached by id, so every cached copy of them, last good entries
+    included, is evicted once the budget changes. Best effort, like every eviction after a committed write."""
+    from litellm.proxy.auth.auth_checks import invalidate_team_member_spend_state, organization_cache_keys
+    from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_broadcast
     from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
 
     if prisma_client is None:
         return
     try:
-        memberships: Final = await TeamMembershipRepository(prisma_client).table.find_many(
-            where={"budget_id": budget_id}
+        memberships, organizations, projects, customers, tags, access_groups = await asyncio.gather(
+            TeamMembershipRepository(prisma_client).table.find_many(where={"budget_id": budget_id}),
+            OrganizationRepository(prisma_client).table.find_many(where={"budget_id": budget_id}),
+            ProjectRepository(prisma_client).table.find_many(where={"budget_id": budget_id}),
+            EndUserRepository(prisma_client).table.find_many(where={"budget_id": budget_id}),
+            TagRepository(prisma_client).table.find_many(where={"budget_id": budget_id}),
+            ModelAccessGroupBudgetRepository(prisma_client).table.find_many(where={"budget_id": budget_id}),
         )
         for membership in memberships:
             await invalidate_team_member_spend_state(
                 user_id=membership.user_id, team_id=membership.team_id, user_api_key_cache=user_api_key_cache
             )
+        await evict_and_broadcast(
+            cache_keys=(
+                default_end_user_budget_cache_key(budget_id),
+                team_member_default_budget_cache_key(budget_id),
+                *chain.from_iterable(organization_cache_keys(org.organization_id) for org in organizations),
+                *(project_cache_key(project.project_id) for project in projects),
+                *(end_user_cache_key(customer.user_id) for customer in customers),
+                *(tag_cache_key(tag.tag_name) for tag in tags),
+                *(model_access_group_cache_key(group.access_group_name) for group in access_groups),
+            ),
+            user_api_key_cache=user_api_key_cache,
+        )
     except Exception as e:  # noqa: BLE001  # the budget write committed; a failed eviction must not fail it
         verbose_proxy_logger.warning(
-            "Could not evict the team memberships on budget %s; they may enforce the old limits until they expire: %s",
+            "Could not evict the objects on budget %s; they may enforce the old limits until they expire: %s",
             budget_id,
             e,
         )
