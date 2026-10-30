@@ -1808,14 +1808,6 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                 statuses.append(self._gauge_status(gauge, in_flight, code))
             return RateLimitResponse(overall_code=overall_code, statuses=statuses)
 
-        local_counts: Final = await self._read_local_gauge_counts(gauge_keys, parent_otel_span)
-        for gauge, in_flight in zip(gauges, local_counts):
-            if in_flight >= gauge["limit"]:
-                return RateLimitResponse(
-                    overall_code="OVER_LIMIT",
-                    statuses=[self._gauge_status(gauge, in_flight, "OVER_LIMIT")],
-                )
-
         if self.parallel_acquire_script is not None:
             try:
                 raw: Final[list[CacheCounterValue]] = await self.parallel_acquire_script(
@@ -1983,10 +1975,10 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
     ) -> bool:
         """Only for a release from the logging callbacks: the response has left and the callbacks' end flushes
         the pipeline. A release before the response goes to Redis at once, so another worker's next acquire
-        never counts a finished request. The local gauge frees the slot at once, so admission on this worker
-        sees the capacity before the pipeline goes out. The count Redis returns from the pipeline is not
-        mirrored: by then a newer acquire on this worker may have written a fresher count, and the next
-        acquire refreshes the gauge anyway."""
+        never counts a finished request. The local gauge frees the slot at once for the in-memory fallback, and an
+        acquire on this worker asks Redis, which counts the slot until the pipeline goes out. The count Redis
+        returns from the pipeline is not mirrored: by then a newer acquire on this worker may have written a
+        fresher count, and the next acquire refreshes the gauge anyway."""
         counter_keys: Final = acquisition["counter_keys"]
         slot_id: Final = acquisition["slot_id"]
         redis_cache: Final = self.internal_usage_cache.dual_cache.redis_cache

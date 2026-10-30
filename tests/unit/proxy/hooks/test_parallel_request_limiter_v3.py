@@ -1094,6 +1094,32 @@ async def test_parallel_gauge_uses_atomic_redis_script_v3():
 
 
 @pytest.mark.asyncio
+async def test_a_full_local_mirror_defers_to_the_redis_gauge_v3() -> None:
+    """The local mirror holds the count from this pod's last script reply, and a release on another pod never
+    reaches it. A pod whose mirror last read full must ask Redis, or it refuses the team until its own slot ends."""
+    local_cache: Final = DualCache()
+    handler: Final = _PROXY_MaxParallelRequestsHandler(internal_usage_cache=InternalUsageCache(local_cache))
+    caller: Final = _token_caller_of_team(max_parallel_requests=2)
+    team_gauge: Final = f"{{team:{_TEAM_SLOT_TEAM_ID}}}:max_parallel_requests"
+    await local_cache.async_set_cache(key=team_gauge, value=2, local_only=True)
+    acquired: Final[list[list[str]]] = []  # mutable-ok: records the script calls
+
+    async def redis_with_room(keys: Sequence[str], args: Sequence[object]) -> list[int]:
+        acquired.append(list(keys))
+        return [0, 2]
+
+    handler.parallel_acquire_script = redis_with_room
+    _request_stash.set(None)
+    await handler.async_pre_call_hook(
+        user_api_key_dict=caller, cache=local_cache, data={"model": "gpt-4o"}, call_type=""
+    )
+
+    assert acquired == [[team_gauge]]
+    stash: Final = get_request_stash()
+    assert stash is not None and stash.parallel_slot is not None
+
+
+@pytest.mark.asyncio
 async def test_should_rate_limit_only_called_when_limits_exist_v3():
     """
     Test that should_rate_limit is only called when actual rate limits are configured.
