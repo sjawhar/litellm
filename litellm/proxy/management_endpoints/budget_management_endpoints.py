@@ -12,16 +12,27 @@ All /budget management endpoints
 """
 
 #### BUDGET TABLE MANAGEMENT ####
+import asyncio
 import math
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
+from itertools import chain
 from types import MappingProxyType
-from typing import Final
+from typing import Final, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from litellm._logging import verbose_proxy_logger
 from litellm.proxy._types import *
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.timezone_utils import get_budget_reset_time
+from litellm.proxy.common_utils.user_api_key_cache import (
+    default_end_user_budget_cache_key,
+    end_user_cache_key,
+    model_access_group_cache_key,
+    project_cache_key,
+    tag_cache_key,
+    team_member_default_budget_cache_key,
+)
 from litellm.proxy.management_endpoints.common_utils import (  # noqa: F401  # legacy module exports
     _user_has_admin_view,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
     user_api_key_has_admin_view,
@@ -29,6 +40,15 @@ from litellm.proxy.management_endpoints.common_utils import (  # noqa: F401  # l
 )
 from litellm.proxy.utils import jsonify_object
 from litellm.repositories.budget_repository import BudgetRepository
+from litellm.repositories.organization_repository import OrganizationRepository
+from litellm.repositories.project_repository import ProjectRepository
+from litellm.repositories.table_repositories import (
+    EndUserRepository,
+    ModelAccessGroupBudgetRepository,
+    TagRepository,
+    TeamMembershipRepository,
+)
+from litellm.repositories.verification_token_repository import VerificationTokenRepository
 
 router: Final = APIRouter()
 
@@ -199,8 +219,108 @@ async def update_budget(
         where={"budget_id": budget_obj.budget_id},
         data=budget_obj_jsonified,
     )
+    await evict_budget_holders(budget_obj.budget_id)
 
     return response
+
+
+_EvictionStep = TypeVar("_EvictionStep")
+
+
+async def _best_effort(
+    budget_id: str, what: str, step: Callable[[], Awaitable[_EvictionStep]]
+) -> _EvictionStep | None:
+    try:
+        return await step()
+    except Exception as e:  # noqa: BLE001  # the budget write committed; one failed step must not skip the rest
+        verbose_proxy_logger.warning(
+            "Could not evict %s on budget %s; they may enforce the old limits until they expire: %s",
+            what,
+            budget_id,
+            e,
+        )
+        return None
+
+
+async def evict_budget_holders(budget_id: str) -> None:
+    """Keys, team memberships, organizations, projects, customers, tags and model access groups carry their budget row,
+    a key also carries the budget of its organization and of its team membership, and the default customer and
+    team-member budgets are cached by id, so every cached copy of them, last good entries included, is evicted once
+    the budget changes. Each read and each eviction stands on its own, so one unreadable table still leaves the other
+    holders evicted. Best effort, like every eviction after a committed write."""
+    from litellm.proxy.auth.auth_checks import (
+        delete_cache_key_objects,
+        invalidate_team_member_spend_state,
+        organization_cache_keys,
+    )
+    from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_broadcast
+    from litellm.proxy.proxy_server import prisma_client, proxy_logging_obj, user_api_key_cache
+
+    if prisma_client is None:
+        return
+    on_budget: Final = {"budget_id": budget_id}
+    memberships, organizations, projects, customers, tags, access_groups = await asyncio.gather(
+        _best_effort(
+            budget_id,
+            "team memberships",
+            lambda: TeamMembershipRepository(prisma_client).table.find_many(where=on_budget),
+        ),
+        _best_effort(
+            budget_id, "organizations", lambda: OrganizationRepository(prisma_client).table.find_many(where=on_budget)
+        ),
+        _best_effort(budget_id, "projects", lambda: ProjectRepository(prisma_client).table.find_many(where=on_budget)),
+        _best_effort(budget_id, "customers", lambda: EndUserRepository(prisma_client).table.find_many(where=on_budget)),
+        _best_effort(budget_id, "tags", lambda: TagRepository(prisma_client).table.find_many(where=on_budget)),
+        _best_effort(
+            budget_id,
+            "model access groups",
+            lambda: ModelAccessGroupBudgetRepository(prisma_client).table.find_many(where=on_budget),
+        ),
+    )
+    on_budget_or_its_organizations: Final = {
+        "OR": [
+            {"budget_id": budget_id},
+            {"organization_id": {"in": [org.organization_id for org in organizations or ()]}},
+        ]
+    }
+    keys: Final = await _best_effort(
+        budget_id,
+        "keys",
+        lambda: VerificationTokenRepository(prisma_client).table.find_many(where=on_budget_or_its_organizations),
+    )
+    for membership in memberships or ():
+        await _best_effort(
+            budget_id,
+            f"the spend state of team member {membership.user_id}",
+            lambda m=membership: invalidate_team_member_spend_state(
+                user_id=m.user_id, team_id=m.team_id, user_api_key_cache=user_api_key_cache
+            ),
+        )
+    await _best_effort(
+        budget_id,
+        "the cached budget holders",
+        lambda: evict_and_broadcast(
+            cache_keys=(
+                default_end_user_budget_cache_key(budget_id),
+                team_member_default_budget_cache_key(budget_id),
+                *chain.from_iterable(organization_cache_keys(org.organization_id) for org in organizations or ()),
+                *(project_cache_key(project.project_id) for project in projects or ()),
+                *(end_user_cache_key(customer.user_id) for customer in customers or ()),
+                *(tag_cache_key(tag.tag_name) for tag in tags or ()),
+                *(model_access_group_cache_key(group.access_group_name) for group in access_groups or ()),
+            ),
+            user_api_key_cache=user_api_key_cache,
+        ),
+    )
+    await _best_effort(
+        budget_id,
+        "the cached keys",
+        lambda: delete_cache_key_objects(
+            hashed_tokens=tuple(key.token for key in keys or ()),
+            user_api_key_cache=user_api_key_cache,
+            proxy_logging_obj=proxy_logging_obj,
+        ),
+    )
 
 
 @router.post(

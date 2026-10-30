@@ -33,6 +33,8 @@ _CONNECTION_CAPACITY_PHRASES: Final = (
 _PRISMA_POOL_TIMEOUT_CODE: Final = "P2024"
 _LOCK_TIMEOUT_SQLSTATE: Final = "55P03"
 _LOCK_TIMEOUT_PHRASE: Final = "canceling statement due to lock timeout"
+_STATEMENT_CANCELLED_SQLSTATES: Final = frozenset(("57014", _LOCK_TIMEOUT_SQLSTATE))
+_STATEMENT_CANCELLED_PHRASE: Final = "canceling statement due to"
 
 
 def _exception_chain(e: BaseException) -> Iterator[BaseException]:
@@ -284,6 +286,18 @@ class PrismaDBExceptionHandler:
         return _LOCK_TIMEOUT_PHRASE in str(e).lower()
 
     @staticmethod
+    def is_statement_cancelled_error(e: Exception) -> bool:
+        """True iff Postgres cancelled the statement: SQLSTATE 57014 (``statement_timeout`` or a cancel request) or
+        55P03 (``lock_timeout``). The database received the statement and answered, so it is up, whatever its load."""
+        import prisma
+
+        if not isinstance(e, _exception_types(prisma.errors.PrismaError)):
+            return False
+        if PrismaDBExceptionHandler.postgres_sqlstate(e) in _STATEMENT_CANCELLED_SQLSTATES:
+            return True
+        return _STATEMENT_CANCELLED_PHRASE in str(e).lower()
+
+    @staticmethod
     def postgres_sqlstate(e: Exception) -> str | None:
         """The SQLSTATE Postgres attached to a failed statement, as prisma surfaces it, or None."""
         import prisma
@@ -468,6 +482,25 @@ class PrismaDBExceptionHandler:
         return PrismaDBExceptionHandler.find_database_service_unavailable_error_in_chain(e) is not None
 
     @staticmethod
+    def is_database_unreachable_error(e: BaseException) -> bool:
+        """True when the database client could not reach the database at all: a connection, timeout or transport
+        failure, a connection the server turned away for lack of capacity (Postgres 53300, a pool timeout), or
+        prisma's engine crashing on the malformed reply of a torn-down connection, anywhere in the ``__cause__`` /
+        ``__context__`` chain. A query the database answered, whatever it answered, is not unreachable, and
+        neither is a query engine that will not come back by itself. A statement the database cancelled anywhere in
+        the chain means it was reached, even under a reconnect or lookup deadline that timed out on top of it."""
+        chain: Final = tuple(link for link in _exception_chain(e) if isinstance(link, Exception))
+        if any(map(PrismaDBExceptionHandler.is_statement_cancelled_error, chain)):
+            return False
+        return any(
+            PrismaDBExceptionHandler.is_database_connection_error(link)
+            or PrismaDBExceptionHandler.is_database_transport_error(link)
+            or PrismaDBExceptionHandler.is_prisma_engine_internal_error(link)
+            or isinstance(link, (ConnectionError, TimeoutError))
+            for link in chain
+        )
+
+    @staticmethod
     def handle_db_exception(e: Exception):
         """
         Primary handler for `allow_requests_on_db_unavailable` flag. Decides whether to raise a DB Exception or not based on the flag.
@@ -482,6 +515,19 @@ class PrismaDBExceptionHandler:
         ):
             return
         raise e
+
+
+class LastGoodEntryMissing(ProxyException):
+    """The database is unreachable and no last good entry is kept for an object whose limits the request is checked
+    against, so the request is refused rather than checked as if that object limited nothing. It answers 503 like an
+    unreachable database, but it is a refusal: ``allow_requests_on_db_unavailable`` never turns it into the fallback
+    identity."""
+
+    def __init__(self, error: Exception) -> None:
+        unavailable: Final = PrismaDBExceptionHandler.service_unavailable_proxy_exception(error)
+        super().__init__(
+            message=unavailable.message, type=unavailable.type, param=unavailable.param, code=unavailable.code
+        )
 
 
 # Default fallback timeouts when neither the caller nor the prisma_client

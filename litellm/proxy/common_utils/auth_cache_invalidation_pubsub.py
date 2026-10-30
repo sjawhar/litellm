@@ -13,7 +13,7 @@ from litellm.proxy.common_utils.config_sync_pubsub import (  # noqa: F401  # leg
     coordination_redis_cache,
     pubsub_capable_client,
 )
-from litellm.proxy.common_utils.user_api_key_cache import AUTH_OBJECTS_TARGET
+from litellm.proxy.common_utils.user_api_key_cache import AUTH_OBJECTS_TARGET, forget_last_good
 
 if TYPE_CHECKING:
     from litellm.caching.in_memory_cache import InMemoryCache
@@ -130,12 +130,13 @@ async def publish_auth_cache_invalidation(
 @with_service_target(AUTH_OBJECTS_TARGET)
 async def evict_and_broadcast(cache_keys: Sequence[str], user_api_key_cache: "UserApiKeyCache") -> None:
     """
-    Drop cached management objects here and on every other worker.
+    Drop cached management objects, and their last good entries, here and on every other worker.
 
     Every endpoint that mutates a cached object must call this: auth serves those objects
     cache-first with no freshness check, so a mutation that leaves the entry in place keeps the
-    stale object enforced until its TTL expires (LIT-3803). Best-effort: the DB write has already
-    committed, so a cache backend error must not fail the endpoint.
+    stale object enforced until its TTL expires (LIT-3803), and a last good entry, which never
+    expires, would serve it during every later database outage. Best-effort: the DB write has
+    already committed, so a cache backend error must not fail the endpoint.
     """
     for cache_key in cache_keys:
         try:
@@ -146,6 +147,17 @@ async def evict_and_broadcast(cache_keys: Sequence[str], user_api_key_cache: "Us
                 cache_key,
                 e,
             )
+        await forget_last_good(user_api_key_cache, cache_key)
+        await publish_auth_cache_invalidation(cache_key=cache_key)
+
+
+@with_service_target(AUTH_OBJECTS_TARGET)
+async def forget_last_good_and_broadcast(cache_keys: Sequence[str], user_api_key_cache: "UserApiKeyCache") -> None:
+    """Drop the last good entries of a mutated team or key from Redis and this pod's memory, and broadcast each
+    key so every pod drops its memory copy and its cached object too. For a mutation that patches the cached
+    object in place rather than evicting it."""
+    for cache_key in cache_keys:
+        await forget_last_good(user_api_key_cache, cache_key)
         await publish_auth_cache_invalidation(cache_key=cache_key)
 
 
@@ -187,6 +199,8 @@ class AuthCacheInvalidationSubscriber:
                 pubsub = client.pubsub()
                 try:
                     await pubsub.subscribe(auth_cache_invalidation_channel(self._redis_cache))
+                    # Invalidations sent while this pod was not subscribed are lost; Redis, back now, answers first.
+                    self._user_api_key_cache.last_good_memory.clear()
                     backoff_seconds = _BACKOFF_INITIAL_SECONDS
                     await self._consume(pubsub)
                 finally:
@@ -220,6 +234,7 @@ class AuthCacheInvalidationSubscriber:
                 additional_cache.set_cache(parsed.cache_key, parsed.new_value, ttl=parsed.ttl)
             return
         self._user_api_key_cache.in_memory_cache_for(parsed.cache_key).delete_cache(parsed.cache_key)
+        self._user_api_key_cache.last_good_memory.delete(parsed.cache_key)
         for additional_cache in self._additional_in_memory_caches:
             additional_cache.delete_cache(parsed.cache_key)
 

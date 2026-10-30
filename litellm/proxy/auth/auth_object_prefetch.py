@@ -27,6 +27,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     AUTH_OBJECTS_TARGET,
     UserApiKeyCache,
     get_management_object_ttl,
+    remember_last_good,
     team_membership_auth_cache_key,
     team_membership_reservation_cache_key,
 )
@@ -312,6 +313,8 @@ async def _fill_from_db(
     writes: Final = tuple((entry, value) for entry in entries if (value := objects[entry.row]) is not None)
     if writes:
         await _write_back(writes, cache)
+    for entry, value in writes:
+        await remember_last_good(cache, entry.cache_key, value)
 
 
 async def prefetch_auth_objects(

@@ -11,6 +11,7 @@ import pytest
 import litellm
 from litellm._service_logger import ServiceLogging
 from litellm.caching.redis_cache import RedisCache, RedisCircuitBreakerOpenError
+from tests.unit.caching.fake_redis_cache import fake_redis_cache
 
 
 @pytest.fixture
@@ -1637,3 +1638,31 @@ def test_call_stack_info_skips_native_lifecycle_frames():
         return native_drive()
 
     assert anthropic_messages() == "anthropic_messages <- test_call_stack_info_skips_native_lifecycle_frames"
+
+
+@pytest.mark.asyncio
+async def test_set_cache_or_raise_without_a_ttl_stores_a_key_redis_never_expires():
+    redis: Final = fake_redis_cache(namespace="gateway")
+
+    await redis.cache.async_set_cache_or_raise("last_good:team_id:t1", {"team_id": "t1"})
+    await redis.cache.async_set_cache_or_raise("last_good_tombstone:team_id:t1", 1, ttl=600)
+
+    client = redis.cache.init_async_client()
+    assert await client.ttl("gateway:last_good:team_id:t1") == -1
+    assert 0 < await client.ttl("gateway:last_good_tombstone:team_id:t1") <= 600
+    assert await redis.cache.async_get_cache_or_raise("last_good:team_id:t1") == {"team_id": "t1"}
+
+
+@pytest.mark.asyncio
+async def test_get_cache_or_raise_tells_a_miss_from_an_unreachable_redis():
+    from redis.exceptions import ConnectionError as RedisConnectionError
+
+    redis: Final = fake_redis_cache()
+    assert await redis.cache.async_get_cache_or_raise("absent") is None
+
+    redis.server.connected = False
+
+    with pytest.raises(RedisConnectionError):
+        await redis.cache.async_get_cache_or_raise("absent")
+    with pytest.raises(RedisConnectionError):
+        await redis.cache.async_set_cache_or_raise("absent", {"a": 1})

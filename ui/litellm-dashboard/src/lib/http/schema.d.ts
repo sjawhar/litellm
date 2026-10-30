@@ -30526,6 +30526,12 @@ export interface components {
              * @default false
              */
             search_tool_deny_by_default: boolean;
+            /**
+             * Serve Last Good Auth Entries
+             * @description keep the entry each database read returns for the keys, teams, memberships, users, projects, organizations, customers, tags, model access groups, budgets and global proxy spend a request is checked against, in Redis with no expiry and in each worker's memory, and serve it while the database is unreachable, so a database failover does not refuse callers that were just served. A key or team the database reported missing, or that was deleted or blocked, is still refused, and a request whose limits have no entry is refused with 503, whatever allow_requests_on_db_unavailable says. While this is on, deleting or blocking a key or team answers 503 and changes nothing when Redis cannot record the revocation, so retry it once Redis is reachable
+             * @default false
+             */
+            serve_last_good_auth_entries: boolean;
             /** @description Daily check of the spend LiteLLM captured against the provider's own bill (OpenAI via OPENAI_ADMIN_KEY). Publishes litellm_spend_capture_rate per provider and alerts when the ratio over the lookback window falls under the threshold (default 0.9). Off unless set. */
             spend_capture_rate_check?: components["schemas"]["SpendCaptureRateCheckSettings"] | null;
             /** @description Which keys of LiteLLM_SpendLogs.metadata are written to the database. Set exactly one of 'include' (write only these keys) or 'exclude' (drop these keys). 'status' and 'cold_storage_object_key' are always written. Daily spend tables, budgets and logging callbacks still see every key. Unset writes every key */

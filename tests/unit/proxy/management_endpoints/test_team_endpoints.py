@@ -5308,11 +5308,22 @@ async def test_team_member_delete_reads_on_the_lock_holding_transaction(
     user_row.teams = [test_team_id]
 
     # Both are wired to answer, so the endpoint completes either way and the awaits below
-    # are what tells which connection it read on.
+    # are what tells which connection it read on. A token read on the pooled client after
+    # the transaction released the lock (the member's cached keys being evicted) is fine.
+    lock_released = asyncio.Event()
+    pooled_token_reads_under_lock = []
+
+    async def pooled_token_answer(**kwargs):
+        if not lock_released.is_set():
+            pooled_token_reads_under_lock.append(kwargs)
+        return []
+
+    async def release_lock(*args):
+        lock_released.set()
+
     pooled_user_read = AsyncMock(return_value=[user_row])
-    pooled_token_read = AsyncMock(return_value=[])
     mock_db_client.db.litellm_usertable.find_many = pooled_user_read
-    mock_db_client.db.litellm_verificationtoken.find_many = pooled_token_read
+    mock_db_client.db.litellm_verificationtoken.find_many = AsyncMock(side_effect=pooled_token_answer)
 
     tx = MagicMock()
     tx.query_raw = AsyncMock(return_value=[{"members_with_roles": [roster_entry]}])
@@ -5325,7 +5336,7 @@ async def test_team_member_delete_reads_on_the_lock_holding_transaction(
 
     tx_cm = MagicMock()
     tx_cm.__aenter__ = AsyncMock(return_value=tx)
-    tx_cm.__aexit__ = AsyncMock(return_value=None)
+    tx_cm.__aexit__ = AsyncMock(side_effect=release_lock)
     mock_db_client.tx = MagicMock(return_value=tx_cm)
 
     await team_member_delete(
@@ -5340,7 +5351,7 @@ async def test_team_member_delete_reads_on_the_lock_holding_transaction(
         where={"user_id": {"in": [test_user_id]}, "team_id": test_team_id}
     )
     pooled_user_read.assert_not_awaited()
-    pooled_token_read.assert_not_awaited()
+    assert pooled_token_reads_under_lock == []
 
     tx.litellm_usertable.update.assert_awaited_once_with(
         where={"user_id": test_user_id}, data={"teams": {"set": []}}
@@ -12337,6 +12348,8 @@ async def _drive_team_write(
     user=None,
     find_returns_none=False,
     mock_sink=None,
+    user_api_key_cache=None,
+    raw_members_with_roles=None,
 ):
     """Drive POST ``update_team`` or PATCH ``patch_team`` against a mocked team.
 
@@ -12369,12 +12382,14 @@ async def _drive_team_write(
         organization_id=None,
         **(existing_kwargs or {}),
     )
+    if raw_members_with_roles is not None:
+        existing = existing.model_copy(update={"members_with_roles": raw_members_with_roles})
     auth = user or UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN, user_id="u")
 
     with (
         _patch("litellm.proxy.proxy_server.prisma_client") as pc,
         _patch("litellm.proxy.proxy_server.llm_router", None),
-        _patch("litellm.proxy.proxy_server.user_api_key_cache", MagicMock()),
+        _patch("litellm.proxy.proxy_server.user_api_key_cache", user_api_key_cache or MagicMock()),
         _patch("litellm.proxy.proxy_server.proxy_logging_obj", MagicMock()),
         _patch("litellm.proxy.proxy_server.litellm_proxy_admin_name", "admin"),
         _patch(
@@ -12559,6 +12574,45 @@ async def test_team_member_key_duration_only_update_preserves_stored_metadata(ki
     written = await _written_metadata_with_budget(kind, {"team_member_key_duration": "7d"})
 
     assert written == {**_STORED_METADATA_WITH_BUDGET, "team_member_key_duration": "7d"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("team_member_budget", [5.0, None], ids=["set", "clear"])
+async def test_team_member_budget_change_drops_the_members_last_good_membership_entries(team_member_budget):
+    """Each member's membership carries the team member budget, and its last good entry never expires, so setting
+    or clearing that budget must evict every member's membership, or a database outage enforces the old budget."""
+    from litellm.proxy._types import LiteLLM_BudgetTable, LiteLLM_TeamMembership
+    from litellm.proxy.common_utils.user_api_key_cache import (
+        UserApiKeyCache,
+        recall_last_good,
+        remember_last_good,
+        team_membership_auth_cache_key,
+    )
+
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    key: Final = team_membership_auth_cache_key(team_id=_PATCH_TEAM_ID, user_id="member-1")
+    await remember_last_good(cache, key, LiteLLM_TeamMembership(user_id="member-1", team_id=_PATCH_TEAM_ID))
+
+    with (
+        patch("litellm.proxy.proxy_server.premium_user", True),  # test-quality-ok: proxy_server module global is the endpoint's only injection point
+        patch(  # test-quality-ok: update_team imports update_budget at call time; the module attribute is its only seam
+            "litellm.proxy.management_endpoints.budget_management_endpoints.update_budget",
+            AsyncMock(return_value=LiteLLM_BudgetTable(budget_id="budget-existing-123")),
+        ),
+        patch(  # test-quality-ok: the membership backfill writes through prisma, which this driver does not model
+            "litellm.proxy.management_endpoints.team_endpoints.TeamMemberBudgetHandler.backfill_team_member_budget_entries",
+            AsyncMock(),
+        ),
+    ):
+        await _drive_team_write(
+            "post",
+            existing_metadata=dict(_STORED_METADATA_WITH_BUDGET),
+            raw_members_with_roles=[{"user_id": "member-1", "role": "user"}],
+            payload={"team_member_budget": team_member_budget},
+            user_api_key_cache=cache,
+        )
+
+    assert await recall_last_good(cache, key, LiteLLM_TeamMembership) is None
 
 
 @pytest.mark.asyncio
@@ -13976,6 +14030,51 @@ async def test_team_member_update_role_change_rewrites_the_roster_it_read_under_
     assert _roster_user_roles(event["before_value"]) == {"alice": "admin", "bob": "user", "carol": "user"}
     assert _roster_user_roles(event["updated_values"]) == {"alice": "admin", "bob": "admin", "carol": "user"}
     assert _roster_team_alias(event["updated_values"]) == "race"
+
+
+@pytest.mark.asyncio
+async def test_team_member_role_change_drops_the_teams_cached_and_last_good_entries(monkeypatch):
+    """A role change rewrites the team's roster, so the cached team and its last good entry, which carry the old
+    roster, must go: otherwise a demoted admin keeps admin rights, and keeps them through a database outage."""
+    from litellm.models.team import LiteLLM_TeamTableCachedObj
+    from litellm.proxy.auth.auth_checks import cache_team_object, get_team_object_from_cache
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, recall_last_good
+
+    snapshot = LiteLLM_TeamTable(
+        team_id="team-roles",
+        team_alias="roles",
+        metadata={},
+        members_with_roles=[Member(user_id="alice", role="admin"), Member(user_id="bob", role="admin")],
+    )
+    team_row = LiteLLM_TeamTable(**snapshot.model_dump())
+    cache = UserApiKeyCache(serve_last_good_entries=True)
+    await cache_team_object(
+        team_id="team-roles",
+        team_table=LiteLLM_TeamTableCachedObj.model_validate(snapshot.model_dump()),
+        user_api_key_cache=cache,
+        proxy_logging_obj=None,
+    )
+    mock_prisma_client = MagicMock()
+    mock_prisma_client.db.litellm_teamtable.find_unique = AsyncMock(return_value=team_row)
+    mock_prisma_client.db.litellm_teamtable.update = AsyncMock(side_effect=_roster_writer(team_row))
+    mock_prisma_client.db.litellm_auditlog.create = AsyncMock()
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", mock_prisma_client)
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
+    _wire_member_delete_tx(mock_prisma_client)
+
+    team_info_patch, upsert_patch = _member_update_patches(snapshot)
+    with team_info_patch, upsert_patch:
+        await team_member_update(
+            data=TeamMemberUpdateRequest(team_id="team-roles", user_id="bob", role="user"),
+            http_request=MagicMock(),
+            user_api_key_dict=UserAPIKeyAuth(
+                user_role=LitellmUserRoles.PROXY_ADMIN, api_key="sk-admin", user_id="admin-user"
+            ),
+        )
+    await _settle_audit_log_tasks()
+
+    assert await get_team_object_from_cache(key="team_id:team-roles", user_api_key_cache=cache, parent_otel_span=None) is None
+    assert await recall_last_good(cache, "team_id:team-roles", LiteLLM_TeamTableCachedObj) is None
 
 
 @pytest.mark.asyncio
@@ -16852,3 +16951,119 @@ def test_aggregated_date_range_error_accepts_canonical_dates_and_keeps_range_che
     assert aggregated_date_range_error("2026-09-24", "2026-09-26") is None
     assert aggregated_date_range_error("2026-09-26", "2026-09-24") == "end_date must be on or after start_date"
     assert aggregated_date_range_error("2020-01-01", "2026-12-31") == "Date range must be at most 400 days"
+
+
+class _BlockableTeamRows:
+    def __init__(self, team: LiteLLM_TeamTable) -> None:
+        self.team = team
+
+    async def find_unique(self, where: dict[str, str], **kwargs: object) -> LiteLLM_TeamTable:
+        return self.team
+
+    async def update(self, where: dict[str, str], data: dict[str, bool], **kwargs: object) -> LiteLLM_TeamTable:
+        self.team = self.team.model_copy(update=data)
+        return self.team
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_after", [True, False], ids=["block", "unblock"])
+async def test_team_block_and_unblock_drop_the_cached_team_and_its_last_good_entry(monkeypatch, blocked_after: bool):
+    """A blocked team must be refused even when the database stops right after the block, and an unblocked one
+    must not keep its blocked copy, so both endpoints evict the cached team and forget its last good entry."""
+    from fastapi import Request
+
+    from litellm.models.team import LiteLLM_TeamTableCachedObj
+    from litellm.proxy._types import BlockTeamRequest
+    from litellm.proxy.auth.auth_checks import cache_team_object, get_team_object_from_cache
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, recall_last_good
+    from litellm.proxy.management_endpoints.team_endpoints import block_team, unblock_team
+
+    team: Final = LiteLLM_TeamTable(team_id="t1", team_alias="lanes", blocked=not blocked_after)
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    await cache_team_object(
+        team_id="t1",
+        team_table=LiteLLM_TeamTableCachedObj.model_validate(team.model_dump()),
+        user_api_key_cache=cache,
+        proxy_logging_obj=None,
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.proxy_server.prisma_client", SimpleNamespace(db=SimpleNamespace(litellm_teamtable=_BlockableTeamRows(team)))
+    )
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
+    assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) is not None
+
+    endpoint: Final = block_team if blocked_after else unblock_team
+    record: Final = await endpoint(
+        data=BlockTeamRequest(team_id="t1"),
+        http_request=MagicMock(spec=Request),
+        user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN, user_id="admin"),
+    )
+
+    assert record.blocked is blocked_after
+    assert await get_team_object_from_cache(key="team_id:t1", user_api_key_cache=cache, parent_otel_span=None) is None
+    assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
+
+
+@pytest.mark.asyncio
+async def test_team_block_refuses_and_leaves_the_team_unblocked_when_redis_cannot_record_it(monkeypatch):
+    from fastapi import HTTPException, Request
+
+    from litellm.proxy._types import BlockTeamRequest
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from litellm.proxy.management_endpoints.team_endpoints import block_team
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis: Final = fake_redis_cache()
+    redis.server.connected = False
+    rows: Final = _BlockableTeamRows(LiteLLM_TeamTable(team_id="t1", team_alias="lanes", blocked=False))
+    monkeypatch.setattr(
+        "litellm.proxy.proxy_server.prisma_client", SimpleNamespace(db=SimpleNamespace(litellm_teamtable=rows))
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.proxy_server.user_api_key_cache",
+        UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True),
+    )
+
+    with pytest.raises(HTTPException) as refused:
+        await block_team(
+            data=BlockTeamRequest(team_id="t1"),
+            http_request=MagicMock(spec=Request),
+            user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN, user_id="admin"),
+        )
+
+    assert refused.value.status_code == 503
+    assert rows.team.blocked is False
+
+
+@pytest.mark.asyncio
+async def test_refresh_cached_team_overwrites_the_last_good_entry_and_tells_every_pod(monkeypatch):
+    from litellm.models.team import LiteLLM_TeamTableCachedObj
+    from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import AUTH_CACHE_INVALIDATION_CHANNEL
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, recall_last_good, remember_last_good
+    from litellm.proxy.management_endpoints.team_endpoints import refresh_cached_team
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis: Final = fake_redis_cache()
+    cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+    await remember_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj(team_id="t1", models=["claude-opus-4-8"]))
+    pubsub: Final = redis.cache.init_async_client().pubsub()
+    await pubsub.subscribe(AUTH_CACHE_INVALIDATION_CHANNEL)
+    monkeypatch.setattr(
+        "litellm.proxy.common_utils.auth_cache_invalidation_pubsub.coordination_redis_cache", lambda: redis.cache
+    )
+
+    await refresh_cached_team(
+        team_row=LiteLLM_TeamTable(team_id="t1", models=["claude-opus-5-5"]),
+        user_api_key_cache=cache,
+        proxy_logging_obj=None,  # pyright: ignore[reportArgumentType]  # no usage cache to clear in this test
+    )
+
+    refreshed: Final = await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj)
+    assert refreshed is not None and refreshed.models == ["claude-opus-5-5"]
+    published: Final = [
+        message
+        for _ in range(200)
+        if (message := await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.01)) is not None
+    ]
+    assert [json.loads(message["data"])["cache_key"] for message in published] == ["team_id:t1"]
+    await pubsub.aclose()

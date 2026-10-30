@@ -15163,6 +15163,31 @@ async def test_load_config_rejects_a_non_positive_user_api_key_cache_max_size(tm
     assert cache.get_cache(key="key-0", local_only=True) == {"token": "key-0"}
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("configured", "kept"), [({"serve_last_good_auth_entries": True}, True), ({}, False)])
+async def test_load_config_serve_last_good_auth_entries_turns_on_the_last_good_store(
+    tmp_path, monkeypatch, configured, kept
+):
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.common_utils.user_api_key_cache import (
+        UserApiKeyCache,
+        recall_last_good,
+        remember_last_good,
+    )
+    from litellm.proxy.proxy_server import ProxyConfig
+
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump({"general_settings": {"user_api_key_cache_ttl": 5, **configured}}))
+    cache = UserApiKeyCache()
+    monkeypatch.setattr(proxy_server_module, "user_api_key_cache", cache)
+    monkeypatch.setattr(proxy_server_module, "general_settings", {}, raising=False)
+
+    await ProxyConfig().load_config(router=None, config_file_path=str(config_file))
+    await remember_last_good(cache, "hashed-token", UserAPIKeyAuth(token="hashed-token"))
+
+    assert (await recall_last_good(cache, "hashed-token", UserAPIKeyAuth) is not None) is kept
+
+
 def test_docs_redoc_openapi_are_reachable_by_default():
     """
     LIT-6745: the interactive/machine-readable docs surfaces are on by

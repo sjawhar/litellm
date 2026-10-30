@@ -812,6 +812,7 @@ async def _run_update_organization_v2(
     existing_metadata,
     existing_object_permission_id=None,
     existing_object_permission_row=None,
+    key_rows=(),
 ):
     from litellm.proxy._types import (
         LitellmUserRoles,
@@ -839,6 +840,7 @@ async def _run_update_organization_v2(
         return_value=existing_object_permission_row
     )
     mock_prisma_client.db.litellm_objectpermissiontable.upsert = AsyncMock()
+    mock_prisma_client.db.litellm_verificationtoken.find_many = AsyncMock(return_value=list(key_rows))
 
     tx = MagicMock()
     tx.litellm_organizationtable = mock_prisma_client.db.litellm_organizationtable
@@ -1573,3 +1575,219 @@ async def test_delete_organization_evicts_the_cache_of_the_keys_it_deletes(monke
     assert all(cache.get_cache(key=cache_key) is None for cache_key in doomed_cache_keys)
     assert all(cache.get_cache(key=cache_key) == {"retained": True} for cache_key in kept_cache_keys)
     assert jwt_table.rows == (kept_row,)
+
+
+@pytest.mark.asyncio
+async def test_delete_organization_drops_the_last_good_entries_of_the_teams_it_deletes(monkeypatch):
+    """A deleted organization's teams must not survive as last good entries a later database outage serves."""
+    from litellm.models.team import LiteLLM_TeamTableCachedObj
+    from litellm.proxy._types import DeleteOrganizationRequest, LitellmUserRoles, UserAPIKeyAuth
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, recall_last_good, remember_last_good
+    from litellm.proxy.management_endpoints.organization_endpoints import delete_organization
+
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    await remember_last_good(cache, "team_id:t-org", LiteLLM_TeamTableCachedObj(team_id="t-org", team_alias="org-lane"))
+    await remember_last_good(cache, "team_alias:org-lane", LiteLLM_TeamTableCachedObj(team_id="t-org"))
+    prisma_client: Final = AsyncMock()
+    prisma_client.db.litellm_teamtable.find_many = AsyncMock(
+        return_value=[SimpleNamespace(team_id="t-org", team_alias="org-lane")]
+    )
+    prisma_client.db.litellm_verificationtoken.find_many = AsyncMock(return_value=[])
+    prisma_client.db.litellm_jwtkeymapping = CascadingJWTMappingTable([])
+    prisma_client.db.litellm_organizationtable.delete = AsyncMock(return_value=MagicMock())
+    monkeypatch.setattr("litellm.proxy.proxy_server.premium_user", True, raising=False)
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", prisma_client)
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
+    monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", None)
+
+    await delete_organization(
+        data=DeleteOrganizationRequest(organization_ids=["org-doomed"]),
+        user_api_key_dict=UserAPIKeyAuth(api_key="sk-admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+    )
+    await remember_last_good(cache, "team_id:t-org", LiteLLM_TeamTableCachedObj(team_id="t-org"))
+
+    assert await recall_last_good(cache, "team_id:t-org", LiteLLM_TeamTableCachedObj) is None
+    assert await recall_last_good(cache, "team_alias:org-lane", LiteLLM_TeamTableCachedObj) is None
+
+
+class _OrganizationReads:
+    """Answers the organization lookups auth runs, or fails each the way an unreachable Postgres does once stopped."""
+
+    def __init__(self, org: object) -> None:
+        self.stopped = False
+        self._org = org
+        self.db = SimpleNamespace(litellm_organizationtable=self)
+
+    async def find_unique(self, where: Mapping[str, object], include: object = None) -> object:
+        import httpx
+
+        if self.stopped:
+            raise httpx.ConnectError("All connection attempts failed")
+        return self._org
+
+
+async def _org_read_by_every_lookup(monkeypatch, org_id: str, *, serving: bool):
+    """An auth cache holding the organization as every auth lookup caches it: with and without its budget, as the
+    last known organization, and, while last good entries are served, as their last good entries."""
+    from litellm.proxy._types import LiteLLM_OrganizationTable
+    from litellm.proxy.auth.auth_checks import get_org_object, get_org_object_for_request
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+
+    cache: Final = UserApiKeyCache(serve_last_good_entries=serving)
+    reads: Final = _OrganizationReads(
+        LiteLLM_OrganizationTable(organization_id=org_id, budget_id="b-org", created_by="admin", updated_by="admin")
+    )
+    await get_org_object(org_id=org_id, prisma_client=reads, user_api_key_cache=cache, include_budget_table=False)  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+    await get_org_object_for_request(
+        org_id=org_id,
+        prisma_client=reads,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+        user_api_key_cache=cache,
+        parent_otel_span=None,
+        proxy_logging_obj=None,
+    )
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
+    return cache, reads
+
+
+async def _org_served_while_the_database_is_stopped(
+    cache, reads: _OrganizationReads, org_id: str
+) -> Mapping[str, bool]:
+    """Which auth lookups still answer with the organization once the database stops. A lookup that does not answer
+    raises the unreachable database's error, or refuses for lack of a last good entry."""
+    import httpx
+
+    from litellm.proxy.auth.auth_checks import get_org_object, get_org_object_for_request
+    from litellm.proxy.db.exception_handler import LastGoodEntryMissing
+
+    reads.stopped = True
+    lookups: Final = {
+        "org": lambda: get_org_object(
+            org_id=org_id,
+            prisma_client=reads,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+            user_api_key_cache=cache,
+            include_budget_table=False,
+        ),
+        "org_for_request": lambda: get_org_object_for_request(
+            org_id=org_id,
+            prisma_client=reads,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+            user_api_key_cache=cache,
+            parent_otel_span=None,
+            proxy_logging_obj=None,
+        ),
+    }
+
+    async def served(lookup) -> bool:
+        try:
+            return await lookup() is not None
+        except (httpx.ConnectError, LastGoodEntryMissing):
+            return False
+
+    return {name: await served(lookup) for name, lookup in lookups.items()}
+
+
+_SERVING: Final = pytest.mark.parametrize("serving", [False, True], ids=["cache_only", "last_good_entries"])
+
+
+@pytest.mark.asyncio
+@_SERVING
+async def test_an_organization_nothing_evicted_is_served_while_the_database_is_stopped(monkeypatch, serving: bool):
+    cache, reads = await _org_read_by_every_lookup(monkeypatch, "org-1", serving=serving)
+
+    assert await _org_served_while_the_database_is_stopped(cache, reads, "org-1") == {
+        "org": True,
+        "org_for_request": True,
+    }
+
+
+@pytest.mark.asyncio
+@_SERVING
+async def test_v1_update_evicts_the_organization_and_its_last_good_entries(monkeypatch, serving: bool):
+    """Auth reads the organization cache-first, and its last good entry never expires: an update that leaves either
+    in place keeps enforcing the old limits, during a database outage for ever."""
+    from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
+    from litellm.proxy.management_endpoints import organization_endpoints
+    from litellm.proxy.utils import jsonify_object
+
+    cache, reads = await _org_read_by_every_lookup(monkeypatch, "org-1", serving=serving)
+    prisma_client: Final = AsyncMock()
+    prisma_client.jsonify_object = jsonify_object
+    prisma_client.db.litellm_organizationtable.find_unique = AsyncMock(
+        return_value=SimpleNamespace(metadata=None, budget_id="b-org", object_permission_id=None)
+    )
+    prisma_client.db.litellm_organizationtable.update = AsyncMock(return_value=MagicMock())
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", prisma_client)
+    monkeypatch.setattr(organization_endpoints, "verify_org_access", AsyncMock())
+    request: Final = MagicMock()
+    request.json = AsyncMock(return_value={"organization_id": "org-1", "organization_alias": "renamed"})
+
+    await organization_endpoints.update_organization(
+        request=request,
+        user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN, user_id="admin-1"),
+    )
+
+    assert not any((await _org_served_while_the_database_is_stopped(cache, reads, "org-1")).values())
+
+
+@pytest.mark.asyncio
+@_SERVING
+async def test_v2_update_evicts_the_organization_and_its_last_good_entries(monkeypatch, serving: bool):
+    cache, reads = await _org_read_by_every_lookup(monkeypatch, "org-1", serving=serving)
+
+    await _run_update_organization_v2(
+        monkeypatch, body={"max_budget": 1.0}, existing_budget_id="b-org", existing_metadata=None
+    )
+
+    assert not any((await _org_served_while_the_database_is_stopped(cache, reads, "org-1")).values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body, evicted",
+    [({"max_budget": 1.0}, True), ({"metadata": {"lane": "a"}}, False)],
+    ids=["budget_changed", "budget_untouched"],
+)
+async def test_v2_budget_change_drops_the_last_good_entries_of_the_organizations_keys(
+    monkeypatch, body: dict, evicted: bool
+):
+    """A key's own entry carries its organization's budget, which a v2 update writes straight to the budget row."""
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, recall_last_good, remember_last_good
+
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    await remember_last_good(
+        cache, "hashed-org-key", UserAPIKeyAuth(token="hashed-org-key", organization_max_budget=50.0)
+    )
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
+
+    await _run_update_organization_v2(
+        monkeypatch,
+        body=body,
+        existing_budget_id="b-org",
+        existing_metadata=None,
+        key_rows=(SimpleNamespace(token="hashed-org-key"),),
+    )
+
+    assert (await recall_last_good(cache, "hashed-org-key", UserAPIKeyAuth) is None) is evicted
+
+
+@pytest.mark.asyncio
+@_SERVING
+async def test_delete_organization_evicts_the_organization_and_its_last_good_entries(monkeypatch, serving: bool):
+    from litellm.proxy._types import DeleteOrganizationRequest, LitellmUserRoles, UserAPIKeyAuth
+    from litellm.proxy.management_endpoints.organization_endpoints import delete_organization
+
+    cache, reads = await _org_read_by_every_lookup(monkeypatch, "org-doomed", serving=serving)
+    prisma_client: Final = AsyncMock()
+    prisma_client.db.litellm_teamtable.find_many = AsyncMock(return_value=[])
+    prisma_client.db.litellm_verificationtoken.find_many = AsyncMock(return_value=[])
+    prisma_client.db.litellm_jwtkeymapping = CascadingJWTMappingTable([])
+    prisma_client.db.litellm_organizationtable.delete = AsyncMock(return_value=MagicMock())
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", prisma_client)
+    monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", None)
+
+    await delete_organization(
+        data=DeleteOrganizationRequest(organization_ids=["org-doomed"]),
+        user_api_key_dict=UserAPIKeyAuth(api_key="sk-admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+    )
+
+    assert not any((await _org_served_while_the_database_is_stopped(cache, reads, "org-doomed")).values())

@@ -2940,6 +2940,19 @@ class ConfigGeneralSettings(LiteLLMPydanticObjectBase):
             "lookups keep hitting the DB"
         ),
     )
+    serve_last_good_auth_entries: bool = Field(
+        False,
+        description=(
+            "keep the entry each database read returns for the keys, teams, memberships, users, projects, "
+            "organizations, customers, tags, model access groups, budgets and global proxy spend a request is checked "
+            "against, in Redis with no expiry and in each worker's memory, and serve it while the database is "
+            "unreachable, so a database failover does not refuse callers that were just served. A key or team the "
+            "database reported missing, or that was deleted or blocked, is still refused, and a request whose limits "
+            "have no entry is refused with 503, whatever allow_requests_on_db_unavailable says. While this is on, "
+            "deleting or blocking a key or team answers 503 and changes nothing when Redis cannot record the "
+            "revocation, so retry it once Redis is reachable"
+        ),
+    )
     max_request_size_mb: int | None = Field(
         None,
         description="max request size in MB, if a request is larger than this size it will be rejected",
