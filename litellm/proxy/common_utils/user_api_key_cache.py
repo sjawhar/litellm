@@ -435,6 +435,14 @@ def end_user_restricted_registry_cache_key() -> str:
     return "end_user_restricted_registry"
 
 
+def default_end_user_budget_cache_key(budget_id: str) -> str:
+    return f"default_end_user_budget:{budget_id}"
+
+
+def team_member_default_budget_cache_key(budget_id: str) -> str:
+    return f"team_member_default_budget:{budget_id}"
+
+
 def team_membership_auth_cache_key(team_id: str, user_id: str) -> str:
     """Cache key one team member's ``LiteLLM_TeamMembership`` row is stored under for the admission check."""
     return f"{team_id}_{user_id}"
@@ -483,6 +491,11 @@ def _last_good_tombstone_key(cache_key: str) -> str:
 def _last_good_store(cache: DualCache) -> UserApiKeyCache | None:
     """The last good entries are a ``UserApiKeyCache`` partition; any other cache keeps none."""
     return cache if isinstance(cache, UserApiKeyCache) else None
+
+
+def serves_last_good_entries(cache: DualCache) -> bool:
+    store: Final = _last_good_store(cache)
+    return store is not None and store.serve_last_good_entries
 
 
 async def _store_in_redis_unless_tombstoned(redis: RedisCache, cache_key: str, payload: object) -> bool:

@@ -19,7 +19,8 @@ from litellm.proxy.auth.user_api_key_auth import (
     UserAPIKeyAuth,
     get_api_key_from_custom_header,
 )
-from fastapi import WebSocket, HTTPException, status
+from fastapi import HTTPException, WebSocket, status
+from fastapi import Request as FastAPIRequest
 
 from litellm.proxy._types import LiteLLM_UserTable, LitellmUserRoles, ProxyException
 from tests._master_key import MASTER_KEY
@@ -1976,13 +1977,14 @@ async def test_key_of_a_team_blocked_before_the_outage_is_refused_while_the_data
 
 @pytest.mark.asyncio
 async def test_key_of_a_team_member_is_served_while_the_database_is_stopped(monkeypatch):
-    """A team member's key carries the member's team spend, so auth also reads the membership row. With the key,
-    the team and the membership all held as last good entries, the stopped database refuses none of them."""
+    """A team member's key carries the member's team spend, so auth also reads the membership row, and the user row
+    whose budget it is checked against. With the key, the team, the membership and the user all held as last good
+    entries, the stopped database refuses none of them."""
     import time
 
     from fastapi import Request
 
-    from litellm.proxy._types import LiteLLM_TeamMembership, LiteLLM_TeamTableCachedObj, hash_token
+    from litellm.proxy._types import LiteLLM_TeamMembership, LiteLLM_TeamTableCachedObj, LiteLLM_UserTable, hash_token
     from litellm.proxy.common_utils.user_api_key_cache import (
         UserApiKeyCache,
         remember_last_good,
@@ -2008,6 +2010,7 @@ async def test_key_of_a_team_member_is_served_while_the_database_is_stopped(monk
         team_membership_auth_cache_key(team_id="t-lane", user_id="u-member"),
         LiteLLM_TeamMembership(user_id="u-member", team_id="t-lane"),
     )
+    await remember_last_good(cache, "u-member", LiteLLM_UserTable(user_id="u-member"))
     monkeypatch.setattr(litellm.proxy.proxy_server, "user_api_key_cache", cache)
     monkeypatch.setattr(litellm.proxy.proxy_server, "master_key", MASTER_KEY)
     monkeypatch.setattr(litellm.proxy.proxy_server, "prisma_client", _StoppedDatabase())
@@ -2017,3 +2020,63 @@ async def test_key_of_a_team_member_is_served_while_the_database_is_stopped(monk
     served = await user_api_key_auth(request=request, api_key="Bearer " + user_key)
 
     assert (served.user_id, served.team_id) == ("u-member", "t-lane")
+
+
+async def _key_with_user_and_project_held(monkeypatch, user_key: str, project: object | None) -> FastAPIRequest:
+    """A stopped database, with the key and its user held as last good entries, and its project when given."""
+    import time
+
+    from litellm.proxy._types import LiteLLM_ProjectTableCachedObj, LiteLLM_UserTable, hash_token
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, project_cache_key, remember_last_good
+
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    await remember_last_good(
+        cache,
+        hash_token(user_key),
+        UserAPIKeyAuth(
+            token=hash_token(user_key), user_id="u-project", project_id="p-lane", last_refreshed_at=time.time()
+        ),
+    )
+    await remember_last_good(cache, "u-project", LiteLLM_UserTable(user_id="u-project"))
+    if isinstance(project, LiteLLM_ProjectTableCachedObj):
+        await remember_last_good(cache, project_cache_key("p-lane"), project)
+    monkeypatch.setattr(litellm.proxy.proxy_server, "user_api_key_cache", cache)
+    monkeypatch.setattr(litellm.proxy.proxy_server, "master_key", MASTER_KEY)
+    monkeypatch.setattr(litellm.proxy.proxy_server, "prisma_client", _StoppedDatabase())
+    request: Final = FastAPIRequest(scope={"type": "http", "method": "POST", "path": "/chat/completions", "headers": []})
+    request._url = URL(url="/chat/completions")
+    return request
+
+
+@pytest.mark.asyncio
+async def test_key_whose_project_has_an_entry_is_served_while_the_database_is_stopped(monkeypatch):
+    from litellm.proxy._types import LiteLLM_ProjectTableCachedObj
+
+    request: Final = await _key_with_user_and_project_held(
+        monkeypatch, "sk-project-held", LiteLLM_ProjectTableCachedObj(project_id="p-lane")
+    )
+
+    assert (await user_api_key_auth(request=request, api_key="Bearer sk-project-held")).project_id == "p-lane"
+
+
+@pytest.mark.asyncio
+async def test_key_of_a_blocked_project_is_refused_while_the_database_is_stopped(monkeypatch):
+    from litellm.proxy._types import LiteLLM_ProjectTableCachedObj
+
+    request: Final = await _key_with_user_and_project_held(
+        monkeypatch, "sk-project-blocked", LiteLLM_ProjectTableCachedObj(project_id="p-lane", blocked=True)
+    )
+
+    with pytest.raises(ProxyException) as refused:
+        await user_api_key_auth(request=request, api_key="Bearer sk-project-blocked")
+    assert "Project=p-lane is blocked" in refused.value.message
+
+
+@pytest.mark.asyncio
+async def test_key_whose_project_has_no_entry_is_refused_while_the_database_is_stopped(monkeypatch):
+    """Served without its project, the key would pass as if the project limited nothing."""
+    request: Final = await _key_with_user_and_project_held(monkeypatch, "sk-project-unknown", None)
+
+    with pytest.raises(ProxyException) as refused:
+        await user_api_key_auth(request=request, api_key="Bearer sk-project-unknown")
+    assert str(refused.value.code) == "503"

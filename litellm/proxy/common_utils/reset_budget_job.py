@@ -45,6 +45,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     model_access_group_spend_counter_key,
     project_cache_key,
     project_spend_counter_key,
+    serves_last_good_entries,
     tag_cache_key,
 )
 from litellm.proxy.db.budget_window_spend_writer import roll_window_spend_row
@@ -408,7 +409,7 @@ async def _forget_reset_last_good(cache_keys: Sequence[str]) -> None:
     try:
         from litellm.proxy.proxy_server import user_api_key_cache
 
-        if not user_api_key_cache.serve_last_good_entries:
+        if not serves_last_good_entries(user_api_key_cache):
             return
         for cache_key in cache_keys:
             await forget_last_good(user_api_key_cache, cache_key)

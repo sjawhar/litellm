@@ -17,6 +17,10 @@ from litellm._logging import verbose_proxy_logger
 from litellm.caching.caching import DualCache
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.proxy._types import LiteLLM_EndUserTable, UserAPIKeyAuth
+from litellm.proxy.auth.auth_checks import (
+    LastGoodEntryMissing,
+    last_good_end_user_blocked,
+)
 from litellm.proxy.common_utils.user_api_key_cache import AUTH_OBJECTS_TARGET
 from litellm.proxy.utils import PrismaClient
 
@@ -58,6 +62,28 @@ class ENTERPRISE_BlockedUserList(CustomLogger):
         if litellm.set_verbose is True:
             print(print_statement)  # noqa
 
+    @staticmethod
+    async def _blocked_in_db(
+        prisma_client: PrismaClient, user: str, cache: DualCache
+    ) -> bool:
+        """Whether the database blocks ``user``. While it cannot be reached, the last good entries answer, and a
+        request they cannot answer is refused rather than let through unchecked."""
+        try:
+            end_user_obj = await prisma_client.db.litellm_endusertable.find_unique(
+                where={"user_id": user}
+            )
+        except Exception as e:
+            try:
+                return await last_good_end_user_blocked(e, user, cache)
+            except LastGoodEntryMissing as missing:
+                raise HTTPException(
+                    status_code=503, detail={"error": missing.message}
+                ) from missing
+        if end_user_obj is None:  # user not in db - assume not blocked
+            end_user_obj = LiteLLM_EndUserTable(user_id=user, blocked=False)
+        cache.set_cache(key=f"litellm:end_user_id:{user}", value=end_user_obj, ttl=60)
+        return end_user_obj.blocked is True
+
     @with_service_target(AUTH_OBJECTS_TARGET)
     async def async_pre_call_hook(
         self,
@@ -93,16 +119,7 @@ class ENTERPRISE_BlockedUserList(CustomLogger):
                     key=cache_key
                 )
                 if end_user_cache_obj is None and self.prisma_client is not None:
-                    # check db
-                    end_user_obj = (
-                        await self.prisma_client.db.litellm_endusertable.find_unique(
-                            where={"user_id": user}
-                        )
-                    )
-                    if end_user_obj is None:  # user not in db - assume not blocked
-                        end_user_obj = LiteLLM_EndUserTable(user_id=user, blocked=False)
-                    cache.set_cache(key=cache_key, value=end_user_obj, ttl=60)
-                    if end_user_obj is not None and end_user_obj.blocked is True:
+                    if await self._blocked_in_db(self.prisma_client, user, cache):
                         raise HTTPException(
                             status_code=400,
                             detail={

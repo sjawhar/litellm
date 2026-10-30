@@ -41,7 +41,6 @@ _RowValues: Final = TypeAdapter(dict[str, object])
 _NO_ROWS: Final[Mapping[str, object]] = MappingProxyType({})
 _TEAM_BOUND_ROWS: Final = frozenset({"team_row", "membership_row"})
 _REFRESH_STAMPED_ROWS: Final = frozenset({"team_row", "project_row"})
-_LAST_GOOD_ROWS: Final = frozenset({"team_row", "membership_row"})
 
 
 def _lists_as_json(alias: str, columns: Sequence[str]) -> str:
@@ -315,8 +314,7 @@ async def _fill_from_db(
     if writes:
         await _write_back(writes, cache)
     for entry, value in writes:
-        if entry.row in _LAST_GOOD_ROWS:
-            await remember_last_good(cache, entry.cache_key, value)
+        await remember_last_good(cache, entry.cache_key, value)
 
 
 async def prefetch_auth_objects(

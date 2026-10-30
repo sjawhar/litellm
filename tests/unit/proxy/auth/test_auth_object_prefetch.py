@@ -361,6 +361,29 @@ async def test_team_row_the_prefetch_read_is_served_while_the_database_is_unreac
 
 
 @pytest.mark.asyncio
+async def test_user_and_organization_rows_the_prefetch_read_are_served_while_the_database_is_unreachable():
+    """The prefetch is also the database read for a key's user and organization, whose limits every request is
+    checked against: without their last good entries a stopped database refuses the key or drops those limits."""
+    import httpx
+
+    prisma = _prisma()
+    cache = UserApiKeyCache(in_memory_cache=InMemoryCache(), serve_last_good_entries=True)
+    await prefetch_auth_objects(refs=_refs(), user_api_key_cache=cache, prisma_client=prisma)
+    await cache.async_delete_cache(USER_ID)
+    await cache.async_delete_cache(f"org_id:{ORG_ID}:with_budget")
+    stopped = AsyncMock(side_effect=httpx.ConnectError("All connection attempts failed"))
+    prisma.db.litellm_usertable.find_unique = stopped
+    prisma.db.litellm_organizationtable.find_unique = stopped
+
+    user = await get_user_object(user_id=USER_ID, prisma_client=prisma, user_api_key_cache=cache, user_id_upsert=False)
+    org = await get_org_object(org_id=ORG_ID, prisma_client=prisma, user_api_key_cache=cache, include_budget_table=True)
+
+    assert user is not None and (user.user_id, user.max_budget) == (USER_ID, 50.0)
+    assert org is not None and org.litellm_budget_table is not None
+    assert (org.organization_id, org.litellm_budget_table.max_budget) == (ORG_ID, 1000.0)
+
+
+@pytest.mark.asyncio
 async def test_identity_prefetch_warms_the_end_user_so_its_getter_needs_neither_redis_nor_the_database():
     end_user_key = end_user_cache_key("eu-1")
     redis = CountingRedis({end_user_key: json.dumps({"user_id": "eu-1", "blocked": False, "spend": 0.0})})

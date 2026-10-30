@@ -1,6 +1,6 @@
 """R69/A79: while the database is unreachable, the gateway serves each key and team it last read from the database,
-whatever the age of its cached entry, and refuses a caller it never read or that was deleted. The database and Redis
-each sit behind a relay the test takes down and brings back."""
+whatever the age of its cached entry, enforces the user limits it last read for them, and refuses a caller it never
+read or that was deleted. The database and Redis each sit behind a relay the test takes down and brings back."""
 
 import json
 import os
@@ -121,6 +121,17 @@ def _outlive_the_cache() -> None:
     time.sleep(CACHE_TTL_SECONDS + 1)
 
 
+def _user_key(proxy: Gateway, *, max_budget: float | None) -> str:
+    """A personal key of a new internal user, whose budget the gateway checks on every request."""
+    user_id: Final = f"last-good-user-{uuid.uuid4().hex}"
+    proxy.post("/user/new", {"user_id": user_id, "models": [MODEL], "max_budget": max_budget, "auto_create_key": False})
+    return string_value(proxy.post("/key/generate", {"user_id": user_id, "models": [MODEL]})["key"])
+
+
+def _over_budget(response: httpx.Response) -> bool:
+    return response.status_code != 200 and "ExceededBudget" in response.text
+
+
 def test_callers_the_gateway_last_read_are_served_while_the_database_is_stopped(tmp_path: Path) -> None:
     master_key: Final = f"sk-{uuid.uuid4().hex}"
     redis_host: Final = os.environ.get("REDIS_HOST", "127.0.0.1")
@@ -163,16 +174,20 @@ def test_callers_the_gateway_last_read_are_served_while_the_database_is_stopped(
             served: Final = {
                 "key": string_value(proxy.post("/key/generate", {"models": [MODEL]})["key"]),
                 "team_key": string_value(proxy.post("/key/generate", {"team_id": by_id, "models": [MODEL]})["key"]),
+                "user_key": _user_key(proxy, max_budget=None),
                 **jwt_callers,
             }
+            spent_user_key: Final = _user_key(proxy, max_budget=0.0)
             deleted: Final = string_value(proxy.post("/key/generate", {"models": [MODEL]})["key"])
 
             assert _statuses(proxy, {**served, "deleted": deleted}) == dict.fromkeys((*served, "deleted"), 200)
+            assert _over_budget(_chat(proxy, spent_user_key)), "the user's budget is spent"
             _outlive_the_cache()
             proxy.post("/key/delete", {"keys": [deleted]})
             database.cut()
 
             assert _statuses(proxy, served) == dict.fromkeys(served, 200), "the database is stopped"
+            assert _over_budget(_chat(proxy, spent_user_key)), "the user's budget holds while the database is stopped"
             refused: Final = _statuses(proxy, {"deleted": deleted, "never_read": f"sk-{uuid.uuid4().hex}"})
             assert all(str(outcome).split()[0] in ("401", "503") for outcome in refused.values()), refused
 
