@@ -1326,8 +1326,19 @@ def _call_type_for_route(route: str | None) -> str | None:
     return call_types[0].value if len(operations) == 1 else None
 
 
+_CALLER_TEAM_IDENTITY_FIELDS: Final = frozenset(("team_id", "team_alias"))
+
+
 def _without_caller_identity_fields(metadata: Mapping[str, object]) -> Mapping[str, object]:
-    return {key: value for key, value in metadata.items() if not key.startswith("user_api_key")}
+    """Drop every name that says who the caller is. The ``user_api_key`` family is the proxy's own
+    identity stamp. ``team_id`` and ``team_alias`` sit outside it and are read as the team by the
+    ClickHouse spend row, the Datadog loggers, New Relic and the OTel span model whenever the
+    authenticated key has no team of its own."""
+    return {
+        key: value
+        for key, value in metadata.items()
+        if not (key.startswith("user_api_key") or key in _CALLER_TEAM_IDENTITY_FIELDS)
+    }
 
 
 def _proxy_stamped_request_metadata(request_data: Mapping[str, object]) -> bool:

@@ -958,6 +958,43 @@ async def test_a_body_shaped_like_the_proxy_stamp_does_not_buy_the_caller_its_id
     }
 
 
+@pytest.mark.asyncio
+async def test_auth_gate_failure_drops_the_team_the_caller_named(
+    proxy_logging, make_user_api_key_auth, monkeypatch
+):
+    """The ClickHouse spend row, the Datadog loggers, New Relic and the OTel span model read
+    team_id and team_alias as the team whenever the authenticated key has none, so a rejected
+    caller's own values must not reach a logger."""
+    recorder = _FailureEventRecorder()
+    monkeypatch.setattr(litellm, "callbacks", [recorder])
+    forged = {"team_id": "victim-team", "team_alias": "victim-team-alias"}
+    authenticated = make_user_api_key_auth(team_id=None, team_alias=None)
+
+    await proxy_logging._handle_logging_proxy_only_error(
+        request_data={
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {**forged, "department": "engineering"},
+            "litellm_metadata": {**forged, "trace_id": "trace-1"},
+        },
+        user_api_key_dict=authenticated,
+        route="/chat/completions",
+        original_exception=litellm.BudgetExceededError(current_cost=2.0, max_budget=1.0),
+    )
+
+    assert len(recorder.logged_litellm_params) == 1
+    logged_metadata = recorder.logged_litellm_params[0]["metadata"]
+    logged_litellm_metadata = recorder.logged_litellm_params[0]["litellm_metadata"]
+    assert {
+        "metadata": {key: logged_metadata.get(key) for key in ("department", *forged)},
+        "litellm_metadata": {key: logged_litellm_metadata.get(key) for key in ("trace_id", *forged)},
+        "payload": {key: recorder.logged_payload_metadata[0].get(key) for key in forged},
+    } == {
+        "metadata": {"department": "engineering", **dict.fromkeys(forged)},
+        "litellm_metadata": {"trace_id": "trace-1", **dict.fromkeys(forged)},
+        "payload": dict.fromkeys(forged),
+    }
+
 
 @pytest.mark.asyncio
 async def test_handle_logging_proxy_only_path_propagates_async_failure_raises(proxy_logging, make_user_api_key_auth):
