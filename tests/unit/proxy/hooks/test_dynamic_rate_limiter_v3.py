@@ -1692,13 +1692,13 @@ def _anthropic_message_stream(model: str, input_tokens: int, output_tokens: int)
     return "".join(f"event: {name}\ndata: {json.dumps(payload)}\n\n" for name, payload in events).encode()
 
 
-async def _await_pool_tokens(handler: DynamicRateLimitHandler, model: str, pool: str, expected: int) -> int:
+async def _await_pool_tokens(handler: DynamicRateLimitHandler, bucket_key: str, pool: str, expected: int) -> int:
     for _ in range(100):
-        charged = await _pool_counter(handler, model, pool, "tokens")
+        charged = await _pool_counter(handler, bucket_key, pool, "tokens")
         if charged >= expected:
             return charged
         await asyncio.sleep(0.05)
-    return await _pool_counter(handler, model, pool, "tokens")
+    return await _pool_counter(handler, bucket_key, pool, "tokens")
 
 
 @pytest.mark.asyncio
@@ -1717,6 +1717,7 @@ async def test_native_anthropic_messages_success_charges_the_team_pool_tokens(
     monkeypatch.setattr(litellm, "priority_reservation", {"high": 0.8, "low": 0.2})
     model = "native-claude"
     upstream_model = "claude-opus-4-7"
+    bucket_key: Final = f"native-deployment:{upstream_model}"
     handler = DynamicRateLimitHandler(internal_usage_cache=DualCache())
     router = Router(
         model_list=[
@@ -1728,11 +1729,17 @@ async def test_native_anthropic_messages_success_charges_the_team_pool_tokens(
                     "rpm": 10,
                     "tpm": 1000,
                 },
+                "model_info": {"id": "native-deployment"},
             }
         ]
     )
-    handler.update_variables(llm_router=router)
     monkeypatch.setattr(litellm, "callbacks", [handler])
+    await handler.async_pre_call_hook(
+        user_api_key_dict=UserAPIKeyAuth(metadata={"priority": "low"}, team_metadata={"priority": "high"}),
+        cache=handler.internal_usage_cache,
+        data={"model": model},
+        call_type="anthropic_messages",
+    )
     upstream_response: Final = (
         httpx.Response(
             200,
@@ -1760,9 +1767,11 @@ async def test_native_anthropic_messages_success_charges_the_team_pool_tokens(
             async for _ in response:
                 pass
 
-        assert await _await_pool_tokens(handler, model, "high", 15) == 15
-    assert await _pool_counter(handler, model, "low", "tokens") == 0
-    assert await _pool_counter(handler, model, "default_pool", "tokens") == 0
+        admission_window_increment: Final = 1
+        expected_high_tokens: Final = 15 + admission_window_increment
+        assert await _await_pool_tokens(handler, bucket_key, "high", expected_high_tokens) == expected_high_tokens
+    assert await _pool_counter(handler, bucket_key, "low", "tokens") == 0
+    assert await _pool_counter(handler, bucket_key, "default_pool", "tokens") == 0
 
 
 @pytest.mark.asyncio
