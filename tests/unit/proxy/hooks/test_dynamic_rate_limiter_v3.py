@@ -7,8 +7,9 @@ Core tests to validate that priority weights are respected (0.9/0.1) instead of 
 import asyncio
 import os
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta
+from functools import partial
 from itertools import chain
 from typing import Final, Literal
 from unittest.mock import AsyncMock, patch
@@ -1751,9 +1752,31 @@ async def test_pre_call_saturation_gauge_uses_larger_of_rpm_and_tpm_after_admiss
         _clear_prometheus_registry()
 
 
+class _LaggingSaturationReadCache(DualCache):
+    """A pod whose saturation pre-read comes from a local copy taken before other pods filled the window."""
+
+    def __init__(self, lagging_counter: str) -> None:
+        super().__init__()
+        self._lagging_counter = lagging_counter
+
+    async def async_get_cache(
+        self, key: str, parent_otel_span: object = None, local_only: bool = False, **kwargs: object
+    ) -> object:
+        if not local_only and "model_saturation_check" in key:
+            return self._lagging_counter
+        return await super().async_get_cache(key, parent_otel_span=parent_otel_span, local_only=local_only, **kwargs)
+
+
 @pytest.mark.asyncio
-async def test_pre_call_saturation_gauge_is_capped_at_one_when_the_window_is_over_capacity(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("make_cache", "expected_pre_read"),
+    (
+        pytest.param(DualCache, 5.0, id="pre_read_over_capacity"),
+        pytest.param(partial(_LaggingSaturationReadCache, lagging_counter="1"), 0.1, id="pre_read_below_capacity"),
+    ),
+)
+async def test_pre_call_saturation_gauge_reads_a_full_window_on_a_model_capacity_429(
+    monkeypatch: pytest.MonkeyPatch, make_cache: Callable[[], DualCache], expected_pre_read: float
 ):
     from fastapi import HTTPException
 
@@ -1761,16 +1784,21 @@ async def test_pre_call_saturation_gauge_is_capped_at_one_when_the_window_is_ove
     try:
         monkeypatch.setattr(litellm, "callbacks", [PrometheusLogger()])
         model = "over-capacity-model"
-        handler = _saturation_handler(model)
+        handler = _saturation_handler(model, cache=make_cache())
         data = _priority_request_data(model, "metadata", "high", None, None)
         user = _team_user("high")
         await _admit(handler, user, data)
         await _record_tokens(handler, data, total_tokens=5000)
+        model_group_info = handler.llm_router.get_model_group_info(model_group=model)
+        assert model_group_info is not None
+        pre_read_saturation = await handler._check_model_saturation(model=model, model_group_info=model_group_info)
 
         with pytest.raises(HTTPException) as blocked:
             await _admit(handler, user, data)
 
         assert blocked.value.status_code == 429
+        assert "Model capacity reached" in blocked.value.detail["error"]
+        assert pre_read_saturation == pytest.approx(expected_pre_read)
         samples = _saturation_samples()
         assert len(samples) == 1
         assert samples[0].labels == {"model_group": model, "priority": "high"}
