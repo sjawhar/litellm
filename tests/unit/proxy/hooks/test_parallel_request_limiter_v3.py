@@ -15,13 +15,16 @@ from typing import Any, Dict, Final, List, Optional
 import pytest
 from fastapi import HTTPException
 from pydantic import TypeAdapter
+from redis.crc import key_slot
 from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import ResponseError as RedisResponseError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 import litellm
 from litellm import Router
 from litellm.caching.caching import DualCache
 from litellm.caching.in_memory_cache import InMemoryCache
+from litellm.caching.redis_batch import request_redis_batch_scope
 from litellm.caching.redis_cache import RedisCircuitBreakerOpenError
 from litellm.constants import INTERNAL_CALL_ORIGIN_METADATA_KEY
 from litellm.proxy._types import LiteLLM_TeamTable, UserAPIKeyAuth
@@ -29,6 +32,7 @@ from litellm.proxy.auth.team_grants import team_grants
 from litellm.proxy.common_utils.proxy_rate_limit_error import ProxyRateLimitError
 from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.proxy.hooks.parallel_request_limiter_v3 import (
+    PARALLEL_REQUEST_SLOT_LEASE_SECONDS,
     PARALLEL_REQUEST_SLOT_TTL_SECONDS,
     PARALLEL_SLOT_RELEASE_DROP_WARNING_INTERVAL_SECONDS,
     PARALLEL_SLOT_RELEASE_RETRY_LIMIT,
@@ -1026,7 +1030,7 @@ async def test_rejected_request_does_not_consume_parallel_slot_v3():
 async def test_parallel_gauge_uses_atomic_redis_script_v3():
     """
     With Redis available, gauge admission goes through the atomic
-    check-and-acquire script (limit, slot TTL, and this request's slot id as
+    check-and-acquire script (limit, slot lease, and this request's slot id as
     args), the returned in-flight count is mirrored into the local cache,
     and an over-limit script result maps to a 429 without occupying a slot.
     """
@@ -1059,7 +1063,7 @@ async def test_parallel_gauge_uses_atomic_redis_script_v3():
     assert isinstance(stashed_slot_id, str) and stashed_slot_id
     assert stashed_acquisition["counter_keys"] == [counter_key]
     assert captured_calls == [
-        ([counter_key], [5, PARALLEL_REQUEST_SLOT_TTL_SECONDS, stashed_slot_id])
+        ([counter_key], [5, PARALLEL_REQUEST_SLOT_LEASE_SECONDS, stashed_slot_id])
     ]
     assert (
         await handler.internal_usage_cache.async_get_cache(
@@ -4379,8 +4383,8 @@ async def test_success_event_releases_parallel_slot_v3(monkeypatch):
 _TEAM_SLOT_TEAM_ID: Final = "team-signed-in-by-token"
 
 
-def _token_caller_of_team(max_parallel_requests: int) -> UserAPIKeyAuth:
-    team: Final = LiteLLM_TeamTable(team_id=_TEAM_SLOT_TEAM_ID, max_parallel_requests=max_parallel_requests)
+def _token_caller_of_team(max_parallel_requests: int, team_id: str = _TEAM_SLOT_TEAM_ID) -> UserAPIKeyAuth:
+    team: Final = LiteLLM_TeamTable(team_id=team_id, max_parallel_requests=max_parallel_requests)
     return UserAPIKeyAuth(api_key=None, team_id=team.team_id, **team_grants(team, None, None))
 
 
@@ -4433,21 +4437,42 @@ async def _end_request(
 
 
 class _GaugeRedis:
-    """One Redis that every pod shares, holding each gauge's slot ids the way the acquire and release scripts do.
-    An acquire whose reply is lost has already added its slot, and while ``down`` no call reaches Redis. While
-    ``acquire_reply_gate`` is set, an acquire that added its slot waits for it before it replies. While
-    ``release_gate`` is set, a release that reaches Redis waits for it before it removes anything."""
+    """One Redis that every pod shares, holding each gauge's slot ids with the time, on ``clock`` when given, each was
+    last acquired or renewed, the way the acquire, renew and release scripts do: an acquire first drops every slot
+    whose lease has ended. An acquire whose reply is lost has already added its slot, and while ``down`` no call
+    reaches Redis. While ``acquire_reply_gate`` is set, an acquire that added its slot waits for it before it replies.
+    While ``release_gate`` is set, a release that reaches Redis waits for it before it removes anything, and while
+    ``renew_gate`` is set, a renewal waits for it before it writes anything. A ``cluster`` refuses a call whose keys
+    hash to more than one cluster slot, as Redis Cluster does."""
 
-    def __init__(self, lost_acquire_replies: int = 0, down_after_lost_reply: bool = False) -> None:
-        self.gauges: Final[dict[str, set[str]]] = {}
+    def __init__(
+        self,
+        lost_acquire_replies: int = 0,
+        down_after_lost_reply: bool = False,
+        clock: TimeController | None = None,
+        cluster: bool = False,
+    ) -> None:
+        self.gauges: Final[dict[str, dict[str, float]]] = {}
         self.lost_acquire_replies = lost_acquire_replies
         self.down_after_lost_reply: Final = down_after_lost_reply
+        self.clock: Final = clock
+        self.cluster: Final = cluster
         self.down = False
         self.breaker_open = False
         self.release_attempts: Final[list[tuple[str, ...]]] = []
         self.acquire_reply_gate: asyncio.Event | None = None
         self.release_gate: asyncio.Event | None = None
         self.held_releases = 0
+        self.renew_gate: asyncio.Event | None = None
+        self.held_renewals = 0
+        self.renewed_slots: Final[list[str]] = []
+        self.renew_calls: Final[list[frozenset[str]]] = []
+
+    def now(self) -> float:
+        return time.time() if self.clock is None else self.clock.now().timestamp()
+
+    def hold(self, key: str, *slot_ids: str) -> None:
+        self.gauges.setdefault(key, {}).update(dict.fromkeys(slot_ids, self.now()))
 
     def slots(self, key: str) -> frozenset[str]:
         return frozenset(self.gauges.get(key, ()))
@@ -4462,6 +4487,8 @@ class _GaugeRedis:
                 raise RedisCircuitBreakerOpenError("Redis circuit breaker is open, skipping run_script")
             if self.down:
                 raise RedisConnectionError("Error 111 connecting to 127.0.0.1:6379. Connection refused.")
+            if self.cluster and len({key_slot(key.encode()) for key in keys}) > 1:
+                raise RedisResponseError("CROSSSLOT Keys in request don't hash to the same slot")
             if script == v3.PARALLEL_ACQUIRE_SCRIPT:
                 reply: Final = self._acquire(keys, args)
                 if self.acquire_reply_gate is not None:
@@ -4472,27 +4499,41 @@ class _GaugeRedis:
                     self.held_releases += 1
                     await self.release_gate.wait()
                 return self._release(keys, args)
+            if script == v3.PARALLEL_RENEW_SCRIPT:
+                self.renew_calls.append(frozenset(str(slot_id) for slot_id in args[1:]))
+                if self.renew_gate is not None:
+                    self.held_renewals += 1
+                    await self.renew_gate.wait()
+                return self._renew(keys, args)
             raise AssertionError(f"unexpected script: {script[:60]}")
 
         return run
 
     def _acquire(self, keys: Sequence[str], args: Sequence[object]) -> list[int]:
+        now: Final = self.now()
         limits: Final = [int(str(limit)) for limit in args[0::3]]
-        for index, (key, limit) in enumerate(zip(keys, limits), start=1):
-            in_flight = len(self.gauges.get(key, ()))
-            if in_flight + 1 > limit:
-                return [1, index, in_flight, limit]
+        leases: Final = [float(str(lease)) for lease in args[1::3]]
+        for index, (key, limit, lease) in enumerate(zip(keys, limits, leases), start=1):
+            self.gauges[key] = {slot_id: at for slot_id, at in self.gauges.get(key, {}).items() if at > now - lease}
+            if len(self.gauges[key]) + 1 > limit:
+                return [1, index, len(self.gauges[key]), limit]
         for key, slot_id in zip(keys, args[2::3]):
-            self.gauges.setdefault(key, set()).add(str(slot_id))
+            self.gauges[key][str(slot_id)] = now
         if self.lost_acquire_replies:
             self.lost_acquire_replies -= 1
             self.down = self.down_after_lost_reply
             raise RedisTimeoutError("Timeout reading from 127.0.0.1:6379")
         return [0, *(len(self.gauges[key]) for key in keys)]
 
+    def _renew(self, keys: Sequence[str], args: Sequence[object]) -> list[int]:
+        for key, slot_id in zip(keys, args[1:]):
+            self.renewed_slots.append(str(slot_id))
+            self.gauges.setdefault(key, {})[str(slot_id)] = self.now()
+        return [len(keys)]
+
     def _release(self, keys: Sequence[str], args: Sequence[object]) -> list[int]:
         for key, slot_id in zip(keys, args):
-            self.gauges.get(key, set()).discard(str(slot_id))
+            self.gauges.get(key, {}).pop(str(slot_id), None)
         return [len(self.gauges.get(key, ())) for key in keys]
 
 
@@ -4500,14 +4541,29 @@ _TEAM_GAUGE: Final = f"{{team:{_TEAM_SLOT_TEAM_ID}}}:max_parallel_requests"
 
 
 def _pod(
-    redis: _GaugeRedis, *, fail_closed: bool = False, clock: TimeController | None = None
+    redis: _GaugeRedis,
+    *,
+    fail_closed: bool = False,
+    clock: TimeController | None = None,
+    group_keys_by_hash_tag: bool = False,
 ) -> _PROXY_MaxParallelRequestsHandler:
     return _PROXY_MaxParallelRequestsHandler(
         internal_usage_cache=InternalUsageCache(DualCache(redis_cache=redis)),  # pyright: ignore[reportArgumentType]  # duck-typed Redis double
         time_provider=None if clock is None else clock.now,
         fail_closed_resolver=lambda: fail_closed,
+        force_hash_tag_grouping_resolver=lambda: group_keys_by_hash_tag,
         parallel_slot_release_retry_delays=(0.0,),
+        parallel_slot_renew_interval_seconds=0.0,
     )
+
+
+def _crash(pod: _PROXY_MaxParallelRequestsHandler) -> None:
+    """The pod's worker dies: nothing it was doing in the background goes on."""
+    retrier: Final = pod._slot_release_retrier  # pyright: ignore[reportPrivateUsage]  # stands in for a dead worker
+    renewer: Final = pod._slot_lease_renewer  # pyright: ignore[reportPrivateUsage]  # stands in for a dead worker
+    for task in (retrier, renewer):
+        if task is not None:
+            task.cancel()
 
 
 async def _until(condition: Callable[[], bool]) -> None:
@@ -4612,7 +4668,7 @@ async def test_releases_held_for_retry_are_capped_and_the_newest_left_to_expire_
     redis: Final = _GaugeRedis()
     pod: Final = _pod(redis)
     slot_ids: Final = tuple(f"slot-{index}" for index in range(PARALLEL_SLOT_RELEASE_RETRY_LIMIT + 1))
-    redis.gauges[_TEAM_GAUGE] = set(slot_ids)
+    redis.hold(_TEAM_GAUGE, *slot_ids)
 
     redis.down = True
     for slot_id in slot_ids:
@@ -4626,24 +4682,24 @@ async def test_releases_held_for_retry_are_capped_and_the_newest_left_to_expire_
 
 
 @pytest.mark.asyncio
-async def test_a_release_held_past_the_slot_ttl_is_dropped_v3() -> None:
-    """By the time the slot's TTL has passed, the acquire and count scripts have pruned it from the gauge, so the
-    release has nothing left to do and is not sent."""
+async def test_a_release_held_past_the_slot_lease_is_dropped_v3() -> None:
+    """A slot's holder stops renewing it when its call ends, so once the lease has passed the acquire and count
+    scripts drop the slot from the gauge, and the release has nothing left to do and is not sent."""
     redis: Final = _GaugeRedis()
     clock: Final = TimeController()
     pod: Final = _pod(redis, clock=clock)
-    redis.gauges[_TEAM_GAUGE] = {"slot-past-its-ttl"}
+    redis.hold(_TEAM_GAUGE, "slot-past-its-lease")
 
     redis.down = True
     await pod._release_parallel_request_slots(
-        ParallelSlotAcquisition(slot_id="slot-past-its-ttl", counter_keys=[_TEAM_GAUGE])
+        ParallelSlotAcquisition(slot_id="slot-past-its-lease", counter_keys=[_TEAM_GAUGE])
     )
-    clock.advance(PARALLEL_REQUEST_SLOT_TTL_SECONDS)
+    clock.advance(PARALLEL_REQUEST_SLOT_LEASE_SECONDS)
     redis.down = False
     for _ in range(10):
         await asyncio.sleep(0)
 
-    assert redis.release_attempts == [("slot-past-its-ttl",)]
+    assert redis.release_attempts == [("slot-past-its-lease",)]
 
 
 @pytest.mark.asyncio
@@ -4653,7 +4709,7 @@ async def test_a_retrier_cancelled_mid_release_keeps_the_release_and_a_later_rel
     one that sends both."""
     redis: Final = _GaugeRedis()
     pod: Final = _pod(redis)
-    redis.gauges[_TEAM_GAUGE] = {"held-when-cancelled", "queued-after"}
+    redis.hold(_TEAM_GAUGE, "held-when-cancelled", "queued-after")
 
     redis.down = True
     await pod._release_parallel_request_slots(
@@ -4681,7 +4737,7 @@ async def test_queued_releases_are_retried_one_at_a_time_v3() -> None:
     and every one of them is released once it answers."""
     redis: Final = _GaugeRedis()
     pod: Final = _pod(redis)
-    redis.gauges[_TEAM_GAUGE] = {"first", "second"}
+    redis.hold(_TEAM_GAUGE, "first", "second")
 
     redis.down = True
     for slot_id in ("first", "second"):
@@ -4704,7 +4760,7 @@ async def test_two_drainers_on_one_release_queue_send_every_release_v3() -> None
     left in the queue unsent and no drainer reaches past the end of it."""
     redis: Final = _GaugeRedis()
     pod: Final = _pod(redis)
-    redis.gauges[_TEAM_GAUGE] = {"first", "second"}
+    redis.hold(_TEAM_GAUGE, "first", "second")
 
     redis.down = True
     for slot_id in ("first", "second"):
@@ -4730,7 +4786,7 @@ async def test_a_release_cancelled_while_it_waits_on_redis_is_retried_v3(path: s
     or may not have run the release, so it is sent again once the retrier gets to it."""
     redis: Final = _GaugeRedis()
     pod: Final = _pod(redis)
-    redis.gauges[_TEAM_GAUGE] = {"slot-of-a-cancelled-request"}
+    redis.hold(_TEAM_GAUGE, "slot-of-a-cancelled-request")
     redis.release_gate = asyncio.Event()
     releasing: Final = asyncio.create_task(
         pod._release_parallel_request_slots(
@@ -4814,6 +4870,221 @@ async def test_a_full_release_queue_warns_on_the_first_drop_and_then_once_an_int
     assert f"holds its limit of {PARALLEL_SLOT_RELEASE_RETRY_LIMIT}." in drop_warnings[0]
 
 
+async def _let_the_loop_run() -> None:
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_a_slot_whose_holder_died_frees_once_its_lease_ends_v3() -> None:
+    """A worker that dies mid-call never releases its slot and stops renewing its lease. The team's other pods count
+    the slot until the lease ends and admit the team right after, not an hour later."""
+    clock: Final = TimeController()
+    redis: Final = _GaugeRedis(clock=clock)
+    pods: Final = (_pod(redis, clock=clock), _pod(redis, clock=clock))
+    caller: Final = _token_caller_of_team(max_parallel_requests=1)
+    await _admit_on(pods[0], caller, "holder-dies-mid-call")
+    _crash(pods[0])
+
+    clock.advance(PARALLEL_REQUEST_SLOT_LEASE_SECONDS - 1)
+    assert (await _refusal_on(pods[1], caller)).status_code == 429
+    clock.advance(1)
+    await _admit_on(pods[1], caller, "after-the-lease")
+
+
+@pytest.mark.asyncio
+async def test_a_slot_stranded_by_a_restart_during_a_redis_outage_frees_once_its_lease_ends_v3() -> None:
+    """A call ends while Redis is away, so its release waits in the worker's retry queue, and then the worker restarts
+    and loses that queue. Once Redis answers, the restarted worker counts the slot only until its lease ends."""
+    clock: Final = TimeController()
+    redis: Final = _GaugeRedis(clock=clock)
+    pod: Final = _pod(redis, clock=clock)
+    caller: Final = _token_caller_of_team(max_parallel_requests=1)
+    held: Final = await _admit_on(pod, caller, "ends-while-redis-is-away")
+
+    redis.down = True
+    await _end_request("failure", pod, caller, held)
+    _crash(pod)
+    redis.down = False
+    restarted: Final = _pod(redis, clock=clock)
+
+    clock.advance(PARALLEL_REQUEST_SLOT_LEASE_SECONDS - 1)
+    assert (await _refusal_on(restarted, caller)).status_code == 429
+    clock.advance(1)
+    await _admit_on(restarted, caller, "after-the-lease")
+
+
+@pytest.mark.asyncio
+async def test_a_call_longer_than_the_lease_keeps_its_slot_while_its_holder_renews_it_v3() -> None:
+    """A long stream outlives many leases. It starts after the worker's only earlier call ended, so the worker had
+    nothing left to renew. The worker renews the stream's lease while it runs, so the team's other pods keep counting
+    the slot, and they admit the team once the stream ends."""
+    clock: Final = TimeController()
+    redis: Final = _GaugeRedis(clock=clock)
+    pods: Final = (_pod(redis, clock=clock), _pod(redis, clock=clock))
+    caller: Final = _token_caller_of_team(max_parallel_requests=1)
+    await _end_request("success", pods[0], caller, await _admit_on(pods[0], caller, "short-call"))
+    await _let_the_loop_run()
+    held: Final = await _admit_on(pods[0], caller, "long-stream")
+
+    for _ in range(5):
+        clock.advance(PARALLEL_REQUEST_SLOT_LEASE_SECONDS - 1)
+        await _let_the_loop_run()
+        assert (await _refusal_on(pods[1], caller)).status_code == 429
+
+    await _end_request("success", pods[0], caller, held)
+    await _admit_on(pods[1], caller, "after-the-stream")
+
+
+@pytest.mark.asyncio
+async def test_a_call_admitted_in_memory_after_a_lost_acquire_reply_keeps_its_slot_in_redis_v3() -> None:
+    """Redis runs the acquire script and loses the reply, so the default fail-open policy admits the call in memory.
+    Its worker renews the slot as for any other call, so the team's other pods keep counting it past the lease, and
+    they admit the team once the call ends."""
+    clock: Final = TimeController()
+    redis: Final = _GaugeRedis(lost_acquire_replies=1, clock=clock)
+    pods: Final = (_pod(redis, clock=clock), _pod(redis, clock=clock))
+    caller: Final = _token_caller_of_team(max_parallel_requests=1)
+    held: Final = await _admit_on(pods[0], caller, "admitted-in-memory")
+
+    for _ in range(3):
+        clock.advance(PARALLEL_REQUEST_SLOT_LEASE_SECONDS - 1)
+        await _let_the_loop_run()
+        assert (await _refusal_on(pods[1], caller)).status_code == 429
+
+    await _end_request("success", pods[0], caller, held)
+    await _admit_on(pods[1], caller, "after-the-call")
+
+
+@pytest.mark.asyncio
+async def test_a_slot_released_through_the_post_call_pipeline_is_no_longer_renewed_v3() -> None:
+    """A call that ends in the logging callbacks puts its release on the request's post-call pipeline, which goes out
+    after the callbacks. The worker stops renewing the slot at once, so no renewal keeps the slot past its release."""
+    redis: Final = _GaugeRedis()
+    pod: Final = _pod(redis)
+    caller: Final = _token_caller_of_team(max_parallel_requests=1)
+    held: Final = await _admit_on(pod, caller, "ends-in-the-callbacks")
+    slot_id: Final = held.parallel_slot["slot_id"] if held.parallel_slot else ""
+
+    with request_redis_batch_scope(post_call_deadline=3600):
+        await _end_request("success", pod, caller, held)
+    renewals_before: Final = len(redis.renewed_slots)
+    await _let_the_loop_run()
+
+    assert slot_id and slot_id not in redis.renewed_slots[renewals_before:]
+
+
+@pytest.mark.asyncio
+async def test_renewals_that_fail_while_redis_is_away_are_tried_again_v3(caplog: pytest.LogCaptureFixture) -> None:
+    """Redis goes away for less than a lease while a long call runs. The renewals that fail are logged and tried
+    again, so the slot still counts once Redis answers."""
+    clock: Final = TimeController()
+    redis: Final = _GaugeRedis(clock=clock)
+    pods: Final = (_pod(redis, clock=clock), _pod(redis, clock=clock))
+    caller: Final = _token_caller_of_team(max_parallel_requests=1)
+    await _admit_on(pods[0], caller, "long-call-through-an-outage")
+
+    redis.down = True
+    clock.advance(PARALLEL_REQUEST_SLOT_LEASE_SECONDS - 1)
+    with caplog.at_level(logging.WARNING, logger="LiteLLM Proxy"):
+        await _let_the_loop_run()
+    redis.down = False
+    await _let_the_loop_run()
+    clock.advance(PARALLEL_REQUEST_SLOT_LEASE_SECONDS - 1)
+
+    assert (await _refusal_on(pods[1], caller)).status_code == 429
+    assert any(record.getMessage().startswith("parallel_renew_script failed") for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_renewal_that_races_the_release_does_not_bring_the_slot_back_v3() -> None:
+    """A slot's renewal can reach Redis after the slot's release and add the slot back. The worker then sees that it
+    no longer holds the slot and releases it again, so the team's other pods do not count it."""
+    redis: Final = _GaugeRedis()
+    pods: Final = (_pod(redis), _pod(redis))
+    caller: Final = _token_caller_of_team(max_parallel_requests=1)
+    held: Final = await _admit_on(pods[0], caller, "ends-while-its-renewal-is-in-flight")
+    gate: Final = asyncio.Event()
+    redis.renew_gate = gate
+    await _until(lambda: redis.held_renewals == 1)
+
+    await _end_request("failure", pods[0], caller, held)
+    assert not redis.slots(_TEAM_GAUGE)
+    gate.set()
+    await _until(lambda: bool(redis.slots(_TEAM_GAUGE)))
+
+    await _until(lambda: not redis.slots(_TEAM_GAUGE))
+    await _admit_on(pods[1], caller, "after-the-late-renewal")
+
+
+@pytest.mark.asyncio
+async def test_one_script_call_renews_every_slot_a_worker_holds_v3() -> None:
+    """A worker renews all the slots it holds with one script call a pass, so a pass takes one round trip to Redis
+    however many slots it holds, and no slot waits behind another's renewal."""
+    redis: Final = _GaugeRedis()
+    pod: Final = _pod(redis)
+    caller: Final = _token_caller_of_team(max_parallel_requests=3)
+    held: Final = tuple([await _admit_on(pod, caller, f"held-{index}") for index in range(3)])
+    slot_ids: Final = frozenset(stash.parallel_slot["slot_id"] for stash in held if stash.parallel_slot)
+
+    await _let_the_loop_run()
+
+    assert len(slot_ids) == 3 and redis.renew_calls[0] == slot_ids
+
+
+@pytest.mark.asyncio
+async def test_renewals_on_a_cluster_send_one_call_per_hash_slot_v3() -> None:
+    """On Redis Cluster one script call may only touch the keys of one hash slot. With keys grouped by hash tag, a
+    worker holding slots of two teams sends one renewal call per hash slot, so both teams' slots stay counted past the
+    lease."""
+    clock: Final = TimeController()
+    redis: Final = _GaugeRedis(clock=clock, cluster=True)
+    pods: Final = (
+        _pod(redis, clock=clock, group_keys_by_hash_tag=True),
+        _pod(redis, clock=clock, group_keys_by_hash_tag=True),
+    )
+    callers: Final = (
+        _token_caller_of_team(max_parallel_requests=1),
+        _token_caller_of_team(max_parallel_requests=1, team_id="another-team"),
+    )
+    assert key_slot(_TEAM_GAUGE.encode()) != key_slot(b"{team:another-team}:max_parallel_requests")
+    for index, caller in enumerate(callers):
+        await _admit_on(pods[0], caller, f"long-call-{index}")
+
+    for _ in range(3):
+        clock.advance(PARALLEL_REQUEST_SLOT_LEASE_SECONDS - 1)
+        await _let_the_loop_run()
+        for caller in callers:
+            assert (await _refusal_on(pods[1], caller)).status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_a_slot_held_past_the_slot_ttl_is_no_longer_renewed_v3(caplog: pytest.LogCaptureFixture) -> None:
+    """A call still holding its slot after PARALLEL_REQUEST_SLOT_TTL_SECONDS is most likely one whose release was lost
+    inside the worker. Its lease is no longer renewed, with a warning, so the slot frees within a lease after the
+    worker's next renewal pass, as it did at the TTL before slots had leases."""
+    clock: Final = TimeController()
+    redis: Final = _GaugeRedis(clock=clock)
+    pods: Final = (_pod(redis, clock=clock), _pod(redis, clock=clock))
+    caller: Final = _token_caller_of_team(max_parallel_requests=1)
+    await _admit_on(pods[0], caller, "never-ends")
+
+    for _ in range(PARALLEL_REQUEST_SLOT_TTL_SECONDS // (PARALLEL_REQUEST_SLOT_LEASE_SECONDS - 1)):
+        clock.advance(PARALLEL_REQUEST_SLOT_LEASE_SECONDS - 1)
+        await _let_the_loop_run()
+    assert (await _refusal_on(pods[1], caller)).status_code == 429
+
+    clock.advance(PARALLEL_REQUEST_SLOT_LEASE_SECONDS)
+    with caplog.at_level(logging.WARNING, logger="LiteLLM Proxy"):
+        await _let_the_loop_run()
+    clock.advance(PARALLEL_REQUEST_SLOT_LEASE_SECONDS)
+    await _let_the_loop_run()
+    await _admit_on(pods[1], caller, "after-the-ttl")
+    assert any(
+        f"has been held for {PARALLEL_REQUEST_SLOT_TTL_SECONDS} s" in record.getMessage() for record in caplog.records
+    )
+
+
 @pytest.mark.asyncio
 async def test_read_only_gauge_check_counts_without_acquiring_v3():
     """
@@ -4846,7 +5117,7 @@ async def test_read_only_gauge_check_counts_without_acquiring_v3():
 
     response = await handler.should_rate_limit(descriptors=descriptors, read_only=True)
     assert captured_calls == [
-        ([counter_key], [PARALLEL_REQUEST_SLOT_TTL_SECONDS])
+        ([counter_key], [PARALLEL_REQUEST_SLOT_LEASE_SECONDS])
     ]
     assert response["overall_code"] == "OK"
     assert response["statuses"] == [
