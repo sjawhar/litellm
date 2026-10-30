@@ -2266,6 +2266,7 @@ class BaseLLMHTTPHandler:
                 "preset_cache_key": None,
                 "stream_response": {},
                 "model_info": kwargs.get("model_info"),
+                "anthropic_organization_id": kwargs.get("anthropic_organization_id"),
                 **vertex_location_params,
                 **anthropic_messages_optional_request_params,
             },

@@ -169,6 +169,7 @@ from litellm.router_utils.add_retry_fallback_headers import (
     replace_complexity_router_headers,
     response_total_token_count,
 )
+from litellm.router_utils.admission_refusal import is_admission_refusal
 from litellm.router_utils.auto_router_model_naming import (
     AUTO_ROUTER_MODEL_PREFIX,
     STRATEGY_ROUTER_PARAM_FIELDS,
@@ -7620,7 +7621,9 @@ class Router:
         }
         try:
             return await run_async_fallback(*args, **failover_kwargs)
-        except (openai.APIError, RouterRateLimitError, RouterRateLimitErrorBasic):
+        except (openai.APIError, RouterRateLimitError, RouterRateLimitErrorBasic) as failover_error:
+            if is_admission_refusal(failover_error):
+                raise
             # Expected model-level failure on the retried deployment. All
             # litellm provider errors derive from openai.APIError; if every
             # remaining deployment in the group is in cooldown the router
@@ -7645,7 +7648,7 @@ class Router:
         """
         Common utilities for async_function_with_fallbacks
         """
-        if verbose_router_logger.isEnabledFor(logging.DEBUG):
+        if verbose_router_logger.isEnabledFor(logging.DEBUG) and not is_admission_refusal(e):
             verbose_router_logger.debug("Traceback%s", redact_string(traceback.format_exc()))
         original_exception: Final = e
         fallback_model_group = None
@@ -7658,7 +7661,12 @@ class Router:
         hop_depth: Final = kwargs.get("fallback_depth")
         nested_fallback_hop: Final = isinstance(hop_depth, int) and hop_depth > 0
 
-        if disable_fallbacks is True or original_model_group is None or is_guardrail_intervention(e):
+        if (
+            disable_fallbacks is True
+            or original_model_group is None
+            or is_guardrail_intervention(e)
+            or is_admission_refusal(e)
+        ):
             raise e
 
         input_kwargs: Final = {
@@ -7872,6 +7880,8 @@ class Router:
 
                 return response
         except Exception as new_exception:
+            if is_admission_refusal(new_exception):
+                raise
             parent_otel_span: Final = get_parent_otel_span_from_kwargs(kwargs)
             fallback_failure_exception_str = truncate_fallback_error_detail(redact_string(str(new_exception)))
             cooldown_info: Final = await async_get_cooldown_deployments_with_debug_info(
@@ -8072,7 +8082,7 @@ class Router:
             response = add_retry_headers_to_response(response=response, attempted_retries=0, max_retries=None)
             return response
         except Exception as e:
-            if is_guardrail_intervention(e):
+            if is_guardrail_intervention(e) or is_admission_refusal(e):
                 raise
             current_attempt = None
             original_exception = e
@@ -8170,6 +8180,8 @@ class Router:
                     return response
 
                 except Exception as e:
+                    if is_admission_refusal(e):
+                        raise
                     # Always track the latest error so we raise the most
                     # recent exception instead of the first one.
                     original_exception = e
@@ -9059,25 +9071,9 @@ class Router:
             if isinstance(_callback, CustomLogger):
                 try:
                     await _callback.async_pre_call_check(deployment, parent_otel_span)
-                except litellm.RateLimitError as e:
-                    ## LOG FAILURE EVENT
-                    if logging_obj is not None:
-                        asyncio.create_task(
-                            logging_obj.dispatch_failure_handlers(
-                                exception=e,
-                                traceback_exception=traceback.format_exc(),
-                                prefer_async_handlers=True,
-                            )
-                        )
-                    set_cooldown_deployments(
-                        litellm_router_instance=self,
-                        exception_status=e.status_code,
-                        original_exception=e,
-                        deployment=deployment["model_info"]["id"],
-                        time_to_cooldown=self.cooldown_time,
-                    )
-                    raise e
                 except Exception as e:
+                    if is_admission_refusal(e):
+                        raise
                     ## LOG FAILURE EVENT
                     if logging_obj is not None:
                         asyncio.create_task(
@@ -9087,7 +9083,15 @@ class Router:
                                 prefer_async_handlers=True,
                             )
                         )
-                    raise e
+                    if isinstance(e, litellm.RateLimitError):
+                        set_cooldown_deployments(
+                            litellm_router_instance=self,
+                            exception_status=e.status_code,
+                            original_exception=e,
+                            deployment=deployment["model_info"]["id"],
+                            time_to_cooldown=self.cooldown_time,
+                        )
+                    raise
 
     @contextlib.asynccontextmanager
     async def _deployment_slot(

@@ -1268,6 +1268,67 @@ async def test_async_anthropic_messages_handler_forwards_router_model_info():
 
 
 @pytest.mark.asyncio
+async def test_async_anthropic_messages_handler_logs_the_serving_organization_and_no_federation_secret():
+    from datetime import datetime
+
+    from litellm.litellm_core_utils.litellm_logging import Logging
+    from litellm.llms.anthropic.pass_through.messages.transformation import AnthropicMessagesConfig
+    from litellm.types.workload_identity import WIF_SECRET_BEARING_KEYS
+
+    handler: Final = BaseLLMHTTPHandler()
+    logging_obj: Final = Logging(
+        model="anthropic/claude-opus-4-7",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=False,
+        call_type="anthropic_messages",
+        start_time=datetime.now(),
+        litellm_call_id="messages-organization-logging",
+        function_id="f",
+    )
+    client: Final = AsyncMock(spec=AsyncHTTPHandler)
+    client.post = AsyncMock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-opus-4-7",
+                "content": [{"type": "text", "text": "hi"}],
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+            request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+        )
+    )
+
+    async def logged_after_call(deployment_kwargs: dict[str, object]) -> dict[str, object]:
+        await handler.async_anthropic_messages_handler(
+            model="claude-opus-4-7",
+            messages=[{"role": "user", "content": "hi"}],
+            anthropic_messages_provider_config=AnthropicMessagesConfig(),
+            anthropic_messages_optional_request_params={"max_tokens": 16},
+            custom_llm_provider="anthropic",
+            litellm_params=GenericLiteLLMParams(),
+            logging_obj=logging_obj,
+            client=client,
+            api_key="sk-test",
+            kwargs=deployment_kwargs,
+        )
+        return dict(logging_obj.model_call_details["litellm_params"])
+
+    federated: Final = await logged_after_call(
+        {"anthropic_organization_id": "org-a", **{key: f"secret-{key}" for key in WIF_SECRET_BEARING_KEYS}}
+    )
+    assert federated["anthropic_organization_id"] == "org-a"
+    assert WIF_SECRET_BEARING_KEYS.isdisjoint(federated)
+
+    fallback_without_organization: Final = await logged_after_call({})
+    assert fallback_without_organization["anthropic_organization_id"] is None
+
+
+@pytest.mark.asyncio
 async def test_async_anthropic_messages_handler_header_priority():
     """
     Test that async_anthropic_messages_handler respects header priority:
