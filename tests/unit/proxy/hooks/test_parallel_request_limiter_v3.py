@@ -30,6 +30,7 @@ from litellm.proxy.common_utils.proxy_rate_limit_error import ProxyRateLimitErro
 from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.proxy.hooks.parallel_request_limiter_v3 import (
     PARALLEL_REQUEST_SLOT_TTL_SECONDS,
+    PARALLEL_SLOT_RELEASE_DROP_WARNING_INTERVAL_SECONDS,
     PARALLEL_SLOT_RELEASE_RETRY_LIMIT,
     ParallelSlotAcquisition,
     PROXY_MaxParallelRequestsHandler_v3,
@@ -4433,7 +4434,8 @@ async def _end_request(
 
 class _GaugeRedis:
     """One Redis that every pod shares, holding each gauge's slot ids the way the acquire and release scripts do.
-    An acquire whose reply is lost has already added its slot, and while ``down`` no call reaches Redis."""
+    An acquire whose reply is lost has already added its slot, and while ``down`` no call reaches Redis. While
+    ``release_gate`` is set, a release that reaches Redis waits for it before it removes anything."""
 
     def __init__(self, lost_acquire_replies: int = 0, down_after_lost_reply: bool = False) -> None:
         self.gauges: Final[dict[str, set[str]]] = {}
@@ -4442,6 +4444,8 @@ class _GaugeRedis:
         self.down = False
         self.breaker_open = False
         self.release_attempts: Final[list[tuple[str, ...]]] = []
+        self.release_gate: asyncio.Event | None = None
+        self.held_releases = 0
 
     def slots(self, key: str) -> frozenset[str]:
         return frozenset(self.gauges.get(key, ()))
@@ -4459,6 +4463,9 @@ class _GaugeRedis:
             if script == v3.PARALLEL_ACQUIRE_SCRIPT:
                 return self._acquire(keys, args)
             if script == v3.PARALLEL_RELEASE_SCRIPT:
+                if self.release_gate is not None:
+                    self.held_releases += 1
+                    await self.release_gate.wait()
                 return self._release(keys, args)
             raise AssertionError(f"unexpected script: {script[:60]}")
 
@@ -4632,6 +4639,94 @@ async def test_a_release_held_past_the_slot_ttl_is_dropped_v3() -> None:
         await asyncio.sleep(0)
 
     assert redis.release_attempts == [("slot-past-its-ttl",)]
+
+
+@pytest.mark.asyncio
+async def test_a_retrier_cancelled_mid_release_keeps_the_release_and_restarts_with_the_next_v3() -> None:
+    """The retrier is cancelled while a release it is sending waits on Redis, as at loop shutdown. The release
+    stays queued, the cancellation still ends the retrier, and the next release that waits for Redis restarts it."""
+    redis: Final = _GaugeRedis()
+    pod: Final = _pod(redis)
+    redis.gauges[_TEAM_GAUGE] = {"held-when-cancelled", "queued-after"}
+
+    redis.down = True
+    await pod._release_parallel_request_slots(
+        ParallelSlotAcquisition(slot_id="held-when-cancelled", counter_keys=[_TEAM_GAUGE])
+    )
+    redis.release_gate = asyncio.Event()
+    redis.down = False
+    await _until(lambda: redis.held_releases == 1)
+    cancelled: Final = pod._slot_release_retrier
+    assert cancelled is not None
+    cancelled.cancel()
+    await _until(cancelled.done)
+    assert cancelled.cancelled()
+
+    redis.release_gate = None
+    redis.down = True
+    await pod._release_parallel_request_slots(ParallelSlotAcquisition(slot_id="queued-after", counter_keys=[_TEAM_GAUGE]))
+    redis.down = False
+    await _until(lambda: not redis.slots(_TEAM_GAUGE))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["end_of_call", "lost_acquire_reply"])
+async def test_a_release_cancelled_while_it_waits_on_redis_is_retried_v3(path: str) -> None:
+    """The request is cancelled while its release waits on Redis, a client that hangs up mid-release. Redis may
+    or may not have run the release, so it is sent again once the retrier gets to it."""
+    redis: Final = _GaugeRedis()
+    pod: Final = _pod(redis)
+    redis.gauges[_TEAM_GAUGE] = {"slot-of-a-cancelled-request"}
+    redis.release_gate = asyncio.Event()
+    releasing: Final = asyncio.create_task(
+        pod._release_parallel_request_slots(
+            ParallelSlotAcquisition(slot_id="slot-of-a-cancelled-request", counter_keys=[_TEAM_GAUGE])
+        )
+        if path == "end_of_call"
+        else pod._release_unconfirmed_parallel_acquire([_TEAM_GAUGE], "slot-of-a-cancelled-request")
+    )
+    await _until(lambda: redis.held_releases == 1)
+
+    releasing.cancel()
+    await _until(releasing.done)
+    assert releasing.cancelled()
+    redis.release_gate = None
+
+    await _until(lambda: not redis.slots(_TEAM_GAUGE))
+
+
+@pytest.mark.asyncio
+async def test_a_full_release_queue_warns_on_the_first_drop_and_then_once_an_interval_v3(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A release dropped from the full queue leaves its slot counted for the slot's hour, so the operator must
+    see it: one warning at the first drop, then at most one an interval, each with how many were dropped."""
+    redis: Final = _GaugeRedis()
+    clock: Final = TimeController()
+    pod: Final = _pod(redis, clock=clock)
+
+    async def release(slot_id: str) -> None:
+        await pod._release_parallel_request_slots(ParallelSlotAcquisition(slot_id=slot_id, counter_keys=[_TEAM_GAUGE]))
+
+    redis.down = True
+    for index in range(PARALLEL_SLOT_RELEASE_RETRY_LIMIT):
+        await release(f"queued-{index}")
+    with caplog.at_level(logging.WARNING, logger="LiteLLM Proxy"):
+        for slot_id in ("dropped-1", "dropped-2", "dropped-3"):
+            await release(slot_id)
+        clock.advance(PARALLEL_SLOT_RELEASE_DROP_WARNING_INTERVAL_SECONDS)
+        await release("dropped-4")
+    redis.down = False
+    await _until(lambda: not pod._unconfirmed_slot_releases)
+
+    drop_warnings: Final = [
+        record.getMessage() for record in caplog.records if record.getMessage().startswith("Dropped ")
+    ]
+    assert len(drop_warnings) == 2, drop_warnings
+    assert drop_warnings[0].startswith("Dropped 1 concurrency slot releases") and "slot dropped-1," in drop_warnings[0]
+    assert drop_warnings[1].startswith("Dropped 3 concurrency slot releases") and "slot dropped-4," in drop_warnings[1]
+    assert f"because {PARALLEL_SLOT_RELEASE_RETRY_LIMIT} already wait for Redis" in drop_warnings[0]
+
 
 
 
