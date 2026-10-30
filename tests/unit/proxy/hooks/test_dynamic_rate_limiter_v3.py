@@ -1820,6 +1820,120 @@ async def test_success_accounting_charges_the_team_class_across_pods_for_whole_a
     assert await _pool_counter(second_pod, model, "default_pool", "tokens") == 0
 
 
+def _anthropic_message_body(model: str, input_tokens: int, output_tokens: int) -> dict:
+    return {
+        "id": "msg_test",
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [{"type": "text", "text": "Hello"}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+    }
+
+
+def _anthropic_message_stream(model: str, input_tokens: int, output_tokens: int) -> bytes:
+    import json
+
+    message_start: Final = {**_anthropic_message_body(model, input_tokens, 1), "content": [], "stop_reason": None}
+    events: Final = (
+        ("message_start", {"type": "message_start", "message": message_start}),
+        (
+            "content_block_start",
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        ),
+        (
+            "content_block_delta",
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hello"}},
+        ),
+        ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        (
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": output_tokens},
+            },
+        ),
+        ("message_stop", {"type": "message_stop"}),
+    )
+    return "".join(f"event: {name}\ndata: {json.dumps(payload)}\n\n" for name, payload in events).encode()
+
+
+async def _await_pool_tokens(handler: DynamicRateLimitHandler, model: str, pool: str, expected: int) -> int:
+    for _ in range(100):
+        charged = await _pool_counter(handler, model, pool, "tokens")
+        if charged >= expected:
+            return charged
+        await asyncio.sleep(0.05)
+    return await _pool_counter(handler, model, pool, "tokens")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", (False, True), ids=("whole", "streamed"))
+async def test_native_anthropic_messages_success_charges_the_team_pool_tokens(
+    monkeypatch: pytest.MonkeyPatch, stream: bool
+):
+    import httpx
+    import respx
+
+    from litellm.caching.llm_caching_handler import LLMClientCache
+
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    monkeypatch.setattr(litellm, "in_memory_llm_clients_cache", LLMClientCache())
+    monkeypatch.setenv("LITELLM_LICENSE", "test-license-key")
+    monkeypatch.setattr(litellm, "priority_reservation", {"high": 0.8, "low": 0.2})
+    model = "native-claude"
+    upstream_model = "claude-opus-4-7"
+    handler = DynamicRateLimitHandler(internal_usage_cache=DualCache())
+    router = Router(
+        model_list=[
+            {
+                "model_name": model,
+                "litellm_params": {
+                    "model": f"anthropic/{upstream_model}",
+                    "api_key": "sk-ant-test",
+                    "rpm": 10,
+                    "tpm": 1000,
+                },
+            }
+        ]
+    )
+    handler.update_variables(llm_router=router)
+    monkeypatch.setattr(litellm, "callbacks", [handler])
+    upstream_response: Final = (
+        httpx.Response(
+            200,
+            content=_anthropic_message_stream(upstream_model, 10, 5),
+            headers={"content-type": "text/event-stream"},
+        )
+        if stream
+        else httpx.Response(200, json=_anthropic_message_body(upstream_model, 10, 5))
+    )
+
+    with respx.mock(assert_all_called=True) as upstream:
+        upstream.post("https://api.anthropic.com/v1/messages").mock(return_value=upstream_response)
+        response = await router.aanthropic_messages(
+            model=model,
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=16,
+            stream=stream,
+            metadata={"user_id": "caller", "priority": "low"},
+            litellm_metadata={
+                "user_api_key_metadata": {"priority": "low"},
+                "user_api_key_team_metadata": {"priority": "high"},
+            },
+        )
+        if stream:
+            async for _ in response:
+                pass
+
+        assert await _await_pool_tokens(handler, model, "high", 15) == 15
+    assert await _pool_counter(handler, model, "low", "tokens") == 0
+    assert await _pool_counter(handler, model, "default_pool", "tokens") == 0
+
+
 @pytest.mark.asyncio
 async def test_success_accounting_charges_a_team_without_class_to_the_default_pool_whatever_the_key_says(
     monkeypatch: pytest.MonkeyPatch,
