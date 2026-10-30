@@ -5369,6 +5369,24 @@ def test_injected_cache_breakpoints_survive_into_spend_log_metadata(bucket):
     assert metadata["litellm_gateway_injected_cache"] == "dep-of-this-row"
 
 
+def test_messages_success_row_takes_model_group_from_litellm_metadata_not_the_callers_metadata():
+    """/v1/messages stamps the router's model_group into litellm_metadata and leaves metadata to the
+    caller, so a model_group the caller put in its own metadata never reaches the success row"""
+    payload = get_logging_payload(
+        kwargs={
+            "model": "claude-sonnet-5",
+            "litellm_params": {
+                "metadata": {"user_id": "s1", "model_group": "client-chosen"},
+                "litellm_metadata": {"user_api_key": "test-key", "model_group": "claude-refuse"},
+            },
+        },
+        response_obj=litellm.ModelResponse(id="msg-routed", choices=[], usage=litellm.Usage()),
+        start_time=datetime.datetime.now(timezone.utc),
+        end_time=datetime.datetime.now(timezone.utc),
+    )
+    assert payload["model_group"] == "claude-refuse"
+
+
 def test_passthrough_caching_carries_no_injection_marker():
     """The negative class the gate depends on: a request whose cache_control the client
     supplied must read as unmarked, not merely unlabelled by accident."""

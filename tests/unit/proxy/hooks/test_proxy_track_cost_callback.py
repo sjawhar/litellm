@@ -354,6 +354,77 @@ async def test_async_post_call_failure_hook_reads_used_client_oauth_token_from_t
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "request_route, metadata_buckets, expected",
+    [
+        pytest.param(
+            "/v1/messages",
+            {
+                "metadata": {"user_id": "s1", "model_group": "client-chosen"},
+                "litellm_metadata": {"model_group": "claude-refuse"},
+            },
+            "claude-refuse",
+            id="messages_router_stamped",
+        ),
+        pytest.param(
+            "/v1/messages",
+            {
+                "metadata": {"user_id": "s1", "model_group": "client-chosen"},
+                "litellm_metadata": {"user_api_key_hash": "proxy"},
+            },
+            "",
+            id="messages_never_routed",
+        ),
+        pytest.param(
+            "/v1/chat/completions",
+            {"metadata": {"model_group": "claude-refuse"}},
+            "claude-refuse",
+            id="chat_router_stamped",
+        ),
+        pytest.param(
+            "/v1/chat/completions",
+            {
+                "metadata": {"model_group": "claude-refuse"},
+                "litellm_params": {"litellm_metadata": {"model_group": "client-chosen"}},
+            },
+            "claude-refuse",
+            id="caller_sent_litellm_params",
+        ),
+    ],
+)
+async def test_async_post_call_failure_hook_takes_model_group_from_the_routes_stamped_bucket(
+    request_route: str, metadata_buckets: dict, expected: str
+):
+    """On /v1/messages the request's own metadata belongs to the caller and the router stamps
+    model_group into litellm_metadata, so the failure row must read that bucket, as the success row does"""
+    logger = ProxyDBLogger()
+    request_data = {
+        "model": "claude-refuse",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "proxy_server_request": {"request_id": "test_request_id"},
+        **metadata_buckets,
+    }
+
+    with patch(
+        "litellm.proxy.db.db_spend_update_writer.DBSpendUpdateWriter.update_database",
+        new_callable=AsyncMock,
+    ) as mock_update_database:
+        await logger.async_post_call_failure_hook(
+            request_data=request_data,
+            original_exception=Exception("rate limited"),
+            user_api_key_dict=UserAPIKeyAuth(api_key="test_api_key", request_route=request_route),
+        )
+
+    payload = get_logging_payload(
+        kwargs=mock_update_database.call_args[1]["kwargs"],
+        response_obj={},
+        start_time=datetime.now(),
+        end_time=datetime.now(),
+    )
+    assert payload["model_group"] == expected
+
+
+@pytest.mark.asyncio
 async def test_async_post_call_failure_hook_bills_guardrail_cost_on_blocked_request():
     """LIT-5651: a request blocked by a guardrail never reaches the LLM, but the
     guardrail invocation itself is billed by the provider. The failure row must

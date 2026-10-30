@@ -2532,6 +2532,7 @@ class TestCallToolRestAPI:
             "server_id": "server-1",
             "name": "demo-tool",
             "arguments": {"foo": "bar"},
+            "metadata": {"model_group": "client-chosen"},
         }
         request = _build_request(
             path="/mcp-rest/tools/call",

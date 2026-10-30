@@ -1,6 +1,6 @@
 #### Search Endpoints #####
 
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 import orjson
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -11,6 +11,23 @@ from litellm.proxy._types import *
 from litellm.proxy.auth.user_api_key_auth import UserAPIKeyAuth, user_api_key_auth
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
 from litellm.proxy.route_llm_request import ProxyMissingRequiredParamError
+
+if TYPE_CHECKING:
+    from litellm.router import Router
+    from litellm.types.router import SearchToolTypedDict
+
+
+def _search_tool_named(llm_router: "Router | None", search_tool_name: object) -> "SearchToolTypedDict | None":
+    if not search_tool_name or llm_router is None or not hasattr(llm_router, "search_tools"):
+        return None
+    verbose_proxy_logger.debug(
+        "Search endpoint - Looking for search_tool_name: %s. Available search tools in router: %s. Total search tools: %s",
+        search_tool_name,
+        [tool.get("search_tool_name") for tool in llm_router.search_tools],
+        len(llm_router.search_tools),
+    )
+    return next((tool for tool in llm_router.search_tools if tool.get("search_tool_name") == search_tool_name), None)
+
 
 router: Final = APIRouter()
 
@@ -149,32 +166,12 @@ async def search(
         verbose_proxy_logger.debug("Search tool authorization denied: %s", e.type)
         raise
 
-    if "search_tool_name" in data and data["search_tool_name"]:
-        data["model"] = data["search_tool_name"]
-        search_tool_name_value: Final = data["search_tool_name"]
-
-        if llm_router is not None and hasattr(llm_router, "search_tools"):
-            verbose_proxy_logger.debug(
-                "Search endpoint - Looking for search_tool_name: %s. Available search tools in router: %s. Total search tools: %s",
-                search_tool_name_value,
-                [tool.get("search_tool_name") for tool in llm_router.search_tools],
-                len(llm_router.search_tools),
-            )
-
-            matching_tools: Final = [
-                tool for tool in llm_router.search_tools if tool.get("search_tool_name") == search_tool_name_value
-            ]
-
-            if matching_tools:
-                search_tool: Final = matching_tools[0]
-                search_provider: Final = search_tool.get("litellm_params", {}).get("search_provider")
-
-                if search_provider:
-                    data["custom_llm_provider"] = search_provider
-
-                if "metadata" not in data:
-                    data["metadata"] = {}
-                data["metadata"]["model_group"] = search_tool_name_value
+    search_tool_name_value: Final = data.get("search_tool_name") or None
+    if search_tool_name_value:
+        data["model"] = search_tool_name_value
+    search_tool: Final = _search_tool_named(llm_router, search_tool_name_value)
+    if search_tool is not None and (search_provider := search_tool["litellm_params"].get("search_provider")):
+        data["custom_llm_provider"] = search_provider
 
     # Ensure team context is available to search router credential resolution.
     # add_litellm_data_to_request() also injects these values, but this keeps
@@ -187,7 +184,9 @@ async def search(
         data["metadata"]["user_api_key_team_id"] = user_api_key_dict.team_id
 
     # Process request using ProxyBaseLLMRequestProcessing
-    processor: Final = ProxyBaseLLMRequestProcessing(data=data)
+    processor: Final = ProxyBaseLLMRequestProcessing(
+        data=data, model_group=search_tool["search_tool_name"] if search_tool is not None else None
+    )
     try:
         return await processor.base_process_llm_request(
             request=request,

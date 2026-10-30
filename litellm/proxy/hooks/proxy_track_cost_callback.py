@@ -124,17 +124,35 @@ _CAPTURED_IDENTITY_CALL_TYPES: Final[frozenset[str]] = frozenset(
 )
 
 
-def _proxy_stamped_used_client_oauth_token(
-    request_data: Mapping[str, object], request_route: str | None
-) -> bool | None:
+def _proxy_metadata(request_data: Mapping[str, object], request_route: str | None) -> Mapping[str, object]:
+    """The metadata bucket the proxy and router stamp for this route; on /v1/messages and /v1/responses the
+    request's own ``metadata`` belongs to the caller."""
     proxy_bucket: Final = (
         get_metadata_variable_name_from_kwargs(request_data)
         if request_route is None
         else metadata_variable_name_for_route(request_route)
     )
-    proxy_metadata: Final = request_data.get(proxy_bucket)
-    stamped: Final = proxy_metadata.get("used_client_oauth_token") if isinstance(proxy_metadata, dict) else None
+    return _str_keyed_fields(request_data.get(proxy_bucket))
+
+
+def _proxy_stamped_used_client_oauth_token(proxy_metadata: Mapping[str, object]) -> bool | None:
+    stamped: Final = proxy_metadata.get("used_client_oauth_token")
     return stamped if isinstance(stamped, bool) else None
+
+
+def _router_stamped_model_group(proxy_metadata: Mapping[str, object]) -> str | None:
+    stamped: Final = proxy_metadata.get("model_group")
+    return stamped if isinstance(stamped, str) else None
+
+
+def _without_caller_litellm_metadata(request_data: Mapping[str, object]) -> Mapping[str, object]:
+    """The proxy never writes ``litellm_params.litellm_metadata`` into a request body, so a copy the caller sent
+    would outrank the metadata the failure row is built from."""
+    litellm_params: Final = _str_keyed_fields(request_data.get("litellm_params"))
+    return {
+        **request_data,
+        "litellm_params": {key: value for key, value in litellm_params.items() if key != "litellm_metadata"},
+    }
 
 
 def _proxy_spend_writer() -> DBSpendUpdateWriter:
@@ -320,7 +338,9 @@ class _ProxyDBLogger(CustomLogger):
             metadata=_metadata, original_exception=original_exception
         )
 
-        _metadata["used_client_oauth_token"] = _proxy_stamped_used_client_oauth_token(request_data, request_route)
+        proxy_metadata: Final = _proxy_metadata(request_data, request_route)
+        _metadata["used_client_oauth_token"] = _proxy_stamped_used_client_oauth_token(proxy_metadata)
+        _metadata["model_group"] = _router_stamped_model_group(proxy_metadata)
 
         existing_metadata: Final[dict] = request_data.get("metadata", None) or {}
         existing_metadata.update(_metadata)
@@ -394,7 +414,9 @@ class _ProxyDBLogger(CustomLogger):
             original_exception=original_exception,
             start_time=actual_start_time,
             spend_rows=_failure_spend_rows(
-                cast("Mapping[str, object]", request_data),  # cast-ok: request dict, copied per row below
+                _without_caller_litellm_metadata(
+                    cast("Mapping[str, object]", request_data)  # cast-ok: request dict, copied per row below
+                ),
                 recovered_response_cost,
                 None,
             ),

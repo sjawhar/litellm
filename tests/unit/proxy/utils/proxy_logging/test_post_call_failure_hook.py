@@ -944,3 +944,52 @@ async def test_post_call_failure_hook_guardrail_block_fires_failure_callback(
     await asyncio.sleep(0)
     await asyncio.sleep(0)
     assert recorded == ["failure"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["/chat/completions", "/v1/messages"])
+async def test_auth_gate_failure_spend_row_takes_the_proxys_model_group_over_the_callers(
+    proxy_logging, make_user_api_key_auth, monkeypatch, route
+):
+    """An auth-gate rejection is logged from a body that never reached add_litellm_data_to_request,
+    so a model_group the caller put in either metadata bucket must not reach the failure spend row"""
+    from litellm.proxy import proxy_server
+    from litellm.proxy._types import ProxyException
+    from litellm.proxy.db.db_spend_update_writer import DBSpendUpdateWriter
+    from litellm.proxy.hooks.proxy_track_cost_callback import ProxyDBLogger
+    from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+
+    writer: Final = MagicMock(spec=DBSpendUpdateWriter)
+    writer.update_database = AsyncMock()
+    monkeypatch.setattr(
+        proxy_server,
+        "llm_router",
+        litellm.Router(
+            model_list=[
+                {"model_name": "internal-model", "litellm_params": {"model": "openai/gpt-4.1", "api_key": "sk-test"}}
+            ]
+        ),
+    )
+    monkeypatch.setattr(litellm, "callbacks", [ProxyDBLogger(spend_writer=lambda: writer)])
+    proxy_logging.alert_types = []
+
+    await proxy_logging.post_call_failure_hook(
+        request_data={
+            "model": "internal-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"user_id": "s1", "model_group": "client-chosen"},
+            "litellm_metadata": {"model_group": "client-chosen"},
+        },
+        original_exception=ProxyException(
+            message="key not allowed to access model", type=ProxyErrorTypes.auth_error, param=None, code=401
+        ),
+        user_api_key_dict=make_user_api_key_auth(request_route=route),
+        error_type=ProxyErrorTypes.auth_error,
+        route=route,
+    )
+
+    now: Final = datetime.now()
+    payload: Final = get_logging_payload(
+        kwargs=writer.update_database.call_args.kwargs["kwargs"], response_obj=None, start_time=now, end_time=now
+    )
+    assert payload["model_group"] == "internal-model"
