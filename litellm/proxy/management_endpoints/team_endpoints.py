@@ -1380,7 +1380,7 @@ async def new_team(
     - tpm_limit: Optional[int] - The TPM (Tokens Per Minute) limit for this team - all keys with this team_id will have at max this TPM limit
     - rpm_limit: Optional[int] - The RPM (Requests Per Minute) limit for this team - all keys associated with this team_id will have at max this RPM limit
     - tpd_limit: Optional[int] - The TPD (Tokens Per Day) limit for this team. Batch submissions are charged against it instead of tpm_limit/rpm_limit
-    - max_parallel_requests: Optional[int] - The most calls in flight at once across every caller of this team, its keys and its token-authenticated callers alike, counted across proxy instances when Redis is configured. Raises 429 above it.
+    - max_parallel_requests: Optional[int] - The most calls in flight at once across every caller of this team, its keys and its token-authenticated callers alike, counted across proxy instances when Redis is configured. Without Redis each worker process counts on its own, so a proxy with 10 workers admits up to 10 times this value. Raises 429 above it.
     - rpm_limit_type: Optional[Literal["guaranteed_throughput", "best_effort_throughput"]] - The type of RPM limit enforcement. Use "guaranteed_throughput" to raise an error if overallocating RPM, or "best_effort_throughput" for best effort enforcement.
     - tpm_limit_type: Optional[Literal["guaranteed_throughput", "best_effort_throughput"]] - The type of TPM limit enforcement. Use "guaranteed_throughput" to raise an error if overallocating TPM, or "best_effort_throughput" for best effort enforcement.
     - max_budget: Optional[float] - The maximum budget allocated to the team - all keys for this team_id will have at max this max_budget
@@ -2147,7 +2147,7 @@ async def update_team(
     - tpm_limit: Optional[int] - The TPM (Tokens Per Minute) limit for this team - all keys with this team_id will have at max this TPM limit
     - rpm_limit: Optional[int] - The RPM (Requests Per Minute) limit for this team - all keys associated with this team_id will have at max this RPM limit
     - tpd_limit: Optional[int] - The TPD (Tokens Per Day) limit for this team. Batch submissions are charged against it instead of tpm_limit/rpm_limit
-    - max_parallel_requests: Optional[int] - The most calls in flight at once across every caller of this team, its keys and its token-authenticated callers alike, counted across proxy instances when Redis is configured. Raises 429 above it.
+    - max_parallel_requests: Optional[int] - The most calls in flight at once across every caller of this team, its keys and its token-authenticated callers alike, counted across proxy instances when Redis is configured. Without Redis each worker process counts on its own, so a proxy with 10 workers admits up to 10 times this value. Raises 429 above it.
     - max_budget: Optional[float] - The maximum budget allocated to the team - all keys for this team_id will have at max this max_budget
     - soft_budget: Optional[float] - The soft budget threshold for the team. If max_budget is set (either in the request or existing), soft_budget must be strictly lower than max_budget. Can be set independently if max_budget is not set.
     - budget_duration: Optional[str] - The duration of the budget for the team. Doc [here](https://docs.litellm.ai/docs/proxy/team_budgets)

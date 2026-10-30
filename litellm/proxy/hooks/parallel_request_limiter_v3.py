@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import cache
 from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
@@ -160,6 +161,17 @@ def _fail_closed_rate_limit_enforcement_from_general_settings() -> bool:
     from litellm.proxy.proxy_server import general_settings
 
     return fail_closed_rate_limit_enforcement_enabled(general_settings)
+
+
+@cache
+def warn_rate_limits_are_per_worker(num_workers: str) -> None:
+    verbose_proxy_logger.warning(
+        "Running %s workers but Redis is not configured. Each worker counts the rpm, tpm and max_parallel_requests "
+        "limits of keys, users, teams and the rest on its own, so each one admits up to %s times its value. "
+        "Configure Redis to share one count across workers.",
+        num_workers,
+        num_workers,
+    )
 
 
 def _force_redis_hash_tag_grouping_from_litellm_settings() -> bool:
