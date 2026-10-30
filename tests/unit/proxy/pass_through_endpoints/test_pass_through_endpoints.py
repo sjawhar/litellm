@@ -7358,6 +7358,74 @@ def test_builtin_passthrough_pins_model_group_to_the_resolved_model(metadata_slo
     assert kwargs["litellm_params"]["metadata"]["model_group"] == "gemini-2.5-flash"
 
 
+@pytest.mark.asyncio
+async def test_builtin_passthrough_rejected_before_forwarding_records_the_routes_model_group():
+    """A pre-call rejection on a built-in provider route is logged from the request body before
+    init_kwargs_for_pass_through_endpoint names the route's model, so the failure spend row must take
+    model_group from the route and never from either metadata bucket of the body, which stays untouched"""
+    from contextlib import ExitStack
+    from datetime import datetime
+
+    from fastapi import HTTPException as FastAPIHTTPException
+
+    from litellm.proxy.db.db_spend_update_writer import DBSpendUpdateWriter
+    from litellm.proxy.hooks.proxy_track_cost_callback import ProxyDBLogger
+    from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+
+    body: Final = {
+        "model": "claude-ok",
+        "max_tokens": 5,
+        "messages": [{"role": "user", "content": "hi"}],
+        "metadata": {"user_id": "s1", "model_group": "client-chosen"},
+        "litellm_metadata": {"model_group": "client-chosen"},
+    }
+    proxy_logging: Final = MagicMock()
+    proxy_logging.pre_call_hook = AsyncMock(side_effect=FastAPIHTTPException(status_code=429, detail="rate limited"))
+    proxy_logging.post_call_failure_hook = AsyncMock()
+    proxy_logging.get_proxy_hook = MagicMock(return_value=None)
+    request: Final = Request(
+        {"type": "http", "method": "POST", "path": "/anthropic/v1/messages", "headers": [], "query_string": b""}
+    )
+    auth: Final = UserAPIKeyAuth(api_key="hashed-key", request_route="/anthropic/v1/messages")
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("litellm.proxy.proxy_server.proxy_logging_obj", proxy_logging))
+        stack.enter_context(patch(f"{_PT_MODULE}.read_request_body", new_callable=AsyncMock, return_value=body))
+        stack.enter_context(patch(f"{_PT_MODULE}.safe_get_request_headers", return_value={}))
+        stack.enter_context(
+            patch(
+                "litellm.proxy.pass_through_endpoints.passthrough_guardrails."
+                "PassthroughGuardrailHandler.collect_guardrails",
+                return_value=[],
+            )
+        )
+        with pytest.raises(ProxyException):
+            await pass_through_request(
+                request=request,
+                target="https://api.anthropic.com/v1/messages",
+                custom_headers={"Content-Type": "application/json"},
+                user_api_key_dict=auth,
+                stream=False,
+                custom_llm_provider="anthropic",
+            )
+
+    request_data: Final = proxy_logging.post_call_failure_hook.call_args.kwargs["request_data"]
+    writer: Final = MagicMock(spec=DBSpendUpdateWriter)
+    writer.update_database = AsyncMock()
+    await ProxyDBLogger(spend_writer=lambda: writer).async_post_call_failure_hook(
+        request_data=request_data,
+        original_exception=Exception("rate limited"),
+        user_api_key_dict=auth,
+    )
+    now: Final = datetime.now()
+    payload: Final = get_logging_payload(
+        kwargs=writer.update_database.call_args.kwargs["kwargs"], response_obj=None, start_time=now, end_time=now
+    )
+    assert payload["model_group"] == "claude-ok"
+    assert body["metadata"]["model_group"] == "client-chosen"
+    assert body["litellm_metadata"]["model_group"] == "client-chosen"
+
+
 @pytest.mark.parametrize(
     "handler_name",
     [
