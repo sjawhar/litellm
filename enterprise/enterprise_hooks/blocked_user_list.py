@@ -17,11 +17,9 @@ from litellm._logging import verbose_proxy_logger
 from litellm.caching.caching import DualCache
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.proxy._types import LiteLLM_EndUserTable, UserAPIKeyAuth
-from litellm.proxy.auth.auth_checks import (
-    LastGoodEntryMissing,
-    last_good_end_user_blocked,
-)
+from litellm.proxy.auth.auth_checks import last_good_end_user_blocked
 from litellm.proxy.common_utils.user_api_key_cache import AUTH_OBJECTS_TARGET
+from litellm.proxy.db.exception_handler import LastGoodEntryMissing
 from litellm.proxy.utils import PrismaClient
 
 

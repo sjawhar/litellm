@@ -136,7 +136,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     T as _LastGoodT,
 )
 from litellm.proxy.db.db_lookup_gate import bounded_db_lookup, db_lookup_gate
-from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
+from litellm.proxy.db.exception_handler import LastGoodEntryMissing, PrismaDBExceptionHandler
 from litellm.proxy.guardrails.tool_name_extraction import (
     TOOL_CAPABLE_CALL_TYPES,
     extract_request_tool_names,
@@ -162,6 +162,7 @@ from litellm.repositories.table_repositories import (
 )
 from litellm.repositories.team_repository import TeamRepository
 from litellm.repositories.user_repository import UserRepository
+from litellm.repositories.verification_token_repository import VerificationTokenRepository
 from litellm.router import Router
 from litellm.types.proxy.auth.auth_checks import UserNotFoundError
 from litellm.types.proxy.model_access_group_budget import ModelAccessGroupBudget
@@ -3081,17 +3082,6 @@ async def recall_last_good_after(
     return found
 
 
-class LastGoodEntryMissing(ProxyException):
-    """The database is unreachable and no last good entry is kept for an object whose limits the request is checked
-    against, so the request is refused rather than checked as if that object limited nothing."""
-
-    def __init__(self, error: Exception) -> None:
-        unavailable: Final = PrismaDBExceptionHandler.service_unavailable_proxy_exception(error)
-        super().__init__(
-            message=unavailable.message, type=unavailable.type, param=unavailable.param, code=unavailable.code
-        )
-
-
 async def recall_last_good_limits_after(
     error: Exception, user_api_key_cache: DualCache, cache_key: str, model_type: type[_LastGoodT]
 ) -> _LastGoodT | None:
@@ -3306,6 +3296,34 @@ async def invalidate_team_member_spend_state(
             team_membership_reservation_cache_key(user_id=user_id, team_id=team_id),
         ),
         user_api_key_cache=user_api_key_cache,
+    )
+    await _evict_team_member_keys(user_id=user_id, team_id=team_id, user_api_key_cache=user_api_key_cache)
+
+
+async def _evict_team_member_keys(user_id: str, team_id: str, user_api_key_cache: UserApiKeyCache) -> None:
+    """A key's own entry carries its team member's spend and rate limits as of its last read, so a member change
+    evicts that member's keys in the team, last good entries included. Best effort, like every eviction after a
+    committed write."""
+    from litellm.proxy.proxy_server import prisma_client, proxy_logging_obj
+
+    if prisma_client is None:
+        return
+    try:
+        member_keys: Final = await VerificationTokenRepository(prisma_client).table.find_many(
+            where={"user_id": user_id, "team_id": team_id}
+        )
+    except Exception as e:  # noqa: BLE001  # the member write committed; a failed eviction must not fail it
+        verbose_proxy_logger.warning(
+            "Could not evict the keys of team member %s in team %s; they may carry the old member limits: %s",
+            user_id,
+            team_id,
+            e,
+        )
+        return
+    await delete_cache_key_objects(
+        hashed_tokens=tuple(key.token for key in member_keys),
+        user_api_key_cache=user_api_key_cache,
+        proxy_logging_obj=proxy_logging_obj,
     )
 
 

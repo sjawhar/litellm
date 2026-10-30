@@ -5308,11 +5308,22 @@ async def test_team_member_delete_reads_on_the_lock_holding_transaction(
     user_row.teams = [test_team_id]
 
     # Both are wired to answer, so the endpoint completes either way and the awaits below
-    # are what tells which connection it read on.
+    # are what tells which connection it read on. A token read on the pooled client after
+    # the transaction released the lock (the member's cached keys being evicted) is fine.
+    lock_released = asyncio.Event()
+    pooled_token_reads_under_lock = []
+
+    async def pooled_token_answer(**kwargs):
+        if not lock_released.is_set():
+            pooled_token_reads_under_lock.append(kwargs)
+        return []
+
+    async def release_lock(*args):
+        lock_released.set()
+
     pooled_user_read = AsyncMock(return_value=[user_row])
-    pooled_token_read = AsyncMock(return_value=[])
     mock_db_client.db.litellm_usertable.find_many = pooled_user_read
-    mock_db_client.db.litellm_verificationtoken.find_many = pooled_token_read
+    mock_db_client.db.litellm_verificationtoken.find_many = AsyncMock(side_effect=pooled_token_answer)
 
     tx = MagicMock()
     tx.query_raw = AsyncMock(return_value=[{"members_with_roles": [roster_entry]}])
@@ -5325,7 +5336,7 @@ async def test_team_member_delete_reads_on_the_lock_holding_transaction(
 
     tx_cm = MagicMock()
     tx_cm.__aenter__ = AsyncMock(return_value=tx)
-    tx_cm.__aexit__ = AsyncMock(return_value=None)
+    tx_cm.__aexit__ = AsyncMock(side_effect=release_lock)
     mock_db_client.tx = MagicMock(return_value=tx_cm)
 
     await team_member_delete(
@@ -5340,7 +5351,7 @@ async def test_team_member_delete_reads_on_the_lock_holding_transaction(
         where={"user_id": {"in": [test_user_id]}, "team_id": test_team_id}
     )
     pooled_user_read.assert_not_awaited()
-    pooled_token_read.assert_not_awaited()
+    assert pooled_token_reads_under_lock == []
 
     tx.litellm_usertable.update.assert_awaited_once_with(
         where={"user_id": test_user_id}, data={"teams": {"set": []}}

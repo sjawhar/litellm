@@ -2073,10 +2073,19 @@ async def test_key_of_a_blocked_project_is_refused_while_the_database_is_stopped
 
 
 @pytest.mark.asyncio
-async def test_key_whose_project_has_no_entry_is_refused_while_the_database_is_stopped(monkeypatch):
-    """Served without its project, the key would pass as if the project limited nothing."""
+@pytest.mark.parametrize("allow_requests_on_db_unavailable", [False, True], ids=["fallback_off", "fallback_on"])
+async def test_key_whose_project_has_no_entry_is_refused_while_the_database_is_stopped(
+    monkeypatch, allow_requests_on_db_unavailable: bool
+):
+    """Served without its project, the key would pass as if the project limited nothing. The refusal is a 503 like an
+    unreachable database, and allow_requests_on_db_unavailable must not turn it into the unlimited fallback identity."""
     request: Final = await _key_with_user_and_project_held(monkeypatch, "sk-project-unknown", None)
+    monkeypatch.setitem(
+        litellm.proxy.proxy_server.general_settings,
+        "allow_requests_on_db_unavailable",
+        allow_requests_on_db_unavailable,
+    )
 
     with pytest.raises(ProxyException) as refused:
         await user_api_key_auth(request=request, api_key="Bearer sk-project-unknown")
-    assert str(refused.value.code) == "503"
+    assert (str(refused.value.code), refused.value.type) == ("503", "no_db_connection")
