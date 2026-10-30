@@ -5032,8 +5032,6 @@ def _init_custom_logger_compatible_class(
                 internal_usage_cache=internal_usage_cache
             )
 
-            if llm_router is not None and isinstance(llm_router, litellm.Router):
-                dynamic_rate_limiter_obj_v3.update_variables(llm_router=llm_router)
             _in_memory_loggers.append(dynamic_rate_limiter_obj_v3)
             return dynamic_rate_limiter_obj_v3
         elif logging_integration == "langtrace":
