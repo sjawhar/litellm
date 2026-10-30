@@ -6,6 +6,7 @@ Core tests to validate that priority weights are respected (0.9/0.1) instead of 
 
 import asyncio
 import contextvars
+import logging
 import os
 import time
 from collections.abc import Callable, Mapping
@@ -2886,6 +2887,31 @@ async def test_a_zero_limit_is_served(monkeypatch: pytest.MonkeyPatch):
     outcomes = [await _served(handler, deployment) for _ in range(5)]
 
     assert outcomes == [True] * 5
+
+
+@pytest.mark.asyncio
+async def test_a_failing_counter_store_serves_the_call_and_reports_the_failure(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    monkeypatch.setattr(litellm, "priority_reservation", None)
+    handler = DynamicRateLimitHandler(internal_usage_cache=DualCache())
+    deployment = _org_a_deployment("anthropic/claude-opus-4-7", litellm_limits=MappingProxyType({"rpm": 1}))
+
+    with (
+        caplog.at_level(logging.ERROR, logger="LiteLLM Proxy"),
+        patch.object(
+            handler.v3_limiter,
+            "atomic_check_and_increment_by_n",
+            new=AsyncMock(side_effect=RuntimeError("counter store down")),
+        ),
+    ):
+        outcomes = [await _served(handler, deployment) for _ in range(3)]
+
+    assert outcomes == [True] * 3
+    errors = [record for record in caplog.records if (record.name, record.levelno) == ("LiteLLM Proxy", logging.ERROR)]
+    assert [record.getMessage() for record in errors] == [
+        "Error in dynamic rate limiter: counter store down, allowing request"
+    ] * 3
 
 
 @pytest.mark.asyncio
