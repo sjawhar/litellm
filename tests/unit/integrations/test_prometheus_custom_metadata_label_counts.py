@@ -2,6 +2,7 @@ import datetime
 import logging
 import sys
 from itertools import chain
+from typing import Final
 
 import pytest
 from prometheus_client import REGISTRY
@@ -422,3 +423,38 @@ def test_virtual_key_rate_limit_metrics_preserve_zero_remaining_values(
     assert any(sample.value == 0 for sample in token_samples)
     assert not any(sample.value == sys.maxsize for sample in request_samples)
     assert not any(sample.value == sys.maxsize for sample in token_samples)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refused", (True, False), ids=("admission_refusal", "provider_429"))
+async def test_admission_refusal_is_not_counted_as_a_deployment_failure(monkeypatch: pytest.MonkeyPatch, refused: bool):
+    from litellm.proxy.common_utils.proxy_rate_limit_error import ProxyRateLimitError
+    from litellm.router_utils.admission_refusal import mark_admission_refusal
+
+    monkeypatch.setattr(litellm, "custom_prometheus_metadata_labels", ["priority"])
+    _clear_prometheus_registry()
+    prometheus_logger = PrometheusLogger()
+    refusal = ProxyRateLimitError(detail={"error": "Priority-based rate limit exceeded"})
+    if refused:
+        mark_admission_refusal(refusal)
+
+    await prometheus_logger.async_log_failure_event(
+        kwargs={
+            "model": "gpt-4o-mini",
+            "litellm_params": {"metadata": {"user_api_key_team_metadata": {"priority": "high"}}},
+            "standard_logging_object": _priority_standard_logging_payload(None, None),
+            "exception": refusal,
+        },
+        response_obj=None,
+        start_time=None,
+        end_time=None,
+    )
+
+    expected_samples: Final = 0 if refused else 1
+    for metric_name in (
+        "litellm_llm_api_failed_requests_metric_total",
+        "litellm_deployment_failure_responses_total",
+        "litellm_deployment_total_requests_total",
+        "litellm_deployment_state",
+    ):
+        assert len(_metric_samples(metric_name)) == expected_samples, metric_name
