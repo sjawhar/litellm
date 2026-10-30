@@ -22,7 +22,9 @@ from prisma.errors import (
 
 import litellm
 from litellm.proxy._types import ProxyErrorTypes, ProxyException
+from litellm.proxy.db.db_lookup_gate import DBLookupDeadlineExceeded
 from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
+from tests.unit.proxy.db.cancelled_statements import CancelReason, cancelled_statement
 
 
 # Test is_database_connection_error method
@@ -991,8 +993,6 @@ def test_is_database_unreachable_error_recognises_connection_timeout_and_transpo
 
 
 def test_is_database_unreachable_error_recognises_the_lookup_deadline() -> None:
-    from litellm.proxy.db.db_lookup_gate import DBLookupDeadlineExceeded
-
     assert PrismaDBExceptionHandler.is_database_unreachable_error(DBLookupDeadlineExceeded("team", 0.5)) is True
 
 
@@ -1021,6 +1021,71 @@ def test_is_database_unreachable_error_excludes_answers_and_permanent_faults(err
     """A database that answered, whatever it said, and a query engine that will never come back by itself, are
     not an outage the last good auth entry may cover."""
     assert PrismaDBExceptionHandler.is_database_unreachable_error(error) is False
+
+
+def _cancelled_then_reconnect_timed_out(reason: CancelReason) -> Exception:
+    """``call_with_db_reconnect_retry`` re-raises the first error from the reconnect's ``TimeoutError``."""
+    cancelled: Final = cancelled_statement(reason)
+    cancelled.__cause__ = TimeoutError("reconnect timed out")
+    return cancelled
+
+
+def _lookup_deadline_over_a_reconnect_that_timed_out(reason: CancelReason | None) -> DBLookupDeadlineExceeded:
+    """``bounded_db_lookup`` turns a lookup's ``TimeoutError`` into its deadline, here a reconnect that timed out
+    while it handled a cancelled statement, or while the engine answered nothing at all (``reason`` None)."""
+    timeout: Final = TimeoutError("reconnect timed out")
+    timeout.__context__ = None if reason is None else cancelled_statement(reason)
+    deadline: Final = DBLookupDeadlineExceeded("key", 10.0)
+    deadline.__cause__ = timeout
+    return deadline
+
+
+def _engine_unreachable_then_reconnect_timed_out() -> Exception:
+    unreachable: Final = httpx.ConnectError("All connection attempts failed")
+    unreachable.__cause__ = TimeoutError("reconnect timed out")
+    return unreachable
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        cancelled_statement("statement timeout"),
+        cancelled_statement("statement timeout", raw=True),
+        cancelled_statement("user request"),
+        cancelled_statement("user request", raw=True),
+        cancelled_statement("lock timeout"),
+        cancelled_statement("lock timeout", raw=True),
+        _cancelled_then_reconnect_timed_out("statement timeout"),
+        _cancelled_then_reconnect_timed_out("user request"),
+        _lookup_deadline_over_a_reconnect_that_timed_out("statement timeout"),
+        _wrapped(cancelled_statement("lock timeout")),
+    ],
+    ids=[
+        "statement_timeout_57014",
+        "statement_timeout_57014_raw_query",
+        "cancel_request_57014",
+        "cancel_request_57014_raw_query",
+        "lock_timeout_55P03",
+        "lock_timeout_55P03_raw_query",
+        "statement_timeout_then_reconnect_timed_out",
+        "cancel_request_then_reconnect_timed_out",
+        "lookup_deadline_over_a_statement_timeout",
+        "wrapped_lock_timeout",
+    ],
+)
+def test_is_database_unreachable_error_excludes_a_statement_the_database_cancelled(error: Exception) -> None:
+    """A database that cancels a statement, for its statement or lock timeout or a cancel request, is up and
+    answering, so the last good auth entry must not cover it, even when a timeout lands on top of the cancel."""
+    assert PrismaDBExceptionHandler.is_database_unreachable_error(error) is False
+
+
+@pytest.mark.parametrize(
+    "error",
+    [_engine_unreachable_then_reconnect_timed_out(), _lookup_deadline_over_a_reconnect_that_timed_out(None)],
+    ids=["engine_unreachable_then_reconnect_timed_out", "lookup_deadline_over_a_silent_engine"],
+)
+def test_is_database_unreachable_error_still_recognises_timeouts_with_no_cancelled_statement(error: Exception) -> None:
+    assert PrismaDBExceptionHandler.is_database_unreachable_error(error) is True
 
 
 def test_is_database_unreachable_error_recognises_the_engine_crash_of_a_torn_down_connection():
