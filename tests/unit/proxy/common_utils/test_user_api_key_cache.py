@@ -42,7 +42,7 @@ class CapturingInMemoryCache(InMemoryCache):
 class _DeleteLandsDuringWrite(RedisCache):
     """The reading pod's Redis: another pod's delete lands just before this pod's entry write reaches Redis."""
 
-    def __init__(self, redis: RedisCache, deleting_pod: UserApiKeyCache) -> None:  # noqa: super().__init__ skipped intentionally
+    def __init__(self, redis: RedisCache, deleting_pod: UserApiKeyCache) -> None:
         self._redis = redis
         self._deleting_pod = deleting_pod
 
@@ -72,7 +72,7 @@ class FakeRedisCache(RedisCache):
     Records the ``ttl`` kwarg DualCache forwards on each Redis write for tests.
     """
 
-    def __init__(self):  # noqa: super().__init__ skipped intentionally
+    def __init__(self):
         self._store: dict[str, str] = {}
         self.last_ttl: Any = None
 

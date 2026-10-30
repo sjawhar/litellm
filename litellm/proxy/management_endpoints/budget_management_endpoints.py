@@ -48,6 +48,7 @@ from litellm.repositories.table_repositories import (
     TagRepository,
     TeamMembershipRepository,
 )
+from litellm.repositories.verification_token_repository import VerificationTokenRepository
 
 router: Final = APIRouter()
 
@@ -218,18 +219,23 @@ async def update_budget(
         where={"budget_id": budget_obj.budget_id},
         data=budget_obj_jsonified,
     )
-    await _evict_budget_holders(budget_obj.budget_id)
+    await evict_budget_holders(budget_obj.budget_id)
 
     return response
 
 
-async def _evict_budget_holders(budget_id: str) -> None:
-    """Team memberships, organizations, projects, customers, tags and model access groups carry their budget row, and
-    the default customer and team-member budgets are cached by id, so every cached copy of them, last good entries
-    included, is evicted once the budget changes. Best effort, like every eviction after a committed write."""
-    from litellm.proxy.auth.auth_checks import invalidate_team_member_spend_state, organization_cache_keys
+async def evict_budget_holders(budget_id: str) -> None:
+    """Keys, team memberships, organizations, projects, customers, tags and model access groups carry their budget row,
+    a key also carries the budget of its organization and of its team membership, and the default customer and
+    team-member budgets are cached by id, so every cached copy of them, last good entries included, is evicted once
+    the budget changes. Best effort, like every eviction after a committed write."""
+    from litellm.proxy.auth.auth_checks import (
+        delete_cache_key_objects,
+        invalidate_team_member_spend_state,
+        organization_cache_keys,
+    )
     from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_broadcast
-    from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
+    from litellm.proxy.proxy_server import prisma_client, proxy_logging_obj, user_api_key_cache
 
     if prisma_client is None:
         return
@@ -241,6 +247,14 @@ async def _evict_budget_holders(budget_id: str) -> None:
             EndUserRepository(prisma_client).table.find_many(where={"budget_id": budget_id}),
             TagRepository(prisma_client).table.find_many(where={"budget_id": budget_id}),
             ModelAccessGroupBudgetRepository(prisma_client).table.find_many(where={"budget_id": budget_id}),
+        )
+        keys: Final = await VerificationTokenRepository(prisma_client).table.find_many(
+            where={
+                "OR": [
+                    {"budget_id": budget_id},
+                    {"organization_id": {"in": [org.organization_id for org in organizations]}},
+                ]
+            }
         )
         for membership in memberships:
             await invalidate_team_member_spend_state(
@@ -257,6 +271,11 @@ async def _evict_budget_holders(budget_id: str) -> None:
                 *(model_access_group_cache_key(group.access_group_name) for group in access_groups),
             ),
             user_api_key_cache=user_api_key_cache,
+        )
+        await delete_cache_key_objects(
+            hashed_tokens=tuple(key.token for key in keys),
+            user_api_key_cache=user_api_key_cache,
+            proxy_logging_obj=proxy_logging_obj,
         )
     except Exception as e:  # noqa: BLE001  # the budget write committed; a failed eviction must not fail it
         verbose_proxy_logger.warning(

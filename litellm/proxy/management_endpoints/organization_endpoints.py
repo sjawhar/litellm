@@ -48,6 +48,7 @@ from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_
 from litellm.proxy.common_utils.timezone_utils import get_budget_reset_time
 from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, revoke_last_good
 from litellm.proxy.management_endpoints.budget_management_endpoints import (
+    evict_budget_holders,
     new_budget,
     update_budget,
 )
@@ -1015,11 +1016,25 @@ async def update_organization_v2(
             include={"members": True, "teams": True, "litellm_budget_table": True},
         )
 
-    await evict_and_broadcast(
-        cache_keys=organization_cache_keys(organization_id), user_api_key_cache=user_api_key_cache
+    await _evict_updated_organization(
+        organization_id=organization_id,
+        budget_id=existing_organization_row.budget_id,
+        budget_changed=bool(budget_updates),
+        user_api_key_cache=user_api_key_cache,
     )
 
     return response
+
+
+async def _evict_updated_organization(
+    organization_id: str, budget_id: str, budget_changed: bool, user_api_key_cache: UserApiKeyCache
+) -> None:
+    """The organization's cached copies always go, and a budget change also evicts everything else on that budget."""
+    await evict_and_broadcast(
+        cache_keys=organization_cache_keys(organization_id), user_api_key_cache=user_api_key_cache
+    )
+    if budget_changed:
+        await evict_budget_holders(budget_id)
 
 
 @router.delete(

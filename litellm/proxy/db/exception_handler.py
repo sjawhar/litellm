@@ -517,6 +517,19 @@ class PrismaDBExceptionHandler:
         raise e
 
 
+class LastGoodEntryMissing(ProxyException):
+    """The database is unreachable and no last good entry is kept for an object whose limits the request is checked
+    against, so the request is refused rather than checked as if that object limited nothing. It answers 503 like an
+    unreachable database, but it is a refusal: ``allow_requests_on_db_unavailable`` never turns it into the fallback
+    identity."""
+
+    def __init__(self, error: Exception) -> None:
+        unavailable: Final = PrismaDBExceptionHandler.service_unavailable_proxy_exception(error)
+        super().__init__(
+            message=unavailable.message, type=unavailable.type, param=unavailable.param, code=unavailable.code
+        )
+
+
 # Default fallback timeouts when neither the caller nor the prisma_client
 # expose `_db_auth_reconnect_timeout_seconds` / `_db_auth_reconnect_lock_timeout_seconds`.
 # Match the auth path's existing defaults so behavior is uniform across read paths.
