@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from traceback import walk_tb
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Final, Literal
 from uuid import uuid4
 
 import anyio
@@ -14,7 +14,6 @@ import httpx2
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import ValidationError
 from starlette.datastructures import Headers
-from typing_extensions import ReadOnly
 
 from litellm._logging import verbose_logger
 from litellm.constants import MCP_CLIENT_TIMEOUT, MCP_TOOL_LISTING_TIMEOUT
@@ -73,10 +72,6 @@ from litellm.proxy.common_utils.http_parsing_utils import (  # noqa: F401  # leg
 )
 from litellm.types.mcp import MCPAuth
 from litellm.types.utils import CallTypes, StandardLoggingMCPToolCall
-
-
-class _MCPModelMetadata(TypedDict):
-    model_group: ReadOnly[str]
 
 
 def _stamp_mcp_tool_metadata(logging_obj: "LiteLLMLoggingObj | None", server_id: str, tool_name: str) -> None:
@@ -1269,12 +1264,9 @@ if MCP_AVAILABLE:
                 )
 
             data["model"] = f"MCP: {tool_name}"
-            model_metadata: Final[_MCPModelMetadata] = {
-                **(data.get("metadata") or MappingProxyType({})),
-                "model_group": f"MCP: {tool_name}",
-            }
-            data["metadata"] = model_metadata
-            proxy_base_llm_response_processor: Final = ProxyBaseLLMRequestProcessing(data=data)
+            proxy_base_llm_response_processor: Final = ProxyBaseLLMRequestProcessing(
+                data=data, model_group=f"MCP: {tool_name}"
+            )
             _request_start_time: Final = datetime.now()  # noqa: DTZ005  # naive to match the tool start time below
             try:
                 (
