@@ -29,6 +29,10 @@ from litellm.proxy.auth.auth_utils import (  # noqa: F401  # legacy module expor
 )
 from litellm.proxy.auth.model_access_denied import ModelAccessDeniedHTTPException
 from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
+from litellm.types.proxy.auth.client_context import (
+    VERIFIED_CLIENT_CONTEXT_KEY,
+    VerifiedClientContext,
+)
 from litellm.types.services import ServiceTypes
 
 # Sentinel user_id for the synthetic UserAPIKeyAuth issued during a DB
@@ -88,10 +92,11 @@ def _get_user_agent(request: Request) -> str | None:
 
 
 _CLIENT_CONTEXT_FIELDS: Final = ("requester_ip_address", "user_agent")
+_CALLER_CLIENT_CONTEXT_NAMES: Final = frozenset((*_CLIENT_CONTEXT_FIELDS, VERIFIED_CLIENT_CONTEXT_KEY))
 
 
 def _without_client_context(metadata: Mapping[str, object]) -> dict[str, object]:
-    return {name: value for name, value in metadata.items() if name not in _CLIENT_CONTEXT_FIELDS}
+    return {name: value for name, value in metadata.items() if name not in _CALLER_CLIENT_CONTEXT_NAMES}
 
 
 def _with_client_context(
@@ -100,15 +105,19 @@ def _with_client_context(
     """Auth gate rejections are raised before `add_litellm_data_to_request` records the
     caller IP and User-Agent, so their failure logs would otherwise carry neither. At this
     point the body is the caller's own, so the request's values replace what it sent under
-    those names, and the bucket the logging layer does not read keeps neither."""
+    those names, and the bucket the logging layer does not read keeps neither.
+
+    The same values also go in as a `VerifiedClientContext`, so a reader that must not take
+    the caller's strings has something only the proxy can have put there."""
     key: Final = "litellm_metadata" if "litellm_metadata" in request_data else "metadata"
     other: Final = "metadata" if key == "litellm_metadata" else "litellm_metadata"
     metadata: Final = request_data.get(key)
     base: Final[Mapping[str, object]] = metadata if isinstance(metadata, Mapping) else EMPTY_MAPPING
-    stamped: Final = {
-        name: value
-        for name, value in zip(_CLIENT_CONTEXT_FIELDS, (requester_ip, user_agent))
-        if value
+    stamped: Final[dict[str, object]] = {
+        **{name: value for name, value in zip(_CLIENT_CONTEXT_FIELDS, (requester_ip, user_agent)) if value},
+        VERIFIED_CLIENT_CONTEXT_KEY: VerifiedClientContext(
+            requester_ip_address=requester_ip, user_agent=user_agent
+        ),
     }
     other_metadata: Final = request_data.get(other)
     other_rewritten: Final = (

@@ -30,6 +30,7 @@ async def test_async_post_call_failure_hook_includes_client_ip_user_agent():
     request_data = {
         "model": "gpt-4",
         "metadata": {
+            "user_api_key_auth": UserAPIKeyAuth(token="test_token"),
             "requester_ip_address": "127.0.0.1",
             "user_agent": "test-agent",
         },
