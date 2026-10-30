@@ -357,22 +357,23 @@ return results
 
 PARALLEL_ACQUIRE_SCRIPT: Final = """
 -- Atomic check-and-acquire for the max_parallel_requests concurrency gauge.
--- Each gauge key is a sorted set of per-request slot ids scored by acquire
--- time (Redis server clock). In-flight requests are counted by ZCARD after
--- pruning slots older than the slot TTL, so unlike the windowed RPM/TPM
--- counters the gauge is never reset while requests are in flight, a
--- rejected request never occupies a slot, and a slot leaked by a crashed
--- worker self-heals after the slot TTL even under continuous traffic.
+-- Each gauge key is a sorted set of per-request slot ids scored by the time
+-- (Redis server clock) their holder last acquired or renewed them. In-flight
+-- requests are counted by ZCARD after pruning slots whose lease has ended, so
+-- unlike the windowed RPM/TPM counters the gauge is never reset while
+-- requests are in flight, a rejected request never occupies a slot, and a
+-- slot whose worker died leaves the gauge one lease after its last renewal
+-- even under continuous traffic.
 --
 -- KEYS: one gauge zset key per descriptor.
--- ARGV: per-key triples (limit, slot_ttl_seconds, slot_id).
+-- ARGV: per-key triples (limit, slot_lease_seconds, slot_id).
 -- Success: { 0, in_flight_1, ... }. Over-limit: { 1, key_index, in_flight, limit }.
 local time_reply = redis.call('TIME')
 local now = tonumber(time_reply[1])
 for i = 1, #KEYS do
     local limit = tonumber(ARGV[(i - 1) * 3 + 1])
-    local slot_ttl = tonumber(ARGV[(i - 1) * 3 + 2])
-    redis.call('ZREMRANGEBYSCORE', KEYS[i], '-inf', now - slot_ttl)
+    local slot_lease = tonumber(ARGV[(i - 1) * 3 + 2])
+    redis.call('ZREMRANGEBYSCORE', KEYS[i], '-inf', now - slot_lease)
     local in_flight = redis.call('ZCARD', KEYS[i])
     if in_flight + 1 > limit then
         return { 1, i, in_flight, limit }
@@ -380,13 +381,31 @@ for i = 1, #KEYS do
 end
 local results = { 0 }
 for i = 1, #KEYS do
-    local slot_ttl = tonumber(ARGV[(i - 1) * 3 + 2])
+    local slot_lease = tonumber(ARGV[(i - 1) * 3 + 2])
     local slot_id = ARGV[(i - 1) * 3 + 3]
     redis.call('ZADD', KEYS[i], now, slot_id)
-    redis.call('EXPIRE', KEYS[i], slot_ttl)
+    redis.call('EXPIRE', KEYS[i], slot_lease)
     table.insert(results, redis.call('ZCARD', KEYS[i]))
 end
 return results
+"""
+
+PARALLEL_RENEW_SCRIPT: Final = """
+-- Renew the leases of the slots one worker holds: each slot's score becomes
+-- the Redis server's now, so the acquire and count scripts count it for
+-- another lease. ZADD adds a slot back when Redis lost it, after a failover
+-- or once its key expired during an outage longer than the lease, so the
+-- gauge returns to the slots in flight.
+-- KEYS: one gauge zset key per (slot, key) pair.
+-- ARGV: slot_lease_seconds, then the slot_id of each KEYS entry.
+local time_reply = redis.call('TIME')
+local now = tonumber(time_reply[1])
+local lease = tonumber(ARGV[1])
+for i = 1, #KEYS do
+    redis.call('ZADD', KEYS[i], now, ARGV[i + 1])
+    redis.call('EXPIRE', KEYS[i], lease)
+end
+return #KEYS
 """
 
 PARALLEL_RELEASE_SCRIPT: Final = """
@@ -405,9 +424,9 @@ return results
 """
 
 PARALLEL_COUNT_SCRIPT: Final = """
--- Read the current in-flight count per gauge key (prunes expired slots
--- first so leaked slots do not inflate the reading).
--- KEYS: gauge zset keys. ARGV: per-key slot_ttl_seconds.
+-- Read the current in-flight count per gauge key (prunes slots whose lease
+-- has ended first, so a dead worker's slots do not inflate the reading).
+-- KEYS: gauge zset keys. ARGV: per-key slot_lease_seconds.
 local time_reply = redis.call('TIME')
 local now = tonumber(time_reply[1])
 local results = {}
@@ -491,15 +510,20 @@ _AUDIO_BYTES_PER_TOKEN: Final = 1600
 # on the same project+model simultaneously without colliding on cache keys.
 PROJECT_ITPM_DESCRIPTOR_KEY: Final = "model_per_project_itpm"
 PROJECT_OTPM_DESCRIPTOR_KEY: Final = "model_per_project_otpm"
-# How long an acquired slot counts toward the in-flight total before it is
-# considered leaked (worker crashed without any release callback firing) and
-# pruned. Also the longest request duration the gauge can track: a request
-# running longer than this stops occupying its slot.
+# How long a slot counts in Redis after its holder last acquired or renewed it. A worker renews every slot it holds,
+# so the slot of a worker that died, crashed or restarted leaves the gauge within this long.
+PARALLEL_REQUEST_SLOT_LEASE_SECONDS: Final = 120
+# How long a worker waits after one pass renewing the leases of the slots it holds before the next pass, so about
+# three passes in a row can fail before a live slot stops counting.
+PARALLEL_REQUEST_SLOT_RENEW_INTERVAL_SECONDS: Final = PARALLEL_REQUEST_SLOT_LEASE_SECONDS / 4
+# The longest a slot counts toward the in-flight total. The in-memory registry prunes a slot after this, and a worker
+# stops renewing a slot it has held this long, most likely one whose release it lost, so that slot leaves the Redis
+# gauge one lease later. A request running longer stops occupying its slot.
 PARALLEL_REQUEST_SLOT_TTL_SECONDS: Final = 3600
 # How long to wait between tries of a slot release that has not reached Redis, the last delay repeating.
 PARALLEL_SLOT_RELEASE_RETRY_DELAYS_SECONDS: Final = (1.0, 2.0, 5.0, 10.0, 30.0, 60.0)
 # Most releases a worker holds for retry. A long outage queues releases of slots Redis never saw, so the newest
-# beyond this are dropped and their slots, if any, leave the gauge at the slot TTL.
+# beyond this are dropped and their slots, if any, leave the gauge when their lease ends.
 PARALLEL_SLOT_RELEASE_RETRY_LIMIT: Final = 1024
 # The least time between two warnings about releases dropped from a full retry queue.
 PARALLEL_SLOT_RELEASE_DROP_WARNING_INTERVAL_SECONDS: Final = 60.0
@@ -710,6 +734,12 @@ class UnconfirmedSlotRelease:
 
 
 @dataclass(frozen=True, slots=True)
+class HeldParallelSlot:
+    counter_keys: tuple[str, ...]
+    acquired_at: float
+
+
+@dataclass(frozen=True, slots=True)
 class TagRateLimit:
     rpm_limit: int | None
     tpm_limit: int | None
@@ -808,6 +838,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
     parallel_acquire_script: _AsyncLuaScript | None
     parallel_release_script: _AsyncLuaScript | None
     parallel_count_script: _AsyncLuaScript | None
+    parallel_renew_script: _AsyncLuaScript | None
 
     def __init__(
         self,
@@ -818,6 +849,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         fail_closed_resolver: Callable[[], bool] = _fail_closed_rate_limit_enforcement_from_general_settings,
         force_hash_tag_grouping_resolver: Callable[[], bool] = _force_redis_hash_tag_grouping_from_litellm_settings,
         parallel_slot_release_retry_delays: Sequence[float] = PARALLEL_SLOT_RELEASE_RETRY_DELAYS_SECONDS,
+        parallel_slot_renew_interval_seconds: float = PARALLEL_REQUEST_SLOT_RENEW_INTERVAL_SECONDS,
     ):
         self.internal_usage_cache = internal_usage_cache
         self._time_provider = time_provider or datetime.now
@@ -830,6 +862,9 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         self._slot_release_retrier: asyncio.Task[None] | None = None
         self._slot_release_drops_since_warning = 0
         self._last_slot_release_drop_warning_at: float | None = None
+        self._slot_renew_interval: Final = parallel_slot_renew_interval_seconds
+        self._held_parallel_slots: Final[dict[str, HeldParallelSlot]] = {}  # mutable-ok: slots whose leases we renew
+        self._slot_lease_renewer: asyncio.Task[None] | None = None
         if self.internal_usage_cache.dual_cache.redis_cache is not None:
             self.batch_rate_limiter_script = self.internal_usage_cache.dual_cache.redis_cache.async_register_script(
                 BATCH_RATE_LIMITER_SCRIPT
@@ -857,6 +892,9 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             self.parallel_count_script = self.internal_usage_cache.dual_cache.redis_cache.async_register_script(
                 PARALLEL_COUNT_SCRIPT
             )
+            self.parallel_renew_script = self.internal_usage_cache.dual_cache.redis_cache.async_register_script(
+                PARALLEL_RENEW_SCRIPT
+            )
         else:
             self.batch_rate_limiter_script = None
             self.batch_counter_read_script = None
@@ -866,6 +904,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             self.parallel_acquire_script = None
             self.parallel_release_script = None
             self.parallel_count_script = None
+            self.parallel_renew_script = None
 
         self.window_size = int(os.getenv("LITELLM_RATE_LIMIT_WINDOW_SIZE", 60))
 
@@ -1807,12 +1846,14 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         registry: each admitted request registers ``slot_id`` with its
         acquire time, and admission requires in_flight + 1 <= limit over the
         unexpired slots. Unlike the windowed RPM/TPM counters, the gauge is
-        never reset while requests are in flight, a rejected request never
-        occupies a slot, and a slot leaked by a crashed worker is pruned
-        after PARALLEL_REQUEST_SLOT_TTL_SECONDS even under continuous
-        traffic. Releases remove exactly this request's slot id, so a
-        double-fired or unmatched release can never free another request's
-        slot.
+        never reset while requests are in flight, and a rejected request never
+        occupies a slot. In Redis a slot is a lease its worker renews while
+        the request runs, so the slot of a worker that died is pruned one
+        lease later even under continuous traffic. A request admitted in
+        memory because the acquire script failed is renewed too, so Redis
+        counts it once Redis answers, whether or not the acquire ran there.
+        Releases remove exactly this request's slot id, so a double-fired or
+        unmatched release can never free another request's slot.
         """
         gauge_keys: Final = [gauge["counter_key"] for gauge in gauges]
 
@@ -1821,7 +1862,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                 try:
                     raw_counts: Final[list[CacheCounterValue]] = await self.parallel_count_script(
                         keys=gauge_keys,
-                        args=[PARALLEL_REQUEST_SLOT_TTL_SECONDS for _ in gauges],
+                        args=[PARALLEL_REQUEST_SLOT_LEASE_SECONDS for _ in gauges],
                     )
                     counts = [max(0, int(value)) for value in raw_counts]
                 except Exception as e:  # noqa: BLE001 - any Redis/Lua failure degrades to the local mirror unless fail-closed rejects
@@ -1846,7 +1887,9 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                 raw: Final[list[CacheCounterValue]] = await self.parallel_acquire_script(
                     keys=gauge_keys,
                     args=[
-                        arg for gauge in gauges for arg in (gauge["limit"], PARALLEL_REQUEST_SLOT_TTL_SECONDS, slot_id)
+                        arg
+                        for gauge in gauges
+                        for arg in (gauge["limit"], PARALLEL_REQUEST_SLOT_LEASE_SECONDS, slot_id)
                     ],
                 )
             except Exception as e:  # noqa: BLE001 - any Redis/Lua failure degrades to in-memory enforcement, never a 500
@@ -1860,7 +1903,10 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                     e,
                 )
                 async with self._check_and_increment_lock:
-                    return await self._acquire_parallel_slots_in_memory(gauges, slot_id, parent_otel_span)
+                    admitted: Final = await self._acquire_parallel_slots_in_memory(gauges, slot_id, parent_otel_span)
+                if admitted["overall_code"] == "OK":
+                    self._renew_parallel_slot_lease_while_held(gauge_keys, slot_id)
+                return admitted
             except BaseException:
                 self._retry_parallel_slot_release(gauge_keys, slot_id)
                 raise
@@ -1880,6 +1926,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                     local_only=True,
                 )
                 statuses.append(self._gauge_status(gauge, int(in_flight), "OK"))
+            self._renew_parallel_slot_lease_while_held(gauge_keys, slot_id)
             return RateLimitResponse(overall_code="OK", statuses=statuses)
 
         async with self._check_and_increment_lock:
@@ -1993,6 +2040,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         slot_id: Final = acquisition["slot_id"]
         if not counter_keys or not slot_id:
             return
+        self._held_parallel_slots.pop(slot_id, None)
         if self.parallel_release_script is not None:
             try:
                 raw: Final[list[CacheCounterValue]] = await self.parallel_release_script(
@@ -2030,6 +2078,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         batch: Final = None if redis_cache is None else active_post_call_redis_batch(redis_cache)
         if batch is None or script is None or not counter_keys or not slot_id:
             return False
+        self._held_parallel_slots.pop(slot_id, None)
         await self._release_parallel_request_slots_in_memory(counter_keys, slot_id, parent_otel_span)
 
         async def settle(future: asyncio.Future[object]) -> None:
@@ -2076,7 +2125,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             UnconfirmedSlotRelease(
                 counter_keys=tuple(counter_keys),
                 slot_id=slot_id,
-                retry_until=self._get_current_time().timestamp() + PARALLEL_REQUEST_SLOT_TTL_SECONDS,
+                retry_until=self._get_current_time().timestamp() + PARALLEL_REQUEST_SLOT_LEASE_SECONDS,
             )
         )
         retrier: Final = self._slot_release_retrier
@@ -2092,11 +2141,11 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         verbose_proxy_logger.warning(
             "Dropped %d concurrency slot releases since the last warning, the newest for slot %s, because the retry "
             "queue already holds its limit of %d. Each dropped slot counts against its max_parallel_requests limits "
-            "until its %d s TTL ends",
+            "until its %d s lease ends",
             self._slot_release_drops_since_warning,
             slot_id,
             PARALLEL_SLOT_RELEASE_RETRY_LIMIT,
-            PARALLEL_REQUEST_SLOT_TTL_SECONDS,
+            PARALLEL_REQUEST_SLOT_LEASE_SECONDS,
         )
         self._slot_release_drops_since_warning = 0
         self._last_slot_release_drop_warning_at = now
@@ -2133,6 +2182,83 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         if not released:
             self._unconfirmed_slot_releases.appendleft(pending)
         return released
+
+    def _renew_parallel_slot_lease_while_held(self, counter_keys: Sequence[str], slot_id: str) -> None:
+        if self.parallel_renew_script is None:
+            return
+        self._held_parallel_slots[slot_id] = HeldParallelSlot(
+            counter_keys=tuple(counter_keys), acquired_at=self._get_current_time().timestamp()
+        )
+        renewer: Final = self._slot_lease_renewer
+        if renewer is None or renewer.done():
+            self._slot_lease_renewer = asyncio.create_task(self._renew_held_slot_leases())
+
+    async def _renew_held_slot_leases(self) -> None:
+        while self._held_parallel_slots:
+            await asyncio.sleep(self._slot_renew_interval)
+            await self._renew_held_slot_leases_once()
+
+    async def _renew_held_slot_leases_once(self) -> None:
+        """One script call renews every slot this worker holds, or one call per Redis Cluster hash slot when keys
+        are grouped by hash tag, so a pass takes one round trip however many slots the worker holds. A call Redis
+        refused is tried again on the next pass, before the leases end. A slot released while the call was on the
+        way may be back in Redis, so it goes to the retry queue again."""
+        script: Final = self.parallel_renew_script
+        if script is None:
+            return
+        now: Final = self._get_current_time().timestamp()
+        for slot_id, held in tuple(self._held_parallel_slots.items()):
+            if now - held.acquired_at >= PARALLEL_REQUEST_SLOT_TTL_SECONDS:
+                self._stop_renewing_long_held_slot(slot_id)
+        renewing: Final = tuple(self._held_parallel_slots.items())
+        pairs: Final = tuple(
+            itertools.chain.from_iterable(((key, slot_id) for key in held.counter_keys) for slot_id, held in renewing)
+        )
+        outcomes: Final = await asyncio.gather(
+            *(self._renew_slot_leases(script, group) for group in self._renewal_groups(pairs))
+        )
+        failures: Final = tuple(failure for failure in outcomes if failure is not None)
+        if failures:
+            log_redis_failure(
+                verbose_proxy_logger,
+                logging.WARNING,
+                f"parallel_renew_script failed for {len(failures)} of {len(outcomes)} calls, will retry",
+                failures[0],
+            )
+        for slot_id, held in renewing:
+            if slot_id not in self._held_parallel_slots:
+                self._retry_parallel_slot_release(held.counter_keys, slot_id)
+
+    def _renewal_groups(self, pairs: tuple[tuple[str, str], ...]) -> tuple[tuple[tuple[str, str], ...], ...]:
+        if not pairs:
+            return ()
+        if not (self._is_redis_cluster() or self._force_hash_tag_grouping_resolver()):
+            return (pairs,)
+        by_hash_slot: Final = sorted(pairs, key=lambda pair: self.keyslot_for_redis_cluster(pair[0]))
+        return tuple(
+            tuple(group)
+            for _, group in itertools.groupby(by_hash_slot, key=lambda pair: self.keyslot_for_redis_cluster(pair[0]))
+        )
+
+    async def _renew_slot_leases(self, script: _AsyncLuaScript, pairs: tuple[tuple[str, str], ...]) -> Exception | None:
+        try:
+            await script(
+                keys=[key for key, _ in pairs],
+                args=[PARALLEL_REQUEST_SLOT_LEASE_SECONDS, *(slot_id for _, slot_id in pairs)],
+            )
+        except Exception as e:  # noqa: BLE001 - a renewal Redis refused is tried again on the next pass
+            return e
+        return None
+
+    def _stop_renewing_long_held_slot(self, slot_id: str) -> None:
+        self._held_parallel_slots.pop(slot_id, None)
+        verbose_proxy_logger.warning(
+            "Concurrency slot %s has been held for %d s, so its lease is no longer renewed and it leaves the gauge "
+            "within %d s. Its release was most likely lost",
+            slot_id,
+            PARALLEL_REQUEST_SLOT_TTL_SECONDS,
+            PARALLEL_REQUEST_SLOT_LEASE_SECONDS,
+        )
 
     async def _mirror_released_parallel_slots(
         self, counter_keys: list[str], remaining_by_key: Sequence[object], parent_otel_span: Span | None
