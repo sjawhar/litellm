@@ -197,6 +197,8 @@ class AuthCacheInvalidationSubscriber:
                 pubsub = client.pubsub()
                 try:
                     await pubsub.subscribe(auth_cache_invalidation_channel(self._redis_cache))
+                    # Invalidations sent while this pod was not subscribed are lost; Redis, back now, answers first.
+                    self._user_api_key_cache.last_good_memory.clear()
                     backoff_seconds = _BACKOFF_INITIAL_SECONDS
                     await self._consume(pubsub)
                 finally:

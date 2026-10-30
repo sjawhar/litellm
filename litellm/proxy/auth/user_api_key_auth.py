@@ -149,7 +149,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     UserApiKeyCache,
     end_user_cache_key,
     end_user_restricted_registry_cache_key,
-    forget_last_good,
+    forget_missing_last_good,
     model_access_group_registry_cache_key,
     remember_last_good,
     team_membership_auth_cache_key,
@@ -3485,7 +3485,7 @@ async def _read_team_membership(
             raise
         return served
     if db_member is None:
-        await forget_last_good(user_api_key_cache, cache_key)
+        await forget_missing_last_good(user_api_key_cache, cache_key)
         return None
     member: Final = LiteLLM_TeamMembership.model_validate(db_member.model_dump())
     await user_api_key_cache.async_set_cache(key=cache_key, value=member, model_type=LiteLLM_TeamMembership, ttl=5)

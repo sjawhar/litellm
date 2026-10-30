@@ -403,13 +403,17 @@ async def _write_team_windows(prisma_client: PrismaClient, row_id: str, payload:
 
 
 async def _forget_reset_last_good(cache_keys: Sequence[str]) -> None:
-    """A reset rewrites spend and budget windows, so the last good entries holding the old ones go too."""
-    from litellm.proxy.proxy_server import user_api_key_cache
+    """A reset rewrites spend and budget windows, so the last good entries holding the old ones go too. Best effort,
+    like the cache invalidation around it: the reset has committed."""
+    try:
+        from litellm.proxy.proxy_server import user_api_key_cache
 
-    if not user_api_key_cache.serve_last_good_entries:
-        return
-    for cache_key in cache_keys:
-        await forget_last_good(user_api_key_cache, cache_key)
+        if not user_api_key_cache.serve_last_good_entries:
+            return
+        for cache_key in cache_keys:
+            await forget_last_good(user_api_key_cache, cache_key)
+    except Exception as e:  # noqa: BLE001  # the reset committed; a failed eviction must not undo or abort it
+        verbose_proxy_logger.warning("Failed to drop the last good entries of %d reset rows: %s", len(cache_keys), e)
 
 
 @dataclass(frozen=True, slots=True)

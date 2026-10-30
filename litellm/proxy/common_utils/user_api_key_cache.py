@@ -49,7 +49,7 @@ class LastGoodMemory:
     __slots__ = ("_clock", "_entries", "_max_entries", "_tombstones")
 
     def __init__(self, max_entries: int, clock: Callable[[], float] = time.monotonic) -> None:
-        self._entries: Final[OrderedDict[str, object]] = OrderedDict()  # mutable-ok: bounded LRU every read updates
+        self._entries: Final[OrderedDict[str, object]] = OrderedDict()  # mutable-ok: bounded LRU each write reorders
         self._tombstones: Final[OrderedDict[str, float]] = OrderedDict()  # mutable-ok: bounded, lapses by clock
         self._max_entries: Final = max_entries
         self._clock: Final = clock
@@ -68,6 +68,9 @@ class LastGoodMemory:
 
     def delete(self, key: str) -> None:
         _ = self._entries.pop(key, None)
+
+    def clear(self) -> None:
+        self._entries.clear()
 
     def tombstone(self, key: str, ttl_seconds: float) -> None:
         self.delete(key)
@@ -564,6 +567,15 @@ async def forget_last_good(cache: DualCache, cache_key: str, *, tombstone: bool 
             cache_key,
             e,
         )
+
+
+async def forget_missing_last_good(cache: DualCache, cache_key: str) -> None:
+    """Drop the entry of a key, team or membership a read just found missing. On the read path, so it costs nothing
+    while the setting is off: every delete already forgets unconditionally."""
+    store: Final = _last_good_store(cache)
+    if store is None or not store.serve_last_good_entries:
+        return
+    await forget_last_good(cache, cache_key)
 
 
 async def revoke_last_good(cache: DualCache, cache_keys: Sequence[str]) -> None:

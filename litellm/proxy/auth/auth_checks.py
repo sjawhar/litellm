@@ -114,6 +114,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     end_user_cache_key,
     end_user_restricted_registry_cache_key,
     forget_last_good,
+    forget_missing_last_good,
     get_management_object_ttl,
     model_access_group_cache_key,
     model_access_group_registry_cache_key,
@@ -2476,7 +2477,7 @@ async def _fetch_team_membership_from_db(
             value=NO_TEAM_MEMBERSHIP_SENTINEL,
             ttl=get_management_object_ttl(user_api_key_cache),
         )
-        await forget_last_good(user_api_key_cache, last_good_key)
+        await forget_missing_last_good(user_api_key_cache, last_good_key)
     else:
         await user_api_key_cache.async_set_cache(
             key=_key,
@@ -3514,7 +3515,7 @@ async def get_team_object(
             use_writer=bool(check_db_only),
         )
     except TeamNotFoundError:
-        await forget_last_good(user_api_key_cache, key)
+        await forget_missing_last_good(user_api_key_cache, key)
         raise
     except Exception as e:
         served: Final = (
@@ -3694,14 +3695,14 @@ async def get_team_object_by_alias(
         ) from e
 
     if not teams:
-        await forget_last_good(user_api_key_cache, cache_key)
+        await forget_missing_last_good(user_api_key_cache, cache_key)
         raise HTTPException(
             status_code=404,
             detail={"error": f"Team with alias '{team_alias}' doesn't exist in db. Create team via `/team/new` call."},
         )
 
     if len(teams) > 1:
-        await forget_last_good(user_api_key_cache, cache_key)
+        await forget_missing_last_good(user_api_key_cache, cache_key)
         raise HTTPException(
             status_code=400,
             detail={
@@ -4173,16 +4174,11 @@ async def get_key_object(
             proxy_logging_obj=proxy_logging_obj,
             check_db_only=check_db_only,
         )
-    except Exception as e:
-        served: Final = (
-            None if check_db_only else await recall_last_good_after(e, user_api_key_cache, hashed_token, UserAPIKeyAuth)
-        )
-        if served is None:
-            raise
-        return served
+    except Exception as e:  # noqa: BLE001  # re-raised by _last_good_key_or_raise unless an outage is covered
+        return await _last_good_key_or_raise(e, user_api_key_cache, hashed_token, check_db_only=check_db_only)
 
     if _valid_token is None:
-        await forget_last_good(user_api_key_cache, hashed_token)
+        await forget_missing_last_good(user_api_key_cache, hashed_token)
         raise ProxyException(
             message=f"Authentication Error, Invalid proxy server token passed. key={hashed_token}, not found in db. Create key via `/key/generate` call.",
             type=ProxyErrorTypes.token_not_found_in_db,
@@ -4215,17 +4211,37 @@ async def get_key_object(
     if check_db_only:
         return _response
 
-    # save the key object to cache
+    await _cache_key_read_from_db(hashed_token, _response, user_api_key_cache, proxy_logging_obj)
+    return _response
+
+
+async def _last_good_key_or_raise(
+    error: Exception, user_api_key_cache: UserApiKeyCache, hashed_token: str, *, check_db_only: bool
+) -> UserAPIKeyAuth:
+    """The key's last good entry when ``error`` is an unreachable database, else ``error`` again. An authoritative
+    (``check_db_only``) read is never served a cached copy."""
+    served: Final = (
+        None if check_db_only else await recall_last_good_after(error, user_api_key_cache, hashed_token, UserAPIKeyAuth)
+    )
+    if served is None:
+        raise error
+    return served
+
+
+async def _cache_key_read_from_db(
+    hashed_token: str,
+    key: UserAPIKeyAuth,
+    user_api_key_cache: UserApiKeyCache,
+    proxy_logging_obj: ProxyLogging | None,
+) -> None:
     await cache_key_object(
         hashed_token=hashed_token,
-        user_api_key_obj=_response,
+        user_api_key_obj=key,
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
     )
-    if _response.token == hashed_token:
-        await remember_last_good(user_api_key_cache, hashed_token, copy_user_api_key_auth_for_cache(_response))
-
-    return _response
+    if key.token == hashed_token:
+        await remember_last_good(user_api_key_cache, hashed_token, copy_user_api_key_auth_for_cache(key))
 
 
 def copy_user_api_key_auth_for_cache(

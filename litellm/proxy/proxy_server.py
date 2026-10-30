@@ -6982,6 +6982,12 @@ class ProxyConfig:
                 if user_api_key_cache.serve_last_good_entries
                 else "not kept, so a database outage refuses every caller whose cached entry has expired",
             )
+            if user_api_key_cache.serve_last_good_entries and user_api_key_cache.redis_cache is None:
+                verbose_proxy_logger.warning(
+                    "general_settings.serve_last_good_auth_entries is on but the auth cache has no Redis "
+                    "(litellm_settings.enable_redis_auth_cache): each worker keeps its own last good entries, and a "
+                    "delete or block on one worker does not drop the copies another worker holds"
+                )
 
             ### USER API KEY CACHE MAX SIZE (in-memory tier shared by keys, teams, users, end users, ...) ###
             if "user_api_key_cache_max_size" in general_settings:

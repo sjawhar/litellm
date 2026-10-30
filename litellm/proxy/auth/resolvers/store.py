@@ -37,7 +37,11 @@ from litellm.proxy.auth.resolvers.models import (
     UserIdentity,
 )
 from litellm.proxy.auth.roles import TeamRole, map_role, team_role
-from litellm.proxy.common_utils.user_api_key_cache import AUTH_OBJECTS_TARGET, forget_last_good, remember_last_good
+from litellm.proxy.common_utils.user_api_key_cache import (
+    AUTH_OBJECTS_TARGET,
+    forget_missing_last_good,
+    remember_last_good,
+)
 
 if TYPE_CHECKING:
     from litellm.caching.caching import DualCache
@@ -130,7 +134,7 @@ class IdentityStore:
                 raise
             return served
         if from_db is None:
-            await forget_last_good(self._cache, hashed_token)
+            await forget_missing_last_good(self._cache, hashed_token)
             raise KeyNotFoundError(hashed_token)
         key: Final = UserAPIKeyAuth.model_validate(from_db.model_dump(exclude_none=True))
 

@@ -2068,6 +2068,21 @@ class TestLastGoodEntryWhileTheDatabaseIsUnreachable:
         assert await recall_last_good(cache, "hashed-reset", UserAPIKeyAuth) is None
 
     @pytest.mark.asyncio
+    async def test_a_miss_with_the_setting_off_makes_no_redis_call(self):
+        """The read path's forget runs only while entries are kept: with the setting off, an unknown key costs no
+        Redis round trip."""
+        from litellm.proxy._types import ProxyException
+
+        redis = fake_redis_cache()
+        client = redis.cache.init_async_client()
+        await client.set("last_good:k-missing", '{"token": "k-missing"}')
+
+        with pytest.raises(ProxyException):
+            await self._key(_Database(), UserApiKeyCache(redis_cache=redis.cache), "k-missing")
+
+        assert await client.exists("last_good:k-missing") == 1
+
+    @pytest.mark.asyncio
     async def test_an_answer_that_is_not_an_outage_is_not_covered(self):
         from fastapi import HTTPException
         from prisma.errors import DataError

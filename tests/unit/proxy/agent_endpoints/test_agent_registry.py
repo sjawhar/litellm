@@ -516,6 +516,7 @@ async def test_agent_deletion_revokes_managed_keys_and_keeps_identity_history(ma
     row: Final = _stored_agent_row({"agent_id": "agent-123", "identity_managed": managed})
     tx.litellm_agentstable.find_unique = AsyncMock(return_value=row)
     tx.litellm_agentstable.delete = AsyncMock(return_value=row)
+    tx.litellm_verificationtoken.find_many = AsyncMock(return_value=[SimpleNamespace(token="agent-key-1")])
     tx.litellm_verificationtoken.delete_many = AsyncMock(return_value=2)
     tx.litellm_retiredagent.upsert = AsyncMock()
     result: Final = await registry.delete_agent_from_db("agent-123", database)
@@ -530,6 +531,31 @@ async def test_agent_deletion_revokes_managed_keys_and_keeps_identity_history(ma
     else:
         tx.litellm_retiredagent.upsert.assert_not_awaited()
         tx.litellm_verificationtoken.delete_many.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_agent_deletion_drops_and_tombstones_its_keys_last_good_entries(monkeypatch) -> None:
+    """A deleted agent's keys must not survive as last good entries a later database outage serves."""
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, recall_last_good, remember_last_good
+
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    await remember_last_good(cache, "agent-key-1", UserAPIKeyAuth(token="agent-key-1", agent_id="agent-123"))
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
+    monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", None)
+    database: Final = MagicMock()
+    tx: Final = database.tx.return_value.__aenter__.return_value
+    row: Final = _stored_agent_row({"agent_id": "agent-123", "identity_managed": True})
+    tx.litellm_agentstable.find_unique = AsyncMock(return_value=row)
+    tx.litellm_agentstable.delete = AsyncMock(return_value=row)
+    tx.litellm_verificationtoken.find_many = AsyncMock(return_value=[SimpleNamespace(token="agent-key-1")])
+    tx.litellm_verificationtoken.delete_many = AsyncMock(return_value=1)
+    tx.litellm_retiredagent.upsert = AsyncMock()
+
+    await AgentRegistry().delete_agent_from_db("agent-123", database)
+    await remember_last_good(cache, "agent-key-1", UserAPIKeyAuth(token="agent-key-1", agent_id="agent-123"))
+
+    assert await recall_last_good(cache, "agent-key-1", UserAPIKeyAuth) is None
 
 
 # ---------- LIT-6736: agent litellm_params secret redaction ----------
