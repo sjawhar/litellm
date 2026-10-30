@@ -681,9 +681,7 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
             )
 
         except _ModelCapacityRateLimitError:
-            _record_model_group_saturation(
-                model=model, pre_read_saturation=max(saturation, 1.0), admission=None, data=data
-            )
+            _record_model_group_saturation(model=model, pre_read_saturation=1.0, admission=None, data=data)
             raise
         except ProxyRateLimitError:
             _record_model_group_saturation(model=model, pre_read_saturation=saturation, admission=None, data=data)
