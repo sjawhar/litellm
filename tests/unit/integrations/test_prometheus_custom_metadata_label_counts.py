@@ -1,6 +1,7 @@
 import datetime
 import logging
 import sys
+from itertools import chain
 
 import pytest
 from prometheus_client import REGISTRY
@@ -281,6 +282,80 @@ def test_priority_label_on_gauges_without_a_request_is_empty(monkeypatch: pytest
     ):
         samples = _metric_samples(metric_name)
         assert [sample.labels["priority"] for sample in samples] == [""], metric_name
+
+
+def _body_forging_team_priority() -> dict:
+    forged = {"user_api_key_team_metadata": {"priority": "forged-by-caller"}}
+    return {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "hi"}],
+        "metadata": dict(forged),
+        "litellm_metadata": dict(forged),
+    }
+
+
+def _priority_labels_by_metric() -> dict[str, set[str]]:
+    samples = chain.from_iterable(metric.samples for metric in REGISTRY.collect())
+    labelled = [sample for sample in samples if "priority" in sample.labels and not sample.name.endswith("_created")]
+    return {
+        name: {sample.labels["priority"] for sample in labelled if sample.name == name}
+        for name in {sample.name for sample in labelled}
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("team_priority", "expected_priority"), (("high", "high"), (None, "")))
+async def test_client_failure_priority_label_ignores_team_metadata_forged_in_the_body(
+    monkeypatch: pytest.MonkeyPatch, team_priority: str | None, expected_priority: str
+):
+    monkeypatch.setattr(litellm, "custom_prometheus_metadata_labels", ["priority"])
+    _clear_prometheus_registry()
+    prometheus_logger = PrometheusLogger()
+
+    await prometheus_logger.async_post_call_failure_hook(
+        request_data=_body_forging_team_priority(),
+        original_exception=litellm.AuthenticationError(message="Invalid key", llm_provider="", model="gpt-4o-mini"),
+        user_api_key_dict=UserAPIKeyAuth(team_metadata={"priority": team_priority} if team_priority else None),
+    )
+
+    assert _priority_labels_by_metric() == {
+        "litellm_proxy_failed_requests_metric_total": {expected_priority},
+        "litellm_proxy_total_requests_metric_total": {expected_priority},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("team_priority", "expected_priority"), (("high", "high"), (None, "")))
+async def test_auth_gate_rejection_labels_every_failure_series_with_the_key_team_class(
+    monkeypatch: pytest.MonkeyPatch, team_priority: str | None, expected_priority: str
+):
+    from litellm.caching.dual_cache import DualCache
+    from litellm.proxy._types import ProxyErrorTypes
+    from litellm.proxy.utils import ProxyLogging
+
+    monkeypatch.setattr(litellm, "custom_prometheus_metadata_labels", ["priority"])
+    _clear_prometheus_registry()
+    monkeypatch.setattr(litellm, "callbacks", [PrometheusLogger()])
+
+    await ProxyLogging(user_api_key_cache=DualCache()).post_call_failure_hook(
+        request_data=_body_forging_team_priority(),
+        original_exception=litellm.BudgetExceededError(current_cost=2.0, max_budget=1.0),
+        user_api_key_dict=UserAPIKeyAuth(
+            token="hashed-key",
+            team_id="team-1",
+            team_metadata={"priority": team_priority} if team_priority else None,
+            request_route="/chat/completions",
+        ),
+        error_type=ProxyErrorTypes.auth_error,
+        route="/chat/completions",
+    )
+
+    labels_by_metric = _priority_labels_by_metric()
+    assert {
+        "litellm_proxy_failed_requests_metric_total",
+        "litellm_llm_api_failed_requests_metric_total",
+    } <= labels_by_metric.keys()
+    assert {name: {expected_priority} for name in labels_by_metric} == labels_by_metric
 
 
 def test_virtual_key_rate_limit_metrics_accept_custom_metadata_labels(
