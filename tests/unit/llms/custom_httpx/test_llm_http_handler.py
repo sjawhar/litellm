@@ -1870,9 +1870,11 @@ async def test_anthropic_post_skips_the_thinking_strip_retry_when_block_binding_
     assert http_client.post.await_count == expected_posts
 
 
-_NULL_SIGNATURE_ERROR: Final = (
-    '{"type":"error","error":{"type":"invalid_request_error","message":"messages.1.content.0.thinking.signature.str: '
-    'Input should be a valid string"}}'
+_INVALID_THINKING_MESSAGES: Final = (
+    "messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation.",
+    "messages.1.content.0: Invalid `signature` in `thinking` block",
+    "messages.1.content.0.thinking.signature.str: Input should be a valid string",
+    "messages.1.content.0.thinking: each thinking block must contain thinking",
 )
 
 
@@ -1882,21 +1884,28 @@ class _ConfigWithoutBlockBinding(AnthropicMessagesConfig):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "config_class", (AnthropicMessagesConfig, _ConfigWithoutBlockBinding), ids=("forwards-binding", "drops-binding")
+)
+@pytest.mark.parametrize(
+    "error_message", _INVALID_THINKING_MESSAGES, ids=("bound", "invalid-signature", "null-signature", "empty-thinking")
+)
+@pytest.mark.parametrize(
     ("prefix_mismatch_behavior", "expected_posts"), (("error", 1), ("drop_block", 2)), ids=("pinned", "drop")
 )
-async def test_anthropic_messages_handler_reads_the_thinking_pin_from_the_caller_not_the_transformed_body(
-    prefix_mismatch_behavior: str, expected_posts: int
+async def test_anthropic_messages_handler_never_strip_retries_a_request_the_caller_pinned(
+    config_class: type[AnthropicMessagesConfig], error_message: str, prefix_mismatch_behavior: str, expected_posts: int
 ) -> None:
-    """The transform rebuilds legacy ``thinking`` without ``block_binding`` for this config, so only the caller's
-    params still say the blocks are pinned. A pinned request must get Anthropic's first 400, not the strip retry."""
+    """A pinned request gets Anthropic's first invalid-thinking 400, whatever it says, also where the transform rebuilds
+    legacy ``thinking`` without ``block_binding`` and only the caller's params still say the blocks are pinned."""
+    error_body: Final = json.dumps({"type": "error", "error": {"type": "invalid_request_error", "message": error_message}})
     handler: Final = BaseLLMHTTPHandler()
     thinking_block: Final = {"type": "thinking", "thinking": "plan", "signature": None}
     request: Final = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
     mock_client: Final = AsyncMock(spec=AsyncHTTPHandler)
     mock_client.post = AsyncMock(
         side_effect=[
-            httpx.Response(400, request=request, text=_NULL_SIGNATURE_ERROR),
-            httpx.Response(400, request=request, text=_NULL_SIGNATURE_ERROR),
+            httpx.Response(400, request=request, text=error_body),
+            httpx.Response(400, request=request, text=error_body),
         ]
     )
     mock_logging_obj: Final = Mock(baseline_cache_context=None)
@@ -1910,7 +1919,7 @@ async def test_anthropic_messages_handler_reads_the_thinking_pin_from_the_caller
                 {"role": "assistant", "content": [thinking_block, {"type": "text", "text": "hello"}]},
                 {"role": "user", "content": "again"},
             ],
-            anthropic_messages_provider_config=_ConfigWithoutBlockBinding(),
+            anthropic_messages_provider_config=config_class(),
             anthropic_messages_optional_request_params={
                 "max_tokens": 32,
                 "thinking": {
