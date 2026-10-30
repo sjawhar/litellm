@@ -12,6 +12,7 @@ from litellm.llms.anthropic.common_utils import (
     flatten_unencrypted_web_search_results_in_anthropic_messages,
     sanitize_tool_use_ids_in_anthropic_messages,
     strip_empty_content_blocks_from_anthropic_messages,
+    validated_object_list,
 )
 from litellm.llms.anthropic.pass_through.utils import is_reasoning_auto_summary_enabled
 from litellm.types.llms.anthropic import (
@@ -38,11 +39,7 @@ def thinking_pinned_after_drops(thinking: object, additional_drop_params: object
     Whether ``thinking.block_binding`` still asks for the error once the deployment's
     ``additional_drop_params`` are applied, the same drop the request on the wire gets
     """
-    drops: Final = (
-        tuple(path for path in additional_drop_params if isinstance(path, str))
-        if isinstance(additional_drop_params, (list, tuple))
-        else ()
-    )
+    drops: Final = tuple(path for path in validated_object_list(additional_drop_params) or () if isinstance(path, str))
     return anthropic_request_errors_on_thinking_binding_mismatch(
         reduce(delete_nested_value, drops, {"thinking": thinking})
     )
@@ -146,20 +143,6 @@ def anthropic_system_to_openai_message(system: object) -> ChatCompletionSystemMe
     return ChatCompletionSystemMessage(role="system", content=system)
 
 
-def sanitize_native_messages(
-    messages: list[dict[str, JsonValue]], *, keep_thinking: bool = False
-) -> list[dict[str, JsonValue]]:
-    """The block rewrites every /v1/messages request gets, without the cache-control injection"""
-    return cast(  # cast-ok: the legacy normalizers preserve the JSON message shape
-        list[dict[str, JsonValue]],
-        flatten_unencrypted_web_search_results_in_anthropic_messages(
-            sanitize_tool_use_ids_in_anthropic_messages(
-                strip_empty_content_blocks_from_anthropic_messages(messages, keep_thinking=keep_thinking)
-            )
-        ),
-    )
-
-
 def prepare_native_messages(
     messages: list[dict[str, JsonValue]],
     system: str | list[dict[str, JsonValue]] | None,
@@ -170,9 +153,15 @@ def prepare_native_messages(
     tools: list[dict[str, JsonValue]] | None = None,
     api_base: str | None = None,
     presanitized: bool = False,
-    keep_thinking: bool = False,
+    thinking: object = None,
 ) -> tuple[list[dict[str, JsonValue]], str | list[dict[str, JsonValue]] | None]:
-    normalized: Final = messages if presanitized else sanitize_native_messages(messages, keep_thinking=keep_thinking)
+    normalized: Final = (
+        messages
+        if presanitized
+        else normalize_native_messages(
+            messages, keep_thinking=thinking_pinned_after_drops(thinking, kwargs.get("additional_drop_params"))
+        )
+    )
     return cast(  # cast-ok: legacy normalizers and injection preserve the JSON message and system shapes
         tuple[list[dict[str, JsonValue]], str | list[dict[str, JsonValue]] | None],
         AnthropicCacheControlHook.maybe_inject_cache_control(
@@ -187,10 +176,15 @@ def prepare_native_messages(
     )
 
 
-def normalize_native_messages(messages: Sequence[object]) -> list[dict[str, object]]:
-    """Apply the block rewrites every /v1/messages request gets before it reaches a provider."""
+def normalize_native_messages(messages: Sequence[object], *, keep_thinking: bool = False) -> list[dict[str, object]]:
+    """
+    Apply the block rewrites every /v1/messages request gets before it reaches a provider. ``keep_thinking`` keeps
+    every thinking block, for a request whose ``thinking.block_binding`` asks Anthropic for the error instead.
+    """
     return flatten_unencrypted_web_search_results_in_anthropic_messages(
-        sanitize_tool_use_ids_in_anthropic_messages(strip_empty_content_blocks_from_anthropic_messages(messages))
+        sanitize_tool_use_ids_in_anthropic_messages(
+            strip_empty_content_blocks_from_anthropic_messages(messages, keep_thinking=keep_thinking)
+        )
     )
 
 

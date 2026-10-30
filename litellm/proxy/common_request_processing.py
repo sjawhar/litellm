@@ -232,7 +232,7 @@ ProxyRouteType: TypeAlias = Literal[
     "adelete_run",
 ]
 from litellm.llms.anthropic.chat.transformation import AnthropicConfig
-from litellm.llms.anthropic.common_utils import anthropic_owns_fallbacks
+from litellm.llms.anthropic.common_utils import anthropic_owns_fallbacks, validated_object_mapping
 
 # Type alias for streaming chunk serializer (chunk after hooks + cost injection -> wire format)
 StreamChunkSerializer = Callable[[object], str]
@@ -1372,9 +1372,10 @@ _is_azure_model_router_request: Final = is_azure_model_router_request
 
 
 def _resolved_provider(request_data: Mapping[str, object]) -> object:
-    logging_obj: Final = request_data.get("litellm_logging_obj")
-    call_details: Final = getattr(logging_obj, "model_call_details", None)
-    return call_details.get("custom_llm_provider") if isinstance(call_details, Mapping) else None
+    call_details: Final = validated_object_mapping(
+        getattr(request_data.get("litellm_logging_obj"), "model_call_details", None)
+    )
+    return call_details.get("custom_llm_provider") if call_details is not None else None
 
 
 def _server_side_fallback_routed_model(request_data: Mapping[str, object]) -> str | None:
@@ -1391,8 +1392,7 @@ def _server_side_fallback_routed_model(request_data: Mapping[str, object]) -> st
         or _resolved_provider(request_data) != "anthropic"
     ):
         return None
-    router_bucket: Final = request_data.get("litellm_metadata")
-    deployment: Final = router_bucket.get("deployment") if isinstance(router_bucket, Mapping) else None
+    deployment: Final = (validated_object_mapping(request_data.get("litellm_metadata")) or {}).get("deployment")
     return deployment if isinstance(deployment, str) and deployment else None
 
 
@@ -1475,7 +1475,7 @@ def _override_openai_response_model(
         if "model" not in response_obj:
             return
         downstream_model = response_obj.get("model")
-        if not provider_model_is_routed(downstream_model, routed_model):
+        if isinstance(downstream_model, str) and not provider_model_is_routed(downstream_model, routed_model):
             return
         if downstream_model != requested_model:
             verbose_proxy_logger.debug(
@@ -1491,7 +1491,7 @@ def _override_openai_response_model(
         return
 
     downstream_model = getattr(response_obj, "model", None)
-    if not provider_model_is_routed(downstream_model, routed_model):
+    if isinstance(downstream_model, str) and not provider_model_is_routed(downstream_model, routed_model):
         return
     if downstream_model != requested_model:
         verbose_proxy_logger.debug(

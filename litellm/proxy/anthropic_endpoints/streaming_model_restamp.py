@@ -40,10 +40,14 @@ def provider_model_is_routed(provider_model: object, routed_model: str | None) -
 def _restamped_event(
     event: Mapping[str, object], requested_model: str, routed_model: str | None = None
 ) -> Mapping[str, object] | None:
-    message: Final = event.get("message")
-    if event.get("type") != _MESSAGE_START_EVENT or not isinstance(message, dict):
+    if event.get("type") != _MESSAGE_START_EVENT:
         return None
-    if message.get("model") == requested_model or not provider_model_is_routed(message.get("model"), routed_model):
+    try:
+        message: Final = _EVENT_ADAPTER.validate_python(event.get("message"))
+    except ValidationError:
+        return None
+    provider_model: Final = message.get("model")
+    if provider_model == requested_model or not provider_model_is_routed(provider_model, routed_model):
         return None
     return {**event, "message": {**message, "model": requested_model}}
 

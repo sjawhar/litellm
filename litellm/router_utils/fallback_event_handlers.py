@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final, cast
+from typing import TYPE_CHECKING, Any, Final
 
 import litellm
 from litellm._logging import verbose_router_logger
@@ -13,7 +13,7 @@ from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.core_helpers import get_metadata_variable_name_from_kwargs, safe_deep_copy
 from litellm.litellm_core_utils.get_llm_provider_logic import inferred_provider
 from litellm.litellm_core_utils.sensitive_data_masker import mask_sensitive_structure
-from litellm.llms.anthropic.common_utils import anthropic_owns_fallbacks
+from litellm.llms.anthropic.common_utils import OBJECT_LIST_ADAPTER, anthropic_owns_fallbacks
 from litellm.router_utils.add_retry_fallback_headers import (
     add_fallback_headers_to_response,
     get_fallback_error_info,
@@ -350,21 +350,21 @@ def reject_non_list_litellm_fallbacks(fallbacks: object, model: object, *, field
 
 
 def request_fallbacks(
-    kwargs: Mapping[str, object], router_fallbacks: list[object] | None, *, anthropic_messages_call: bool = False
+    kwargs: Mapping[str, object], router_fallbacks: Sequence[object] | None, *, anthropic_messages_call: bool = False
 ) -> list[object] | None:
     """The Router's fallback list for this request: the per-request override, else the Router's own"""
     fallbacks: Final = kwargs.get(_router_fallbacks_key(kwargs, anthropic_messages_call), router_fallbacks)
     reject_non_list_litellm_fallbacks(fallbacks, kwargs.get("model"))
-    return cast("list[object] | None", fallbacks)  # cast-ok: checked a list or None above
+    return None if fallbacks is None else OBJECT_LIST_ADAPTER.validate_python(fallbacks)
 
 
 def pop_request_fallbacks(
     kwargs: dict[str, object],  # mutable-ok: async_function_with_retries pops its controls before the attempt runs
-    router_fallbacks: list[object] | None,
+    router_fallbacks: Sequence[object] | None,
 ) -> list[object] | None:
     fallbacks: Final = kwargs.pop(_router_fallbacks_key(kwargs, False), router_fallbacks)
     reject_non_list_litellm_fallbacks(fallbacks, kwargs.get("model"))
-    return cast("list[object] | None", fallbacks)  # cast-ok: checked a list or None above
+    return None if fallbacks is None else OBJECT_LIST_ADAPTER.validate_python(fallbacks)
 
 
 @dataclass(frozen=True, slots=True)

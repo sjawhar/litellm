@@ -455,7 +455,7 @@ _BANNED_REQUEST_BODY_PARAMS: Final[tuple[str, ...]] = (
 
 
 def _check_banned_params(
-    body: dict,
+    body: Mapping[str, object],
     general_settings: dict,
     llm_router: Router | None,
     model: str,
@@ -611,9 +611,21 @@ def request_fallback_model_names(request_body: Mapping[str, object]) -> tuple[st
     return _target_model_names(iter_request_fallback_targets(request_body))
 
 
-def anthropic_fallback_model_names(request_body: Mapping[str, object]) -> tuple[str, ...]:
-    """The models named in the body's ``fallbacks`` read as Anthropic's server-side fallback list"""
-    return _target_model_names(_iter_fallback_targets(request_body.get("fallbacks"), 0))
+def key_fallback_model_names(
+    request_body: Mapping[str, object], *, anthropic_owns_body_fallbacks: bool
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """
+    The models every LiteLLM fallback list names, and the models the body's ``fallbacks`` names when it is Anthropic's
+    server-side fallback list instead
+    """
+    return (
+        _target_model_names(
+            iter_request_fallback_targets(request_body, skip_body_fallbacks=anthropic_owns_body_fallbacks)
+        ),
+        _target_model_names(_iter_fallback_targets(request_body.get("fallbacks"), 0))
+        if anthropic_owns_body_fallbacks
+        else (),
+    )
 
 
 def _reject_fallback_target_credentials(target: Mapping[str, object], allows_client_credentials: bool) -> None:
@@ -641,7 +653,7 @@ def _reject_url_valued_fallback_target(value: str) -> None:
 
 
 def is_request_body_safe(
-    request_body: dict[str, object],
+    request_body: Mapping[str, object],
     general_settings: dict,
     llm_router: Router | None,
     model: str,
@@ -696,9 +708,8 @@ def is_request_body_safe(
                 manages_deployments=manages_deployments,
             )
     for target in iter_request_fallback_targets(request_body):
-        if isinstance(target, dict):
-            _check_banned_params(target, general_settings, llm_router, model, manages_deployments=manages_deployments)
         if isinstance(target, Mapping):
+            _check_banned_params(target, general_settings, llm_router, model, manages_deployments=manages_deployments)
             _reject_fallback_target_credentials(target, allows_client_credentials)
             target_model = target.get("model")
             if isinstance(target_model, str):
