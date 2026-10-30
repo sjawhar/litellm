@@ -10,6 +10,7 @@ import itertools
 import logging
 import os
 import uuid
+from collections import deque
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence, Set
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -41,7 +42,7 @@ from litellm.caching.redis_batch import (
     active_post_call_redis_batch,
     active_request_redis_batch,
 )
-from litellm.caching.redis_cache import log_redis_failure
+from litellm.caching.redis_cache import RedisCircuitBreakerOpenError, log_redis_failure
 from litellm.constants import DYNAMIC_RATE_LIMIT_ERROR_THRESHOLD_PER_MINUTE, INTERNAL_CALL_ORIGIN_METADATA_KEY
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
@@ -495,6 +496,11 @@ PROJECT_OTPM_DESCRIPTOR_KEY: Final = "model_per_project_otpm"
 # pruned. Also the longest request duration the gauge can track: a request
 # running longer than this stops occupying its slot.
 PARALLEL_REQUEST_SLOT_TTL_SECONDS: Final = 3600
+# How long to wait between tries of a slot release that has not reached Redis, the last delay repeating.
+PARALLEL_SLOT_RELEASE_RETRY_DELAYS_SECONDS: Final = (1.0, 2.0, 5.0, 10.0, 30.0, 60.0)
+# Most releases a worker holds for retry. A long outage queues releases of slots Redis never saw, so the newest
+# beyond this are dropped and their slots, if any, leave the gauge at the slot TTL.
+PARALLEL_SLOT_RELEASE_RETRY_LIMIT: Final = 1024
 
 
 CacheCounterValue: TypeAlias = int | float | str | bytes
@@ -695,6 +701,13 @@ class CounterRefund:
 
 
 @dataclass(frozen=True, slots=True)
+class UnconfirmedSlotRelease:
+    counter_keys: tuple[str, ...]
+    slot_id: str
+    retry_until: float
+
+
+@dataclass(frozen=True, slots=True)
 class TagRateLimit:
     rpm_limit: int | None
     tpm_limit: int | None
@@ -802,6 +815,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         model_group_resolver: Callable[[str], str | None] = _resolve_model_group_alias_via_proxy_router,
         fail_closed_resolver: Callable[[], bool] = _fail_closed_rate_limit_enforcement_from_general_settings,
         force_hash_tag_grouping_resolver: Callable[[], bool] = _force_redis_hash_tag_grouping_from_litellm_settings,
+        parallel_slot_release_retry_delays: Sequence[float] = PARALLEL_SLOT_RELEASE_RETRY_DELAYS_SECONDS,
     ):
         self.internal_usage_cache = internal_usage_cache
         self._time_provider = time_provider or datetime.now
@@ -809,6 +823,9 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         self._model_group_resolver = model_group_resolver
         self._fail_closed_resolver = fail_closed_resolver
         self._force_hash_tag_grouping_resolver = force_hash_tag_grouping_resolver
+        self._slot_release_retry_delays: Final = parallel_slot_release_retry_delays
+        self._unconfirmed_slot_releases: Final[deque[UnconfirmedSlotRelease]] = deque()  # mutable-ok: retry queue
+        self._slot_release_retrier: asyncio.Task[None] | None = None
         if self.internal_usage_cache.dual_cache.redis_cache is not None:
             self.batch_rate_limiter_script = self.internal_usage_cache.dual_cache.redis_cache.async_register_script(
                 BATCH_RATE_LIMITER_SCRIPT
@@ -1829,6 +1846,8 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                     ],
                 )
             except Exception as e:  # noqa: BLE001 - any Redis/Lua failure degrades to in-memory enforcement, never a 500
+                if self._fail_closed_resolver() and not isinstance(e, RedisCircuitBreakerOpenError):
+                    await self._release_unconfirmed_parallel_acquire(gauge_keys, slot_id)
                 self._reject_if_rate_limit_unverifiable("parallel_acquire_script", e)
                 log_redis_failure(
                     verbose_proxy_logger,
@@ -1960,6 +1979,8 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         matching acquire or a double-fired release can never free another
         request's slot. The in-memory fallback decrements integer mirror
         values (floored at 0) because the mirror carries no per-slot ids.
+        A release Redis did not confirm is retried until it does, so other
+        workers stop counting the slot once Redis answers again.
         """
         counter_keys: Final = acquisition["counter_keys"]
         slot_id: Final = acquisition["slot_id"]
@@ -1977,9 +1998,10 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                 log_redis_failure(
                     verbose_proxy_logger,
                     logging.WARNING,
-                    "parallel_release_script failed, falling back to in-memory release",
+                    "parallel_release_script failed, releasing in memory and retrying the Redis release",
                     e,
                 )
+                self._retry_parallel_slot_release(counter_keys, slot_id)
         await self._release_parallel_request_slots_in_memory(counter_keys, slot_id, parent_otel_span)
 
     async def _defer_parallel_slot_release(
@@ -2005,12 +2027,76 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                 log_redis_failure(
                     verbose_proxy_logger,
                     logging.WARNING,
-                    "parallel_release_script failed, the slot stays released in memory only",
+                    "parallel_release_script failed in the post-call pipeline, retrying the Redis release",
                     future.exception() if not future.cancelled() else asyncio.CancelledError(),
                 )
+                self._retry_parallel_slot_release(counter_keys, slot_id)
 
         batch.script(PARALLEL_RELEASE_SCRIPT, script, counter_keys, (slot_id,) * len(counter_keys)).on_settled(settle)
         return True
+
+    async def _release_unconfirmed_parallel_acquire(self, gauge_keys: Sequence[str], slot_id: str) -> None:
+        """The acquire script can run in Redis and still fail on the way back, a reset connection or a read
+        timeout. A request refused for that holds no slot, so its slot id leaves Redis now or once Redis answers."""
+        if not await self._release_parallel_slots_in_redis(gauge_keys, slot_id):
+            self._retry_parallel_slot_release(gauge_keys, slot_id)
+
+    async def _release_parallel_slots_in_redis(self, counter_keys: Sequence[str], slot_id: str) -> bool:
+        script: Final = self.parallel_release_script
+        if script is None:
+            return True
+        try:
+            await script(keys=list(counter_keys), args=[slot_id for _ in counter_keys])
+        except Exception as e:  # noqa: BLE001 - a release Redis did not confirm is retried, never a 500
+            log_redis_failure(verbose_proxy_logger, logging.WARNING, "parallel_release_script failed, will retry", e)
+            return False
+        return True
+
+    def _retry_parallel_slot_release(self, counter_keys: Sequence[str], slot_id: str) -> None:
+        if len(self._unconfirmed_slot_releases) >= PARALLEL_SLOT_RELEASE_RETRY_LIMIT:
+            verbose_proxy_logger.debug(
+                "%d slot releases already wait for Redis, so slot %s is left to expire",
+                len(self._unconfirmed_slot_releases),
+                slot_id,
+            )
+            return
+        self._unconfirmed_slot_releases.append(
+            UnconfirmedSlotRelease(
+                counter_keys=tuple(counter_keys),
+                slot_id=slot_id,
+                retry_until=self._get_current_time().timestamp() + PARALLEL_REQUEST_SLOT_TTL_SECONDS,
+            )
+        )
+        retrier: Final = self._slot_release_retrier
+        if retrier is None or retrier.done():
+            self._slot_release_retrier = asyncio.create_task(self._retry_unconfirmed_slot_releases())
+
+    async def _retry_unconfirmed_slot_releases(self) -> None:
+        delays: Final = itertools.chain(
+            self._slot_release_retry_delays, itertools.repeat(self._slot_release_retry_delays[-1])
+        )
+        for delay in delays:
+            await asyncio.sleep(delay)
+            if await self._drain_unconfirmed_slot_releases():
+                return
+
+    async def _drain_unconfirmed_slot_releases(self) -> bool:
+        """Oldest first. False when Redis refused one, which stays first in line."""
+        while self._unconfirmed_slot_releases:
+            if not await self._retry_oldest_slot_release():
+                return False
+        return True
+
+    async def _retry_oldest_slot_release(self) -> bool:
+        """A release whose slot is past its TTL is dropped, since the acquire and count scripts have pruned that
+        slot already."""
+        pending: Final = self._unconfirmed_slot_releases.popleft()
+        if pending.retry_until <= self._get_current_time().timestamp():
+            return True
+        if await self._release_parallel_slots_in_redis(pending.counter_keys, pending.slot_id):
+            return True
+        self._unconfirmed_slot_releases.appendleft(pending)
+        return False
 
     async def _mirror_released_parallel_slots(
         self, counter_keys: list[str], remaining_by_key: Sequence[object], parent_otel_span: Span | None
