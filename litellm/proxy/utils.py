@@ -170,7 +170,7 @@ from litellm.proxy._types import (
 )
 from litellm.proxy.agent_endpoints.auth.agent_access_groups import CeilingResolver, resolve_agent_access_group_ceiling
 from litellm.proxy.auth.route_checks import RouteChecks
-from litellm.proxy.common_utils.callback_utils import add_guardrail_to_applied_guardrails_header
+from litellm.proxy.common_utils.callback_utils import add_guardrail_to_applied_guardrails_header, strip_callback_config
 from litellm.proxy.common_utils.config_sync_pubsub import publish_config_param_change
 from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.proxy.db.create_views import (
@@ -1324,6 +1324,19 @@ def _call_type_for_route(route: str | None) -> str | None:
         return None
     operations: Final = frozenset(call_type.value.removeprefix("a") for call_type in call_types)
     return call_types[0].value if len(operations) == 1 else None
+
+
+def _without_caller_identity_fields(metadata: Mapping[str, object]) -> Mapping[str, object]:
+    return {key: value for key, value in metadata.items() if not key.startswith("user_api_key")}
+
+
+def _proxy_stamped_request_metadata(request_data: Mapping[str, object]) -> bool:
+    """True when add_litellm_data_to_request already wrote the authenticated identity into a metadata
+    bucket. A request body can forge the ``user_api_key_*`` names but never the UserAPIKeyAuth instance."""
+    buckets: Final = (request_data.get("metadata"), request_data.get("litellm_metadata"))
+    return any(
+        isinstance(bucket, dict) and isinstance(bucket.get("user_api_key_auth"), UserAPIKeyAuth) for bucket in buckets
+    )
 
 
 _PROXY_ONLY_LLM_API_ERRORS: Final = (HTTPException, ProxyException, GuardrailRaisedException)
@@ -3709,6 +3722,24 @@ class ProxyLogging:
             user_api_key_logged_metadata: Final = LiteLLMProxyRequestSetup.get_sanitized_user_information_from_key(
                 user_api_key_dict=user_api_key_dict
             )
+            if _proxy_stamped_request_metadata(request_data):
+                request_data["metadata"] = {  # rebind-ok: the proxy already wrote this request's identity
+                    **(request_data.get("metadata") or {}),
+                    **user_api_key_logged_metadata,
+                }
+            else:
+                # An auth-gate rejection never reaches add_litellm_data_to_request, so the body still holds
+                # whatever user_api_key fields the caller sent in either metadata bucket.
+                caller_litellm_metadata: Final = request_data.get("litellm_metadata")
+                if isinstance(caller_litellm_metadata, dict):
+                    request_data["litellm_metadata"] = _without_caller_identity_fields(  # rebind-ok: drops forgeries
+                        caller_litellm_metadata
+                    )
+                request_data["metadata"] = {  # rebind-ok: replaces forged identity with the authenticated one
+                    **_without_caller_identity_fields(request_data.get("metadata") or {}),
+                    **user_api_key_logged_metadata,
+                    "user_api_key_team_metadata": strip_callback_config(user_api_key_dict.team_metadata),
+                }
 
             litellm_logging_obj, data = litellm.utils.function_setup(
                 original_function=route or "IGNORE_THIS",
@@ -3717,9 +3748,6 @@ class ProxyLogging:
                 **request_data,
             )
             request_data["litellm_logging_obj"] = litellm_logging_obj  # rebind-ok: lifted then popped by the caller
-            if "metadata" not in request_data:
-                request_data["metadata"] = {}
-            request_data["metadata"].update(user_api_key_logged_metadata)
 
         if litellm_logging_obj is not None:
             ## UPDATE LOGGING INPUT
