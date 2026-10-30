@@ -1100,7 +1100,7 @@ async def test_prompt(
         optional_params["stream"] = True
 
         # Build request data for chat completion
-        data: Final[dict[str, object]] = {
+        data: Final = {
             "model": template.model,
             "messages": messages,
         }

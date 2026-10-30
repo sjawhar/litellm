@@ -689,13 +689,9 @@ async def _route_request_single_attempt(  # noqa: ANN202  # returns unawaited pr
             if llm_router is not None and route_type == "anthropic_messages" and anthropic_owns_fallbacks(data)
             else {}
         )
-        data.update(
-            {
-                settings_destination.get(key, key): override_settings[key]
-                for key in per_request_settings
-                if override_settings.get(key) is not None and settings_destination.get(key, key) not in data
-            }
-        )
+        for key in per_request_settings:
+            if override_settings.get(key) is not None and settings_destination.get(key, key) not in data:
+                data[settings_destination.get(key, key)] = override_settings[key]
 
         # Use main router with overridden kwargs
         if llm_router is not None:

@@ -94,15 +94,13 @@ from litellm.proxy.auth.auth_object_prefetch import (
 )
 from litellm.proxy.auth.auth_utils import (
     abbreviate_api_key,
-    anthropic_fallback_model_names,
-    fallback_target_model_name,
     get_end_user_id_from_request_body,
     get_model_from_request,
     get_request_route,
     get_request_route_template,
     is_invalid_virtual_key_error,
     is_request_body_safe,
-    iter_request_fallback_targets,
+    key_fallback_model_names,
     log_model_access_denial,
     normalize_request_route,
     pre_db_read_auth_checks,
@@ -3843,13 +3841,11 @@ async def enforce_key_and_fallback_model_access(
         and request is not None
         and anthropic_beta_opts_into_server_side_fallback(request.headers)
     )
-    fallback_names: Final = tuple(
-        name
-        for target in iter_request_fallback_targets(request_data, skip_body_fallbacks=anthropic_owns_body_fallbacks)
-        if (name := fallback_target_model_name(target)) is not None
+    fallback_names, anthropic_fallback_names = key_fallback_model_names(
+        request_data, anthropic_owns_body_fallbacks=anthropic_owns_body_fallbacks
     )
 
-    for _name in dict.fromkeys(fallback_names):  # dedupe, preserve order
+    for _name in fallback_names:
         await can_key_call_model(
             model=_name,
             llm_model_list=llm_model_list,
@@ -3863,7 +3859,7 @@ async def enforce_key_and_fallback_model_access(
         )
 
     # Anthropic serves its own fallback models, so they need only the key's model access, not a Router group
-    for _name in anthropic_fallback_model_names(request_data) if anthropic_owns_body_fallbacks else ():
+    for _name in anthropic_fallback_names:
         await can_key_call_model(
             model=_name,
             llm_model_list=llm_model_list,
@@ -3876,7 +3872,7 @@ async def enforce_router_settings_fallback_access(
     *,
     request_data: Mapping[str, object],
     valid_token: UserAPIKeyAuth,
-    general_settings: dict[str, object],
+    general_settings: dict,
     llm_router: litellm.Router | None,
 ) -> None:
     """

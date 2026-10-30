@@ -42,8 +42,8 @@ from .interceptors import get_messages_interceptors
 from .utils import (
     AnthropicMessagesRequestUtils,
     mock_response,
+    normalize_native_messages,
     prepare_native_messages,
-    sanitize_native_messages,
     thinking_pinned_after_drops,
 )
 
@@ -235,15 +235,15 @@ async def _try_websearch_short_circuit(
 @client
 async def anthropic_messages(
     max_tokens: int,
-    messages: list[dict],
+    messages: list[dict[str, object]],
     model: str,
     metadata: dict | None = None,
     stop_sequences: list[str] | None = None,
     stream: bool | None = False,
     system: str | list | None = None,
     temperature: float | None = None,
-    thinking: dict | None = None,
-    tool_choice: dict | None = None,
+    thinking: dict[str, object] | None = None,
+    tool_choice: dict[str, object] | None = None,
     tools: list[dict] | None = None,
     top_k: int | None = None,
     top_p: float | None = None,
@@ -258,7 +258,7 @@ async def anthropic_messages(
 
     Runs the empty-content-block sanitizer before any backend dispatch.
     """
-    messages = sanitize_native_messages(messages, keep_thinking=True)  # rebind-ok: the hooks see sanitized messages
+    messages = normalize_native_messages(messages, keep_thinking=True)  # rebind-ok: the hooks see sanitized messages
 
     original_stream: Final = stream or kwargs.get("_websearch_interception_converted_stream", False)
 
@@ -307,15 +307,13 @@ async def anthropic_messages(
     # Thinking blocks wait for the pin a pre-request hook leaves: an unpinned request drops its empty unsigned ones,
     # before cache-control injection, which then runs once on the messages that go out.
     dispatched_messages, dispatched_system = prepare_native_messages(
-        (
-            messages
-            if thinking_pinned_after_drops(thinking, kwargs.get("additional_drop_params"))
-            else strip_empty_content_blocks_from_anthropic_messages(messages)
+        strip_empty_content_blocks_from_anthropic_messages(
+            messages, keep_thinking=thinking_pinned_after_drops(thinking, kwargs.get("additional_drop_params"))
         ),
         system,
         kwargs,
         model=model,
-        custom_llm_provider=custom_llm_provider,
+        custom_llm_provider=custom_llm_provider if isinstance(custom_llm_provider, str) else None,
         tools=tools,
         api_base=api_base,
         presanitized=True,
@@ -429,8 +427,8 @@ def anthropic_messages_handler(
     stream: bool | None = False,
     system: str | list | None = None,
     temperature: float | None = None,
-    thinking: dict | None = None,
-    tool_choice: dict | None = None,
+    thinking: dict[str, object] | None = None,
+    tool_choice: dict[str, object] | None = None,
     tools: list[dict] | None = None,
     top_k: int | None = None,
     top_p: float | None = None,
@@ -463,7 +461,7 @@ def anthropic_messages_handler(
         tools=tools,
         api_base=api_base,
         presanitized=bool(kwargs.pop("_litellm_messages_presanitized", False)),
-        keep_thinking=thinking_pinned_after_drops(thinking, kwargs.get("additional_drop_params")),
+        thinking=thinking,
     )
 
     metadata = validate_anthropic_api_metadata(metadata)
@@ -578,10 +576,10 @@ def anthropic_messages_handler(
         )
         # Anthropic's `fallbacks` has no meaning on a translated provider, and the Responses API has no client-side
         # fallback, where LiteLLM's list would only suppress the success log. litellm.acompletion runs LiteLLM's list.
-        if routes_to_responses_api or anthropic_owns_fallbacks(kwargs):
-            kwargs.pop("fallbacks", None)
-        litellm_fallbacks: Final = cast(dict[str, object], kwargs).get("fallbacks")  # cast-ok: untyped **kwargs
-        reject_non_list_litellm_fallbacks(litellm_fallbacks, original_model)
+        litellm_kwargs: Final = cast(dict[str, object], kwargs)  # cast-ok: untyped **kwargs
+        if routes_to_responses_api or anthropic_owns_fallbacks(litellm_kwargs):
+            litellm_kwargs.pop("fallbacks", None)
+        reject_non_list_litellm_fallbacks(litellm_kwargs.get("fallbacks"), original_model)
         if routes_to_responses_api:
             return LiteLLMMessagesToResponsesAPIHandler.anthropic_messages_handler(
                 max_tokens=max_tokens,
