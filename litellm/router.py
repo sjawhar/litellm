@@ -7648,7 +7648,7 @@ class Router:
         """
         Common utilities for async_function_with_fallbacks
         """
-        if verbose_router_logger.isEnabledFor(logging.DEBUG):
+        if verbose_router_logger.isEnabledFor(logging.DEBUG) and not is_admission_refusal(e):
             verbose_router_logger.debug("Traceback%s", redact_string(traceback.format_exc()))
         original_exception: Final = e
         fallback_model_group = None

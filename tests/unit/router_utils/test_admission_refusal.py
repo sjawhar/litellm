@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Callable, Mapping
 
 import pytest
@@ -124,6 +125,37 @@ async def test_marked_admission_refusal_is_final_with_no_retry_fallback_or_coold
     assert admission.attempts == (REFUSED_DEPLOYMENT,)
     assert get_cooldown_deployments(router, parent_otel_span=None) == []
 
+
+class _TracebackCounter(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.tracebacks = 0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.getMessage().startswith("Traceback"):
+            self.tracebacks += 1
+
+
+@pytest.mark.asyncio
+async def test_marked_admission_refusal_logs_no_router_traceback_at_debug(monkeypatch: pytest.MonkeyPatch):
+    from litellm._logging import verbose_router_logger
+
+    admission = _RefusesOneDeployment(
+        lambda: _marked(litellm.RateLimitError(message="bucket full", llm_provider="openai", model="gpt-5.6"))
+    )
+    monkeypatch.setattr(litellm, "callbacks", [admission])
+    counter = _TracebackCounter()
+    previous_level = verbose_router_logger.level
+    verbose_router_logger.addHandler(counter)
+    verbose_router_logger.setLevel(logging.DEBUG)
+    try:
+        with pytest.raises(litellm.RateLimitError):
+            await _router().acompletion(model="claude", messages=[{"role": "user", "content": "hi"}])
+    finally:
+        verbose_router_logger.removeHandler(counter)
+        verbose_router_logger.setLevel(previous_level)
+
+    assert counter.tracebacks == 0
 
 @pytest.mark.asyncio
 async def test_unmarked_pre_call_rate_limit_still_cools_down_and_moves_to_another_deployment(
