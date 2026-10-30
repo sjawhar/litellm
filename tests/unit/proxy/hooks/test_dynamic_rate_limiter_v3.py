@@ -5,16 +5,20 @@ Core tests to validate that priority weights are respected (0.9/0.1) instead of 
 """
 
 import asyncio
+import contextvars
 import os
 import time
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta
 from functools import partial
 from itertools import chain
+from types import MappingProxyType
 from typing import Final, Literal
 from unittest.mock import AsyncMock, patch
+from uuid import uuid4
 
 import pytest
+import respx
 from prometheus_client import REGISTRY
 from prometheus_client.samples import Sample
 
@@ -2435,7 +2439,6 @@ async def test_bucket_capacity_falls_back_to_the_limits_in_model_info(monkeypatc
     assert "Model RPM: 1" in full.value.detail["error"]
 
 
-
 @pytest.mark.asyncio
 async def test_bucket_refusal_makes_no_upstream_call_tries_no_other_deployment_and_cools_nothing_down(
     monkeypatch: pytest.MonkeyPatch, counting_provider: _CountingProvider
@@ -2506,6 +2509,7 @@ def _logged_wildcard_call(
     deployment: Mapping[str, object],
     trusted_metadata_key: Literal["metadata", "litellm_metadata"],
     team_priority: str,
+    forged_caller_deployment: object,
 ) -> dict[str, object]:
     match deployment:
         case {"litellm_params": {"model": str() as served_model, "anthropic_organization_id": str() as organization}}:
@@ -2517,7 +2521,7 @@ def _logged_wildcard_call(
         "deployment": served_model,
         "user_api_key_team_metadata": {"priority": team_priority},
     }
-    forged_caller_metadata = {"deployment": "anthropic/claude-opus-5", "user_id": "caller"}
+    forged_caller_metadata = {"deployment": forged_caller_deployment, "user_id": "caller"}
     shape = (
         {"metadata": trusted_metadata}
         if trusted_metadata_key == "metadata"
@@ -2535,11 +2539,17 @@ def _logged_wildcard_call(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "trusted_metadata_key",
-    (pytest.param("metadata", id="chat_completions"), pytest.param("litellm_metadata", id="messages")),
+    ("trusted_metadata_key", "forged_caller_deployment"),
+    (
+        pytest.param("metadata", None, id="chat_completions"),
+        pytest.param("litellm_metadata", "anthropic/claude-opus-5", id="messages"),
+        pytest.param("litellm_metadata", None, id="messages_with_a_malformed_caller_deployment"),
+    ),
 )
 async def test_success_accounting_charges_the_bucket_of_the_deployment_that_served_the_call(
-    monkeypatch: pytest.MonkeyPatch, trusted_metadata_key: Literal["metadata", "litellm_metadata"]
+    monkeypatch: pytest.MonkeyPatch,
+    trusted_metadata_key: Literal["metadata", "litellm_metadata"],
+    forged_caller_deployment: object,
 ):
     monkeypatch.setenv("LITELLM_LICENSE", "test-license-key")
     monkeypatch.setattr(litellm, "priority_reservation", {"high": 0.7})
@@ -2552,7 +2562,7 @@ async def test_success_accounting_charges_the_bucket_of_the_deployment_that_serv
         await handler.async_pre_call_check(deployment, None)
 
     await handler.async_log_success_event(
-        kwargs=_logged_wildcard_call(served_by, trusted_metadata_key, "high"),
+        kwargs=_logged_wildcard_call(served_by, trusted_metadata_key, "high", forged_caller_deployment),
         response_obj=ModelResponse(usage=Usage(prompt_tokens=0, completion_tokens=1200, total_tokens=1200)),
         start_time=None,
         end_time=None,
@@ -2568,3 +2578,329 @@ async def test_success_accounting_charges_the_bucket_of_the_deployment_that_serv
         await _pool_counter(handler, f"{ORG_A}:claude-opus-5", "high", "tokens"),
         await _pool_counter(handler, f"{ORG_B}:opus-4", "high", "tokens"),
     ) == (1200, 0, 0)
+
+
+class _SuccessLogged(CustomLogger):
+    def __init__(self) -> None:
+        super().__init__()
+        self.logged: Final = asyncio.Event()
+
+    async def async_log_success_event(
+        self, kwargs: Mapping[str, object], response_obj: object, start_time: datetime, end_time: datetime
+    ) -> None:
+        self.logged.set()
+
+
+@pytest.mark.asyncio
+async def test_messages_tokens_reach_the_bucket_of_the_organization_admitted_through_the_real_router(
+    monkeypatch: pytest.MonkeyPatch, httpx_transport: None
+):
+    for name in ("ANTHROPIC_API_BASE", "ANTHROPIC_BASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(litellm, "priority_reservation", None)
+    handler = DynamicRateLimitHandler(internal_usage_cache=DualCache())
+    success = _SuccessLogged()
+    monkeypatch.setattr(litellm, "callbacks", [handler, success])
+    router = Router(
+        model_list=[
+            {
+                "model_name": "claude",
+                "litellm_params": {
+                    "model": "anthropic/claude-opus-4-7",
+                    "api_key": "sk-fake",
+                    "anthropic_organization_id": ORG_A,
+                    "tpm": 1000,
+                },
+                "model_info": {"id": f"{ORG_A}-claude", "bucket_class": OPUS_4_CLASSES},
+            }
+        ]
+    )
+    logging_obj, data = litellm.utils.function_setup(
+        original_function="anthropic_messages",
+        rules_obj=litellm.utils.Rules(),
+        start_time=datetime.now(),
+        model="claude",
+        max_tokens=16,
+        messages=[{"role": "user", "content": "hi"}],
+        litellm_call_id=uuid4().hex,
+        litellm_metadata={},
+    )
+
+    with respx.mock() as upstream:
+        upstream.post("https://api.anthropic.com/v1/messages").respond(
+            200,
+            json={
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-opus-4-7",
+                "content": [{"type": "text", "text": "hi"}],
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 1, "output_tokens": 1200},
+            },
+        )
+        await router.aanthropic_messages(**data, litellm_logging_obj=logging_obj)
+    await asyncio.wait_for(success.logged.wait(), timeout=20)
+
+    with pytest.raises(ProxyRateLimitError) as full:
+        await handler.async_pre_call_check(router.get_deployment(model_id=f"{ORG_A}-claude").model_dump(), None)
+    assert "Model capacity reached" in full.value.detail["error"]
+
+
+def _messages_upstream_reply() -> dict[str, object]:
+    return {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-opus-4-7",
+        "content": [{"type": "text", "text": "hi"}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+
+
+@pytest.mark.asyncio
+async def test_messages_call_over_bucket_capacity_is_refused_once_with_one_upstream_post_and_no_cooldown(
+    monkeypatch: pytest.MonkeyPatch, httpx_transport: None
+):
+    from litellm.router_utils.admission_refusal import is_admission_refusal
+    from litellm.router_utils.cooldown_handlers import get_cooldown_deployments
+
+    for name in ("ANTHROPIC_API_BASE", "ANTHROPIC_BASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(litellm, "priority_reservation", None)
+    handler = DynamicRateLimitHandler(internal_usage_cache=DualCache())
+    monkeypatch.setattr(litellm, "callbacks", [handler])
+    router = Router(
+        model_list=[
+            {
+                "model_name": "claude",
+                "litellm_params": {
+                    "model": "anthropic/claude-opus-4-7",
+                    "api_key": "sk-fake",
+                    "anthropic_organization_id": organization,
+                    "rpm": 1,
+                    "weight": weight,
+                },
+                "model_info": {"id": f"{organization}-claude", "bucket_class": OPUS_4_CLASSES},
+            }
+            for organization, weight in ((ORG_A, 1), (ORG_B, 0))
+        ],
+        num_retries=2,
+        retry_after=0,
+    )
+
+    async def call() -> object:
+        logging_obj, data = litellm.utils.function_setup(
+            original_function="anthropic_messages",
+            rules_obj=litellm.utils.Rules(),
+            start_time=datetime.now(),
+            model="claude",
+            max_tokens=16,
+            messages=[{"role": "user", "content": "hi"}],
+            litellm_call_id=uuid4().hex,
+            litellm_metadata={},
+        )
+        return await router.aanthropic_messages(**data, litellm_logging_obj=logging_obj)
+
+    with respx.mock() as upstream:
+        posts = upstream.post("https://api.anthropic.com/v1/messages").respond(200, json=_messages_upstream_reply())
+        await call()
+        with pytest.raises(ProxyRateLimitError) as refused:
+            await call()
+
+    assert refused.value.status_code == 429
+    assert is_admission_refusal(refused.value)
+    assert posts.call_count == 1
+    assert get_cooldown_deployments(router, parent_otel_span=None) == []
+
+
+@pytest.mark.asyncio
+async def test_unverifiable_counters_refusal_is_final_with_no_retry_fallback_or_cooldown(
+    monkeypatch: pytest.MonkeyPatch, counting_provider: _CountingProvider
+):
+    from fastapi import HTTPException
+
+    from litellm.proxy.hooks.parallel_request_limiter_v3 import RateLimitUnverifiableError
+    from litellm.router_utils.cooldown_handlers import get_cooldown_deployments
+
+    handler = DynamicRateLimitHandler(internal_usage_cache=DualCache())
+    spy = _AttemptSpy()
+    monkeypatch.setattr(litellm, "callbacks", [spy, handler])
+    router = Router(
+        model_list=[
+            _counting_deployment(ORG_A, rpm=10, weight=1),
+            _counting_deployment(ORG_B, rpm=10, weight=0),
+            _counting_deployment("org-fallback", model_name="claude-fallback"),
+        ],
+        num_retries=2,
+        retry_after=0,
+        fallbacks=[{"claude": ["claude-fallback"]}],
+    )
+
+    with patch.object(
+        handler.v3_limiter, "atomic_check_and_increment_by_n", new=AsyncMock(side_effect=RateLimitUnverifiableError())
+    ):
+        with pytest.raises(HTTPException) as refused:
+            await _proxy_call(handler, router, UserAPIKeyAuth(team_metadata={}))
+
+    assert refused.value.status_code == 503
+    assert counting_provider.served_by == ()
+    assert spy.attempts == (f"{ORG_A}-claude",)
+    assert get_cooldown_deployments(router, parent_otel_span=None) == []
+
+
+def _org_a_deployment(
+    model: str,
+    deployment_id: str = f"{ORG_A}-claude",
+    litellm_limits: Mapping[str, int] = MappingProxyType({"rpm": 1}),
+    model_info: Mapping[str, object] = MappingProxyType({"bucket_class": OPUS_4_CLASSES}),
+) -> dict[str, object]:
+    return {
+        "model_name": "claude",
+        "litellm_params": {"model": model, "anthropic_organization_id": ORG_A, **litellm_limits},
+        "model_info": {"id": deployment_id, **model_info},
+    }
+
+
+async def _served(handler: DynamicRateLimitHandler, deployment: Mapping[str, object]) -> bool:
+    try:
+        await handler.async_pre_call_check(deployment, None)
+    except ProxyRateLimitError:
+        return False
+    return True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "malformed_bucket_class",
+    (["opus-4"], {"claude-opus-4-7": 4}, "opus-4"),
+    ids=("list", "non_string_class", "string"),
+)
+async def test_malformed_bucket_class_serves_each_model_as_its_own_class(
+    monkeypatch: pytest.MonkeyPatch, malformed_bucket_class: object
+):
+    monkeypatch.setattr(litellm, "priority_reservation", None)
+    handler = DynamicRateLimitHandler(internal_usage_cache=DualCache())
+    malformed = MappingProxyType({"bucket_class": malformed_bucket_class})
+
+    outcomes = [
+        await _served(handler, _org_a_deployment(model, model_info=malformed))
+        for model in ("anthropic/claude-opus-4-7", "anthropic/claude-opus-4-6", "anthropic/claude-opus-4-7")
+    ]
+
+    assert outcomes == [True, True, False]
+
+
+@pytest.mark.asyncio
+async def test_two_unmapped_models_do_not_share_a_bucket(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(litellm, "priority_reservation", None)
+    handler = DynamicRateLimitHandler(internal_usage_cache=DualCache())
+
+    outcomes = [
+        await _served(handler, _org_a_deployment(model))
+        for model in ("anthropic/claude-opus-5", "anthropic/claude-sonnet-5", "anthropic/claude-opus-5")
+    ]
+
+    assert outcomes == [True, True, False]
+
+
+@pytest.mark.asyncio
+async def test_deployments_of_one_organization_share_the_bucket_of_their_class(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(litellm, "priority_reservation", None)
+    handler = DynamicRateLimitHandler(internal_usage_cache=DualCache())
+
+    outcomes = [
+        await _served(handler, _org_a_deployment(model, deployment_id=deployment_id))
+        for model, deployment_id in (
+            ("anthropic/claude-opus-4-7", "org-a-first-deployment"),
+            ("anthropic/claude-opus-4-6", "org-a-second-deployment"),
+        )
+    ]
+
+    assert outcomes == [True, False]
+
+
+@pytest.mark.asyncio
+async def test_litellm_params_limits_win_over_model_info_limits(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(litellm, "priority_reservation", None)
+    handler = DynamicRateLimitHandler(internal_usage_cache=DualCache())
+    deployment = _org_a_deployment(
+        "anthropic/claude-opus-4-7", model_info=MappingProxyType({"bucket_class": OPUS_4_CLASSES, "rpm": 5})
+    )
+
+    outcomes = [await _served(handler, deployment) for _ in range(2)]
+
+    assert outcomes == [True, False]
+
+
+@pytest.mark.asyncio
+async def test_a_zero_limit_is_served(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(litellm, "priority_reservation", None)
+    handler = DynamicRateLimitHandler(internal_usage_cache=DualCache())
+    deployment = _org_a_deployment("anthropic/claude-opus-4-7", litellm_limits=MappingProxyType({"rpm": 0, "tpm": 0}))
+
+    outcomes = [await _served(handler, deployment) for _ in range(5)]
+
+    assert outcomes == [True] * 5
+
+
+@pytest.mark.asyncio
+async def test_refusal_names_the_provider_and_model_of_the_deployment_not_the_model_group(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(litellm, "priority_reservation", None)
+    handler = DynamicRateLimitHandler(internal_usage_cache=DualCache())
+    deployment = _org_a_deployment("anthropic/claude-opus-4-7")
+    await handler.async_pre_call_check(deployment, None)
+
+    with pytest.raises(ProxyRateLimitError) as refused:
+        await handler.async_pre_call_check(deployment, None)
+
+    assert (refused.value.llm_provider, refused.value.model) == ("anthropic", "claude-opus-4-7")
+
+
+@pytest.mark.asyncio
+async def test_bucket_admission_keeps_the_per_key_rate_limit_headers(monkeypatch: pytest.MonkeyPatch):
+    from litellm.proxy.hooks.parallel_request_limiter_v3 import (
+        RateLimitResponse,
+        RateLimitStatus,
+        claim_request_stash_for_data,
+    )
+
+    monkeypatch.setattr(litellm, "priority_reservation", None)
+    handler = DynamicRateLimitHandler(internal_usage_cache=DualCache())
+    deployment = _org_a_deployment("anthropic/claude-opus-4-7", litellm_limits=MappingProxyType({"rpm": 10}))
+    data = {"model": "claude", "litellm_call_id": "call-1"}
+    response = {"id": "msg_1", "type": "message", "role": "assistant", "content": [], "_hidden_params": {}}
+
+    async def request() -> None:
+        claim_request_stash_for_data(data).rate_limit_response = RateLimitResponse(
+            overall_code="OK",
+            statuses=[
+                RateLimitStatus(
+                    code="OK",
+                    current_limit=100,
+                    limit_remaining=99,
+                    rate_limit_type="requests",
+                    descriptor_key="api_key",
+                )
+            ],
+        )
+        await handler.async_pre_call_hook(
+            user_api_key_dict=UserAPIKeyAuth(), cache=handler.internal_usage_cache, data=data, call_type="acompletion"
+        )
+        await handler.async_pre_call_check(deployment, None)
+        await handler.async_pre_call_check(deployment, None)
+        await handler.async_post_call_success_hook(data=data, user_api_key_dict=UserAPIKeyAuth(), response=response)
+
+    await asyncio.create_task(request(), context=contextvars.Context())
+
+    headers = response["_hidden_params"]["additional_headers"]
+    assert (headers["x-ratelimit-api_key-remaining-requests"], headers["x-ratelimit-api_key-limit-requests"]) == (99, 100)
+    assert (
+        headers["x-ratelimit-model_saturation_check-remaining-requests"],
+        headers["x-ratelimit-model_saturation_check-limit-requests"],
+    ) == (8, 10)

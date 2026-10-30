@@ -3,7 +3,7 @@ Dynamic rate limiter v3 - Saturation-aware priority-based rate limiting per prov
 """
 
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Final, Literal
 
 from fastapi import HTTPException
 from pydantic import ConfigDict, TypeAdapter, ValidationError, with_config
-from typing_extensions import ReadOnly, TypedDict
+from typing_extensions import ReadOnly, Required, TypedDict
 
 import litellm
 from litellm import ModelResponse
@@ -28,8 +28,8 @@ from litellm.proxy.common_utils.proxy_rate_limit_error import (
 from litellm.proxy.hooks.parallel_request_limiter_v3 import (  # noqa: F401  # legacy module exports
     PROXY_MaxParallelRequestsHandler_v3,
     RateLimitDescriptor,
-    RateLimitDescriptorRateLimitObject,
     RateLimitResponse,
+    RateLimitStatus,
     _PROXY_MaxParallelRequestsHandler_v3,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
     claim_request_stash_for_data,
     get_or_create_request_stash,
@@ -78,16 +78,16 @@ def _is_latin1_encodable(value: object) -> bool:
 class _DeploymentModelInfo(TypedDict, total=False):
     id: ReadOnly[str]
     bucket_class: ReadOnly[object]
-    rpm: ReadOnly[float | None]
-    tpm: ReadOnly[float | None]
+    rpm: ReadOnly[int | None]
+    tpm: ReadOnly[int | None]
 
 
 @with_config(ConfigDict(extra="ignore"))
 class _DeploymentParams(TypedDict, total=False):
-    model: ReadOnly[str]
+    model: ReadOnly[Required[str]]
     anthropic_organization_id: ReadOnly[str | None]
-    rpm: ReadOnly[float | None]
-    tpm: ReadOnly[float | None]
+    rpm: ReadOnly[int | None]
+    tpm: ReadOnly[int | None]
 
 
 @with_config(ConfigDict(extra="ignore"))
@@ -98,16 +98,9 @@ class _RoutedDeployment(TypedDict):
 
 
 @with_config(ConfigDict(extra="ignore"))
-class _TrustedMetadata(TypedDict, total=False):
-    deployment: ReadOnly[str]
-
-
-@with_config(ConfigDict(extra="ignore"))
 class _LoggedCall(TypedDict, total=False):
     model_info: ReadOnly[_DeploymentModelInfo | None]
     anthropic_organization_id: ReadOnly[str | None]
-    litellm_metadata: ReadOnly[_TrustedMetadata | None]
-    metadata: ReadOnly[_TrustedMetadata | None]
 
 
 _ROUTED_DEPLOYMENT: Final = TypeAdapter(_RoutedDeployment)
@@ -139,6 +132,11 @@ def _bucket_class(served_model: str, model_info: _DeploymentModelInfo) -> str:
     try:
         bucket_classes: Final = _BUCKET_CLASSES.validate_python(model_info.get("bucket_class", MappingProxyType({})))
     except ValidationError:
+        verbose_proxy_logger.debug(
+            "Dynamic rate limiter: deployment %s has a malformed bucket_class, serving %s as its own class",
+            model_info.get("id"),
+            served_model,
+        )
         return served_model
     return bucket_classes.get(served_model) or served_model
 
@@ -151,22 +149,29 @@ def _bucket_key(deployment_model: str, organization_id: str | None, model_info: 
     return f"{organization}:{_bucket_class(served_model, model_info)}"
 
 
-def _deployment_limit(*candidates: float | None) -> int | None:
-    return next((int(limit) for limit in candidates if limit is not None and limit > 0), None)
+def _deployment_limit(*candidates: int | None) -> int | None:
+    return next((limit for limit in candidates if limit is not None and limit > 0), None)
 
 
 def _admission_bucket(deployment: _RoutedDeployment) -> _Bucket | None:
     litellm_params: Final = deployment["litellm_params"]
     model_info: Final = deployment["model_info"]
-    deployment_model: Final = litellm_params.get("model")
-    if deployment_model is None:
-        return None
-    key: Final = _bucket_key(deployment_model, litellm_params.get("anthropic_organization_id"), model_info)
+    key: Final = _bucket_key(litellm_params["model"], litellm_params.get("anthropic_organization_id"), model_info)
     rpm: Final = _deployment_limit(litellm_params.get("rpm"), model_info.get("rpm"))
     tpm: Final = _deployment_limit(litellm_params.get("tpm"), model_info.get("tpm"))
     if key is None or (rpm is None and tpm is None):
         return None
     return _Bucket(key=key, capacity=ModelGroupInfo(model_group=key, providers=[], rpm=rpm, tpm=tpm))
+
+
+def _routed_deployment_model(litellm_params: object) -> str | None:
+    match litellm_params:
+        case {"litellm_metadata": {"deployment": str() as deployment}} if deployment:
+            return deployment
+        case {"metadata": {"deployment": str() as deployment}} if deployment:
+            return deployment
+        case _:
+            return None
 
 
 def _served_bucket_key(litellm_params: object) -> str | None:
@@ -175,9 +180,7 @@ def _served_bucket_key(litellm_params: object) -> str | None:
     except ValidationError:
         return None
     model_info: Final = logged.get("model_info")
-    deployment_model: Final = (logged.get("litellm_metadata") or {}).get("deployment") or (
-        logged.get("metadata") or {}
-    ).get("deployment")
+    deployment_model: Final = _routed_deployment_model(litellm_params)
     if model_info is None or deployment_model is None:
         return None
     return _bucket_key(deployment_model, logged.get("anthropic_organization_id"), model_info)
@@ -195,10 +198,7 @@ def _model_window_saturation(rate_limit_response: RateLimitResponse, pre_read_sa
 
 
 def _record_model_group_saturation(
-    model: str,
-    pre_read_saturation: float,
-    admission: RateLimitResponse | None,
-    data: Mapping[str, object],
+    request: _AdmissionRequest, pre_read_saturation: float, admission: RateLimitResponse | None
 ) -> None:
     try:
         from litellm.integrations.prometheus import PrometheusLogger
@@ -207,11 +207,11 @@ def _record_model_group_saturation(
         if prometheus_logger is None:
             return
         prometheus_logger.set_model_group_saturation_ratio(
-            model_group=model,
+            model_group=request.model_group,
             saturation=(
                 pre_read_saturation if admission is None else _model_window_saturation(admission, pre_read_saturation)
             ),
-            litellm_params=data,
+            litellm_params=request.request_data,
         )
     except Exception as e:  # noqa: BLE001  # a metrics failure must never change rate-limit enforcement
         verbose_proxy_logger.debug("Error recording model group saturation metric: %s", e)
@@ -226,6 +226,21 @@ def _reserved_priority(priority: str | None) -> str | None:
 def _priority_pool_key(bucket_key: str, priority: str | None) -> str:
     reserved_priority: Final = _reserved_priority(priority)
     return f"{bucket_key}:default_pool" if reserved_priority is None else f"{bucket_key}:{reserved_priority}"
+
+
+_BUCKET_DESCRIPTOR_KEYS: Final = frozenset(("model_saturation_check", "priority_model"))
+
+
+def _with_bucket_statuses(
+    existing: RateLimitResponse | None, overall_code: str, bucket_statuses: Sequence[RateLimitStatus]
+) -> RateLimitResponse:
+    """The request's rate-limit statuses with this admission's bucket statuses in place of any earlier attempt's."""
+    other_limiters: Final = (
+        ()
+        if existing is None
+        else tuple(status for status in existing["statuses"] if status["descriptor_key"] not in _BUCKET_DESCRIPTOR_KEYS)
+    )
+    return RateLimitResponse(overall_code=overall_code, statuses=[*other_limiters, *bucket_statuses])
 
 
 class _ModelCapacityRateLimitError(ProxyRateLimitError):
@@ -285,7 +300,7 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
             ttl=local_cache_ttl,
         )
 
-    def _get_priority_weight(self, priority: str | None, model_info: ModelGroupInfo | None = None) -> float:
+    def _get_priority_weight(self, priority: str | None, model_info: ModelGroupInfo) -> float:
         """Get the weight for a given priority from litellm.priority_reservation"""
         weight: float = _get_priority_settings().default_priority
         if litellm.priority_reservation is None or priority not in litellm.priority_reservation:
@@ -332,8 +347,8 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
         self,
         bucket_key: str,
         priority: str | None,
-        normalized_weights: dict[str, float],
-        model_info: ModelGroupInfo | None = None,
+        normalized_weights: Mapping[str, float],
+        model_info: ModelGroupInfo,
     ) -> tuple[float, str]:
         """
         Get priority weight and pool key for a given priority.
@@ -407,18 +422,17 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
             model_info=capacity,
         )
 
-        rate_limit_config: Final[RateLimitDescriptorRateLimitObject] = {}
-
-        if capacity.tpm is not None:
-            rate_limit_config["tokens_per_unit"] = int(capacity.tpm * priority_weight)
-
-        if capacity.rpm is not None:
-            rate_limit_config["requests_per_unit"] = int(capacity.rpm * priority_weight)
-
-        if not rate_limit_config:
-            return ()
-        rate_limit_config["window_size"] = self.v3_limiter.window_size
-        return (RateLimitDescriptor(key="priority_model", value=priority_key, rate_limit=rate_limit_config),)
+        return (
+            RateLimitDescriptor(
+                key="priority_model",
+                value=priority_key,
+                rate_limit={
+                    "requests_per_unit": None if capacity.rpm is None else int(capacity.rpm * priority_weight),
+                    "tokens_per_unit": None if capacity.tpm is None else int(capacity.tpm * priority_weight),
+                    "window_size": self.v3_limiter.window_size,
+                },
+            ),
+        )
 
     def _create_model_tracking_descriptor(self, bucket: _Bucket) -> RateLimitDescriptor:
         """Create the descriptor that tracks and caps the bucket's whole window."""
@@ -439,7 +453,7 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
         deployment_model: str,
         priority: str | None,
         saturation: float,
-        parent_otel_span: "Span | None" = None,
+        parent_otel_span: "Span | None",
     ) -> RateLimitResponse:
         """
         Atomically check and increment the bucket's counters.
@@ -484,10 +498,9 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
             "Atomic check+increment response: %s", json.dumps(atomic_response, indent=2, default=list)
         )
 
-        capacity: Final = bucket.capacity
-        model_tpm: Final = capacity.tpm if capacity.tpm is not None else "not configured"
-        model_rpm: Final = capacity.rpm if capacity.rpm is not None else "not configured"
         if atomic_response["overall_code"] == "OVER_LIMIT":
+            model_tpm: Final = bucket.capacity.tpm if bucket.capacity.tpm is not None else "not configured"
+            model_rpm: Final = bucket.capacity.rpm if bucket.capacity.rpm is not None else "not configured"
             resolved_model, llm_provider = resolve_llm_provider_for_rate_limit(deployment_model)
             for status in atomic_response["statuses"]:
                 if status["code"] != "OVER_LIMIT":
@@ -580,18 +593,23 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
         # priority allocation has accurate usage when it later becomes
         # enforced. The increment-then-check semantics of should_rate_limit
         # are fine because we ignore the OVER_LIMIT response.
-        if priority_descriptors and not should_enforce_priority:
-            priority_tracking_response: Final = await self.v3_limiter.should_rate_limit(
-                descriptors=priority_descriptors,
-                parent_otel_span=parent_otel_span,
-                read_only=False,
-            )
-            get_or_create_request_stash().rate_limit_response = RateLimitResponse(
-                overall_code=atomic_response["overall_code"],
-                statuses=atomic_response["statuses"] + priority_tracking_response["statuses"],
-            )
-        else:
-            get_or_create_request_stash().rate_limit_response = atomic_response
+        tracking_statuses: Final = (
+            (
+                await self.v3_limiter.should_rate_limit(
+                    descriptors=priority_descriptors,
+                    parent_otel_span=parent_otel_span,
+                    read_only=False,
+                )
+            )["statuses"]
+            if priority_descriptors and not should_enforce_priority
+            else []
+        )
+        stash: Final = get_or_create_request_stash()
+        stash.rate_limit_response = _with_bucket_statuses(
+            stash.rate_limit_response,
+            atomic_response["overall_code"],
+            (*atomic_response["statuses"], *tracking_statuses),
+        )
         return atomic_response
 
     @with_service_target("rate_limits")
@@ -606,18 +624,17 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
         Record the calling team's class for ``async_pre_call_check``, which admits the request against the bucket
         of the deployment the router picks. No counter moves here.
         """
-        match data.get("model"):
-            case str() as model_group:
-                claim_request_stash_for_data(data)
-                _admission_request.set(
-                    _AdmissionRequest(
-                        model_group=model_group,
-                        team_class=self._get_priority_from_user_api_key_dict(user_api_key_dict=user_api_key_dict),
-                        request_data=data,
-                    )
-                )
-            case _:
-                pass
+        model_group: Final = data.get("model")
+        if not isinstance(model_group, str):
+            return None
+        claim_request_stash_for_data(data)
+        _admission_request.set(
+            _AdmissionRequest(
+                model_group=model_group,
+                team_class=self._get_priority_from_user_api_key_dict(user_api_key_dict=user_api_key_dict),
+                request_data=data,
+            )
+        )
         return None
 
     @with_service_target("rate_limits")
@@ -644,11 +661,8 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
             verbose_proxy_logger.debug("Dynamic rate limiter: no bucket limits for %s, serving", routed["model_name"])
             return
 
-        request: Final = _admission_request.get()
-        model_group: Final = request.model_group if request is not None else routed["model_name"]
-        priority: Final = request.team_class if request is not None else None
-        request_data: Final[Mapping[str, object]] = (
-            request.request_data if request is not None else MappingProxyType({})
+        request: Final = _admission_request.get() or _AdmissionRequest(
+            model_group=routed["model_name"], team_class=None, request_data=MappingProxyType({})
         )
 
         saturation: Final = await self._check_bucket_saturation(bucket)
@@ -658,38 +672,30 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
                 bucket.key,
                 saturation * 100,
                 _get_priority_settings().saturation_threshold * 100,
-                priority,
+                request.team_class,
             )
             atomic_response: Final = await self._check_rate_limits(
                 bucket=bucket,
-                model_group=model_group,
-                deployment_model=routed["litellm_params"].get("model", model_group),
-                priority=priority,
+                model_group=request.model_group,
+                deployment_model=routed["litellm_params"]["model"],
+                priority=request.team_class,
                 saturation=saturation,
                 parent_otel_span=parent_otel_span,
             )
         except _ModelCapacityRateLimitError:
-            _record_model_group_saturation(
-                model=model_group, pre_read_saturation=1.0, admission=None, data=request_data
-            )
+            _record_model_group_saturation(request, pre_read_saturation=1.0, admission=None)
             raise
         except ProxyRateLimitError:
-            _record_model_group_saturation(
-                model=model_group, pre_read_saturation=saturation, admission=None, data=request_data
-            )
+            _record_model_group_saturation(request, pre_read_saturation=saturation, admission=None)
             raise
         except HTTPException:
             raise
         except Exception as e:
             verbose_proxy_logger.error("Error in dynamic rate limiter: %s, allowing request", e)
-            _record_model_group_saturation(
-                model=model_group, pre_read_saturation=saturation, admission=None, data=request_data
-            )
+            _record_model_group_saturation(request, pre_read_saturation=saturation, admission=None)
             return
 
-        _record_model_group_saturation(
-            model=model_group, pre_read_saturation=saturation, admission=atomic_response, data=request_data
-        )
+        _record_model_group_saturation(request, pre_read_saturation=saturation, admission=atomic_response)
 
     @with_service_target("rate_limits")
     async def async_post_call_success_hook(

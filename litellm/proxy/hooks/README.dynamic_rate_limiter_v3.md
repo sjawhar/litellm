@@ -35,13 +35,13 @@ Saturation and the priority pools are kept per provider bucket: the organization
          ┌───────────────┴───────────────┐
          │                               │
          ▼                               ▼
-   < 80% (Generous)                >= 80% (Strict)
+   < threshold (Generous)          >= threshold (Strict)
          │                               │
          ▼                               ▼
 ┌─────────────────────┐         ┌─────────────────────┐
 │  Generous Mode      │         │  Strict Mode        │
 │                     │         │                     │
-│  - Enforce model-   │         │  - Normalize        │
+│  - Enforce bucket-  │         │  - Normalize        │
 │    wide capacity    │         │    priority weights │
 │  - No priority      │         │    (if over 1.0)    │
 │    restrictions     │         │                     │
@@ -155,13 +155,13 @@ This ensures total allocation never exceeds model capacity.
 
 ### Mode Selection
 
-**Generous Mode (< 80% saturation):**
-- Creates single model-wide descriptor
+**Generous Mode (below `saturation_threshold`):**
+- Counts the priority pools without enforcing them
 - Enforces total capacity only
 - Allows any priority to use available capacity
-- Prevents over-subscription via model-wide limit
+- Prevents over-subscription via the bucket-wide limit
 
-**Strict Mode (>= 80% saturation):**
+**Strict Mode (at or above `saturation_threshold`):**
 - Creates priority-specific descriptors with normalized weights
 - Each priority gets its reserved allocation
 - Keeps enforcing the bucket-wide limit at 100%

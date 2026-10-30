@@ -17,6 +17,7 @@ from litellm.router_utils.add_retry_fallback_headers import (
     add_fallback_headers_to_response,
     get_fallback_error_info,
 )
+from litellm.router_utils.admission_refusal import is_admission_refusal
 from litellm.router_utils.batch_utils import get_router_metadata_variable_name
 from litellm.router_utils.cooldown_handlers import (
     _first_present,  # pyright: ignore[reportPrivateUsage] - shared internal helper, used across router_utils
@@ -799,6 +800,8 @@ async def run_async_fallback(
             )
             return response
         except Exception as e:
+            if is_admission_refusal(e):
+                raise
             error_from_fallbacks = e
             fallback_errors = fallback_errors + (get_fallback_error_info(e),)
             await log_failure_fallback_event(

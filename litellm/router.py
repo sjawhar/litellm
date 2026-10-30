@@ -7621,7 +7621,9 @@ class Router:
         }
         try:
             return await run_async_fallback(*args, **failover_kwargs)
-        except (openai.APIError, RouterRateLimitError, RouterRateLimitErrorBasic):
+        except (openai.APIError, RouterRateLimitError, RouterRateLimitErrorBasic) as failover_error:
+            if is_admission_refusal(failover_error):
+                raise
             # Expected model-level failure on the retried deployment. All
             # litellm provider errors derive from openai.APIError; if every
             # remaining deployment in the group is in cooldown the router
@@ -7878,6 +7880,8 @@ class Router:
 
                 return response
         except Exception as new_exception:
+            if is_admission_refusal(new_exception):
+                raise
             parent_otel_span: Final = get_parent_otel_span_from_kwargs(kwargs)
             fallback_failure_exception_str = truncate_fallback_error_detail(redact_string(str(new_exception)))
             cooldown_info: Final = await async_get_cooldown_deployments_with_debug_info(
@@ -8176,6 +8180,8 @@ class Router:
                     return response
 
                 except Exception as e:
+                    if is_admission_refusal(e):
+                        raise
                     # Always track the latest error so we raise the most
                     # recent exception instead of the first one.
                     original_exception = e
