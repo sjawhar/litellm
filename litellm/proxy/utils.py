@@ -237,7 +237,11 @@ from litellm.proxy.hooks.sensitive_data_routing import (  # noqa: F401, RUF100  
     PROXY_SensitiveDataRoutingHandler,
     _PROXY_SensitiveDataRoutingHandler,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
 )
-from litellm.proxy.litellm_pre_call_utils import LiteLLMProxyRequestSetup, add_guardrails_from_auth_metadata
+from litellm.proxy.litellm_pre_call_utils import (
+    LiteLLMProxyRequestSetup,
+    add_guardrails_from_auth_metadata,
+    without_router_reserved_fields,
+)
 from litellm.proxy.management_helpers.key_settings_audit import with_settings_updated_at
 from litellm.proxy.policy_engine.pipeline_executor import PipelineExecutor
 from litellm.proxy.policy_engine.policy_registry import get_policy_registry
@@ -3704,6 +3708,12 @@ class ProxyLogging:
         litellm_logging_obj: Logging | None = request_data.get("litellm_logging_obj", None)
         if litellm_logging_obj is None:
             from litellm._uuid import uuid
+
+            # An auth-gate rejection never reaches add_litellm_data_to_request, so either metadata bucket can
+            # still hold a model_group (or another router stamp) the caller sent.
+            request_data |= without_router_reserved_fields(  # rebind-ok: drops the caller-sent router stamps
+                cast("Mapping[str, object]", request_data)  # cast-ok: request bodies are str-keyed JSON objects
+            )
 
             request_data.setdefault("litellm_call_id", str(uuid.uuid4()))
             user_api_key_logged_metadata: Final = LiteLLMProxyRequestSetup.get_sanitized_user_information_from_key(

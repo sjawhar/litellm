@@ -1747,8 +1747,9 @@ def _timing_values(
 
 
 class ProxyBaseLLMRequestProcessing:
-    def __init__(self, data: dict):
+    def __init__(self, data: dict, model_group: str | None = None):
         self.data = data
+        self.model_group: Final = model_group
         self._tags_before_guardrails: frozenset[str] | None = None
 
     @property
@@ -2098,6 +2099,7 @@ class ProxyBaseLLMRequestProcessing:
             user_api_key_dict=user_api_key_dict,
             version=version,
             proxy_config=proxy_config,
+            model_group=self.model_group,
         )
         if not general_settings.get("expose_fallback_errors_to_caller"):
             self.data.pop("include_fallback_errors", None)

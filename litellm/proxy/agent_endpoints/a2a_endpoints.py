@@ -764,7 +764,6 @@ async def invoke_agent_a2a(
         if "metadata" not in body:
             body["metadata"] = {}
         body["metadata"]["agent_id"] = agent.agent_id
-        body["metadata"]["model_group"] = f"a2a_agent/{agent_name}"
         body["metadata"]["model_info"] = {"id": agent.agent_id}
         body["agent_id"] = agent.agent_id
 
@@ -781,7 +780,7 @@ async def invoke_agent_a2a(
         )
 
         caller_identity: Final = _caller_identity_headers(user_api_key_dict)
-        processor: Final = ProxyBaseLLMRequestProcessing(data=body)
+        processor: Final = ProxyBaseLLMRequestProcessing(data=body, model_group=f"a2a_agent/{agent_name}")
         data, logging_obj = await processor.common_processing_pre_call_logic(
             request=request,
             general_settings=general_settings,
