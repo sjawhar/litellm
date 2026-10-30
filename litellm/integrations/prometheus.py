@@ -71,6 +71,10 @@ from litellm.types.integrations.prometheus import (
     team_priority_label,
     validate_prometheus_deployment_and_latency_caller_identity,
 )
+from litellm.types.proxy.auth.client_context import (
+    VERIFIED_CLIENT_CONTEXT_KEY,
+    VerifiedClientContext,
+)
 from litellm.types.proxy.carried_budget_state import (
     KeyBudgetSnapshot,
     OrgBudgetSnapshot,
@@ -365,6 +369,27 @@ def _bounded_requested_model_label(requested_model: object, router_originated: b
     ):
         return requested_model
     return UNRECOGNIZED_REQUESTED_MODEL_LABEL
+
+
+def _as_label(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _trusted_client_context(
+    request_data: Mapping[str, object],
+    stamped_bucket_of: Callable[[Mapping[str, object]], Mapping[str, object] | None],
+) -> tuple[str | None, str | None]:
+    """The caller's address and User-Agent as the proxy resolved them, never as the body sent them. They come
+    from the bucket the proxy stamped its identity into, or from the object the auth gate attaches when it
+    rejects a request before that stamp exists. A body can send either name but neither of those two things."""
+    stamped: Final = stamped_bucket_of(request_data)
+    if stamped is not None:
+        return _as_label(stamped.get("requester_ip_address")), _as_label(stamped.get("user_agent"))
+    for bucket in (request_data.get("metadata"), request_data.get("litellm_metadata")):
+        verified = bucket.get(VERIFIED_CLIENT_CONTEXT_KEY) if isinstance(bucket, dict) else None
+        if isinstance(verified, VerifiedClientContext):
+            return _as_label(verified.requester_ip_address), _as_label(verified.user_agent)
+    return None, None
 
 
 class PrometheusLogger(CustomLogger):
@@ -2897,7 +2922,7 @@ class PrometheusLogger(CustomLogger):
                 proxy_server_request=request_data.get("proxy_server_request", {}),
             )
             _metadata: Final = request_data.get("metadata", {}) or {}
-            _client_context: Final = proxy_stamped_metadata_bucket(request_data) or _metadata
+            _client_ip, _user_agent = _trusted_client_context(request_data, proxy_stamped_metadata_bucket)
             model_id: Final = _metadata.get("model_info", {}).get("id") or request_data.get("model_info", {}).get("id")
             rate_limit_category, rate_limit_type = self._extract_rate_limit_labels(original_exception)
             api_provider: Final = self._extract_api_provider_from_request_data(
@@ -2923,8 +2948,8 @@ class PrometheusLogger(CustomLogger):
                 rate_limit_type=rate_limit_type,
                 tags=_tags,
                 route=user_api_key_dict.request_route,
-                client_ip=_client_context.get("requester_ip_address"),
-                user_agent=_client_context.get("user_agent"),
+                client_ip=_client_ip,
+                user_agent=_user_agent,
                 model_id=model_id,
                 api_provider=api_provider,
                 stream=(str(request_data.get("stream")) if litellm.prometheus_emit_stream_label else None),
