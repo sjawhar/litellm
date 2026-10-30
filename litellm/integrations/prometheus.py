@@ -65,6 +65,7 @@ from litellm.repositories.user_repository import UserRepository
 from litellm.types.guardrails import GuardrailEventHooks
 from litellm.types.integrations.prometheus import *
 from litellm.types.integrations.prometheus import (
+    priority_of_team_metadata,
     sanitize_prometheus_label_name,
     sanitize_prometheus_label_value,
     team_priority_label,
@@ -1588,7 +1589,7 @@ class PrometheusLogger(CustomLogger):
             exception_status=None,
             exception_class=None,
             custom_metadata_labels=_with_team_priority_label(
-                get_custom_labels_from_metadata(metadata=combined_metadata), litellm_params
+                get_custom_labels_from_metadata(metadata=combined_metadata), team_priority_label(litellm_params)
             ),
             route=standard_logging_payload["metadata"].get("user_api_key_request_route"),
             client_ip=standard_logging_payload["metadata"].get("requester_ip_address"),
@@ -2461,7 +2462,7 @@ class PrometheusLogger(CustomLogger):
                         standard_logging_payload=kwargs.get("standard_logging_object")
                     )
                 ),
-                kwargs.get("litellm_params"),
+                team_priority_label(kwargs.get("litellm_params")),
             ),
         )
         label_context: Final = PrometheusLabelFactoryContext(enum_values)
@@ -2663,7 +2664,7 @@ class PrometheusLogger(CustomLogger):
                             standard_logging_payload=standard_logging_payload
                         )
                     ),
-                    litellm_params,
+                    team_priority_label(litellm_params),
                 ),
             )
             PrometheusLogger._inc_labeled_counter(
@@ -2925,7 +2926,9 @@ class PrometheusLogger(CustomLogger):
                 model_id=model_id,
                 api_provider=api_provider,
                 stream=(str(request_data.get("stream")) if litellm.prometheus_emit_stream_label else None),
-                custom_metadata_labels=_with_team_priority_label({}, request_data),
+                custom_metadata_labels=_with_team_priority_label(
+                    {}, priority_of_team_metadata(user_api_key_dict.team_metadata)
+                ),
             )
             _label_ctx: Final = PrometheusLabelFactoryContext(enum_values)
             PrometheusLogger._inc_labeled_counter(
@@ -3163,7 +3166,7 @@ class PrometheusLogger(CustomLogger):
                 tags=standard_logging_payload.get("request_tags", []),
                 client_ip=client_ip,
                 user_agent=user_agent,
-                custom_metadata_labels=_with_team_priority_label({}, _litellm_params),
+                custom_metadata_labels=_with_team_priority_label({}, team_priority_label(_litellm_params)),
             )
 
             """
@@ -4998,10 +5001,10 @@ def get_custom_labels_from_metadata(metadata: dict) -> dict[str, str]:
     return result
 
 
-def _with_team_priority_label(custom_labels: Mapping[str, str], litellm_params: object) -> Mapping[str, str]:
+def _with_team_priority_label(custom_labels: Mapping[str, str], team_priority: str) -> Mapping[str, str]:
     if UserAPIKeyLabelNames.PRIORITY.value not in litellm.custom_prometheus_metadata_labels:
         return custom_labels
-    return MappingProxyType({**custom_labels, UserAPIKeyLabelNames.PRIORITY.value: team_priority_label(litellm_params)})
+    return MappingProxyType({**custom_labels, UserAPIKeyLabelNames.PRIORITY.value: team_priority})
 
 
 def _get_combined_custom_metadata_from_standard_logging_payload(
