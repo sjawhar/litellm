@@ -2589,6 +2589,38 @@ async def test_success_accounting_charges_the_bucket_of_the_deployment_that_serv
     ) == (1200, 0, 0)
 
 
+@pytest.mark.asyncio
+async def test_success_accounting_charges_nothing_when_the_logged_call_names_no_routed_deployment(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("LITELLM_LICENSE", "test-license-key")
+    monkeypatch.setattr(litellm, "priority_reservation", {"high": 0.7})
+    cache: Final = DualCache()
+    handler: Final = DynamicRateLimitHandler(internal_usage_cache=cache)
+    served_by: Final = _wildcard_deployment(_wildcard_router(tpm=1000), "anthropic/claude-opus-4-6", ORG_A)
+    await handler.async_pre_call_check(served_by, None)
+    counters_after_admission: Final = dict(cache.in_memory_cache.cache_dict)
+
+    await handler.async_log_success_event(
+        kwargs={
+            "litellm_params": {
+                "model_info": served_by["model_info"],
+                "anthropic_organization_id": ORG_A,
+                "metadata": {
+                    "model_group": "anthropic/claude-opus-4-6",
+                    "user_api_key_team_metadata": {"priority": "high"},
+                },
+            },
+            "standard_logging_object": {},
+        },
+        response_obj=ModelResponse(usage=Usage(prompt_tokens=0, completion_tokens=1200, total_tokens=1200)),
+        start_time=None,
+        end_time=None,
+    )
+
+    assert cache.in_memory_cache.cache_dict == counters_after_admission
+
+
 class _SuccessLogged(CustomLogger):
     def __init__(self) -> None:
         super().__init__()
@@ -2785,8 +2817,8 @@ async def _served(handler: DynamicRateLimitHandler, deployment: Mapping[str, obj
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "malformed_bucket_class",
-    (["opus-4"], {"claude-opus-4-7": 4}, "opus-4"),
-    ids=("list", "non_string_class", "string"),
+    (["opus-4"], {"claude-opus-4-7": 4}, "opus-4", {"claude-opus-4-7": "", "claude-opus-4-6": ""}),
+    ids=("list", "non_string_class", "string", "empty_class_names"),
 )
 async def test_malformed_bucket_class_serves_each_model_as_its_own_class(
     monkeypatch: pytest.MonkeyPatch, malformed_bucket_class: object
