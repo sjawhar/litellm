@@ -173,6 +173,35 @@ async def test_update_budget_drops_the_last_good_entries_of_everything_on_it(cli
         getattr(mock_prisma.db, table).find_many.assert_awaited_once_with(where={"budget_id": "budget_shared"})
 
 
+@pytest.mark.asyncio
+async def test_update_budget_evicts_the_other_holders_when_one_table_cannot_be_read(client_and_mocks, monkeypatch):
+    """A budget update reads seven tables. One of them failing must not leave the keys on the budget serving their
+    old limits from a last good entry that never expires."""
+    from litellm.proxy._types import LiteLLM_BudgetTable
+    from litellm.proxy.common_utils.user_api_key_cache import (
+        UserApiKeyCache,
+        recall_last_good,
+        remember_last_good,
+    )
+
+    client, mock_prisma, _ = client_and_mocks
+    mock_prisma.db.litellm_tagtable.find_many = AsyncMock(side_effect=Exception("tag table is unreadable"))
+    mock_prisma.db.litellm_verificationtoken = _KeyRows(
+        types.SimpleNamespace(
+            token="hashed-own-budget", budget_id="budget_shared", organization_id=None, team_id=None, user_id=None
+        )
+    )
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    budget: Final = LiteLLM_BudgetTable(budget_id="budget_shared", max_budget=50.0)
+    await remember_last_good(cache, "hashed-own-budget", budget)
+    monkeypatch.setattr(ps, "user_api_key_cache", cache)
+
+    resp = client.post("/budget/update", json={"budget_id": "budget_shared", "max_budget": 5.0})
+
+    assert resp.status_code == 200, resp.text
+    assert await recall_last_good(cache, "hashed-own-budget", LiteLLM_BudgetTable) is None
+
+
 @pytest.mark.parametrize("bad_duration", ["0s", "-5m"])
 @pytest.mark.asyncio
 async def test_new_budget_rejects_a_duration_that_never_advances(

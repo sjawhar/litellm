@@ -2099,7 +2099,7 @@ class TestLastGoodEntryWhileTheDatabaseIsUnreachable:
     async def test_member_budget_change_drops_the_last_good_entries_of_that_members_keys(self, monkeypatch):
         """A key's own entry carries its team member's spend and rate limits as of its last read, so a member budget
         edit, which runs through invalidate_team_member_spend_state, drops the entries of that member's keys in the
-        team, and of no other key."""
+        team, and of no other key. The member still holds the key, so the next read stores its entry again."""
         from litellm.proxy import proxy_server
         from litellm.proxy.auth.auth_checks import invalidate_team_member_spend_state
         from litellm.proxy.common_utils.user_api_key_cache import recall_last_good
@@ -2129,6 +2129,8 @@ class TestLastGoodEntryWhileTheDatabaseIsUnreachable:
             "hashed-member-other-team": True,
             "hashed-teammate": True,
         }
+        await remember_last_good(cache, "hashed-member", UserAPIKeyAuth(token="hashed-member", team_member_spend=2.0))
+        assert await recall_last_good(cache, "hashed-member", UserAPIKeyAuth) is not None
 
     @pytest.mark.asyncio
     async def test_budget_reset_drops_the_reset_entries_last_good_copies(self, monkeypatch):
