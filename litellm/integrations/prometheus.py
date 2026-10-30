@@ -62,6 +62,7 @@ from litellm.repositories.organization_repository import OrganizationRepository
 from litellm.repositories.table_repositories import EndUserRepository
 from litellm.repositories.team_repository import TeamRepository
 from litellm.repositories.user_repository import UserRepository
+from litellm.router_utils.admission_refusal import is_admission_refusal
 from litellm.types.guardrails import GuardrailEventHooks
 from litellm.types.integrations.prometheus import *
 from litellm.types.integrations.prometheus import (
@@ -2631,6 +2632,9 @@ class PrometheusLogger(CustomLogger):
         standard_logging_payload: Final[StandardLoggingPayload] = kwargs.get("standard_logging_object", {})
 
         if self._should_skip_metrics_for_invalid_key(kwargs=kwargs, standard_logging_payload=standard_logging_payload):
+            return
+        exception: Final = kwargs.get("exception")
+        if isinstance(exception, BaseException) and is_admission_refusal(exception):
             return
 
         model: Final = kwargs.get("model", "")
