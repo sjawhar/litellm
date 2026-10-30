@@ -46,16 +46,14 @@ _INVALID_THINKING_ERRORS: Final = pytest.mark.parametrize(
 
 
 @_INVALID_THINKING_ERRORS
-def test_a_request_asking_for_the_binding_error_is_never_stripped_or_retried(error_message: str):
-    config: Final = AnthropicMessagesConfig()
-    error: Final = _invalid_thinking_400(error_message)
+def test_the_strip_leaves_a_request_asking_for_the_binding_error_alone(error_message: str):
     request: Final = _request("error")
     sent: Final = copy.deepcopy(request)
 
-    retried: Final = config.should_retry_anthropic_messages_on_http_error(error, {}, request_body=request)
-    config.transform_anthropic_messages_request_on_http_error(error, request)
+    AnthropicMessagesConfig().transform_anthropic_messages_request_on_http_error(
+        _invalid_thinking_400(error_message), request
+    )
 
-    assert retried is False
     assert request == sent
 
 

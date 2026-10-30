@@ -1649,6 +1649,11 @@ def is_anthropic_invalid_thinking_block_error(error_text: str) -> bool:
     return "must contain thinking" in lower
 
 
+def is_anthropic_thinking_binding_mismatch_error(error_text: str) -> bool:
+    """messages.N.content.M: Invalid `signature` in `thinking` block. The block is bound to a different conversation."""
+    return "bound to a different conversation" in error_text.lower()
+
+
 def anthropic_request_errors_on_thinking_binding_mismatch(request_body: object) -> bool:
     """``thinking.block_binding.prefix_mismatch_behavior: error`` is the caller asking
     for Anthropic's 400, so LiteLLM never strips that request's thinking."""
