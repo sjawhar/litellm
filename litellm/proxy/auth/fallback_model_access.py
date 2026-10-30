@@ -11,9 +11,9 @@ key, team and user search tool grants instead, the same check /search runs on th
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Final
+from typing import Final, TypeVar
 
-from pydantic import ValidationError
+from pydantic import ConfigDict, StrictBool, ValidationError
 
 from litellm._logging import verbose_proxy_logger
 from litellm.proxy._types import ProxyException, UserAPIKeyAuth
@@ -29,6 +29,12 @@ class _RequestMetadata(LiteLLMBaseModel):
 
 class _FallbackAccessSettings(LiteLLMBaseModel):
     enforce_fallback_model_access: bool = False
+
+
+class _ClientCredentialSetting(LiteLLMBaseModel):
+    model_config = ConfigDict(frozen=True)
+    # Strict: only a real `true` in the config opens the one path that lets a caller's credential ride on a hop
+    allow_client_side_credentials: StrictBool = False
 
 
 async def is_model_authorized_for_token(*, model: str, valid_token: UserAPIKeyAuth, llm_router: Router) -> bool:
@@ -82,10 +88,25 @@ def _user_api_key_auth_from_request(request_kwargs: Mapping[str, object]) -> Use
     )
 
 
-def _enforced_by_general_settings() -> bool:
+_Settings: Final = TypeVar("_Settings", bound=LiteLLMBaseModel)
+
+
+def _general_setting(model: type[_Settings]) -> _Settings:
     from litellm.proxy.proxy_server import general_settings
 
-    return _FallbackAccessSettings.model_validate(general_settings).enforce_fallback_model_access
+    return model.model_validate(general_settings)
+
+
+def fallback_target_credentials_allowed() -> bool:
+    """The proxy-wide client-credential opt-in, the one setting that lets a fallback target carry a credential"""
+    try:
+        return _general_setting(_ClientCredentialSetting).allow_client_side_credentials
+    except ValidationError:
+        return False
+
+
+def _enforced_by_general_settings() -> bool:
+    return _general_setting(_FallbackAccessSettings).enforce_fallback_model_access
 
 
 @dataclass(frozen=True, slots=True)

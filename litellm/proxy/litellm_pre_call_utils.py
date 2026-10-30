@@ -216,6 +216,7 @@ def sanitize_for_log(value: object) -> str:
 
 
 from litellm.router import Router
+from litellm.router_utils.fallback_event_handlers import MID_STREAM_FALLBACK_CONTROLS_KEY, ROUTER_FALLBACKS_KWARG
 from litellm.secret_managers.main import get_secret_bool
 from litellm.types.llms.anthropic import ANTHROPIC_API_HEADERS
 from litellm.types.services import ServiceTypes
@@ -348,6 +349,12 @@ _UNTRUSTED_ROOT_CONTROL_FIELDS: Final = (
     # protection on a real deployment failure or force a false "not caller-controlled"
     # reading that lets its own bad timeout cool down deployments other tenants rely on.
     "client_side_timeout",
+    # Set only by route_request, from the key/team router_settings (a client's own router_settings_override loses its
+    # fallbacks under the server-side-fallback beta). A body value would skip every fallback check.
+    ROUTER_FALLBACKS_KWARG,
+    # Router-internal fallback state, never a caller's to set.
+    "fallback_model_group",
+    MID_STREAM_FALLBACK_CONTROLS_KEY,
 )
 
 _UNTRUSTED_METADATA_CONTROL_FIELDS: Final = (
@@ -1227,6 +1234,9 @@ def _tenant_service_name(user_api_key_dict: UserAPIKeyAuth) -> str | None:
     )
 
 
+_COMMA_JOINED_REPEATED_HEADERS: Final = frozenset({"anthropic-beta"})
+
+
 def clean_headers(
     headers: Headers,
     litellm_key_header_name: str | None = None,
@@ -1276,7 +1286,11 @@ def clean_headers(
         elif header_lower not in _SPECIAL_HEADERS_CACHE and (
             litellm_key_lower is None or header_lower != litellm_key_lower
         ):
-            clean_headers[header] = value
+            clean_headers[header] = (
+                f"{clean_headers[header]},{value}"
+                if header_lower in _COMMA_JOINED_REPEATED_HEADERS and header in clean_headers
+                else value
+            )
     return clean_headers
 
 
