@@ -696,4 +696,7 @@ class TestLastGoodEntries:
         redis = fake_redis_cache()
         redis.server.connected = False
 
-        await revoke_last_good(UserApiKeyCache(redis_cache=redis.cache), ("hashed-token-1",))
+        cache = UserApiKeyCache(redis_cache=redis.cache)
+        await revoke_last_good(cache, ("hashed-token-1",))
+
+        assert cache.last_good_memory.tombstoned("hashed-token-1") is False

@@ -19,6 +19,7 @@ from typing import Final
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from litellm._logging import verbose_proxy_logger
 from litellm.proxy._types import *
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.timezone_utils import get_budget_reset_time
@@ -207,16 +208,25 @@ async def update_budget(
 
 async def _evict_memberships_on_budget(budget_id: str) -> None:
     """A team membership carries its budget row, so every cached copy of a membership on this budget, its last good
-    entry included, is evicted once the budget changes."""
+    entry included, is evicted once the budget changes. Best effort, like every eviction after a committed write."""
     from litellm.proxy.auth.auth_checks import invalidate_team_member_spend_state
     from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
 
     if prisma_client is None:
         return
-    memberships: Final = await TeamMembershipRepository(prisma_client).table.find_many(where={"budget_id": budget_id})
-    for membership in memberships:
-        await invalidate_team_member_spend_state(
-            user_id=membership.user_id, team_id=membership.team_id, user_api_key_cache=user_api_key_cache
+    try:
+        memberships: Final = await TeamMembershipRepository(prisma_client).table.find_many(
+            where={"budget_id": budget_id}
+        )
+        for membership in memberships:
+            await invalidate_team_member_spend_state(
+                user_id=membership.user_id, team_id=membership.team_id, user_api_key_cache=user_api_key_cache
+            )
+    except Exception as e:  # noqa: BLE001  # the budget write committed; a failed eviction must not fail it
+        verbose_proxy_logger.warning(
+            "Could not evict the team memberships on budget %s; they may enforce the old limits until they expire: %s",
+            budget_id,
+            e,
         )
 
 

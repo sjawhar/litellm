@@ -2727,6 +2727,16 @@ def _resolve_token_to_update(data: UpdateKeyRequest, existing_key_row: LiteLLM_V
     return existing_key_row.token
 
 
+async def _revoke_key_if_blocking(
+    data: UpdateKeyRequest, existing_key_row: LiteLLM_VerificationToken, user_api_key_cache: UserApiKeyCache
+) -> None:
+    if data.blocked is True:
+        await revoke_last_good(
+            user_api_key_cache,
+            (hash_token_if_needed(_resolve_token_to_update(data=data, existing_key_row=existing_key_row)),),
+        )
+
+
 async def _process_single_key_update(
     update_key_request: UpdateKeyRequest,
     user_api_key_dict: UserAPIKeyAuth,
@@ -2888,8 +2898,7 @@ async def _process_single_key_update(
             detail={"error": "Database not connected"},
         )
 
-    if key_request.blocked is True:
-        await revoke_last_good(user_api_key_cache, (hash_token_if_needed(key_request.key),))
+    await _revoke_key_if_blocking(key_request, existing_key_row, user_api_key_cache)
     update_values: Final = await _handle_update_object_permission(
         data_json=non_default_values,
         existing_key_row=existing_key_row,

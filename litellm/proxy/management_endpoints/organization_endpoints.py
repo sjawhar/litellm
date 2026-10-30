@@ -94,6 +94,7 @@ if TYPE_CHECKING:
         LiteLLM_OrganizationMembership as PrismaOrganizationMembership,
     )
     from prisma.models import LiteLLM_OrganizationTable as PrismaOrganizationTable
+    from prisma.models import LiteLLM_TeamTable as PrismaTeamTable
     from prisma.models import LiteLLM_UserTable as PrismaUserTable
     from prisma.models import LiteLLM_VerificationToken as PrismaVerificationToken
 
@@ -181,6 +182,8 @@ class _OrganizationMembershipTableClient(Protocol):
 
 
 class _TeamTableClient(Protocol):
+    async def find_many(self, where: Mapping[str, object] | None = None) -> "Sequence[PrismaTeamTable]": ...
+
     async def delete_many(self, where: Mapping[str, object]) -> int: ...
 
 

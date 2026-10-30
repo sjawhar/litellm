@@ -252,6 +252,30 @@ async def test_subscriber_drops_this_pods_last_good_entry_on_message() -> None:
 
 
 @pytest.mark.asyncio
+async def test_subscriber_clears_this_pods_last_good_memory_when_it_subscribes() -> None:
+    """Invalidations sent while the pod was not subscribed are lost, so a (re)subscription drops the memory line:
+    Redis, reachable again, answers first."""
+    hashed_token = hashlib.sha256(b"sk-held-across-a-redis-gap").hexdigest()
+    cache = UserApiKeyCache(serve_last_good_entries=True)
+    await remember_last_good(cache, hashed_token, UserAPIKeyAuth(token=hashed_token))
+
+    subscriber = AuthCacheInvalidationSubscriber(
+        redis_cache=_FakeRedisCache(client=_ScriptedPubSubRedisClient(pubsubs=[_QueuePubSub(initial_messages=[])])),
+        user_api_key_cache=cache,
+    )
+    subscriber.start()
+    try:
+        for _ in range(200):
+            if cache.last_good_memory.get(hashed_token) is None:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        await subscriber.stop()
+
+    assert cache.last_good_memory.get(hashed_token) is None
+
+
+@pytest.mark.asyncio
 async def test_subscriber_ignores_malformed_messages() -> None:
     cache = UserApiKeyCache()
     cache.in_memory_cache.set_cache("project_id:p-1", {"models": []})
