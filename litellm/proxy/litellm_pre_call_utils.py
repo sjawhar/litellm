@@ -2336,14 +2336,14 @@ async def add_litellm_data_to_request(
     # via multipart/form-data or extra_body) cannot smuggle admin fields past
     # the isinstance(dict) guard.
     #
-    # The proxy populates a family of ``user_api_key_*`` fields below
-    # (user_api_key_metadata, user_api_key_user_id, user_api_key_alias,
-    # user_api_key_spend, user_api_key_team_metadata, …) into
-    # data[_metadata_variable_name]. Because the proxy only writes to ONE of
-    # the two metadata dicts, a caller pre-populating any of these keys on
+    # The proxy populates a family of ``user_api_key`` fields below
+    # (user_api_key, user_api_key_metadata, user_api_key_user_id,
+    # user_api_key_alias, user_api_key_spend, user_api_key_team_metadata, …)
+    # into data[_metadata_variable_name]. Because the proxy only writes to ONE
+    # of the two metadata dicts, a caller pre-populating any of these keys on
     # the OTHER metadata dict would have their forged values surface in
     # guardrails, spend tracking, audit logs, and identity resolution. Strip
-    # by prefix so new ``user_api_key_*`` fields added in the future are
+    # by prefix so new ``user_api_key*`` fields added in the future are
     # covered without per-key maintenance.
     for _meta_key in ("metadata", "litellm_metadata"):
         _user_meta = data.get(_meta_key)
@@ -2353,7 +2353,7 @@ async def add_litellm_data_to_request(
                 allow_client_message_redaction_opt_out=(_allow_client_message_redaction_opt_out),
             )
             for _k in [
-                k for k in _user_meta if k.startswith("user_api_key_") or k in _UNTRUSTED_METADATA_CONTROL_FIELDS
+                k for k in _user_meta if k.startswith("user_api_key") or k in _UNTRUSTED_METADATA_CONTROL_FIELDS
             ]:
                 _user_meta.pop(_k, None)
 
