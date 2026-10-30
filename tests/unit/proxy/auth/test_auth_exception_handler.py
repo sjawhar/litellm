@@ -819,9 +819,10 @@ async def test_auth_failure_logs_requester_ip_address(
 
 
 @pytest.mark.asyncio
-async def test_auth_failure_keeps_existing_requester_ip_address():
-    """An IP already recorded upstream (e.g. a trusted-proxy resolved value) wins over
-    the socket peer."""
+async def test_auth_failure_replaces_a_requester_ip_address_the_caller_sent():
+    """At the auth gate the body is the caller's own, so an IP it put in metadata would
+    otherwise reach the spend log and the prometheus client_ip label as if the proxy had
+    resolved it. A trusted proxy's address arrives through use_x_forwarded_for instead."""
     with (
         patch("litellm.proxy.auth.auth_exception_handler.seed_request_identity"),
         patch(
@@ -842,15 +843,65 @@ async def test_auth_failure_keeps_existing_requester_ip_address():
                     param=None,
                     code=status.HTTP_401_UNAUTHORIZED,
                 ),
-                _http_request(),
-                {"metadata": {"requester_ip_address": "198.51.100.4"}},
+                _http_request(headers={"user-agent": "real-client/1.0"}),
+                {"metadata": {"requester_ip_address": "198.51.100.4", "user_agent": "forged-agent"}},
                 "/v1/chat/completions",
                 None,
                 "sk-bad-key",
             )
 
     logged_request_data = mock_hook.call_args[1]["request_data"]
-    assert logged_request_data["metadata"]["requester_ip_address"] == "198.51.100.4"
+    assert logged_request_data["metadata"] == {
+        "requester_ip_address": "10.1.2.3",
+        "user_agent": "real-client/1.0",
+    }
+
+
+@pytest.mark.asyncio
+async def test_auth_failure_drops_client_context_the_caller_sent_in_the_other_bucket():
+    """Routes whose proxy bucket is litellm_metadata get the stamp there, so a caller that
+    sends both buckets could otherwise leave its own IP and User-Agent in metadata, which
+    is the bucket the prometheus failure counters read."""
+    with (
+        patch("litellm.proxy.auth.auth_exception_handler.seed_request_identity"),
+        patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj.post_call_failure_hook",
+            new_callable=AsyncMock,
+            return_value=None,
+        ) as mock_hook,
+        patch(
+            "litellm.proxy.proxy_server.general_settings",
+            {"allow_requests_on_db_unavailable": False},
+        ),
+    ):
+        with pytest.raises(ProxyException):
+            await UserAPIKeyAuthExceptionHandler._handle_authentication_error(
+                ProxyException(
+                    message="Invalid API key",
+                    type=ProxyErrorTypes.auth_error,
+                    param=None,
+                    code=status.HTTP_401_UNAUTHORIZED,
+                ),
+                _http_request(headers={"user-agent": "real-client/1.0"}),
+                {
+                    "litellm_metadata": {},
+                    "metadata": {
+                        "user_supplied": "keep-me",
+                        "requester_ip_address": "9.9.9.9",
+                        "user_agent": "forged-agent",
+                    },
+                },
+                "/v1/responses",
+                None,
+                "sk-bad-key",
+            )
+
+    logged_request_data = mock_hook.call_args[1]["request_data"]
+    assert logged_request_data["litellm_metadata"] == {
+        "requester_ip_address": "10.1.2.3",
+        "user_agent": "real-client/1.0",
+    }
+    assert logged_request_data["metadata"] == {"user_supplied": "keep-me"}
 
 
 @pytest.mark.asyncio

@@ -87,22 +87,34 @@ def _get_user_agent(request: Request) -> str | None:
     return request.headers.get("user-agent")
 
 
+_CLIENT_CONTEXT_FIELDS: Final = ("requester_ip_address", "user_agent")
+
+
+def _without_client_context(metadata: Mapping[str, object]) -> dict[str, object]:
+    return {name: value for name, value in metadata.items() if name not in _CLIENT_CONTEXT_FIELDS}
+
+
 def _with_client_context(
     request_data: dict[str, object], requester_ip: str | None, user_agent: str | None
 ) -> dict[str, object]:
     """Auth gate rejections are raised before `add_litellm_data_to_request` records the
-    caller IP and User-Agent, so their failure logs would otherwise carry neither."""
+    caller IP and User-Agent, so their failure logs would otherwise carry neither. At this
+    point the body is the caller's own, so the request's values replace what it sent under
+    those names, and the bucket the logging layer does not read keeps neither."""
     key: Final = "litellm_metadata" if "litellm_metadata" in request_data else "metadata"
+    other: Final = "metadata" if key == "litellm_metadata" else "litellm_metadata"
     metadata: Final = request_data.get(key)
     base: Final[Mapping[str, object]] = metadata if isinstance(metadata, Mapping) else EMPTY_MAPPING
     stamped: Final = {
         name: value
-        for name, value in (("requester_ip_address", requester_ip), ("user_agent", user_agent))
-        if value and not base.get(name)
+        for name, value in zip(_CLIENT_CONTEXT_FIELDS, (requester_ip, user_agent))
+        if value
     }
-    if not stamped:
-        return request_data
-    return {**request_data, key: {**base, **stamped}}
+    other_metadata: Final = request_data.get(other)
+    other_rewritten: Final = (
+        {other: _without_client_context(other_metadata)} if isinstance(other_metadata, Mapping) else {}
+    )
+    return {**request_data, key: {**_without_client_context(base), **stamped}, **other_rewritten}
 
 
 def _escape_control_chars(value: str) -> str:
