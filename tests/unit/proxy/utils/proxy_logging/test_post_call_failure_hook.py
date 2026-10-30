@@ -817,6 +817,148 @@ async def test_handle_logging_proxy_only_path_no_logging_obj_creates_one(
     fake_logging_obj.async_failure_handler.assert_called_once()
 
 
+class _FailureEventRecorder(CustomLogger):
+    def __init__(self) -> None:
+        super().__init__()
+        self.logged_litellm_params: list[dict] = []
+        self.logged_payload_metadata: list[dict] = []
+
+    async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time) -> None:
+        self.logged_litellm_params.append(kwargs["litellm_params"])
+        self.logged_payload_metadata.append((kwargs.get("standard_logging_object") or {}).get("metadata") or {})
+
+
+@pytest.mark.asyncio
+async def test_auth_gate_failure_logs_the_authenticated_identity_instead_of_caller_user_api_key_fields(
+    proxy_logging, make_user_api_key_auth, monkeypatch
+):
+    recorder = _FailureEventRecorder()
+    monkeypatch.setattr(litellm, "callbacks", [recorder])
+    forged = {
+        "user_api_key": "f" * 64,
+        "user_api_key_team_id": "forged-team",
+        "user_api_key_team_metadata": {"priority": "forged"},
+        "user_api_key_metadata": {"priority": "forged"},
+    }
+
+    authenticated = make_user_api_key_auth(
+        team_metadata={"priority": "high", "callback_settings": {"success_callback": ["langfuse"]}}
+    )
+    await proxy_logging._handle_logging_proxy_only_error(
+        request_data={
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {**forged, "department": "engineering"},
+            "litellm_metadata": {**forged, "trace_id": "trace-1"},
+        },
+        user_api_key_dict=authenticated,
+        route="/chat/completions",
+        original_exception=litellm.BudgetExceededError(current_cost=2.0, max_budget=1.0),
+    )
+
+    assert len(recorder.logged_litellm_params) == 1
+    logged_metadata = recorder.logged_litellm_params[0]["metadata"]
+    logged_litellm_metadata = recorder.logged_litellm_params[0]["litellm_metadata"]
+    assert {
+        "metadata": {key: logged_metadata.get(key) for key in ("department", *forged)},
+        "litellm_metadata": {key: logged_litellm_metadata.get(key) for key in ("trace_id", *forged)},
+        "logged_key_hash": recorder.logged_payload_metadata[0].get("user_api_key_hash"),
+    } == {
+        "metadata": {
+            "department": "engineering",
+            "user_api_key": None,
+            "user_api_key_team_id": authenticated.team_id,
+            "user_api_key_team_metadata": {"priority": "high"},
+            "user_api_key_metadata": None,
+        },
+        "litellm_metadata": {
+            "trace_id": "trace-1",
+            "user_api_key": None,
+            "user_api_key_team_id": None,
+            "user_api_key_team_metadata": None,
+            "user_api_key_metadata": None,
+        },
+        "logged_key_hash": authenticated.api_key,
+    }
+
+
+@pytest.mark.asyncio
+async def test_failure_after_add_litellm_data_to_request_keeps_the_fields_the_proxy_stamped(
+    proxy_logging, make_user_api_key_auth, monkeypatch
+):
+    recorder = _FailureEventRecorder()
+    monkeypatch.setattr(litellm, "callbacks", [recorder])
+    authenticated = make_user_api_key_auth()
+    stamped = {
+        "user_api_key_auth": authenticated,
+        "user_api_key_model_max_budget": {"gpt-4o": 5.0},
+        "user_api_key_budget_reservation": {"id": "reservation-1"},
+        "user_api_key_metadata": {"owner": "platform"},
+    }
+
+    await proxy_logging._handle_logging_proxy_only_error(
+        request_data={
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": dict(stamped),
+        },
+        user_api_key_dict=authenticated,
+        route="/assistants",
+        original_exception=litellm.BudgetExceededError(current_cost=2.0, max_budget=1.0),
+    )
+
+    assert len(recorder.logged_litellm_params) == 1
+    logged_metadata = recorder.logged_litellm_params[0]["metadata"]
+    assert {key: logged_metadata.get(key) for key in (*stamped, "user_api_key_team_id")} == {
+        **stamped,
+        "user_api_key_team_id": authenticated.team_id,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "forged_auth",
+    ({"team_id": "evil"}, "UserAPIKeyAuth", [{"team_id": "evil"}], None),
+    ids=("dict", "string", "list", "null"),
+)
+async def test_a_body_shaped_like_the_proxy_stamp_does_not_buy_the_caller_its_identity(
+    proxy_logging, make_user_api_key_auth, monkeypatch, forged_auth
+):
+    recorder = _FailureEventRecorder()
+    monkeypatch.setattr(litellm, "callbacks", [recorder])
+    authenticated = make_user_api_key_auth()
+
+    await proxy_logging._handle_logging_proxy_only_error(
+        request_data={
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {
+                "user_api_key_auth": forged_auth,
+                "user_api_key": "f" * 64,
+                "user_api_key_team_id": "forged-team",
+            },
+        },
+        user_api_key_dict=authenticated,
+        route="/chat/completions",
+        original_exception=litellm.BudgetExceededError(current_cost=2.0, max_budget=1.0),
+    )
+
+    assert len(recorder.logged_litellm_params) == 1
+    logged_metadata = recorder.logged_litellm_params[0]["metadata"]
+    assert {
+        "user_api_key_auth": logged_metadata.get("user_api_key_auth"),
+        "user_api_key": logged_metadata.get("user_api_key"),
+        "user_api_key_team_id": logged_metadata.get("user_api_key_team_id"),
+        "logged_key_hash": recorder.logged_payload_metadata[0].get("user_api_key_hash"),
+    } == {
+        "user_api_key_auth": None,
+        "user_api_key": None,
+        "user_api_key_team_id": authenticated.team_id,
+        "logged_key_hash": authenticated.api_key,
+    }
+
+
+
 @pytest.mark.asyncio
 async def test_handle_logging_proxy_only_path_propagates_async_failure_raises(proxy_logging, make_user_api_key_auth):
     logging_obj = MagicMock()
