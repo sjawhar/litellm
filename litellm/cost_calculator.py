@@ -1652,9 +1652,12 @@ def completion_cost(
         if fallback_parts is not None:
             routed_model: Final = (litellm_model_name or model or "").split("/", 1)[-1]
 
-            def price_attempt(attempt_model: str | None, part: Mapping[str, object]) -> float:
+            def price_attempt(
+                attempt_model: str | None, part: Mapping[str, object]
+            ) -> tuple[float, CostBreakdown | None]:
                 routed: Final = attempt_model is None or is_model_or_dated_snapshot(attempt_model, routed_model)
-                return completion_cost(
+                stored_before: Final = litellm_logging_obj.cost_breakdown if litellm_logging_obj is not None else None
+                cost: Final = completion_cost(
                     completion_response=part,
                     call_type=call_type,
                     custom_llm_provider=custom_llm_provider,
@@ -1672,15 +1675,15 @@ def completion_cost(
                     litellm_model_name=litellm_model_name if routed else None,
                     router_model_id=router_model_id if routed else None,
                 )
+                stored: Final = litellm_logging_obj.cost_breakdown if litellm_logging_obj is not None else None
+                # An attempt whose store failed leaves the previous attempt's breakdown in place
+                return cost, None if stored is stored_before else stored
 
-            priced_attempts: Final = tuple(
-                (
-                    price_attempt(attempt_model, part),
-                    litellm_logging_obj.cost_breakdown if litellm_logging_obj is not None else None,
-                )
-                for attempt_model, part in fallback_parts
+            return _sum_attempt_costs(
+                tuple(price_attempt(attempt_model, part) for attempt_model, part in fallback_parts),
+                litellm_logging_obj,
+                custom_llm_provider if isinstance(custom_llm_provider, str) else None,
             )
-            return _sum_attempt_costs(priced_attempts, litellm_logging_obj, custom_llm_provider)
 
         if (
             (call_type == "aimage_generation" or call_type == "image_generation")

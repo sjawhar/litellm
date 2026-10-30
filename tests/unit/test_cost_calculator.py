@@ -1,4 +1,5 @@
 import datetime
+import itertools
 import time
 from collections.abc import Mapping
 from types import MappingProxyType, SimpleNamespace
@@ -8820,3 +8821,42 @@ def test_anthropic_server_side_fallback_stores_one_breakdown_for_all_attempts():
     assert breakdown["total_cost"] == pytest.approx(cost)
     assert breakdown["input_cost"] + breakdown["output_cost"] == pytest.approx(cost)
     assert breakdown["original_cost"] == pytest.approx(cost)
+
+
+class _LoggingWhoseSecondStoreFails(Logging):
+    """A logging object whose second cost-breakdown store raises, as a failed attempt store does"""
+
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self.stores: Final = itertools.count(1)
+
+    def set_cost_breakdown(self, *args: object, **kwargs: object) -> None:
+        if next(self.stores) == 2:
+            raise ValueError("cost breakdown store failed")
+        super().set_cost_breakdown(*args, **kwargs)
+
+
+@pytest.mark.usefixtures("_local_model_cost_map")
+def test_anthropic_server_side_fallback_never_sums_a_stale_attempt_breakdown():
+    requested: Final = "claude-fable-5"
+    served: Final = "claude-opus-4-8"
+    logging_obj: Final = _LoggingWhoseSecondStoreFails(
+        model=f"anthropic/{requested}",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=False,
+        call_type="anthropic_messages",
+        start_time=datetime.datetime(2026, 10, 28, 12, 0, 0),
+        litellm_call_id="server-side-fallback-stale-breakdown",
+        function_id="f",
+    )
+    cost: Final = completion_cost(
+        completion_response=_anthropic_fallback_response(requested, served),
+        model=f"anthropic/{requested}",
+        custom_llm_provider="anthropic",
+        call_type="anthropic_messages",
+        litellm_logging_obj=logging_obj,
+    )
+    breakdown: Final = logging_obj.cost_breakdown
+    assert cost == pytest.approx(_price(requested, 535, 0) + _price(served, 412, 264))
+    assert breakdown is not None
+    assert breakdown["input_cost"] == pytest.approx(_price(requested, 535, 0))
