@@ -631,6 +631,14 @@ async def test_dynamic_rate_limiter_v1_unknown_model_falls_back():
 # ---------------------------------------------------------------------------
 
 
+def _gpt_4o_mini_deployment() -> dict:
+    return {
+        "model_name": "gpt-4o-mini",
+        "litellm_params": {"model": "gpt-4o-mini", "rpm": 100},
+        "model_info": {"id": "gpt-4o-mini-deployment"},
+    }
+
+
 @pytest.mark.asyncio
 async def test_dynamic_rate_limiter_v3_model_capacity_path_populates_provider():
     """
@@ -640,8 +648,6 @@ async def test_dynamic_rate_limiter_v3_model_capacity_path_populates_provider():
     path — that's the most common production trip — and confirm the
     raised exception carries provider info.
     """
-    from litellm.types.router import ModelGroupInfo
-
     handler = PROXY_DynamicRateLimitHandlerV3(internal_usage_cache=DualCache())
     handler.v3_limiter.atomic_check_and_increment_by_n = AsyncMock(
         return_value={
@@ -666,18 +672,8 @@ async def test_dynamic_rate_limiter_v3_model_capacity_path_populates_provider():
         }
     )
 
-    user_api_key_dict = UserAPIKeyAuth(api_key="sk-dyn-v3")
-    user_api_key_dict.metadata = {}
-    model_info = ModelGroupInfo(model_group="gpt-4o-mini", providers=["openai"])
-
     with pytest.raises(HTTPException) as exc_info:
-        await handler._check_rate_limits(
-            model="gpt-4o-mini",
-            model_group_info=model_info,
-            user_api_key_dict=user_api_key_dict,
-            priority="default",
-            saturation=1.0,
-        )
+        await handler.async_pre_call_check(_gpt_4o_mini_deployment(), None)
 
     exc = exc_info.value
     assert exc.status_code == 429
@@ -689,8 +685,6 @@ async def test_dynamic_rate_limiter_v3_model_capacity_path_populates_provider():
 @pytest.mark.asyncio
 async def test_dynamic_rate_limiter_v3_unknown_descriptor_path_populates_provider():
     """Fail-closed unknown-descriptor branch must still attribute provider."""
-    from litellm.types.router import ModelGroupInfo
-
     handler = PROXY_DynamicRateLimitHandlerV3(internal_usage_cache=DualCache())
     handler.v3_limiter.atomic_check_and_increment_by_n = AsyncMock(
         return_value={
@@ -715,18 +709,8 @@ async def test_dynamic_rate_limiter_v3_unknown_descriptor_path_populates_provide
         }
     )
 
-    user_api_key_dict = UserAPIKeyAuth(api_key="sk-dyn-v3-unknown")
-    user_api_key_dict.metadata = {}
-    model_info = ModelGroupInfo(model_group="gpt-4o-mini", providers=["openai"])
-
     with pytest.raises(HTTPException) as exc_info:
-        await handler._check_rate_limits(
-            model="gpt-4o-mini",
-            model_group_info=model_info,
-            user_api_key_dict=user_api_key_dict,
-            priority="default",
-            saturation=1.0,
-        )
+        await handler.async_pre_call_check(_gpt_4o_mini_deployment(), None)
 
     assert exc_info.value.llm_provider == "openai"
 

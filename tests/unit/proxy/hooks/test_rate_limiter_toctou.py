@@ -24,7 +24,7 @@ import pytest
 
 
 import litellm
-from litellm import DualCache, Router
+from litellm import DualCache
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.hooks.batch_rate_limiter import BatchFileUsage
 from litellm.proxy.hooks.dynamic_rate_limiter_v3 import (
@@ -71,6 +71,15 @@ def _make_phase1_barrier(num_concurrent: int, timeout: float = 0.1):
         return patched
 
     return wrap
+
+
+def _dynamic_deployment(model: str, rpm: int | None = None, tpm: int | None = None) -> dict:
+    limits = {**({"rpm": rpm} if rpm is not None else {}), **({"tpm": tpm} if tpm is not None else {})}
+    return {
+        "model_name": model,
+        "litellm_params": {"model": "gpt-3.5-turbo", **limits},
+        "model_info": {"id": f"{model}-deployment"},
+    }
 
 
 @pytest.mark.asyncio
@@ -213,45 +222,14 @@ async def test_dynamic_rate_limiter_v3_concurrent_bypasses_model_capacity(monkey
     dual_cache = DualCache()
     handler = DynamicRateLimitHandler(internal_usage_cache=dual_cache)
 
-    model = "toctou-dyn-model"
-    llm_router = Router(
-        model_list=[
-            {
-                "model_name": model,
-                "litellm_params": {
-                    "model": "gpt-3.5-turbo",
-                    "api_key": "test-key",
-                    "api_base": "test-base",
-                    "rpm": MODEL_RPM,
-                },
-            }
-        ]
-    )
-    handler.update_variables(llm_router=llm_router)
+    deployment = _dynamic_deployment("toctou-dyn-model", rpm=MODEL_RPM)
 
     barrier = _make_phase1_barrier(NUM_CONCURRENT)
     handler.v3_limiter.should_rate_limit = barrier(handler.v3_limiter.should_rate_limit)
 
-    from litellm.types.router import ModelGroupInfo
-
-    model_group_info = ModelGroupInfo(
-        model_group=model,
-        providers=["openai"],
-        rpm=MODEL_RPM,
-        tpm=None,
-    )
-
     async def one_request(idx: int):
-        user = UserAPIKeyAuth(api_key=hash_token(f"dyn-key-{idx}"))
-        user.metadata = {"priority": "high"}
         try:
-            await handler._check_rate_limits(
-                model=model,
-                model_group_info=model_group_info,
-                user_api_key_dict=user,
-                priority="high",
-                saturation=0.0,
-            )
+            await handler.async_pre_call_check(deployment, None)
             return "OK"
         except Exception as e:
             return e
@@ -287,21 +265,7 @@ async def test_dynamic_rate_limiter_v3_uses_atomic_check_and_increment(monkeypat
     dual_cache = DualCache()
     handler = DynamicRateLimitHandler(internal_usage_cache=dual_cache)
 
-    model = "atomic-dyn-model"
-    llm_router = Router(
-        model_list=[
-            {
-                "model_name": model,
-                "litellm_params": {
-                    "model": "gpt-3.5-turbo",
-                    "api_key": "test-key",
-                    "api_base": "test-base",
-                    "tpm": 1000,
-                },
-            }
-        ]
-    )
-    handler.update_variables(llm_router=llm_router)
+    deployment = _dynamic_deployment("atomic-dyn-model", tpm=1000)
 
     atomic_descriptors_observed: List[List[str]] = []
     original_atomic = handler.v3_limiter.atomic_check_and_increment_by_n
@@ -313,23 +277,7 @@ async def test_dynamic_rate_limiter_v3_uses_atomic_check_and_increment(monkeypat
 
     handler.v3_limiter.atomic_check_and_increment_by_n = logging_atomic
 
-    from litellm.types.router import ModelGroupInfo
-
-    user = UserAPIKeyAuth(api_key=hash_token("dyn-atomic-key"))
-    user.metadata = {"priority": "high"}
-
-    await handler._check_rate_limits(
-        model=model,
-        model_group_info=ModelGroupInfo(
-            model_group=model,
-            providers=["openai"],
-            rpm=None,
-            tpm=1000,
-        ),
-        user_api_key_dict=user,
-        priority="high",
-        saturation=0.0,
-    )
+    await handler.async_pre_call_check(deployment, None)
 
     assert atomic_descriptors_observed, (
         "Dynamic limiter must route enforced descriptors through "
@@ -429,21 +377,7 @@ async def test_dynamic_rate_limiter_v3_fails_closed_on_unknown_descriptor(monkey
     dual_cache = DualCache()
     handler = DynamicRateLimitHandler(internal_usage_cache=dual_cache)
 
-    model = "fail-closed-model"
-    llm_router = Router(
-        model_list=[
-            {
-                "model_name": model,
-                "litellm_params": {
-                    "model": "gpt-3.5-turbo",
-                    "api_key": "test-key",
-                    "api_base": "test-base",
-                    "tpm": 1000,
-                },
-            }
-        ]
-    )
-    handler.update_variables(llm_router=llm_router)
+    deployment = _dynamic_deployment("fail-closed-model", tpm=1000)
 
     async def fake_atomic(*args, **kwargs):
         return {
@@ -461,24 +395,8 @@ async def test_dynamic_rate_limiter_v3_fails_closed_on_unknown_descriptor(monkey
 
     handler.v3_limiter.atomic_check_and_increment_by_n = fake_atomic
 
-    from litellm.types.router import ModelGroupInfo
-
-    user = UserAPIKeyAuth(api_key=hash_token("fail-closed-key"))
-    user.metadata = {"priority": "high"}
-
     with pytest.raises(HTTPException) as exc:
-        await handler._check_rate_limits(
-            model=model,
-            model_group_info=ModelGroupInfo(
-                model_group=model,
-                providers=["openai"],
-                rpm=None,
-                tpm=1000,
-            ),
-            user_api_key_dict=user,
-            priority="high",
-            saturation=0.0,
-        )
+        await handler.async_pre_call_check(deployment, None)
     assert (
         exc.value.status_code == 429
     ), f"Expected 429 fail-closed on unknown descriptor; got {exc.value.status_code}"

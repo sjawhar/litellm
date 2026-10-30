@@ -767,16 +767,12 @@ class TestProxyHooksActuallyRaiseProxyRateLimitError:
         """
         from unittest.mock import AsyncMock, MagicMock
 
-        from litellm.proxy._types import UserAPIKeyAuth
+        from litellm.caching.caching import DualCache
         from litellm.proxy.hooks.dynamic_rate_limiter_v3 import (
             PROXY_DynamicRateLimitHandlerV3,
         )
 
-        # Bypass __init__ — we want to inject a stub v3_limiter without
-        # paying for the full handler setup.
-        handler = PROXY_DynamicRateLimitHandlerV3.__new__(
-            PROXY_DynamicRateLimitHandlerV3
-        )
+        handler = PROXY_DynamicRateLimitHandlerV3(internal_usage_cache=DualCache())
         v3_limiter = MagicMock()
         v3_limiter.window_size = 60
         v3_limiter.atomic_check_and_increment_by_n = AsyncMock(
@@ -809,17 +805,14 @@ class TestProxyHooksActuallyRaiseProxyRateLimitError:
         handler._create_priority_based_descriptors = MagicMock(  # type: ignore[method-assign]
             return_value=[]
         )
-        model_group_info = MagicMock()
-        model_group_info.tpm = 1000
-        model_group_info.rpm = 100
-
         with pytest.raises(ProxyRateLimitError) as exc_info:
-            await handler._check_rate_limits(
-                model="gpt-4",
-                model_group_info=model_group_info,
-                user_api_key_dict=UserAPIKeyAuth(api_key="sk-test-v3"),
-                priority="default",
-                saturation=0.99,
+            await handler.async_pre_call_check(
+                {
+                    "model_name": "gpt-4",
+                    "litellm_params": {"model": "gpt-4", "rpm": 100, "tpm": 1000},
+                    "model_info": {"id": "gpt-4-deployment"},
+                },
+                None,
             )
         e = exc_info.value
         assert e.status_code == 429
