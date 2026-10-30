@@ -475,11 +475,12 @@ async def test_add_litellm_data_to_request_strips_admin_injection_slots():
 
 @pytest.mark.asyncio
 async def test_add_litellm_data_to_request_strips_all_user_api_key_prefix_keys():
-    """Strip must cover the full user_api_key_* family, not a hand-maintained
-    list of 2-3 names. Proxy writes a dozen such fields (user_id, alias,
-    spend, team_id, request_route, …) and an attacker populating any of them
+    """Strip must cover the full user_api_key family, the bare key included, not a
+    hand-maintained list of 2-3 names. Proxy writes a dozen such fields (user_id,
+    alias, spend, team_id, request_route, …) and an attacker populating any of them
     in the non-authoritative metadata key would otherwise forge identity /
-    spend in audit logs and guardrails."""
+    spend in audit logs and guardrails. The bare user_api_key is the one every
+    standard-logging payload falls back to for user_api_key_hash."""
     from litellm.proxy.litellm_pre_call_utils import add_litellm_data_to_request
 
     request_mock = MagicMock(spec=Request)
@@ -493,6 +494,7 @@ async def test_add_litellm_data_to_request_strips_all_user_api_key_prefix_keys()
     request_mock.client.host = "127.0.0.1"
 
     attacker_injected = {
+        "user_api_key": "f" * 64,
         "user_api_key_user_id": "victim",
         "user_api_key_alias": "admin-key",
         "user_api_key_spend": 0.0,
@@ -528,11 +530,53 @@ async def test_add_litellm_data_to_request_strips_all_user_api_key_prefix_keys()
         version="test-version",
     )
 
-    # The non-authoritative metadata dict must not retain ANY attacker-injected
-    # user_api_key_* key.
+    # Neither the non-authoritative metadata dict nor the authoritative one may
+    # retain an attacker-injected user_api_key key.
     other = updated.get("litellm_metadata") or {}
-    attacker_leaks = [k for k in other if k.startswith("user_api_key_")]
+    attacker_leaks = [k for k in other if k.startswith("user_api_key")]
     assert attacker_leaks == [], f"Unexpected leaked keys: {attacker_leaks}"
+    assert (updated.get("metadata") or {}).get("user_api_key") == user_api_key_dict.api_key
+
+
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_strips_the_bare_user_api_key_the_proxy_does_not_own():
+    """On /v1/messages the proxy stamps litellm_metadata, so a caller's
+    metadata.user_api_key outlives the strip unless it covers the bare name too.
+    get_standard_logging_metadata turns a sha256-shaped one into the standard
+    logging payload's user_api_key_hash, which its consumers log, label metrics
+    with and file spend rows under."""
+    from litellm.proxy.litellm_pre_call_utils import add_litellm_data_to_request
+
+    request_mock = MagicMock(spec=Request)
+    request_mock.url = MagicMock()
+    request_mock.url.path = "/v1/messages"
+    request_mock.url.__str__.return_value = "http://localhost/v1/messages"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {"Content-Type": "application/json"}
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    user_api_key_dict = UserAPIKeyAuth(api_key="hashed-key", user_id="real-user", metadata={}, team_metadata={})
+
+    updated = await add_litellm_data_to_request(
+        data={
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"user_api_key": "f" * 64},
+            "litellm_metadata": {},
+        },
+        request=request_mock,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    assert {
+        "metadata": (updated.get("metadata") or {}).get("user_api_key"),
+        "litellm_metadata": (updated.get("litellm_metadata") or {}).get("user_api_key"),
+    } == {"metadata": None, "litellm_metadata": user_api_key_dict.api_key}
 
 
 @pytest.mark.asyncio
