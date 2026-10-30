@@ -4699,6 +4699,31 @@ async def test_queued_releases_are_retried_one_at_a_time_v3() -> None:
 
 
 @pytest.mark.asyncio
+async def test_two_drainers_on_one_release_queue_send_every_release_v3() -> None:
+    """Two tasks drain the queue at once while Redis is slow. Each takes a different release, so no release is
+    left in the queue unsent and no drainer reaches past the end of it."""
+    redis: Final = _GaugeRedis()
+    pod: Final = _pod(redis)
+    redis.gauges[_TEAM_GAUGE] = {"first", "second"}
+
+    redis.down = True
+    for slot_id in ("first", "second"):
+        await pod._release_parallel_request_slots(ParallelSlotAcquisition(slot_id=slot_id, counter_keys=[_TEAM_GAUGE]))
+    gate: Final = asyncio.Event()
+    redis.release_gate = gate
+    redis.down = False
+    await _until(lambda: redis.held_releases == 1)
+
+    second_drainer: Final = asyncio.create_task(pod._drain_unconfirmed_slot_releases())
+    await _until(lambda: redis.held_releases == 2)
+    gate.set()
+    assert await second_drainer
+
+    await _until(lambda: not redis.slots(_TEAM_GAUGE))
+    assert not pod._unconfirmed_slot_releases
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["end_of_call", "lost_acquire_reply"])
 async def test_a_release_cancelled_while_it_waits_on_redis_is_retried_v3(path: str) -> None:
     """The request is cancelled while its release waits on Redis, a client that hangs up mid-release. Redis may
