@@ -168,8 +168,8 @@ def test_callers_the_gateway_last_read_are_served_while_the_database_is_stopped(
             deleted: Final = string_value(proxy.post("/key/generate", {"models": [MODEL]})["key"])
 
             assert _statuses(proxy, {**served, "deleted": deleted}) == dict.fromkeys((*served, "deleted"), 200)
-            proxy.post("/key/delete", {"keys": [deleted]})
             _outlive_the_cache()
+            proxy.post("/key/delete", {"keys": [deleted]})
             database.cut()
 
             assert _statuses(proxy, served) == dict.fromkeys(served, 200), "the database is stopped"

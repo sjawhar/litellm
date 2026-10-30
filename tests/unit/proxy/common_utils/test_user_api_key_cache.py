@@ -19,6 +19,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     is_user_key_cache_key,
     recall_last_good,
     remember_last_good,
+    revoke_last_good,
 )
 from litellm.proxy.proxy_server import UserAPIKeyCacheTTLEnum
 from tests.unit.caching.fake_redis_cache import fake_redis_cache
@@ -661,3 +662,38 @@ class TestLastGoodEntries:
 
         assert memory.set("a", {"v": 1}) is True
         assert memory.get("a") == {"v": 1}
+
+    @pytest.mark.asyncio
+    async def test_revoke_tombstones_and_drops_the_entry_so_no_read_can_store_it_again(self):
+        redis = fake_redis_cache()
+        cache = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+        other_pod = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+        await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        await revoke_last_good(cache, ("team_id:t1",))
+        await remember_last_good(other_pod, "team_id:t1", self._team("t1"))
+
+        assert await redis.cache.init_async_client().get("last_good:team_id:t1") is None
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
+
+    @pytest.mark.asyncio
+    async def test_revoke_refuses_with_503_and_logs_an_error_when_redis_cannot_take_it(self, caplog):
+        from fastapi import HTTPException
+
+        redis = fake_redis_cache()
+        cache = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+        await remember_last_good(cache, "hashed-token-1", UserAPIKeyAuth(token="hashed-token-1"))
+        redis.server.connected = False
+
+        with pytest.raises(HTTPException) as refused:
+            await revoke_last_good(cache, ("hashed-token-1",))
+
+        assert refused.value.status_code == 503
+        assert any(r.levelname == "ERROR" and "hashed-token-1" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_revoke_does_nothing_while_the_setting_is_off(self):
+        redis = fake_redis_cache()
+        redis.server.connected = False
+
+        await revoke_last_good(UserApiKeyCache(redis_cache=redis.cache), ("hashed-token-1",))

@@ -7,6 +7,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, Final, TypeVar, cast, overload
 
+from fastapi import HTTPException
 from pydantic import BaseModel
 
 from litellm._logging import verbose_proxy_logger
@@ -563,3 +564,35 @@ async def forget_last_good(cache: DualCache, cache_key: str, *, tombstone: bool 
             cache_key,
             e,
         )
+
+
+async def revoke_last_good(cache: DualCache, cache_keys: Sequence[str]) -> None:
+    """Tombstone and drop the last good entries of keys or teams a request is about to delete or block, before it
+    writes anything. A Redis entry never expires, so with ``serve_last_good_auth_entries`` on, a Redis that cannot
+    record the revocation refuses the request with 503: nothing has changed yet and the operator retries, rather
+    than a revoked credential staying where a later database outage serves it."""
+    store: Final = _last_good_store(cache)
+    if store is None or not store.serve_last_good_entries or not cache_keys:
+        return
+    if store.redis_cache is not None:
+        try:
+            for cache_key in cache_keys:
+                await store.redis_cache.async_set_cache_or_raise(
+                    _last_good_tombstone_key(cache_key), 1, ttl=LAST_GOOD_TOMBSTONE_TTL_SECONDS
+                )
+                _ = await store.redis_cache.async_delete_cache(_last_good_redis_key(cache_key))
+        except Exception as e:
+            verbose_proxy_logger.error(
+                "Refused to revoke %s: Redis could not record the revocation of their last good auth entries: %s",
+                ", ".join(cache_keys),
+                e,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "The auth cache could not record this revocation, so nothing was changed. "
+                    "Retry once Redis is reachable."
+                },
+            ) from e
+    for cache_key in cache_keys:
+        store.last_good_memory.tombstone(cache_key, LAST_GOOD_TOMBSTONE_TTL_SECONDS)

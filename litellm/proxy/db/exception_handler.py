@@ -470,9 +470,10 @@ class PrismaDBExceptionHandler:
     @staticmethod
     def is_database_unreachable_error(e: BaseException) -> bool:
         """True when the database client could not reach the database at all: a connection, timeout or transport
-        failure, or prisma's engine crashing on the malformed reply of a torn-down connection, anywhere in the
-        ``__cause__`` / ``__context__`` chain. A database that answered, whatever it answered, is not unreachable,
-        and neither is a query engine that will not come back by itself."""
+        failure, a connection the server turned away for lack of capacity (Postgres 53300, a pool timeout), or
+        prisma's engine crashing on the malformed reply of a torn-down connection, anywhere in the ``__cause__`` /
+        ``__context__`` chain. A query the database answered, whatever it answered, is not unreachable, and
+        neither is a query engine that will not come back by itself."""
         return any(
             isinstance(link, Exception)
             and (

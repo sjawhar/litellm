@@ -29,6 +29,7 @@ from litellm.proxy.management_endpoints.common_utils import (  # noqa: F401  # l
 )
 from litellm.proxy.utils import jsonify_object
 from litellm.repositories.budget_repository import BudgetRepository
+from litellm.repositories.table_repositories import TeamMembershipRepository
 
 router: Final = APIRouter()
 
@@ -199,8 +200,24 @@ async def update_budget(
         where={"budget_id": budget_obj.budget_id},
         data=budget_obj_jsonified,
     )
+    await _evict_memberships_on_budget(budget_obj.budget_id)
 
     return response
+
+
+async def _evict_memberships_on_budget(budget_id: str) -> None:
+    """A team membership carries its budget row, so every cached copy of a membership on this budget, its last good
+    entry included, is evicted once the budget changes."""
+    from litellm.proxy.auth.auth_checks import invalidate_team_member_spend_state
+    from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
+
+    if prisma_client is None:
+        return
+    memberships: Final = await TeamMembershipRepository(prisma_client).table.find_many(where={"budget_id": budget_id})
+    for membership in memberships:
+        await invalidate_team_member_spend_state(
+            user_id=membership.user_id, team_id=membership.team_id, user_api_key_cache=user_api_key_cache
+        )
 
 
 @router.post(

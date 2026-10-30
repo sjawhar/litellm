@@ -49,6 +49,7 @@ from litellm.proxy.auth.auth_checks import (  # noqa: F401  # legacy module expo
     _delete_cache_key_object,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
     delete_cache_key_object,
     delete_cache_team_object,
+    team_cache_keys,
 )
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_broadcast
@@ -56,6 +57,7 @@ from litellm.proxy.common_utils.http_parsing_utils import (  # noqa: F401  # leg
     _safe_get_request_headers,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
     safe_get_request_headers,
 )
+from litellm.proxy.common_utils.user_api_key_cache import revoke_last_good
 from litellm.proxy.management_endpoints.internal_user_endpoints import new_user
 from litellm.proxy.management_endpoints.scim.scim_transformations import (
     ScimTransformations,
@@ -1040,6 +1042,9 @@ async def _set_user_keys_blocked(user_id: str, blocked: bool) -> int:
 
     if not affected_keys:
         return 0
+
+    if blocked:
+        await revoke_last_good(user_api_key_cache, tuple(key_row.token for key_row in affected_keys))
 
     for key_row in affected_keys:
         current_metadata: dict[str, object] = dict(key_row.metadata) if isinstance(key_row.metadata, dict) else {}
@@ -2649,6 +2654,7 @@ async def update_group(
             where={"team_id": group_id},
             data=update_data,
         )
+        await _evict_patched_team(group_id, existing_team.team_alias, group.displayName)
 
         # Handle user-team relationship changes
         current_members: Final = set(await _get_team_member_user_ids_from_team(existing_team))
@@ -2696,6 +2702,7 @@ async def delete_group(
         existing_team: Final = await _check_team_exists(group_id)
 
         member_ids: Final = await _get_team_member_user_ids_from_team(existing_team)
+        await _revoke_team_before_delete(group_id, existing_team.team_alias)
 
         # For each member, remove this team from their teams list
         for member_id in member_ids:
@@ -2712,6 +2719,7 @@ async def delete_group(
 
         # Delete team
         await _table(TeamRepository(prisma_client)).delete(where={"team_id": group_id})
+        await _evict_patched_team(group_id, existing_team.team_alias, None, revoked=True)
 
         return Response(status_code=204)
 
@@ -2920,7 +2928,7 @@ async def _apply_group_patch_updates(group_id: str, update_data: dict[str, objec
     return await TeamRepository(prisma_client).table.find_unique(where={"team_id": group_id})
 
 
-async def _evict_patched_team(team_id: str, old_alias: str | None, new_alias: object) -> None:
+async def _evict_patched_team(team_id: str, old_alias: str | None, new_alias: object, *, revoked: bool = False) -> None:
     """Evict the team a group patch rewrote, by id and by both its aliases, its last good entries included."""
     from litellm.proxy.proxy_server import proxy_logging_obj, user_api_key_cache
 
@@ -2931,7 +2939,14 @@ async def _evict_patched_team(team_id: str, old_alias: str | None, new_alias: ob
             team_alias=alias,
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
+            revoked=revoked,
         )
+
+
+async def _revoke_team_before_delete(team_id: str, team_alias: str | None) -> None:
+    from litellm.proxy.proxy_server import user_api_key_cache
+
+    await revoke_last_good(user_api_key_cache, team_cache_keys(team_id, team_alias))
 
 
 async def _handle_group_membership_changes(group_id: str, current_members: set[str], final_members: set[str]) -> None:

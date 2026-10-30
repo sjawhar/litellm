@@ -50,6 +50,7 @@ from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_
 from litellm.proxy.common_utils.user_api_key_cache import (
     AUTH_OBJECTS_TARGET,
     object_permission_cache_key,
+    revoke_last_good,
     user_object_permission_id_cache_key,
 )
 from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
@@ -2520,6 +2521,14 @@ async def delete_user(
                         )
                     },
                 )
+
+        await revoke_last_good(
+            user_api_key_cache,
+            tuple(
+                key.token
+                for key in await _verification_token_table(prisma_client).find_many(where={"user_id": user_id})
+            ),
+        )
 
         # we do this after the first for loop, since first for loop is for validation. we only want this inserted after validation passes
         if is_audit_logging_enabled():

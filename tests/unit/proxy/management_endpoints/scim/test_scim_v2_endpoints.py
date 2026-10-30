@@ -3067,6 +3067,34 @@ async def test_delete_group_recomputes_roles_for_members(mocker):
 
 
 @pytest.mark.asyncio
+async def test_delete_group_drops_and_tombstones_the_teams_last_good_entries(mocker):
+    """A team SCIM deletes must not survive as a last good entry a later database outage serves, by id or by alias."""
+    from litellm.models.team import LiteLLM_TeamTableCachedObj
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, recall_last_good, remember_last_good
+
+    cache = UserApiKeyCache(serve_last_good_entries=True)
+    for cache_key in ("team_id:test-team-123", "team_alias:lanes"):
+        await remember_last_good(cache, cache_key, LiteLLM_TeamTableCachedObj(team_id="test-team-123"))
+    existing_team = mocker.MagicMock(team_alias="lanes", members_with_roles=[])
+    mock_prisma_client = mocker.MagicMock()
+    mock_prisma_client.db.litellm_teamtable.find_unique = AsyncMock(return_value=existing_team)
+    mock_prisma_client.db.litellm_teamtable.delete = AsyncMock()
+    mocker.patch(
+        "litellm.proxy.management_endpoints.scim.scim_v2._get_prisma_client_or_raise_exception",
+        AsyncMock(return_value=mock_prisma_client),
+    )
+    mocker.patch("litellm.proxy.management_endpoints.scim.scim_v2._recompute_scim_member_roles", AsyncMock())
+    mocker.patch("litellm.proxy.proxy_server.user_api_key_cache", cache)
+
+    await delete_group(group_id="test-team-123")
+    for cache_key in ("team_id:test-team-123", "team_alias:lanes"):
+        await remember_last_good(cache, cache_key, LiteLLM_TeamTableCachedObj(team_id="test-team-123"))
+
+    assert await recall_last_good(cache, "team_id:test-team-123", LiteLLM_TeamTableCachedObj) is None
+    assert await recall_last_good(cache, "team_alias:lanes", LiteLLM_TeamTableCachedObj) is None
+
+
+@pytest.mark.asyncio
 async def test_handle_existing_user_by_email_applies_role_when_admin_group_set(mocker):
     """When admin_group is configured, re-upserting an existing email persists the
     resolved role so a now-non-admin user can't keep a stale PROXY_ADMIN."""
