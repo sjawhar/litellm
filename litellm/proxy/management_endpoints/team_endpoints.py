@@ -18,6 +18,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from itertools import chain
 from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
@@ -108,6 +109,7 @@ from litellm.proxy.auth.auth_checks import (  # noqa: F401  # legacy module expo
     get_team_object,
     get_user_object,
     invalidate_team_member_spend_state,
+    team_cache_keys,
 )
 from litellm.proxy.auth.auth_utils import (
     enforce_batch_limits_are_admin_only,
@@ -120,7 +122,12 @@ from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import (
 )
 from litellm.proxy.common_utils.callback_utils import encrypt_callback_vars
 from litellm.proxy.common_utils.json_merge_patch import apply_json_merge_patch
-from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+from litellm.proxy.common_utils.user_api_key_cache import (
+    UserApiKeyCache,
+    forget_last_good,
+    revoke_last_good,
+    team_membership_auth_cache_key,
+)
 from litellm.proxy.db.db_span import db_span
 from litellm.proxy.hooks.key_management_event_hooks import KeyManagementEventHooks
 from litellm.proxy.hooks.model_max_budget_limiter import (
@@ -2111,12 +2118,13 @@ async def _evict_created_membership_caches(
     team_id: str,
     user_api_key_cache: UserApiKeyCache,
 ) -> None:
-    """Evict the ``get_team_membership`` negative-cache sentinel for members whose row was just created.
+    """Evict every cached copy of these members' ``LiteLLM_TeamMembership`` rows after a path created or changed them.
 
     A session-token request caches ``NO_TEAM_MEMBERSHIP_SENTINEL`` for a member with no
     ``LiteLLM_TeamMembership`` row. When a create path (``/team/member_add`` or the ``/team/update``
     budget backfill) later writes that row with a per-member budget, the stale sentinel keeps the
-    member's budget unenforced until the membership cache TTL expires, so it must be evicted here.
+    member's budget unenforced until the membership cache TTL expires, so it must be evicted here. A changed
+    team member budget is evicted the same way, its never-expiring last good membership entries included.
     """
     await asyncio.gather(
         *(
@@ -2488,6 +2496,9 @@ async def update_team(
                     },
                 }
 
+        if data.blocked is True:
+            await revoke_last_good(user_api_key_cache, team_cache_keys(data.team_id, existing_team.team_alias))
+
         if _team_member_fields_in_request and TeamMemberBudgetHandler.should_create_budget(
             team_member_budget=data.team_member_budget,
             team_member_rpm_limit=data.team_member_rpm_limit,
@@ -2514,11 +2525,6 @@ async def update_team(
                     team_member_budget_id=_backfill_budget_id,
                     prisma_client=prisma_client,
                 )
-                await _evict_created_membership_caches(
-                    user_ids=_member_user_ids(existing_team_row.members_with_roles),
-                    team_id=data.team_id,
-                    user_api_key_cache=user_api_key_cache,
-                )
         elif _team_member_fields_in_request:
             updated_kv = await TeamMemberBudgetHandler.clear_team_member_budget_fields(
                 team_table=existing_team_row,
@@ -2528,6 +2534,12 @@ async def update_team(
             )
         else:
             TeamMemberBudgetHandler.clean_team_member_fields(updated_kv)
+        if _team_member_fields_in_request and existing_team_row.members_with_roles:
+            await _evict_created_membership_caches(
+                user_ids=_member_user_ids(existing_team_row.members_with_roles),
+                team_id=data.team_id,
+                user_api_key_cache=user_api_key_cache,
+            )
 
         # Check object permission
         if data.object_permission is not None:
@@ -3727,6 +3739,7 @@ async def _team_member_delete(
             hashed_tokens=tuple(key.token for key in keys_to_delete),
             prisma_client=prisma_client,
         )
+        await revoke_last_good(user_api_key_cache, tuple(key.token for key in keys_to_delete))
 
         if removed_team_members:
             await _team_tx_db(tx).update(
@@ -3790,6 +3803,9 @@ async def _team_member_delete(
             user_id=user_id,
             team_id=data.team_id,
             user_api_key_cache=user_api_key_cache,
+        )
+        await forget_last_good(
+            user_api_key_cache, team_membership_auth_cache_key(team_id=data.team_id, user_id=user_id), tombstone=True
         )
 
     _emit_team_members_metric(existing_team_row)
@@ -3936,6 +3952,7 @@ async def team_member_update(
     if role_change is not None:
         members_before_role_update, team_members = role_change
         team_table.members_with_roles = list(team_members)
+        await _evict_cached_teams(((data.team_id, team_table.team_alias),))
         _schedule_team_membership_audit_log(
             team_id=data.team_id,
             team_alias=team_table.team_alias,
@@ -4468,6 +4485,14 @@ async def delete_team(
     jwt_mapping_cache_keys: Final = await get_jwt_key_mapping_cache_keys_for_tokens(
         hashed_tokens=tuple(key.token for key in keys_to_delete),
         prisma_client=prisma_client,
+    )
+
+    await revoke_last_good(
+        user_api_key_cache,
+        (
+            *chain.from_iterable(team_cache_keys(team.team_id, team.team_alias) for team in team_rows),
+            *(key.token for key in keys_to_delete),
+        ),
     )
 
     if keys_to_delete:
@@ -5232,7 +5257,7 @@ async def _set_team_blocked(
 ) -> "prisma_models.LiteLLM_TeamTable | None":
     """Write the team's ``blocked`` flag, then evict the team everywhere it is cached, its last good entry
     included, so neither a live pod nor a later database outage serves the team as it was."""
-    from litellm.proxy.proxy_server import prisma_client
+    from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
 
     if prisma_client is None:
         raise Exception("No DB Connected.")
@@ -5250,6 +5275,8 @@ async def _set_team_blocked(
     ):
         team_access_denied()
 
+    if blocked:
+        await revoke_last_good(user_api_key_cache, team_cache_keys(team_id, existing_team.team_alias))
     record: Final = await _team_db(prisma_client).update(where={"team_id": team_id}, data={"blocked": blocked})
     await _evict_cached_teams(((team_id, existing_team.team_alias),), revoked=blocked)
     return record

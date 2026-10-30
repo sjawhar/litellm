@@ -2469,18 +2469,21 @@ async def _fetch_team_membership_from_db(
     )
     membership: Final = None if response is None else LiteLLM_TeamMembership.model_validate(response.dict())
     _key: Final = team_membership_reservation_cache_key(user_id=user_id, team_id=team_id)
+    last_good_key: Final = team_membership_auth_cache_key(team_id=team_id, user_id=user_id)
     if membership is None:
         await user_api_key_cache.async_set_cache(
             key=_key,
             value=NO_TEAM_MEMBERSHIP_SENTINEL,
             ttl=get_management_object_ttl(user_api_key_cache),
         )
+        await forget_last_good(user_api_key_cache, last_good_key)
     else:
         await user_api_key_cache.async_set_cache(
             key=_key,
             value=membership,
             model_type=LiteLLM_TeamMembership,
         )
+        await remember_last_good(user_api_key_cache, last_good_key, membership)
     return membership
 
 
@@ -2499,14 +2502,25 @@ async def _load_team_membership_on_cache_miss(
     if not isinstance(redis_membership, _TeamMembershipCacheMiss):
         return redis_membership
 
-    return await _fetch_team_membership_from_db(
-        user_id=user_id,
-        team_id=team_id,
-        prisma_client=prisma_client,
-        user_api_key_cache=user_api_key_cache,
-        parent_otel_span=parent_otel_span,
-        proxy_logging_obj=proxy_logging_obj,
-    )
+    try:
+        return await _fetch_team_membership_from_db(
+            user_id=user_id,
+            team_id=team_id,
+            prisma_client=prisma_client,
+            user_api_key_cache=user_api_key_cache,
+            parent_otel_span=parent_otel_span,
+            proxy_logging_obj=proxy_logging_obj,
+        )
+    except Exception as e:
+        served: Final = await recall_last_good_after(
+            e,
+            user_api_key_cache,
+            team_membership_auth_cache_key(team_id=team_id, user_id=user_id),
+            LiteLLM_TeamMembership,
+        )
+        if served is None:
+            raise
+        return served
 
 
 @with_service_target(AUTH_OBJECTS_TARGET)
@@ -3142,6 +3156,12 @@ async def invalidate_team_member_spend_state(
         ),
         user_api_key_cache=user_api_key_cache,
     )
+    await forget_last_good(user_api_key_cache, team_membership_auth_cache_key(team_id=team_id, user_id=user_id))
+
+
+def team_cache_keys(team_id: str, team_alias: str | None) -> tuple[str, ...]:
+    """The keys `_cache_team_object` writes a team under: its id, and its alias when it has one."""
+    return (f"team_id:{team_id}", *((f"team_alias:{team_alias}",) if team_alias else ()))
 
 
 @with_service_target(AUTH_OBJECTS_TARGET)
@@ -3169,7 +3189,7 @@ async def delete_cache_team_object(
     `revoked` is for a delete or a block: it tombstones the team's last good entries, so a read that was in
     flight when the row changed cannot store them again.
     """
-    keys: Final = (f"team_id:{team_id}", *((f"team_alias:{team_alias}",) if team_alias else ()))
+    keys: Final = team_cache_keys(team_id, team_alias)
 
     for key in keys:
         try:
@@ -4202,7 +4222,8 @@ async def get_key_object(
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
     )
-    await remember_last_good(user_api_key_cache, hashed_token, copy_user_api_key_auth_for_cache(_response))
+    if _response.token == hashed_token:
+        await remember_last_good(user_api_key_cache, hashed_token, copy_user_api_key_auth_for_cache(_response))
 
     return _response
 

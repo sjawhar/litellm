@@ -25,6 +25,7 @@ def client_and_mocks(monkeypatch):
     mock_prisma.db = types.SimpleNamespace(
         litellm_budgettable=mock_table,
         litellm_dailyspend=mock_table,
+        litellm_teammembership=types.SimpleNamespace(find_many=AsyncMock(return_value=[])),
     )
 
     # Monkeypatch Mocked Prisma client into the server module
@@ -67,6 +68,33 @@ async def test_new_budget_success(client_and_mocks):
     assert body["updated_by"] == "test_user"
 
     mock_table.create.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_update_budget_drops_the_last_good_entries_of_memberships_on_it(client_and_mocks, monkeypatch):
+    """A team membership carries its budget row and its last good entry never expires, so a changed budget must
+    evict every membership on it, or a database outage enforces the old limits."""
+    from litellm.proxy._types import LiteLLM_TeamMembership
+    from litellm.proxy.common_utils.user_api_key_cache import (
+        UserApiKeyCache,
+        recall_last_good,
+        remember_last_good,
+        team_membership_auth_cache_key,
+    )
+
+    client, mock_prisma, _ = client_and_mocks
+    mock_prisma.db.litellm_teammembership.find_many = AsyncMock(
+        return_value=[types.SimpleNamespace(user_id="u1", team_id="t1")]
+    )
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    key: Final = team_membership_auth_cache_key(team_id="t1", user_id="u1")
+    await remember_last_good(cache, key, LiteLLM_TeamMembership(user_id="u1", team_id="t1"))
+    monkeypatch.setattr(ps, "user_api_key_cache", cache)
+
+    resp = client.post("/budget/update", json={"budget_id": "budget_shared", "max_budget": 5.0})
+
+    assert resp.status_code == 200, resp.text
+    assert await recall_last_good(cache, key, LiteLLM_TeamMembership) is None
 
 
 @pytest.mark.parametrize("bad_duration", ["0s", "-5m"])

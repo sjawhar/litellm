@@ -2946,7 +2946,8 @@ class ConfigGeneralSettings(LiteLLMPydanticObjectBase):
             "keep the last team and key entry each database read returned, in Redis with no expiry and in each "
             "worker's memory, and serve it while the database is unreachable, so a database failover does not refuse "
             "callers that were just served. A team or key the database reported missing, or that was deleted or "
-            "blocked, is still refused"
+            "blocked, is still refused. While this is on, deleting or blocking a key or team answers 503 and changes "
+            "nothing when Redis cannot record the revocation, so retry it once Redis is reachable"
         ),
     )
     max_request_size_mb: int | None = Field(

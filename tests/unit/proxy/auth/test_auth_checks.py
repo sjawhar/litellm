@@ -39,6 +39,7 @@ from litellm.proxy.auth.auth_checks import (
 from litellm.proxy.utils import ProxyLogging
 from litellm.proxy.utils import CallInfo
 from tests.unit.caching.fake_redis_cache import fake_redis_cache
+from litellm.proxy.common_utils.user_api_key_cache import remember_last_good
 
 
 @pytest.mark.parametrize("customer_spend, customer_budget", [(0, 10), (10, 0)])
@@ -1987,6 +1988,20 @@ class TestLastGoodEntryWhileTheDatabaseIsUnreachable:
             await self._key(database, cache, "k1")
 
     @pytest.mark.asyncio
+    async def test_rotated_out_key_read_in_its_grace_period_is_not_kept_under_the_old_hash(self):
+        """During a regenerate grace period the old hash reads back the new key's row. Keeping that under the old
+        hash, with no expiry, would let a later outage admit the old key after its grace period ended."""
+        database = _Database()
+        database.keys["old-hash"] = UserAPIKeyAuth(token="new-hash", models=["claude-opus-5-5"])
+        cache = _serving_cache()
+        await self._key(database, cache, "old-hash")
+        await self._expire(cache, "old-hash")
+        database.stopped_with = _STOPPED
+
+        with pytest.raises(httpx.ConnectError):
+            await self._key(database, cache, "old-hash")
+
+    @pytest.mark.asyncio
     async def test_key_the_database_reported_missing_stays_refused(self):
         from litellm.proxy._types import ProxyException
 
@@ -2022,6 +2037,35 @@ class TestLastGoodEntryWhileTheDatabaseIsUnreachable:
             await self._team(database, cache, "t1")
         with pytest.raises(HTTPException):
             await self._team_by_alias(database, cache, "lanes")
+
+    @pytest.mark.asyncio
+    async def test_member_budget_or_role_change_drops_the_memberships_last_good_entry(self):
+        """Member removal and budget or role changes run through invalidate_team_member_spend_state; the
+        membership's last good entry must go with the caches, or an outage serves the old budget."""
+        from litellm.proxy._types import LiteLLM_TeamMembership
+        from litellm.proxy.auth.auth_checks import invalidate_team_member_spend_state
+        from litellm.proxy.common_utils.user_api_key_cache import recall_last_good, team_membership_auth_cache_key
+
+        cache = _serving_cache()
+        key = team_membership_auth_cache_key(team_id="t1", user_id="u1")
+        await remember_last_good(cache, key, LiteLLM_TeamMembership(user_id="u1", team_id="t1"))
+
+        await invalidate_team_member_spend_state(user_id="u1", team_id="t1", user_api_key_cache=cache)
+
+        assert await recall_last_good(cache, key, LiteLLM_TeamMembership) is None
+
+    @pytest.mark.asyncio
+    async def test_budget_reset_drops_the_reset_entries_last_good_copies(self, monkeypatch):
+        from litellm.proxy.common_utils.reset_budget_job import ResetBudgetJob
+        from litellm.proxy.common_utils.user_api_key_cache import recall_last_good
+
+        cache = _serving_cache()
+        await remember_last_good(cache, "hashed-reset", UserAPIKeyAuth(token="hashed-reset", spend=99.0))
+        monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
+
+        await ResetBudgetJob._invalidate_cache("user_api_key_cache", ("hashed-reset",))
+
+        assert await recall_last_good(cache, "hashed-reset", UserAPIKeyAuth) is None
 
     @pytest.mark.asyncio
     async def test_an_answer_that_is_not_an_outage_is_not_covered(self):

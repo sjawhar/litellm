@@ -130,3 +130,16 @@ async def test_resolve_keeps_refusing_a_key_the_database_reported_missing():
 
     with pytest.raises(httpx.ConnectError):
         await IdentityStore(database, cache).resolve(hashed_token=hashed)
+
+
+async def test_resolve_does_not_keep_a_rotated_out_key_under_its_old_hash():
+    old_hash = hash_token("sk-rotated-out")
+    new_hash = hash_token("sk-rotated-in")
+    database = _KeyRows({old_hash: UserAPIKeyAuth(token=new_hash, models=["claude-opus-5-5"])})
+    cache = UserApiKeyCache(serve_last_good_entries=True)
+    await IdentityStore(database, cache).resolve(hashed_token=old_hash)
+    await cache.async_delete_cache(old_hash)
+    database.stopped = True
+
+    with pytest.raises(httpx.ConnectError):
+        await IdentityStore(database, cache).resolve(hashed_token=old_hash)

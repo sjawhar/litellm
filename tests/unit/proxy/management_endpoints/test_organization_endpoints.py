@@ -1573,3 +1573,36 @@ async def test_delete_organization_evicts_the_cache_of_the_keys_it_deletes(monke
     assert all(cache.get_cache(key=cache_key) is None for cache_key in doomed_cache_keys)
     assert all(cache.get_cache(key=cache_key) == {"retained": True} for cache_key in kept_cache_keys)
     assert jwt_table.rows == (kept_row,)
+
+
+@pytest.mark.asyncio
+async def test_delete_organization_drops_the_last_good_entries_of_the_teams_it_deletes(monkeypatch):
+    """A deleted organization's teams must not survive as last good entries a later database outage serves."""
+    from litellm.models.team import LiteLLM_TeamTableCachedObj
+    from litellm.proxy._types import DeleteOrganizationRequest, LitellmUserRoles, UserAPIKeyAuth
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, recall_last_good, remember_last_good
+    from litellm.proxy.management_endpoints.organization_endpoints import delete_organization
+
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    await remember_last_good(cache, "team_id:t-org", LiteLLM_TeamTableCachedObj(team_id="t-org", team_alias="org-lane"))
+    await remember_last_good(cache, "team_alias:org-lane", LiteLLM_TeamTableCachedObj(team_id="t-org"))
+    prisma_client: Final = AsyncMock()
+    prisma_client.db.litellm_teamtable.find_many = AsyncMock(
+        return_value=[SimpleNamespace(team_id="t-org", team_alias="org-lane")]
+    )
+    prisma_client.db.litellm_verificationtoken.find_many = AsyncMock(return_value=[])
+    prisma_client.db.litellm_jwtkeymapping = CascadingJWTMappingTable([])
+    prisma_client.db.litellm_organizationtable.delete = AsyncMock(return_value=MagicMock())
+    monkeypatch.setattr("litellm.proxy.proxy_server.premium_user", True, raising=False)
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", prisma_client)
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
+    monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", None)
+
+    await delete_organization(
+        data=DeleteOrganizationRequest(organization_ids=["org-doomed"]),
+        user_api_key_dict=UserAPIKeyAuth(api_key="sk-admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+    )
+    await remember_last_good(cache, "team_id:t-org", LiteLLM_TeamTableCachedObj(team_id="t-org"))
+
+    assert await recall_last_good(cache, "team_id:t-org", LiteLLM_TeamTableCachedObj) is None
+    assert await recall_last_good(cache, "team_alias:org-lane", LiteLLM_TeamTableCachedObj) is None

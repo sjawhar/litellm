@@ -14,6 +14,7 @@ Endpoints for /organization operations
 #### ORGANIZATION MANAGEMENT ####
 
 from collections.abc import Mapping, Sequence
+from itertools import chain
 from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
@@ -36,13 +37,15 @@ from litellm.proxy._types import *
 from litellm.proxy.auth.auth_checks import (
     can_user_call_model,
     delete_cache_key_objects,
+    delete_cache_team_object,
     get_jwt_key_mapping_cache_keys_for_tokens,
     get_user_object,
+    team_cache_keys,
 )
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_broadcast
 from litellm.proxy.common_utils.timezone_utils import get_budget_reset_time
-from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, revoke_last_good
 from litellm.proxy.management_endpoints.budget_management_endpoints import (
     new_budget,
     update_budget,
@@ -1041,8 +1044,12 @@ async def delete_organization(
 
     deleted_orgs: Final = []
     for organization_id in data.organization_ids:
-        # delete all teams in the organization
-        await _table(TeamRepository(prisma_client)).delete_many(where={"organization_id": organization_id})
+        await _delete_organization_teams(
+            organization_id=organization_id,
+            prisma_client=prisma_client,
+            user_api_key_cache=user_api_key_cache,
+            proxy_logging_obj=proxy_logging_obj,
+        )
         # delete all members in the organization
         await _table(OrganizationMembershipRepository(prisma_client)).delete_many(
             where={"organization_id": organization_id}
@@ -1066,6 +1073,35 @@ async def delete_organization(
         deleted_orgs.append(deleted_org)
 
     return deleted_orgs
+
+
+async def _delete_organization_teams(
+    organization_id: str,
+    prisma_client: PrismaClient,
+    user_api_key_cache: UserApiKeyCache,
+    proxy_logging_obj: ProxyLogging | None,
+) -> None:
+    """Delete the organization's teams after recording the revocation of their last good entries and those of the
+    organization's keys, so neither outlives the delete in a store that never expires."""
+    org_filter: Final[_OrganizationIdFilter] = {"organization_id": organization_id}
+    teams: Final = await _table(TeamRepository(prisma_client)).find_many(where=org_filter)
+    keys: Final = await _table(VerificationTokenRepository(prisma_client)).find_many(where=org_filter)
+    await revoke_last_good(
+        user_api_key_cache,
+        (
+            *chain.from_iterable(team_cache_keys(team.team_id, team.team_alias) for team in teams),
+            *(key.token for key in keys),
+        ),
+    )
+    await _table(TeamRepository(prisma_client)).delete_many(where=org_filter)
+    for team in teams:
+        await delete_cache_team_object(
+            team_id=team.team_id,
+            team_alias=team.team_alias,
+            user_api_key_cache=user_api_key_cache,
+            proxy_logging_obj=proxy_logging_obj,
+            revoked=True,
+        )
 
 
 async def _delete_organization_keys(

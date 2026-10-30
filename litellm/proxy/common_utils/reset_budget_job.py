@@ -40,6 +40,7 @@ from litellm.proxy.common_utils.timezone_utils import (
 from litellm.proxy.common_utils.user_api_key_cache import (
     AUTH_OBJECTS_TARGET,
     end_user_cache_key,
+    forget_last_good,
     model_access_group_cache_key,
     model_access_group_spend_counter_key,
     project_cache_key,
@@ -389,6 +390,7 @@ async def _write_key_windows(prisma_client: PrismaClient, row_id: str, payload: 
             where={"token": row_id},
             data={"budget_limits": payload},
         )
+    await _forget_reset_last_good((row_id,))
 
 
 async def _write_team_windows(prisma_client: PrismaClient, row_id: str, payload: str) -> None:
@@ -397,6 +399,17 @@ async def _write_team_windows(prisma_client: PrismaClient, row_id: str, payload:
             where={"team_id": row_id},
             data={"budget_limits": payload},
         )
+    await _forget_reset_last_good((f"team_id:{row_id}",))
+
+
+async def _forget_reset_last_good(cache_keys: Sequence[str]) -> None:
+    """A reset rewrites spend and budget windows, so the last good entries holding the old ones go too."""
+    from litellm.proxy.proxy_server import user_api_key_cache
+
+    if not user_api_key_cache.serve_last_good_entries:
+        return
+    for cache_key in cache_keys:
+        await forget_last_good(user_api_key_cache, cache_key)
 
 
 @dataclass(frozen=True, slots=True)
@@ -657,6 +670,7 @@ class ResetBudgetJob:
                     await spend_counter_cache.async_delete_cache_keys(keys)
                 case "user_api_key_cache":
                     await user_api_key_cache.async_delete_cache_keys(keys)
+                    await _forget_reset_last_good(keys)
                 case _:
                     assert_never(cache)
         except Exception as e:

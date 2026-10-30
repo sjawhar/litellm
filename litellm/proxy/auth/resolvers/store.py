@@ -156,7 +156,8 @@ class IdentityStore:
             user_api_key_cache=self._cache,
             proxy_logging_obj=self._proxy_logging_obj,
         )
-        await remember_last_good(self._cache, hashed_token, copy_user_api_key_auth_for_cache(user_api_key_obj=key))
+        if key.token == hashed_token:
+            await remember_last_good(self._cache, hashed_token, copy_user_api_key_auth_for_cache(user_api_key_obj=key))
         return key
 
     @staticmethod
