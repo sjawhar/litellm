@@ -184,6 +184,26 @@ async def test_search_with_only_a_query_falls_back_to_the_proxy_default_model(mo
     assert router.asearch.await_args.kwargs["model"] == "perplexity-search"
 
 
+@pytest.mark.asyncio
+async def test_search_names_the_matched_tool_as_model_group_over_the_callers(monkeypatch):
+    router = MagicMock()
+    router.search_tools = [{"search_tool_name": "search-a", "litellm_params": {"search_provider": "tavily"}}]
+    router.asearch = AsyncMock(return_value={"object": "search", "results": []})
+    monkeypatch.setattr(proxy_server, "llm_router", router)
+
+    await search(
+        request=_json_request(
+            {"query": "litellm", "search_tool_name": "search-a", "metadata": {"model_group": "client-chosen"}}
+        ),
+        fastapi_response=MagicMock(),
+        user_api_key_dict=UserAPIKeyAuth(api_key="sk-test"),
+    )
+
+    router.asearch.assert_awaited_once()
+    assert router.asearch.await_args.kwargs["metadata"]["model_group"] == "search-a"
+    assert router.asearch.await_args.kwargs["custom_llm_provider"] == "tavily"
+
+
 def _standalone_key(key_search_tools: list[str] | None) -> UserAPIKeyAuth:
     caller: Final = UserAPIKeyAuth(
         api_key="sk-standalone",

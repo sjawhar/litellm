@@ -14963,6 +14963,9 @@ async def test_anthropic_messages_default_wildcard_fallback_still_buffers_lifecy
     assert [chunk async for chunk in wrapped] == [_anthropic_messages_content_chunk("hi")]
 
 
+_SERVER_SIDE_FALLBACK_BETA = {"anthropic-beta": "server-side-fallback-2026-07-01"}
+
+
 def _anthropic_messages_two_order_primary_model_list() -> list:
     return [
         {
@@ -14995,6 +14998,29 @@ def _anthropic_messages_two_order_primary_model_list() -> list:
         pytest.param({"fallbacks": [{"*": ["fallback"]}]}, {"model": "primary"}, True, id="wildcard"),
         pytest.param({"fallbacks": None}, {"model": "primary", "fallbacks": [{"model": "fallback"}]}, True, id="request-dict-fallback"),
         pytest.param({"fallbacks": None}, {"model": "primary", "fallbacks": ["fallback"]}, True, id="request-list-fallback"),
+        pytest.param(
+            {"fallbacks": [{"*": ["fallback"]}]},
+            {"model": "primary", "fallbacks": None, "extra_headers": _SERVER_SIDE_FALLBACK_BETA},
+            True,
+            id="beta-request-field-does-not-override-router-wildcard",
+        ),
+        pytest.param(
+            {"fallbacks": None},
+            {"model": "primary", "fallbacks": [{"model": "fallback"}], "extra_headers": _SERVER_SIDE_FALLBACK_BETA},
+            False,
+            id="beta-request-dict-is-anthropic-server-side-fallback",
+        ),
+        pytest.param(
+            {"fallbacks": None},
+            {
+                "model": "primary",
+                "fallbacks": "default",
+                "router_fallbacks": [{"primary": ["fallback"]}],
+                "extra_headers": _SERVER_SIDE_FALLBACK_BETA,
+            },
+            True,
+            id="beta-router-fallbacks-kwarg",
+        ),
         pytest.param(
             {"fallbacks": [{"primary": ["fallback"]}]},
             {"model": "primary", "disable_fallbacks": True},

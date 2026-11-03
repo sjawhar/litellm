@@ -2,6 +2,7 @@ from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Final
 
+from litellm.llms.anthropic.common_utils import drop_clear_thinking_edits
 from litellm.llms.bedrock.base_aws_llm import BaseAWSLLM
 from litellm.llms.bedrock.common_utils import MANTLE_MESSAGES_PATH
 from litellm.llms.bedrock.messages.mantle_transformation import AmazonMantleMessagesConfig
@@ -43,6 +44,17 @@ class BedrockMantleAnthropicMessagesConfig(BedrockMantleAuthMixin, AmazonMantleM
             "clear_thinking_20251015": ANTHROPIC_BETA_HEADER_VALUES.CONTEXT_MANAGEMENT_2025_06_27.value,
         }
     )
+
+    @classmethod
+    def _filter_context_management_for_bedrock_invoke(
+        cls,
+        anthropic_messages_request: dict,  # mutable-ok: filters the request in place like the base
+        beta_set: set,  # mutable-ok: collects betas in place like the base
+    ) -> None:
+        thinking: Final = anthropic_messages_request.get("thinking")
+        if not isinstance(thinking, dict) or thinking.get("type") not in ("enabled", "adaptive"):
+            drop_clear_thinking_edits(anthropic_messages_request)
+        super()._filter_context_management_for_bedrock_invoke(anthropic_messages_request, beta_set)
 
     def __init__(self, aws_signer: BaseAWSLLM | None = None) -> None:
         AmazonMantleMessagesConfig.__init__(self)

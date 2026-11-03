@@ -25,6 +25,7 @@ from litellm.llms.anthropic.prompt_cache_prediction import (
     parse_cache_plan,
     parse_observed_cache,
     parse_prompt,
+    prepare_native_baseline_body,
     resolve_baseline_prediction_target,
     resolve_prediction_target,
     supported_prediction_headers,
@@ -451,3 +452,22 @@ async def test_native_count_preserves_settings_and_requires_every_prefix(
         assert tuple(marker.prefix_tokens for marker in result.breakpoints) == (5000, 5800)
     assert tuple(route.call_count for route in routes) == (1, 1, 1)
     assert unexpected.call_count == 0
+
+
+@pytest.mark.parametrize(("prefix_mismatch_behavior", "kept"), [("error", True), ("drop_block", False)])
+def test_baseline_body_keeps_the_thinking_blocks_a_pinned_request_sends(prefix_mismatch_behavior: str, kept: bool):
+    unsigned_empty: Final = {"type": "thinking", "thinking": ""}
+    request: Final = {
+        "model": "claude-opus-4-8",
+        "max_tokens": 16,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [unsigned_empty, {"type": "text", "text": "answer"}]},
+            {"role": "user", "content": "again"},
+        ],
+        "thinking": {"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": prefix_mismatch_behavior}},
+    }
+    body: Final = prepare_native_baseline_body(request, "anthropic/claude-opus-4-8")
+    assert body is not None
+    content: Final = json.loads(json.dumps(body["messages"]))[1]["content"]
+    assert (unsigned_empty in content) is kept

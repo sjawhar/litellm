@@ -117,6 +117,8 @@ from litellm.proxy.litellm_pre_call_utils import (  # noqa: F401  # legacy modul
     _key_or_team_allows_client_pricing_override,  # pyright: ignore[reportPrivateUsage]  # reuse the proxy's pricing trust policy
     _strip_client_pricing_overrides,  # pyright: ignore[reportPrivateUsage]  # sanitize before trusted hooks add guardrail costs
     get_dynamic_logging_metadata,  # pyright: ignore[reportPrivateUsage]  # shared proxy helper, same import style as _read_request_body above
+    metadata_variable_name_for_route,
+    without_router_reserved_fields,
 )
 from litellm.proxy.route_llm_request import ProxyModelNotFoundError
 from litellm.proxy.utils import normalize_route_for_root_path
@@ -604,8 +606,6 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         """
         Filter out litellm params from the request body
         """
-        from litellm.proxy.proxy_server import llm_router
-
         _parsed_body = _parsed_body or {}
         parsed_body_typed: Final[Mapping[str, object]] = cast(Mapping[str, object], _parsed_body)  # cast-ok: json
         server_marker_free_body: Final = without_server_streaming_classification(parsed_body_typed)
@@ -613,14 +613,10 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         # downstream guardrail scans and snapshots never observe the server streaming marker.
         _parsed_body.clear()
         _parsed_body.update(server_marker_free_body)
-        managed_model: Final = get_model_from_request(
-            request_data=_parsed_body,
-            route=get_request_route(request),
-            request_headers=request.headers,
-            request_query_params=request.query_params,
-            llm_router=llm_router,
-            request=request,
-            team_id=user_api_key_dict.team_id,
+        managed_model: Final = _managed_model(
+            request,
+            cast("dict[str, object]", _parsed_body),  # cast-ok: json body
+            user_api_key_dict.team_id,
         )
 
         litellm_keys_in_body: Final = MappingProxyType(
@@ -821,12 +817,53 @@ def _carry_guardrail_logging_info(request_data: dict, guardrail_data: dict | Non
     metadata.setdefault("standard_logging_guardrail_information", list(entries))
 
 
+def _managed_model(
+    request: Request,
+    request_data: dict[str, object],  # mutable-ok: get_model_from_request reads the caller's own body dict
+    team_id: str | None,
+) -> str | Sequence[str] | None:
+    from litellm.proxy.proxy_server import llm_router
+
+    return get_model_from_request(
+        request_data=request_data,
+        route=get_request_route(request),
+        request_headers=request.headers,
+        request_query_params=request.query_params,
+        llm_router=llm_router,
+        request=request,
+        team_id=team_id,
+    )
+
+
+def _route_model_group(
+    request: Request | None, body: Mapping[str, object], team_id: str | None
+) -> Mapping[str, Mapping[str, object]]:
+    """The model group a built-in provider route names, in the metadata bucket the failure spend row reads
+    for that route. A user-defined pass-through forwards its body verbatim, so its model names an upstream
+    model and stamps nothing."""
+    if request is None or request_dispatched_to_pass_through_endpoint(request):
+        return {}
+    try:
+        model_group: Final = _managed_model(request, dict(body), team_id)
+    except Exception:  # noqa: BLE001  # the failure row must still be written when the body names no valid model
+        verbose_proxy_logger.debug("pass_through_endpoint: no route model for the failure spend row", exc_info=True)
+        return {}
+    if not isinstance(model_group, str):
+        return {}
+    bucket_name: Final = metadata_variable_name_for_route(get_request_route(request))
+    stripped_bucket: Final = without_router_reserved_fields(body).get(bucket_name, {})
+    return {bucket_name: {**stripped_bucket, "model_group": model_group}}
+
+
 def _build_passthrough_failure_request_payload(
     parsed_body: dict | None,
     kwargs: dict | None,
     logging_obj: LiteLLMLoggingObj | None,
     custom_llm_provider: str | None,
     upstream_usage: UpstreamReportedUsage | None = None,
+    *,
+    request: Request | None = None,
+    team_id: str | None = None,
 ) -> dict:
     """Build the ``request_data`` dict passed to ``post_call_failure_hook``.
 
@@ -838,7 +875,14 @@ def _build_passthrough_failure_request_payload(
     error response. Spend tracking only attributes a recovered cost when it
     comes paired with a usage object, so both keys are written together.
     """
-    request_payload: Final[dict] = dict(cast(Mapping[str, object], parsed_body or {}))  # cast-ok: json body
+    body: Final = cast(  # cast-ok: json body
+        Mapping[str, object], parsed_body if isinstance(parsed_body, dict) else {}
+    )
+    request_payload: Final[dict] = {
+        **body,
+        **without_router_reserved_fields(body),
+        **_route_model_group(request, body, team_id),
+    }
     if kwargs:
         request_payload.update(kwargs)
     if logging_obj is not None:
@@ -1512,6 +1556,8 @@ async def pass_through_request(
                     logging_obj=logging_obj,
                     custom_llm_provider=custom_llm_provider,
                     upstream_usage=upstream_usage,
+                    request=request,
+                    team_id=user_api_key_dict.team_id,
                 ),
                 logging_obj=logging_obj,
             )
@@ -1550,6 +1596,8 @@ async def pass_through_request(
                                 kwargs=kwargs,
                                 logging_obj=logging_obj,
                                 custom_llm_provider=custom_llm_provider,
+                                request=request,
+                                team_id=user_api_key_dict.team_id,
                             ),
                         ),
                         managed_id_provider=_managed_id_provider,
@@ -1604,6 +1652,8 @@ async def pass_through_request(
                     logging_obj=logging_obj,
                     custom_llm_provider=custom_llm_provider,
                     upstream_usage=upstream_usage,
+                    request=request,
+                    team_id=user_api_key_dict.team_id,
                 ),
                 logging_obj=logging_obj,
             )
@@ -1642,6 +1692,8 @@ async def pass_through_request(
                                 kwargs=kwargs,
                                 logging_obj=logging_obj,
                                 custom_llm_provider=custom_llm_provider,
+                                request=request,
+                                team_id=user_api_key_dict.team_id,
                             ),
                         ),
                         managed_id_provider=_managed_id_provider,
@@ -1704,6 +1756,8 @@ async def pass_through_request(
             logging_obj=logging_obj,
             custom_llm_provider=custom_llm_provider,
             upstream_usage=upstream_usage,
+            request=request,
+            team_id=user_api_key_dict.team_id,
         )
         failure_request_payload["response_body"] = response_body
         await _log_passthrough_upstream_failure(
@@ -1882,7 +1936,14 @@ async def pass_through_request(
             await proxy_logging_obj.post_call_failure_hook(
                 user_api_key_dict=user_api_key_dict,
                 original_exception=e,
-                request_data=e.request_data,
+                request_data=_build_passthrough_failure_request_payload(
+                    parsed_body=e.request_data,
+                    kwargs=kwargs,
+                    logging_obj=logging_obj,
+                    custom_llm_provider=custom_llm_provider,
+                    request=request,
+                    team_id=user_api_key_dict.team_id,
+                ),
             )
         except Exception:
             verbose_proxy_logger.warning(
@@ -1924,18 +1985,14 @@ async def pass_through_request(
         # Monitoring: Trigger post_call_failure_hook
         # for pass through endpoint failure
         #########################################################
-        request_payload: Final[dict] = _parsed_body or {}
-        # add user_api_key_dict, litellm_call_id, passthrough_logging_payloa for logging
-        if kwargs:
-            for key, value in kwargs.items():
-                request_payload[key] = value
-        if logging_obj is not None:
-            request_payload["litellm_logging_obj"] = logging_obj
-
-        if "model" not in request_payload and _parsed_body and isinstance(_parsed_body, dict):
-            request_payload["model"] = _parsed_body.get("model", "")
-        if "custom_llm_provider" not in request_payload and custom_llm_provider:
-            request_payload["custom_llm_provider"] = custom_llm_provider
+        request_payload: Final = _build_passthrough_failure_request_payload(
+            parsed_body=_parsed_body,
+            kwargs=kwargs,
+            logging_obj=logging_obj,
+            custom_llm_provider=custom_llm_provider,
+            request=request,
+            team_id=user_api_key_dict.team_id,
+        )
 
         _carry_guardrail_logging_info(request_payload, post_call_guardrail_data)
 

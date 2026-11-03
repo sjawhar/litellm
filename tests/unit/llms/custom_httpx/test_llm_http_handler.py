@@ -47,6 +47,7 @@ from litellm.llms.bedrock.messages.invoke_transformations.anthropic_claude3_tran
 )
 from litellm.llms.bedrock.files.transformation import BedrockFilesConfig
 from litellm.llms.anthropic.skills.transformation import AnthropicSkillsConfig
+from litellm.llms.anthropic.pass_through.messages.transformation import AnthropicMessagesConfig
 from litellm.llms.openai.evals.transformation import OpenAIEvalsConfig
 from litellm.llms.mistral.files.transformation import MistralFilesConfig
 from litellm.llms.openai.vector_store_files.transformation import OpenAIVectorStoreFilesConfig
@@ -1867,6 +1868,79 @@ async def test_anthropic_post_skips_the_thinking_strip_retry_when_block_binding_
     else:
         assert (await _post()).status_code == 200
     assert http_client.post.await_count == expected_posts
+
+
+_INVALID_THINKING_MESSAGES: Final = (
+    "messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation.",
+    "messages.1.content.0: Invalid `signature` in `thinking` block",
+    "messages.1.content.0.thinking.signature.str: Input should be a valid string",
+    "messages.1.content.0.thinking: each thinking block must contain thinking",
+)
+
+
+class _ConfigWithoutBlockBinding(AnthropicMessagesConfig):
+    """A provider config subclass, which does not forward ``thinking.block_binding`` (the Vertex AI case)"""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "config_class", (AnthropicMessagesConfig, _ConfigWithoutBlockBinding), ids=("forwards-binding", "drops-binding")
+)
+@pytest.mark.parametrize(
+    "error_message", _INVALID_THINKING_MESSAGES, ids=("bound", "invalid-signature", "null-signature", "empty-thinking")
+)
+@pytest.mark.parametrize(
+    ("prefix_mismatch_behavior", "expected_posts"), (("error", 1), ("drop_block", 2)), ids=("pinned", "drop")
+)
+async def test_anthropic_messages_handler_never_strip_retries_a_request_the_caller_pinned(
+    config_class: type[AnthropicMessagesConfig], error_message: str, prefix_mismatch_behavior: str, expected_posts: int
+) -> None:
+    """A pinned request gets Anthropic's first invalid-thinking 400, whatever it says, also where the transform rebuilds
+    legacy ``thinking`` without ``block_binding`` and only the caller's params still say the blocks are pinned."""
+    error_body: Final = json.dumps({"type": "error", "error": {"type": "invalid_request_error", "message": error_message}})
+    handler: Final = BaseLLMHTTPHandler()
+    thinking_block: Final = {"type": "thinking", "thinking": "plan", "signature": None}
+    request: Final = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    mock_client: Final = AsyncMock(spec=AsyncHTTPHandler)
+    mock_client.post = AsyncMock(
+        side_effect=[
+            httpx.Response(400, request=request, text=error_body),
+            httpx.Response(400, request=request, text=error_body),
+        ]
+    )
+    mock_logging_obj: Final = Mock(baseline_cache_context=None)
+    mock_logging_obj.model_call_details = {}
+
+    async def _call() -> object:
+        return await handler.async_anthropic_messages_handler(
+            model="claude-opus-4-8",
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [thinking_block, {"type": "text", "text": "hello"}]},
+                {"role": "user", "content": "again"},
+            ],
+            anthropic_messages_provider_config=config_class(),
+            anthropic_messages_optional_request_params={
+                "max_tokens": 32,
+                "thinking": {
+                    "type": "enabled",
+                    "budget_tokens": 1024,
+                    "block_binding": {"prefix_mismatch_behavior": prefix_mismatch_behavior},
+                },
+            },
+            custom_llm_provider="anthropic",
+            litellm_params=GenericLiteLLMParams(),
+            logging_obj=mock_logging_obj,
+            client=mock_client,
+            api_key="sk-test",
+            stream=False,
+            kwargs={},
+        )
+
+    with pytest.raises(BaseLLMException) as raised:
+        await _call()
+    assert raised.value.status_code == 400
+    assert mock_client.post.await_count == expected_posts
 
 
 def test_base_responses_config_sign_request_is_noop_by_default():
