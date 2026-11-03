@@ -227,9 +227,7 @@ async def update_budget(
 _EvictionStep = TypeVar("_EvictionStep")
 
 
-async def _best_effort(
-    budget_id: str, what: str, step: Callable[[], Awaitable[_EvictionStep]]
-) -> _EvictionStep | None:
+async def _best_effort(budget_id: str, what: str, step: Callable[[], Awaitable[_EvictionStep]]) -> _EvictionStep | None:
     try:
         return await step()
     except Exception as e:  # noqa: BLE001  # the budget write committed; one failed step must not skip the rest
