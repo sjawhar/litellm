@@ -40,6 +40,7 @@ from litellm.proxy.management_endpoints.common_utils import (  # noqa: F401  # l
 )
 from litellm.proxy.utils import jsonify_object
 from litellm.repositories.budget_repository import BudgetRepository
+from litellm.repositories.chunked_in import find_many_in
 from litellm.repositories.organization_repository import OrganizationRepository
 from litellm.repositories.project_repository import ProjectRepository
 from litellm.repositories.table_repositories import (
@@ -275,17 +276,18 @@ async def evict_budget_holders(budget_id: str) -> None:
             lambda: ModelAccessGroupBudgetRepository(prisma_client).table.find_many(where=on_budget),
         ),
     )
-    on_budget_or_its_organizations: Final = {
-        "OR": [
-            {"budget_id": budget_id},
-            {"organization_id": {"in": [org.organization_id for org in organizations or ()]}},
-        ]
-    }
-    keys: Final = await _best_effort(
-        budget_id,
-        "keys",
-        lambda: VerificationTokenRepository(prisma_client).table.find_many(where=on_budget_or_its_organizations),
+    key_table: Final = VerificationTokenRepository(prisma_client).table
+    keys_on_budget, keys_of_its_organizations = await asyncio.gather(
+        _best_effort(budget_id, "keys", lambda: key_table.find_many(where=on_budget)),
+        _best_effort(
+            budget_id,
+            "keys of its organizations",
+            lambda: find_many_in(
+                key_table, "organization_id", tuple(org.organization_id for org in organizations or ())
+            ),
+        ),
     )
+    keys: Final = (*(keys_on_budget or ()), *(keys_of_its_organizations or ()))
     for membership in memberships or ():
         await _best_effort(
             budget_id,
