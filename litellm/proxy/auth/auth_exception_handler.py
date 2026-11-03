@@ -8,10 +8,10 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final
 
 from fastapi import HTTPException, Request, status
+from typing_extensions import TypeIs  # noqa: TID251  # TypeIs reaches typing only on 3.13
 
 import litellm
 from litellm._logging import verbose_proxy_logger, verbose_proxy_stdout_logger
-from litellm.constants import EMPTY_MAPPING
 from litellm.integrations.otel.runtime import seed_request_identity
 from litellm.litellm_core_utils.core_helpers import is_expected_client_error
 from litellm.proxy._types import (
@@ -96,6 +96,13 @@ _CLIENT_CONTEXT_FIELDS: Final = ("requester_ip_address", "user_agent")
 _CALLER_CLIENT_CONTEXT_NAMES: Final = frozenset((*_CLIENT_CONTEXT_FIELDS, VERIFIED_CLIENT_CONTEXT_KEY))
 
 
+_NO_METADATA: Final[Mapping[str, object]] = MappingProxyType({})
+
+
+def _is_metadata_bucket(value: object) -> TypeIs[Mapping[str, object]]:  # guard-ok: request metadata keys are str
+    return isinstance(value, Mapping)
+
+
 def _without_client_context(metadata: Mapping[str, object]) -> Mapping[str, object]:
     return MappingProxyType(
         {name: value for name, value in metadata.items() if name not in _CALLER_CLIENT_CONTEXT_NAMES}
@@ -115,14 +122,14 @@ def _with_client_context(
     key: Final = "litellm_metadata" if "litellm_metadata" in request_data else "metadata"
     other: Final = "metadata" if key == "litellm_metadata" else "litellm_metadata"
     metadata: Final = request_data.get(key)
-    base: Final[Mapping[str, object]] = metadata if isinstance(metadata, Mapping) else EMPTY_MAPPING
+    base: Final[Mapping[str, object]] = metadata if _is_metadata_bucket(metadata) else _NO_METADATA
     stamped: Final[dict[str, object]] = {
         **{name: value for name, value in zip(_CLIENT_CONTEXT_FIELDS, (requester_ip, user_agent)) if value},
         VERIFIED_CLIENT_CONTEXT_KEY: VerifiedClientContext(requester_ip_address=requester_ip, user_agent=user_agent),
     }
     other_metadata: Final = request_data.get(other)
     other_rewritten: Final = (
-        {other: _without_client_context(other_metadata)} if isinstance(other_metadata, Mapping) else {}
+        {other: _without_client_context(other_metadata)} if _is_metadata_bucket(other_metadata) else {}
     )
     return {**request_data, key: {**_without_client_context(base), **stamped}, **other_rewritten}
 
