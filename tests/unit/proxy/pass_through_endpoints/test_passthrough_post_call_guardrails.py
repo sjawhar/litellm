@@ -312,3 +312,119 @@ def test_modify_response_exception_importable_from_both_paths():
     )
 
     assert FromExceptions is FromGuardrail
+
+
+_CLIENT_BUCKETS = {
+    "metadata": {"user_id": "s1", "model_group": "client-chosen"},
+    "litellm_metadata": {"model_group": "client-chosen"},
+}
+_PROVIDER_ROUTES = (
+    pytest.param(
+        "/anthropic/v1/messages",
+        "https://api.anthropic.com/v1/messages",
+        "anthropic",
+        {"model": "claude-ok", "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]},
+        "claude-ok",
+        id="anthropic",
+    ),
+    pytest.param(
+        "/gemini/v1beta/models/gemini-2.5-flash:generateContent",
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+        "gemini",
+        {"contents": [{"role": "user", "parts": [{"text": "hi"}]}]},
+        "gemini-2.5-flash",
+        id="gemini",
+    ),
+)
+
+
+async def _failure_row_model_group(request_data, route):
+    from datetime import datetime
+
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.db.db_spend_update_writer import DBSpendUpdateWriter
+    from litellm.proxy.hooks.proxy_track_cost_callback import ProxyDBLogger
+    from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+
+    writer = MagicMock(spec=DBSpendUpdateWriter)
+    writer.update_database = AsyncMock()
+    await ProxyDBLogger(spend_writer=lambda: writer).async_post_call_failure_hook(
+        request_data=request_data,
+        original_exception=Exception("refused"),
+        user_api_key_dict=UserAPIKeyAuth(api_key="hashed-key", request_route=route),
+    )
+    now = datetime.now()
+    return get_logging_payload(
+        kwargs=writer.update_database.call_args.kwargs["kwargs"], response_obj=None, start_time=now, end_time=now
+    )["model_group"]
+
+
+async def _drive_provider_pass_through(mock_proxy_logging, upstream_response, path, target, provider, body):
+    from fastapi import Request
+
+    from litellm.proxy._types import UserAPIKeyAuth
+
+    request = Request({"type": "http", "method": "POST", "path": path, "headers": [], "query_string": b""})
+    with _common_patches(mock_proxy_logging, upstream_response):
+        with patch(f"{_PT_MOD}.read_request_body", new_callable=AsyncMock, return_value=body):
+            return await pass_through_request(
+                request=request,
+                target=target,
+                custom_headers={"Content-Type": "application/json"},
+                user_api_key_dict=UserAPIKeyAuth(api_key="hashed-key", request_route=path),
+                stream=False,
+                custom_llm_provider=provider,
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path, target, provider, request_body, route_model", _PROVIDER_ROUTES)
+@patch(_COLLECT, return_value=["rubrik"])
+async def test_response_guardrail_block_failure_row_takes_the_routes_model_group(
+    mock_collect, path, target, provider, request_body, route_model
+):
+    """A response guardrail that blocks a built-in provider pass-through reply hands back the hook's own
+    request dict, so the failure spend row must take model_group from the route, not from the body"""
+
+    async def block(data, user_api_key_dict, response):
+        raise ModifyResponseException(message="blocked", model=route_model, request_data=data, guardrail_name="rubrik")
+
+    mock_proxy_logging = MagicMock()
+    mock_proxy_logging.pre_call_hook = AsyncMock(side_effect=lambda **kwargs: kwargs["data"])
+    mock_proxy_logging.post_call_success_hook = AsyncMock(side_effect=block)
+    mock_proxy_logging.post_call_failure_hook = AsyncMock()
+    mock_proxy_logging.post_call_response_headers_hook = AsyncMock(return_value={})
+
+    result = await _drive_provider_pass_through(
+        mock_proxy_logging, _make_httpx_response({"ok": True}), path, target, provider, {**request_body, **_CLIENT_BUCKETS}
+    )
+
+    assert json.loads(result.body)["error"]["type"] == "content_filter"
+    request_data = mock_proxy_logging.post_call_failure_hook.call_args.kwargs["request_data"]
+    assert await _failure_row_model_group(request_data, path) == route_model
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path, target, provider, request_body, route_model", _PROVIDER_ROUTES)
+@patch(_COLLECT, return_value=[])
+async def test_upstream_error_failure_row_takes_the_routes_model_group(
+    mock_collect, path, target, provider, request_body, route_model
+):
+    """An upstream 4xx on a built-in provider pass-through is logged from the body plus the pass-through
+    kwargs, so the failure spend row must take model_group from the route, not from the body"""
+    mock_proxy_logging = MagicMock()
+    mock_proxy_logging.pre_call_hook = AsyncMock(side_effect=lambda **kwargs: kwargs["data"])
+    mock_proxy_logging.post_call_failure_hook = AsyncMock()
+    mock_proxy_logging.post_call_response_headers_hook = AsyncMock(return_value={})
+
+    await _drive_provider_pass_through(
+        mock_proxy_logging,
+        _make_httpx_response({"error": {"type": "invalid_request_error"}}, 400),
+        path,
+        target,
+        provider,
+        {**request_body, **_CLIENT_BUCKETS},
+    )
+
+    request_data = mock_proxy_logging.post_call_failure_hook.call_args.kwargs["request_data"]
+    assert await _failure_row_model_group(request_data, path) == route_model

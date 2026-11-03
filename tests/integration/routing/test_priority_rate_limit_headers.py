@@ -85,7 +85,7 @@ def test_non_streaming_v1_messages_success_carries_v3_priority_rate_limit_header
             rpm=MODEL_RPM,
             tpm=MODEL_TPM,
         )
-        key: Final = scenario.key(metadata={"priority": "premium"})
+        key: Final = scenario.key(team_id=scenario.team(metadata={"priority": "premium"}))
         response: Final = candidate.request(
             "POST",
             "/v1/messages",

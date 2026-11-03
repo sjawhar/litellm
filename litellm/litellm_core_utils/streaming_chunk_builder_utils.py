@@ -5,6 +5,7 @@ from itertools import groupby
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, TypeAlias, TypedDict, Union, cast
 
+from pydantic import TypeAdapter, ValidationError
 from typing_extensions import ReadOnly, Required
 
 from litellm._logging import verbose_logger
@@ -48,6 +49,18 @@ if TYPE_CHECKING:
         ChatCompletionRedactedThinkingBlock,
         ChatCompletionThinkingBlock,
     )
+
+
+_OBJECT_LIST: Final = TypeAdapter(list[object])
+
+
+def _object_list(value: object) -> Sequence[object] | None:
+    if value is None:
+        return None
+    try:
+        return _OBJECT_LIST.validate_python(value)
+    except ValidationError:
+        return None
 
 
 class _ThinkingBlockFragment(TypedDict, total=False):
@@ -998,6 +1011,19 @@ class ChunkProcessor:
         ]
         return values[-1] if values else None
 
+    def _last_iterations(self, chunks: Sequence["_UsageBearingChunk | ModelResponse"]) -> Sequence[object] | None:
+        """
+        The last ``usage.iterations`` a chunk carried. Anthropic sends every attempt's model and tokens there on the
+        final ``message_delta``, and a reply its server-side fallback served is priced attempt by attempt from it.
+        """
+        values: Final = tuple(
+            iterations
+            for chunk in chunks
+            if (usage_chunk := self._extract_usage_chunk(chunk)) is not None
+            and (iterations := _object_list(getattr(usage_chunk, "iterations", None))) is not None
+        )
+        return values[-1] if values else None
+
     @staticmethod
     def _finish_reason_of_choice(choice: object) -> str | None:
         match choice:
@@ -1170,6 +1196,7 @@ class ChunkProcessor:
             for field, value in (
                 ("inference_geo", calculated_usage_per_chunk["inference_geo"]),
                 ("speed", calculated_usage_per_chunk["speed"]),
+                ("iterations", self._last_iterations(chunks)),
             )
             if value is not None
         }

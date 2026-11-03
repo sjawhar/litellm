@@ -13,11 +13,16 @@ from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.core_helpers import get_metadata_variable_name_from_kwargs, safe_deep_copy
 from litellm.litellm_core_utils.get_llm_provider_logic import inferred_provider
 from litellm.litellm_core_utils.sensitive_data_masker import mask_sensitive_structure
+from litellm.llms.anthropic.common_utils import OBJECT_LIST_ADAPTER, anthropic_owns_fallbacks
 from litellm.router_utils.add_retry_fallback_headers import (
     add_fallback_headers_to_response,
     get_fallback_error_info,
 )
 from litellm.router_utils.batch_utils import get_router_metadata_variable_name
+from litellm.router_utils.clientside_credential_handler import (
+    reject_fallback_target_credentials,
+    reject_fallback_target_routing,
+)
 from litellm.router_utils.cooldown_handlers import (
     _first_present,  # pyright: ignore[reportPrivateUsage] - shared internal helper, used across router_utils
     cast_exception_status_to_int,
@@ -305,13 +310,61 @@ def carry_over_pre_routing_selection(live_kwargs: Mapping[str, object], snapshot
 
 
 MID_STREAM_FALLBACK_CONTROLS_KEY: Final = "_mid_stream_fallback_controls"
+ROUTER_FALLBACKS_KWARG: Final = "router_fallbacks"
 _PER_REQUEST_FALLBACK_CONTROL_KEYS: Final = (
     "fallbacks",
+    ROUTER_FALLBACKS_KWARG,
     "context_window_fallbacks",
     "content_policy_fallbacks",
     "num_retries",
     "model_group_retry_policy",
 )
+
+
+def provider_owns_fallbacks_field(kwargs: Mapping[str, object], *, anthropic_messages_call: bool = False) -> bool:
+    """
+    Whether this anthropic_messages request's `fallbacks` is Anthropic's server-side fallback list, which then goes to
+    Anthropic as is while the Router's own per-request list rides in ROUTER_FALLBACKS_KWARG. A caller that knows the
+    call is anthropic_messages says so, since not every kwargs carries ``original_generic_function``.
+    """
+    function_name: Final[object] = getattr(kwargs.get("original_generic_function"), "__name__", None)
+    return (anthropic_messages_call or function_name == "anthropic_messages") and anthropic_owns_fallbacks(kwargs)
+
+
+def _router_fallbacks_key(kwargs: Mapping[str, object], anthropic_messages_call: bool) -> str:
+    return (
+        ROUTER_FALLBACKS_KWARG
+        if provider_owns_fallbacks_field(kwargs, anthropic_messages_call=anthropic_messages_call)
+        else "fallbacks"
+    )
+
+
+def reject_non_list_litellm_fallbacks(fallbacks: object, model: object, *, field: str = "fallbacks") -> None:
+    """LiteLLM fallback fields hold lists of model groups."""
+    if fallbacks is not None and not isinstance(fallbacks, list):
+        raise litellm.BadRequestError(
+            message=f"LiteLLM {field} must be a list of model groups, got {type(fallbacks).__name__}",
+            model=model if isinstance(model, str) else "",
+            llm_provider="",
+        )
+
+
+def request_fallbacks(
+    kwargs: Mapping[str, object], router_fallbacks: Sequence[object] | None, *, anthropic_messages_call: bool = False
+) -> list[object] | None:
+    """The Router's fallback list for this request: the per-request override, else the Router's own"""
+    fallbacks: Final = kwargs.get(_router_fallbacks_key(kwargs, anthropic_messages_call), router_fallbacks)
+    reject_non_list_litellm_fallbacks(fallbacks, kwargs.get("model"))
+    return None if fallbacks is None else OBJECT_LIST_ADAPTER.validate_python(fallbacks)
+
+
+def pop_request_fallbacks(
+    kwargs: dict[str, object],  # mutable-ok: async_function_with_retries pops its controls before the attempt runs
+    router_fallbacks: Sequence[object] | None,
+) -> list[object] | None:
+    fallbacks: Final = kwargs.pop(_router_fallbacks_key(kwargs, False), router_fallbacks)
+    reject_non_list_litellm_fallbacks(fallbacks, kwargs.get("model"))
+    return None if fallbacks is None else OBJECT_LIST_ADAPTER.validate_python(fallbacks)
 
 
 @dataclass(frozen=True, slots=True)
@@ -381,6 +434,9 @@ def mid_stream_fallback_hop_kwargs(
 
 
 _MID_STREAM_RETRY_STRIPPED_KEYS: Final = (*_PER_REQUEST_FALLBACK_CONTROL_KEYS, "original_function")
+_PROVIDER_FALLBACKS_RETRY_STRIPPED_KEYS: Final = tuple(
+    key for key in _MID_STREAM_RETRY_STRIPPED_KEYS if key != "fallbacks"
+)
 _MID_STREAM_RETRY_ATTEMPTED_KEY: Final = "attempted_retries"
 _MID_STREAM_RETRY_BUDGET_KEY: Final = "max_retries"
 
@@ -393,7 +449,12 @@ def mid_stream_retry_kwargs(
     pops the per-request controls and the chain's original_function before any attempt runs, and
     the controls carrier the snapshot still holds restores the overrides into the retry's own hop.
     """
-    return {key: value for key, value in hop_kwargs.items() if key not in _MID_STREAM_RETRY_STRIPPED_KEYS}
+    stripped: Final = (
+        _PROVIDER_FALLBACKS_RETRY_STRIPPED_KEYS
+        if provider_owns_fallbacks_field(hop_kwargs)
+        else _MID_STREAM_RETRY_STRIPPED_KEYS
+    )
+    return {key: value for key, value in hop_kwargs.items() if key not in stripped}
 
 
 def _request_metadata_bucket(kwargs: Mapping[str, object]) -> Mapping[str, object] | None:
@@ -730,13 +791,20 @@ async def run_async_fallback(
     failed_model_group: Final = get_pre_routing_selection(kwargs) or original_model_group
     attempted.record(failed_model_group)
 
-    # A dict target is merged straight into kwargs below, and kwargs win over the deployment's own
-    # params, so a stored key/team/global fallback could otherwise set a federation field that the
-    # request itself is forbidden to carry. Checked here rather than at the merge: inside the loop
-    # the refusal would be caught as a per-target failure and quietly skipped to the next one.
+    # A dict target is merged straight into kwargs below, and kwargs win over the deployment's own params, so a target
+    # could otherwise set a federation field, or a credential, endpoint or header that runs the hop under the
+    # deployment's identity, whichever request field or setting the list came from. Checked here rather than at the
+    # merge: inside the loop the refusal would be caught as a per-target failure and quietly skipped to the next one.
+    credentials_allowed: Final[Callable[[], bool] | None] = getattr(
+        litellm_router, "fallback_target_credentials_allowed", None
+    )
+    refuses_credentials: Final = credentials_allowed is None or not credentials_allowed()
     for target in fallback_model_group:
         if isinstance(target, dict):
             reject_server_owned_wif_params(target)
+            reject_fallback_target_routing(target)
+            if refuses_credentials:
+                reject_fallback_target_credentials(target)
 
     for mg in fallback_model_group:
         if mg == failed_model_group:

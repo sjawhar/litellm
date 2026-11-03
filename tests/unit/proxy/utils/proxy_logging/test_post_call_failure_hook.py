@@ -817,6 +817,148 @@ async def test_handle_logging_proxy_only_path_no_logging_obj_creates_one(
     fake_logging_obj.async_failure_handler.assert_called_once()
 
 
+class _FailureEventRecorder(CustomLogger):
+    def __init__(self) -> None:
+        super().__init__()
+        self.logged_litellm_params: list[dict] = []
+        self.logged_payload_metadata: list[dict] = []
+
+    async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time) -> None:
+        self.logged_litellm_params.append(kwargs["litellm_params"])
+        self.logged_payload_metadata.append((kwargs.get("standard_logging_object") or {}).get("metadata") or {})
+
+
+@pytest.mark.asyncio
+async def test_auth_gate_failure_logs_the_authenticated_identity_instead_of_caller_user_api_key_fields(
+    proxy_logging, make_user_api_key_auth, monkeypatch
+):
+    recorder = _FailureEventRecorder()
+    monkeypatch.setattr(litellm, "callbacks", [recorder])
+    forged = {
+        "user_api_key": "f" * 64,
+        "user_api_key_team_id": "forged-team",
+        "user_api_key_team_metadata": {"priority": "forged"},
+        "user_api_key_metadata": {"priority": "forged"},
+    }
+
+    authenticated = make_user_api_key_auth(
+        team_metadata={"priority": "high", "callback_settings": {"success_callback": ["langfuse"]}}
+    )
+    await proxy_logging._handle_logging_proxy_only_error(
+        request_data={
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {**forged, "department": "engineering"},
+            "litellm_metadata": {**forged, "trace_id": "trace-1"},
+        },
+        user_api_key_dict=authenticated,
+        route="/chat/completions",
+        original_exception=litellm.BudgetExceededError(current_cost=2.0, max_budget=1.0),
+    )
+
+    assert len(recorder.logged_litellm_params) == 1
+    logged_metadata = recorder.logged_litellm_params[0]["metadata"]
+    logged_litellm_metadata = recorder.logged_litellm_params[0]["litellm_metadata"]
+    assert {
+        "metadata": {key: logged_metadata.get(key) for key in ("department", *forged)},
+        "litellm_metadata": {key: logged_litellm_metadata.get(key) for key in ("trace_id", *forged)},
+        "logged_key_hash": recorder.logged_payload_metadata[0].get("user_api_key_hash"),
+    } == {
+        "metadata": {
+            "department": "engineering",
+            "user_api_key": None,
+            "user_api_key_team_id": authenticated.team_id,
+            "user_api_key_team_metadata": {"priority": "high"},
+            "user_api_key_metadata": None,
+        },
+        "litellm_metadata": {
+            "trace_id": "trace-1",
+            "user_api_key": None,
+            "user_api_key_team_id": None,
+            "user_api_key_team_metadata": None,
+            "user_api_key_metadata": None,
+        },
+        "logged_key_hash": authenticated.api_key,
+    }
+
+
+@pytest.mark.asyncio
+async def test_failure_after_add_litellm_data_to_request_keeps_the_fields_the_proxy_stamped(
+    proxy_logging, make_user_api_key_auth, monkeypatch
+):
+    recorder = _FailureEventRecorder()
+    monkeypatch.setattr(litellm, "callbacks", [recorder])
+    authenticated = make_user_api_key_auth()
+    stamped = {
+        "user_api_key_auth": authenticated,
+        "user_api_key_model_max_budget": {"gpt-4o": 5.0},
+        "user_api_key_budget_reservation": {"id": "reservation-1"},
+        "user_api_key_metadata": {"owner": "platform"},
+    }
+
+    await proxy_logging._handle_logging_proxy_only_error(
+        request_data={
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": dict(stamped),
+        },
+        user_api_key_dict=authenticated,
+        route="/assistants",
+        original_exception=litellm.BudgetExceededError(current_cost=2.0, max_budget=1.0),
+    )
+
+    assert len(recorder.logged_litellm_params) == 1
+    logged_metadata = recorder.logged_litellm_params[0]["metadata"]
+    assert {key: logged_metadata.get(key) for key in (*stamped, "user_api_key_team_id")} == {
+        **stamped,
+        "user_api_key_team_id": authenticated.team_id,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "forged_auth",
+    ({"team_id": "evil"}, "UserAPIKeyAuth", [{"team_id": "evil"}], None),
+    ids=("dict", "string", "list", "null"),
+)
+async def test_a_body_shaped_like_the_proxy_stamp_does_not_buy_the_caller_its_identity(
+    proxy_logging, make_user_api_key_auth, monkeypatch, forged_auth
+):
+    recorder = _FailureEventRecorder()
+    monkeypatch.setattr(litellm, "callbacks", [recorder])
+    authenticated = make_user_api_key_auth()
+
+    await proxy_logging._handle_logging_proxy_only_error(
+        request_data={
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {
+                "user_api_key_auth": forged_auth,
+                "user_api_key": "f" * 64,
+                "user_api_key_team_id": "forged-team",
+            },
+        },
+        user_api_key_dict=authenticated,
+        route="/chat/completions",
+        original_exception=litellm.BudgetExceededError(current_cost=2.0, max_budget=1.0),
+    )
+
+    assert len(recorder.logged_litellm_params) == 1
+    logged_metadata = recorder.logged_litellm_params[0]["metadata"]
+    assert {
+        "user_api_key_auth": logged_metadata.get("user_api_key_auth"),
+        "user_api_key": logged_metadata.get("user_api_key"),
+        "user_api_key_team_id": logged_metadata.get("user_api_key_team_id"),
+        "logged_key_hash": recorder.logged_payload_metadata[0].get("user_api_key_hash"),
+    } == {
+        "user_api_key_auth": None,
+        "user_api_key": None,
+        "user_api_key_team_id": authenticated.team_id,
+        "logged_key_hash": authenticated.api_key,
+    }
+
+
+
 @pytest.mark.asyncio
 async def test_handle_logging_proxy_only_path_propagates_async_failure_raises(proxy_logging, make_user_api_key_auth):
     logging_obj = MagicMock()
@@ -944,3 +1086,101 @@ async def test_post_call_failure_hook_guardrail_block_fires_failure_callback(
     await asyncio.sleep(0)
     await asyncio.sleep(0)
     assert recorded == ["failure"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["/chat/completions", "/v1/messages"])
+async def test_auth_gate_failure_spend_row_takes_the_proxys_model_group_over_the_callers(
+    proxy_logging, make_user_api_key_auth, monkeypatch, route
+):
+    """An auth-gate rejection is logged from a body that never reached add_litellm_data_to_request,
+    so a model_group the caller put in either metadata bucket must not reach the failure spend row"""
+    from litellm.proxy import proxy_server
+    from litellm.proxy._types import ProxyException
+    from litellm.proxy.db.db_spend_update_writer import DBSpendUpdateWriter
+    from litellm.proxy.hooks.proxy_track_cost_callback import ProxyDBLogger
+    from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+
+    writer: Final = MagicMock(spec=DBSpendUpdateWriter)
+    writer.update_database = AsyncMock()
+    monkeypatch.setattr(
+        proxy_server,
+        "llm_router",
+        litellm.Router(
+            model_list=[
+                {"model_name": "internal-model", "litellm_params": {"model": "openai/gpt-4.1", "api_key": "sk-test"}}
+            ]
+        ),
+    )
+    monkeypatch.setattr(litellm, "callbacks", [ProxyDBLogger(spend_writer=lambda: writer)])
+    proxy_logging.alert_types = []
+
+    await proxy_logging.post_call_failure_hook(
+        request_data={
+            "model": "internal-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"user_id": "s1", "model_group": "client-chosen"},
+            "litellm_metadata": {"model_group": "client-chosen"},
+        },
+        original_exception=ProxyException(
+            message="key not allowed to access model", type=ProxyErrorTypes.auth_error, param=None, code=401
+        ),
+        user_api_key_dict=make_user_api_key_auth(request_route=route),
+        error_type=ProxyErrorTypes.auth_error,
+        route=route,
+    )
+
+    now: Final = datetime.now()
+    payload: Final = get_logging_payload(
+        kwargs=writer.update_database.call_args.kwargs["kwargs"], response_obj=None, start_time=now, end_time=now
+    )
+    assert payload["model_group"] == "internal-model"
+
+
+@pytest.mark.asyncio
+async def test_search_call_rejected_inside_add_litellm_data_to_request_keeps_the_tools_model_group(
+    proxy_logging, make_user_api_key_auth, monkeypatch
+):
+    """A search call rejected inside add_litellm_data_to_request (no session id under
+    missing_session_id: reject) is logged with no logging object yet, after the endpoint stamped its
+    own group; the failure row keeps that group and still drops the caller's"""
+    from fastapi import Request
+
+    from litellm.proxy._types import ProxyException
+    from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
+    from litellm.proxy.db.db_spend_update_writer import DBSpendUpdateWriter
+    from litellm.proxy.hooks.proxy_track_cost_callback import ProxyDBLogger
+    from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+
+    writer: Final = MagicMock(spec=DBSpendUpdateWriter)
+    writer.update_database = AsyncMock()
+    monkeypatch.setattr(litellm, "callbacks", [ProxyDBLogger(spend_writer=lambda: writer)])
+    proxy_logging.alert_types = []
+    request: Final = Request(
+        {"type": "http", "method": "POST", "path": "/v1/search", "headers": [], "query_string": b""}
+    )
+    auth: Final = make_user_api_key_auth(request_route="/v1/search")
+    processor: Final = ProxyBaseLLMRequestProcessing(
+        data={"model": "search-a", "query": "litellm", "metadata": {"model_group": "client-chosen"}},
+        model_group="search-a",
+    )
+
+    with pytest.raises(ProxyException) as rejected:
+        await processor.common_processing_pre_call_logic(
+            request=request,
+            general_settings={"missing_session_id": "reject"},
+            user_api_key_dict=auth,
+            proxy_logging_obj=proxy_logging,
+            proxy_config=MagicMock(),
+            route_type="asearch",
+        )
+    with pytest.raises(ProxyException):
+        await processor.handle_llm_api_exception(
+            e=rejected.value, user_api_key_dict=auth, proxy_logging_obj=proxy_logging, version=None
+        )
+
+    now: Final = datetime.now()
+    payload: Final = get_logging_payload(
+        kwargs=writer.update_database.call_args.kwargs["kwargs"], response_obj=None, start_time=now, end_time=now
+    )
+    assert payload["model_group"] == "search-a"

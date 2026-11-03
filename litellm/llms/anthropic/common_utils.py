@@ -5,10 +5,10 @@ This file contains common utils for anthropic calls.
 import copy
 import json
 import re
-from collections.abc import Mapping, MutableMapping, Sequence
+from collections.abc import Iterable, Mapping, MutableMapping, Sequence
 from datetime import datetime, timezone
 from types import MappingProxyType
-from typing import Any, ClassVar, Final, Literal, TypeVar
+from typing import Any, ClassVar, Final, Literal, Protocol, TypeVar, runtime_checkable
 from urllib.parse import quote
 
 import httpx
@@ -1656,11 +1656,65 @@ def is_anthropic_thinking_binding_mismatch_error(error_text: str) -> bool:
 
 def anthropic_request_errors_on_thinking_binding_mismatch(request_body: object) -> bool:
     """``thinking.block_binding.prefix_mismatch_behavior: error`` is the caller asking
-    for the 400, so a retry that strips thinking must not override it."""
+    for Anthropic's 400, so LiteLLM never strips that request's thinking."""
     body: Final = validated_object_mapping(request_body)
     thinking: Final = validated_object_mapping(body.get("thinking")) if body is not None else None
     binding: Final = validated_object_mapping(thinking.get("block_binding")) if thinking is not None else None
     return binding is not None and binding.get("prefix_mismatch_behavior") == "error"
+
+
+_SERVER_SIDE_FALLBACK_BETA_PREFIX: Final = "server-side-fallback-"
+
+
+@runtime_checkable
+class _HeaderItems(Protocol):
+    """Any header mapping, read through items() so every line of a repeated header counts"""
+
+    def items(self) -> Iterable[tuple[object, object]]: ...
+
+
+def _header_text(value: object) -> str | None:
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("latin-1")
+    return value if isinstance(value, str) else None
+
+
+def anthropic_beta_opts_into_server_side_fallback(headers: object) -> bool:
+    """Whether ``headers`` carry a ``server-side-fallback-*`` token in ``anthropic-beta``, matched as HTTP does"""
+    if not isinstance(headers, _HeaderItems):
+        return False
+    beta_values: Final = tuple(
+        text
+        for name, value in headers.items()
+        if (_header_text(name) or "").lower() == "anthropic-beta" and (text := _header_text(value)) is not None
+    )
+    return any(
+        token.strip().lower().startswith(_SERVER_SIDE_FALLBACK_BETA_PREFIX)
+        for token in ",".join(beta_values).split(",")
+    )
+
+
+def anthropic_owns_fallbacks(request: Mapping[str, object]) -> bool:
+    """
+    Whether the request's ``fallbacks`` field is Anthropic's server-side fallback list instead of LiteLLM's client-side
+    one: the request's ``anthropic-beta`` header opts into server-side fallback. ``request`` is the request kwargs,
+    whose headers arrive as ``headers``, ``extra_headers`` or the proxy's ``provider_specific_header``.
+    """
+    scoped: Final = request.get("provider_specific_header")
+    scoped_mapping: Final = validated_object_mapping(scoped)
+    scoped_headers: Final = (
+        (scoped_mapping,) if scoped_mapping is not None else tuple(validated_object_list(scoped) or ())
+    )
+    return any(
+        map(
+            anthropic_beta_opts_into_server_side_fallback,
+            (
+                request.get("headers"),
+                request.get("extra_headers"),
+                *((validated_object_mapping(header) or {}).get("extra_headers") for header in scoped_headers),
+            ),
+        )
+    )
 
 
 def strip_thinking_blocks_from_anthropic_messages(messages: Sequence[object]) -> list[object]:
@@ -1769,6 +1823,8 @@ def strip_thinking_blocks_from_anthropic_messages_request_dict(
     ``messages`` and remove ``thinking`` with its dependent context-management
     edits (see :func:`pop_thinking_and_clear_thinking_edits`).
     """
+    if anthropic_request_errors_on_thinking_binding_mismatch(data):
+        return
     msgs: Final = data.get("messages")
     if isinstance(msgs, list):
         data["messages"] = strip_thinking_blocks_from_anthropic_messages(msgs)
@@ -1777,6 +1833,8 @@ def strip_thinking_blocks_from_anthropic_messages_request_dict(
 
 def strip_empty_content_blocks_from_anthropic_messages(
     messages: Sequence[object],
+    *,
+    keep_thinking: bool = False,
 ) -> list[Any]:
     """
     Return a new message list with empty or whitespace-only ``{"type": "text"}``
@@ -1808,6 +1866,9 @@ def strip_empty_content_blocks_from_anthropic_messages(
     omitted, matching :func:`strip_thinking_blocks_from_anthropic_messages`.
     The caller's list and its content blocks are never mutated; modified
     messages are returned as shallow copies with a fresh content list.
+
+    ``keep_thinking`` leaves every thinking block in place, for a request whose
+    ``thinking.block_binding`` asks Anthropic for the error instead.
     """
     out: Final[list[Any]] = []
     for m in messages:
@@ -1815,7 +1876,11 @@ def strip_empty_content_blocks_from_anthropic_messages(
             out.append(m)
             continue
         content = m["content"]
-        filtered = [b for b in content if not _is_empty_text_block(b) and not is_empty_unsigned_thinking_block(b)]
+        filtered = [
+            b
+            for b in content
+            if not _is_empty_text_block(b) and (keep_thinking or not is_empty_unsigned_thinking_block(b))
+        ]
         if len(filtered) == len(content):
             out.append(m)
         elif filtered:

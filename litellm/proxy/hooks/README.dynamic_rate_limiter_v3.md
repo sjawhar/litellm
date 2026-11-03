@@ -102,17 +102,13 @@ litellm.priority_reservation_settings = PriorityReservationSettings(
 ```
 
 **Settings:**
-- `default_priority` (default: 0.5) - Priority weight for users without explicit priority metadata
+- `default_priority` (default: 0.5) - Priority weight for teams without a priority
 - `saturation_threshold` (default: 0.80) - Saturation level (0.0-1.0) at which strict priority enforcement begins
 - `tracking_multiplier` (default: 10) - Multiplier for model-wide tracking limits in strict mode
 
-### User Priority Assignment
+### Team Priority Assignment
 
-Set priority in user metadata:
-
-```python
-user_api_key_dict.metadata = {"priority": "premium"}
-```
+A request's priority is its team's `metadata.priority`, set with `PATCH /team/{team_id}` and the body `{"metadata": {"priority": "premium"}}`. A key's own metadata and the request body never set it. A request from a team with no priority, or with a priority missing from `priority_reservation`, shares the default pool.
 
 ## Priority Weight Normalization
 

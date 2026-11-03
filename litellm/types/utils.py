@@ -4666,13 +4666,13 @@ class PriorityReservationSettings(LiteLLMBaseModel):
     """
     Settings for priority-based rate limiting reservation.
 
-    Defines what priority to assign to keys without explicit priority metadata.
+    Defines the share given to teams without a priority in ``metadata.priority``.
     The priority_reservation mapping is configured separately via litellm.priority_reservation.
     """
 
     default_priority: float = Field(
         default=0.25,
-        description="Priority level to assign to API keys without explicit priority metadata. Should match a key in litellm.priority_reservation.",
+        description="Priority weight for teams without a priority in metadata.priority. They share one default pool.",
     )
 
     saturation_threshold: float = Field(

@@ -26,6 +26,7 @@ from litellm.types.router import GenericLiteLLMParams
 from ...common_utils import (
     AnthropicError,
     AnthropicModelInfo,
+    anthropic_request_errors_on_thinking_binding_mismatch,
     merge_anthropic_beta_headers,
     optionally_handle_anthropic_oauth,
     pop_thinking_for_model,
@@ -115,6 +116,7 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
             "output_config",
             "reasoning_effort",
             "safeguards",
+            *(("fallbacks",) if self._resolved_provider == "anthropic" else ()),
             # TODO: Add Anthropic `metadata` support
             # "metadata",
         ]
@@ -601,6 +603,9 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
                 message="max_tokens is required for Anthropic /v1/messages API",
                 status_code=400,
             )
+        caller_pins_thinking: Final = anthropic_request_errors_on_thinking_binding_mismatch(
+            anthropic_messages_optional_request_params
+        )
 
         self._translate_reasoning_effort_to_anthropic(
             model=model,
@@ -668,7 +673,9 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
             messages = strip_advisor_blocks_from_messages(messages)
 
         anthropic_messages_request: Final[AnthropicMessagesRequest] = AnthropicMessagesRequest(
-            messages=strip_encrypted_reasoning_blocks_from_anthropic_messages(messages),
+            messages=messages
+            if caller_pins_thinking
+            else strip_encrypted_reasoning_blocks_from_anthropic_messages(messages),
             max_tokens=max_tokens,
             model=model,
             **anthropic_messages_optional_request_params,

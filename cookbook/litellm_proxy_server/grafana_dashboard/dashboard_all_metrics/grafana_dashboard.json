@@ -6563,6 +6563,63 @@
       ],
       "title": "litellm_project_model_rate_limit_used_metric",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Current model-group saturation ratio from the dynamic rate limiter",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 447
+      },
+      "id": 115,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "max by (model_group, priority) (litellm_model_group_saturation_ratio)",
+          "legendFormat": "{{model_group}} / {{priority}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "litellm_model_group_saturation_ratio",
+      "type": "timeseries"
     }
   ],
   "preload": false,

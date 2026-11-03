@@ -33,6 +33,7 @@ on:
     branches:
       - main
       - "litellm_**"
+      - "release/**"
     paths:
       - "litellm-rust/**"
       - "litellm/rust_bridge/**"
