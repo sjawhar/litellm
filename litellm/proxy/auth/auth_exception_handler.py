@@ -115,9 +115,7 @@ def _with_client_context(
     base: Final[Mapping[str, object]] = metadata if isinstance(metadata, Mapping) else EMPTY_MAPPING
     stamped: Final[dict[str, object]] = {
         **{name: value for name, value in zip(_CLIENT_CONTEXT_FIELDS, (requester_ip, user_agent)) if value},
-        VERIFIED_CLIENT_CONTEXT_KEY: VerifiedClientContext(
-            requester_ip_address=requester_ip, user_agent=user_agent
-        ),
+        VERIFIED_CLIENT_CONTEXT_KEY: VerifiedClientContext(requester_ip_address=requester_ip, user_agent=user_agent),
     }
     other_metadata: Final = request_data.get(other)
     other_rewritten: Final = (
