@@ -2897,7 +2897,10 @@ class PrometheusLogger(CustomLogger):
                 proxy_server_request=request_data.get("proxy_server_request", {}),
             )
             _metadata: Final = request_data.get("metadata", {}) or {}
-            _client_context: Final = proxy_stamped_metadata_bucket(request_data) or _metadata
+            request_view: Final = cast(
+                Mapping[str, object], request_data
+            )  # cast-ok: the proxy request body is keyed by str
+            _client_context: Final = proxy_stamped_metadata_bucket(request_view) or _metadata
             model_id: Final = _metadata.get("model_info", {}).get("id") or request_data.get("model_info", {}).get("id")
             rate_limit_category, rate_limit_type = self._extract_rate_limit_labels(original_exception)
             api_provider: Final = self._extract_api_provider_from_request_data(
