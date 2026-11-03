@@ -142,8 +142,8 @@ from litellm.types.llms.openai import (
 )
 from litellm.types.mcp import MCPPostCallResponseObject
 from litellm.types.prompts.init_prompts import PromptSpec
-from litellm.types.rerank import RerankResponse
 from litellm.types.proxy.auth.client_context import VERIFIED_CLIENT_CONTEXT_KEY
+from litellm.types.rerank import RerankResponse
 from litellm.types.utils import (
     DEPLOYMENT_SCOPED_PRICING_FIELDS,
     CachingDetails,
