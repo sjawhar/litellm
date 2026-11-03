@@ -105,11 +105,7 @@ def _with_client_context(
     other: Final = "metadata" if key == "litellm_metadata" else "litellm_metadata"
     metadata: Final = request_data.get(key)
     base: Final[Mapping[str, object]] = metadata if isinstance(metadata, Mapping) else EMPTY_MAPPING
-    stamped: Final = {
-        name: value
-        for name, value in zip(_CLIENT_CONTEXT_FIELDS, (requester_ip, user_agent))
-        if value
-    }
+    stamped: Final = {name: value for name, value in zip(_CLIENT_CONTEXT_FIELDS, (requester_ip, user_agent)) if value}
     other_metadata: Final = request_data.get(other)
     other_rewritten: Final = (
         {other: _without_client_context(other_metadata)} if isinstance(other_metadata, Mapping) else {}
