@@ -318,6 +318,26 @@ class TestLoggingWorker:
 
         assert callback.await_count == 1
 
+    def test_flush_returns_after_a_task_the_worker_cannot_start(self):
+        """
+        Regression: a queued item that ``asyncio.create_task`` refuses (here ``None``, in the
+        realtime tests a ``MagicMock`` standing in for a handler's coroutine) was never marked done,
+        so the queue's unfinished counter stayed above zero and every later ``flush()`` waited forever
+        """
+        worker = LoggingWorker(timeout=1.0, max_queue_size=10)
+        callback = AsyncMock()
+
+        async def enqueue_then_flush_and_stop():
+            worker.ensure_initialized_and_enqueue(None)
+            worker.ensure_initialized_and_enqueue(callback())
+            await asyncio.wait_for(worker.flush(), timeout=3)
+            await worker.stop()
+
+        asyncio.run(enqueue_then_flush_and_stop())
+
+        assert callback.await_count == 1
+        worker._flush_on_exit()
+
     def test_flush_on_exit_swallows_cancellation_and_drains_remaining(self):
         """A callback raising CancelledError must not abort the atexit flush of later events."""
         worker = LoggingWorker(timeout=1.0, max_queue_size=10)

@@ -407,6 +407,10 @@ class AnthropicCompaction(TypedDict, total=False):
     instructions: ReadOnly[str]
 
 
+class AnthropicFallbackModel(TypedDict, total=False):
+    model: Required[ReadOnly[str]]
+
+
 class AnthropicMessagesRequestOptionalParams(TypedDict, total=False):
     max_tokens: int | None
     metadata: AnthropicMetadata | dict | None
@@ -430,6 +434,7 @@ class AnthropicMessagesRequestOptionalParams(TypedDict, total=False):
     cache_control: dict[str, Any] | None  # Automatic prompt caching
     reasoning_effort: str | None
     safeguards: ReadOnly[list[dict[str, object]] | None]
+    fallbacks: ReadOnly[Literal["default"] | Sequence[AnthropicFallbackModel] | None]
 
 
 class AnthropicMessagesRequest(AnthropicMessagesRequestOptionalParams, total=False):
