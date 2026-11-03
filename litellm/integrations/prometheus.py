@@ -15,7 +15,12 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Annotated, Any, Final, Generic, Literal, Protocol, TypeAlias, TypeVar, cast
 
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
-from typing_extensions import ReadOnly, TypedDict, assert_never
+from typing_extensions import (
+    ReadOnly,
+    TypedDict,
+    TypeIs,  # noqa: TID251  # TypeIs reaches typing only on 3.13
+    assert_never,
+)
 
 import litellm
 from litellm._internal_context import with_service_target
@@ -375,18 +380,24 @@ def _as_label(value: object) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _is_metadata_bucket(value: object) -> TypeIs[Mapping[str, object]]:  # guard-ok: request metadata keys are str
+    return isinstance(value, dict)
+
+
 def _trusted_client_context(
-    request_data: Mapping[str, object],
+    request_data: object,
     stamped_bucket_of: Callable[[Mapping[str, object]], Mapping[str, object] | None],
 ) -> tuple[str | None, str | None]:
     """The caller's address and User-Agent as the proxy resolved them, never as the body sent them. They come
     from the bucket the proxy stamped its identity into, or from the object the auth gate attaches when it
     rejects a request before that stamp exists. A body can send either name but neither of those two things."""
+    if not _is_metadata_bucket(request_data):
+        return None, None
     stamped: Final = stamped_bucket_of(request_data)
     if stamped is not None:
         return _as_label(stamped.get("requester_ip_address")), _as_label(stamped.get("user_agent"))
     for bucket in (request_data.get("metadata"), request_data.get("litellm_metadata")):
-        verified = bucket.get(VERIFIED_CLIENT_CONTEXT_KEY) if isinstance(bucket, dict) else None
+        verified = bucket.get(VERIFIED_CLIENT_CONTEXT_KEY) if _is_metadata_bucket(bucket) else None
         if isinstance(verified, VerifiedClientContext):
             return _as_label(verified.requester_ip_address), _as_label(verified.user_agent)
     return None, None
@@ -2922,7 +2933,10 @@ class PrometheusLogger(CustomLogger):
                 proxy_server_request=request_data.get("proxy_server_request", {}),
             )
             _metadata: Final = request_data.get("metadata", {}) or {}
-            _client_ip, _user_agent = _trusted_client_context(request_data, proxy_stamped_metadata_bucket)
+            request_view: Final = cast(
+                Mapping[str, object], request_data
+            )  # cast-ok: the proxy request body is keyed by str
+            _client_ip, _user_agent = _trusted_client_context(request_view, proxy_stamped_metadata_bucket)
             model_id: Final = _metadata.get("model_info", {}).get("id") or request_data.get("model_info", {}).get("id")
             rate_limit_category, rate_limit_type = self._extract_rate_limit_labels(original_exception)
             api_provider: Final = self._extract_api_provider_from_request_data(
