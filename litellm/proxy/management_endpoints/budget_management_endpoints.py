@@ -276,14 +276,17 @@ async def evict_budget_holders(budget_id: str) -> None:
             lambda: ModelAccessGroupBudgetRepository(prisma_client).table.find_many(where=on_budget),
         ),
     )
-    key_table: Final = VerificationTokenRepository(prisma_client).table
     keys_on_budget, keys_of_its_organizations = await asyncio.gather(
-        _best_effort(budget_id, "keys", lambda: key_table.find_many(where=on_budget)),
+        _best_effort(
+            budget_id, "keys", lambda: VerificationTokenRepository(prisma_client).table.find_many(where=on_budget)
+        ),
         _best_effort(
             budget_id,
             "keys of its organizations",
             lambda: find_many_in(
-                key_table, "organization_id", tuple(org.organization_id for org in organizations or ())
+                VerificationTokenRepository(prisma_client).table,
+                "organization_id",
+                tuple(org.organization_id for org in organizations or ()),
             ),
         ),
     )
