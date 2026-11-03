@@ -2100,6 +2100,7 @@ class BaseLLMHTTPHandler:
         api_key: str | None,
         model: str,
         timeout: float | httpx.Timeout | None = None,
+        caller_pins_thinking: bool = False,
     ) -> httpx.Response:
         max_attempts: Final = max(provider_config.max_retry_on_anthropic_messages_http_error, 1)
         litellm_params_dict: Final = dict(litellm_params)
@@ -2118,8 +2119,11 @@ class BaseLLMHTTPHandler:
                 return response
             except httpx.HTTPStatusError as e:
                 hit_max_attempt = attempt_idx + 1 == max_attempts
-                should_retry = provider_config.should_retry_anthropic_messages_on_http_error(
-                    e=e, litellm_params=litellm_params_dict, request_body=request_body
+                should_retry = (
+                    not caller_pins_thinking
+                    and provider_config.should_retry_anthropic_messages_on_http_error(
+                        e=e, litellm_params=litellm_params_dict, request_body=request_body
+                    )
                 )
                 if should_retry and not hit_max_attempt:
                     if logging_obj.baseline_cache_context is not None:
@@ -2229,6 +2233,9 @@ class BaseLLMHTTPHandler:
             litellm_params.get("additional_drop_params") or (),
             anthropic_messages_optional_request_params,
         )
+        from litellm.llms.anthropic.common_utils import anthropic_request_errors_on_thinking_binding_mismatch
+
+        caller_pins_thinking: Final = anthropic_request_errors_on_thinking_binding_mismatch(request_params)
         if (
             request_params.get("safeguards") is not None
             and anthropic_messages_provider_config.should_filter_anthropic_beta_headers()
@@ -2334,6 +2341,7 @@ class BaseLLMHTTPHandler:
             headers=headers,
             signed_json_body=(signed_json_body if signed_json_body is not None else request_body_json),
             request_body=request_body,
+            caller_pins_thinking=caller_pins_thinking,
             stream=stream or False,
             logging_obj=logging_obj,
             provider_config=anthropic_messages_provider_config,

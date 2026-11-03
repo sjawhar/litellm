@@ -767,6 +767,40 @@ async def test_new_team_persists_tpd_limit(mock_db_client, mock_admin_auth):
 
 
 @pytest.mark.asyncio
+async def test_new_team_persists_max_parallel_requests(mock_db_client, mock_admin_auth):
+    mock_db_client.jsonify_team_object = lambda db_data: db_data
+    mock_db_client.get_data = AsyncMock(return_value=None)
+    mock_db_client.update_data = AsyncMock(return_value=MagicMock())
+    mock_db_client.db = MagicMock()
+    mock_db_client.db.litellm_modeltable = MagicMock()
+    mock_db_client.db.litellm_modeltable.create = AsyncMock(return_value=MagicMock(id="model123"))
+
+    team_create_result = MagicMock(team_id="team-parallel")
+    team_create_result.model_dump.return_value = {"team_id": "team-parallel", "max_parallel_requests": 50}
+    mock_team_create = AsyncMock(return_value=team_create_result)
+    mock_db_client.db.litellm_teamtable = MagicMock()
+    mock_db_client.db.litellm_teamtable.create = mock_team_create
+    _wire_team_create_tx(mock_db_client)
+    mock_db_client.db.litellm_teamtable.count = AsyncMock(return_value=0)
+    mock_db_client.db.litellm_teamtable.update = AsyncMock(return_value=team_create_result)
+    mock_db_client.db.litellm_usertable = MagicMock()
+    mock_db_client.db.litellm_usertable.update = AsyncMock(return_value=MagicMock())
+
+    from fastapi import Request
+
+    from litellm.proxy._types import NewTeamRequest
+    from litellm.proxy.management_endpoints.team_endpoints import new_team
+
+    await new_team(
+        data=NewTeamRequest.model_validate({"team_alias": "parallel-team", "max_parallel_requests": 50}),
+        http_request=MagicMock(spec=Request),
+        user_api_key_dict=mock_admin_auth,
+    )
+
+    assert mock_team_create.call_args.kwargs["data"]["max_parallel_requests"] == 50
+
+
+@pytest.mark.asyncio
 async def test_new_team_with_mcp_tool_permissions(mock_db_client, mock_admin_auth):
     """
     Test that /team/new correctly handles mcp_tool_permissions in object_permission.
@@ -12997,6 +13031,20 @@ async def test_patch_preserves_explicit_null_as_a_clear():
 
     assert "max_budget" in written
     assert written["max_budget"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["post", "patch"])
+@pytest.mark.parametrize("value", [50, None], ids=["set", "clear"])
+async def test_team_update_and_patch_write_max_parallel_requests(kind, value):
+    """A token caller's only concurrency limit is its team's, so both write paths must carry it to the row."""
+    _, update_mock = await _drive_team_write(
+        kind, existing_kwargs={"max_parallel_requests": 10}, payload={"max_parallel_requests": value}
+    )
+    written = update_mock.call_args.kwargs["data"]
+
+    assert "max_parallel_requests" in written
+    assert written["max_parallel_requests"] == value
 
 
 def _patch_body_to_update_request(body: dict):

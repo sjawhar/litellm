@@ -1560,6 +1560,52 @@ class TestAnthropicThinkingSignatureSelfHeal:
         assert "thinking" not in data
         assert data["messages"] == []
 
+    def test_strip_thinking_request_dict_drops_clear_thinking_edits(self):
+        from litellm.llms.anthropic.common_utils import (
+            strip_thinking_blocks_from_anthropic_messages_request_dict,
+        )
+
+        data = {
+            "messages": [{"role": "assistant", "content": [{"type": "thinking", "thinking": "unsigned"}]}],
+            "thinking": {"type": "adaptive"},
+            "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
+        }
+        strip_thinking_blocks_from_anthropic_messages_request_dict(data)
+        assert "context_management" not in data
+
+    @pytest.mark.parametrize(
+        ("context_management", "expected"),
+        [
+            pytest.param(
+                {"edits": [{"type": "clear_thinking_20990101"}, {"type": "clear_tool_uses_20250919"}]},
+                {"edits": [{"type": "clear_tool_uses_20250919"}]},
+                id="any-clear-thinking-version-dropped-others-kept",
+            ),
+            pytest.param({"edits": [{"type": "clear_thinking_20251015"}]}, None, id="emptied-removed"),
+            pytest.param(
+                {"edits": [{"type": "clear_thinking_20251015"}], "extra": 1},
+                {"edits": [], "extra": 1},
+                id="other-keys-kept",
+            ),
+            pytest.param({"edits": []}, {"edits": []}, id="empty-edits-untouched"),
+            pytest.param("clear_thinking_20251015", "clear_thinking_20251015", id="non-dict-untouched"),
+            pytest.param({"edits": "clear_thinking"}, {"edits": "clear_thinking"}, id="non-list-edits-untouched"),
+            pytest.param(
+                {"edits": ["clear_thinking_20251015", {"type": "clear_thinking_20251015"}]},
+                {"edits": ["clear_thinking_20251015"]},
+                id="non-dict-edit-kept",
+            ),
+        ],
+    )
+    def test_pop_thinking_and_clear_thinking_edits(self, context_management, expected):
+        from litellm.llms.anthropic.common_utils import (
+            pop_thinking_and_clear_thinking_edits,
+        )
+
+        params = {"thinking": {"type": "adaptive"}, "context_management": context_management}
+        pop_thinking_and_clear_thinking_edits(params)
+        assert params == ({} if expected is None else {"context_management": expected})
+
     def test_strip_empty_content_blocks_from_anthropic_messages(self):
         """Covers #22930.  The core regression scenario: an assistant message
         with an empty text block alongside ``tool_use`` loses the empty block
@@ -4405,3 +4451,35 @@ def test_anthropic_error_frame_exception_classes_an_overloaded_frame_as_internal
     error: Final = anthropic_error_frame_exception("overloaded_error", "Overloaded", 503, "claude-sonnet-4-5")
 
     assert type(error) is litellm.InternalServerError
+
+
+@pytest.mark.parametrize(
+    ("request_kwargs", "expected"),
+    [
+        pytest.param(
+            {"extra_headers": {"anthropic-beta": "server-side-fallback-2026-07-01"}}, True, id="extra-headers"
+        ),
+        pytest.param({"headers": {"Anthropic-Beta": "a-beta, server-side-fallback-2026-06-01"}}, True, id="headers"),
+        pytest.param(
+            {
+                "provider_specific_header": [
+                    {"custom_llm_provider": "typesafe", "extra_headers": {"x-other": "1"}},
+                    {"custom_llm_provider": "anthropic", "extra_headers": {"anthropic-beta": "server-side-fallback-x"}},
+                ]
+            },
+            True,
+            id="proxy-scoped-headers",
+        ),
+        pytest.param({"headers": {b"anthropic-beta": b"server-side-fallback-2026-07-01"}}, True, id="bytes-headers"),
+        pytest.param({"extra_headers": {"anthropic-beta": "Server-Side-Fallback-2026-07-01"}}, True, id="token-case"),
+        pytest.param({"extra_headers": {"anthropic-beta": "fallback-credit-2026-07-01"}}, False, id="other-beta"),
+        pytest.param({"extra_headers": {"x-server-side-fallback-2026-07-01": "1"}}, False, id="other-header"),
+        pytest.param({"fallbacks": "default"}, False, id="no-headers"),
+    ],
+)
+def test_anthropic_owns_fallbacks_only_when_the_beta_header_opts_in(
+    request_kwargs: Mapping[str, object], expected: bool
+) -> None:
+    from litellm.llms.anthropic.common_utils import anthropic_owns_fallbacks
+
+    assert anthropic_owns_fallbacks(request_kwargs) is expected

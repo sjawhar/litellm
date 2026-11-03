@@ -4056,6 +4056,33 @@ async def test_load_config_warns_per_worker_login_counters_without_general_setti
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("num_workers", "warned"), [("10", True), ("1", False)])
+async def test_load_config_warns_that_rate_limits_are_per_worker_without_redis(
+    tmp_path, monkeypatch, caplog, num_workers, warned
+):
+    """Without Redis each worker counts the rpm, tpm and max_parallel_requests limits on its own, so a team at
+    max_parallel_requests 3 behind ten workers runs up to 30 calls at once. The operator must hear that at startup."""
+    import logging
+
+    import litellm.proxy.proxy_server as proxy_server
+    from litellm.proxy.hooks.parallel_request_limiter_v3 import warn_rate_limits_are_per_worker
+    from litellm.proxy.proxy_server import ProxyConfig
+
+    for redis_var in ("REDIS_HOST", "REDIS_URL", "REDIS_CLUSTER_NODES", "REDIS_SENTINEL_NODES"):
+        monkeypatch.delenv(redis_var, raising=False)
+    monkeypatch.setenv("NUM_WORKERS", num_workers)
+    monkeypatch.setattr(proxy_server, "redis_usage_cache", None)
+    warn_rate_limits_are_per_worker.cache_clear()
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("model_list: []\n")
+
+    with caplog.at_level(logging.WARNING, logger="LiteLLM Proxy"):
+        await ProxyConfig().load_config(router=MagicMock(), config_file_path=str(config_file))
+
+    assert ("so each one admits up to 10 times its value" in caplog.text) is warned
+
+
+@pytest.mark.asyncio
 async def test_load_config_warns_that_the_source_login_limit_is_off_without_trusted_proxy_ranges(
     tmp_path, monkeypatch, caplog
 ):
