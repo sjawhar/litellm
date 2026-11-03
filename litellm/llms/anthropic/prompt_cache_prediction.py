@@ -647,9 +647,10 @@ def prepare_native_baseline_body(request: Mapping[str, object], model: str) -> M
             model=resolved_model,
             custom_llm_provider="anthropic",
             tools=_MESSAGES.validate_python(owned.get("tools") or []),
+            thinking=owned.get("thinking"),
         )
         options: Final = AnthropicMessagesRequestUtils.get_requested_anthropic_messages_optional_param(
-            {**owned, "system": system},
+            {**context, "system": system},
             model=resolved_model,
             custom_llm_provider="anthropic",
             drop_params=owned.get("drop_params") is True,

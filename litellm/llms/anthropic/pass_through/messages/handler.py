@@ -16,6 +16,8 @@ from litellm.integrations.anthropic_cache_control_hook import AnthropicCacheCont
 from litellm.litellm_core_utils.exception_mapping_utils import exception_type
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.llms.anthropic.common_utils import (
+    anthropic_owns_fallbacks,
+    strip_empty_content_blocks_from_anthropic_messages,
     strip_provider_specific_fields_from_anthropic_messages,
     tools_marked_for_a_tool_config_point,
 )
@@ -25,6 +27,7 @@ from litellm.llms.base_llm.anthropic_messages.transformation import (
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.llms.custom_httpx.llm_http_handler import BaseLLMHTTPHandler
+from litellm.router_utils.fallback_event_handlers import reject_non_list_litellm_fallbacks
 from litellm.types.llms.anthropic_messages.anthropic_request import AnthropicMetadata
 from litellm.types.llms.anthropic_messages.anthropic_response import (
     AnthropicMessagesResponse,
@@ -36,7 +39,13 @@ from litellm.utils import ProviderConfigManager, client
 from ..adapters.handler import LiteLLMMessagesToCompletionTransformationHandler
 from ..responses_adapters.handler import LiteLLMMessagesToResponsesAPIHandler
 from .interceptors import get_messages_interceptors
-from .utils import AnthropicMessagesRequestUtils, mock_response, prepare_native_messages
+from .utils import (
+    AnthropicMessagesRequestUtils,
+    mock_response,
+    normalize_native_messages,
+    prepare_native_messages,
+    thinking_pinned_after_drops,
+)
 
 __all__ = ("anthropic_messages", "anthropic_messages_handler")
 
@@ -226,15 +235,15 @@ async def _try_websearch_short_circuit(
 @client
 async def anthropic_messages(
     max_tokens: int,
-    messages: list[dict],
+    messages: list[dict[str, object]],
     model: str,
     metadata: dict | None = None,
     stop_sequences: list[str] | None = None,
     stream: bool | None = False,
     system: str | list | None = None,
     temperature: float | None = None,
-    thinking: dict | None = None,
-    tool_choice: dict | None = None,
+    thinking: dict[str, object] | None = None,
+    tool_choice: dict[str, object] | None = None,
     tools: list[dict] | None = None,
     top_k: int | None = None,
     top_p: float | None = None,
@@ -249,9 +258,7 @@ async def anthropic_messages(
 
     Runs the empty-content-block sanitizer before any backend dispatch.
     """
-    messages, system = prepare_native_messages(
-        messages, system, kwargs, model=model, custom_llm_provider=custom_llm_provider, tools=tools, api_base=api_base
-    )
+    messages = normalize_native_messages(messages, keep_thinking=True)  # rebind-ok: the hooks see sanitized messages
 
     original_stream: Final = stream or kwargs.get("_websearch_interception_converted_stream", False)
 
@@ -297,6 +304,20 @@ async def anthropic_messages(
     request_kwargs.pop("litellm_params", None)
     # Merge back any other modifications
     kwargs.update(request_kwargs)
+    # Thinking blocks wait for the pin a pre-request hook leaves: an unpinned request drops its empty unsigned ones,
+    # before cache-control injection, which then runs once on the messages that go out.
+    dispatched_messages, dispatched_system = prepare_native_messages(
+        strip_empty_content_blocks_from_anthropic_messages(
+            messages, keep_thinking=thinking_pinned_after_drops(thinking, kwargs.get("additional_drop_params"))
+        ),
+        system,
+        kwargs,
+        model=model,
+        custom_llm_provider=custom_llm_provider if isinstance(custom_llm_provider, str) else None,
+        tools=tools,
+        api_base=api_base,
+        presanitized=True,
+    )
 
     # Short-circuit web-search-only requests: detect the pattern, execute
     # search directly via Tavily/Perplexity, and return a synthetic response
@@ -305,7 +326,7 @@ async def anthropic_messages(
     # callers get SSE events instead of a plain dict.
     short_circuit_response: Final = await _try_websearch_short_circuit(
         model=model,
-        messages=messages,
+        messages=dispatched_messages,
         tools=tools,
         custom_llm_provider=custom_llm_provider,
         stream=original_stream,
@@ -321,7 +342,7 @@ async def anthropic_messages(
         if interceptor.can_handle(tools, custom_llm_provider):
             return await interceptor.handle(
                 model=model,
-                messages=messages,
+                messages=dispatched_messages,
                 tools=tools,
                 stream=original_stream,
                 max_tokens=max_tokens,
@@ -330,7 +351,7 @@ async def anthropic_messages(
                 api_base=api_base,
                 metadata=metadata,
                 stop_sequences=stop_sequences,
-                system=system,
+                system=dispatched_system,
                 temperature=temperature,
                 thinking=thinking,
                 tool_choice=tool_choice,
@@ -345,12 +366,12 @@ async def anthropic_messages(
     func: Final = partial(
         anthropic_messages_handler,
         max_tokens=max_tokens,
-        messages=messages,
+        messages=dispatched_messages,
         model=model,
         metadata=metadata,
         stop_sequences=stop_sequences,
         stream=stream,
-        system=system,
+        system=dispatched_system,
         temperature=temperature,
         thinking=thinking,
         tool_choice=tool_choice,
@@ -361,9 +382,9 @@ async def anthropic_messages(
         api_base=api_base,
         client=client,
         custom_llm_provider=custom_llm_provider,
-        # messages were already empty-content-block sanitized at the top of this
-        # function and are NOT reassigned before this dispatch, so the handler
-        # can skip its (otherwise redundant) second full-messages scan. Passed
+        # messages were already empty-content-block sanitized above, thinking
+        # blocks under the pin the pre-request hooks left, so the handler can
+        # skip its (otherwise redundant) second full-messages scan. Passed
         # explicitly (not via **kwargs) so it only affects this direct
         # dispatch -- interceptor / sync entry points still sanitize.
         _litellm_messages_presanitized=True,
@@ -406,8 +427,8 @@ def anthropic_messages_handler(
     stream: bool | None = False,
     system: str | list | None = None,
     temperature: float | None = None,
-    thinking: dict | None = None,
-    tool_choice: dict | None = None,
+    thinking: dict[str, object] | None = None,
+    tool_choice: dict[str, object] | None = None,
     tools: list[dict] | None = None,
     top_k: int | None = None,
     top_p: float | None = None,
@@ -440,6 +461,7 @@ def anthropic_messages_handler(
         tools=tools,
         api_base=api_base,
         presanitized=bool(kwargs.pop("_litellm_messages_presanitized", False)),
+        thinking=thinking,
     )
 
     metadata = validate_anthropic_api_metadata(metadata)
@@ -549,9 +571,16 @@ def anthropic_messages_handler(
         )
     if anthropic_messages_provider_config is None:
         # Route to Responses API for OpenAI / Azure, chat/completions for everything else.
-        if kwargs.get("compaction") is None and _should_route_to_responses_api(
+        routes_to_responses_api: Final = kwargs.get("compaction") is None and _should_route_to_responses_api(
             custom_llm_provider, original_model, model
-        ):
+        )
+        # Anthropic's `fallbacks` has no meaning on a translated provider, and the Responses API has no client-side
+        # fallback, where LiteLLM's list would only suppress the success log. litellm.acompletion runs LiteLLM's list.
+        litellm_kwargs: Final = cast(dict[str, object], kwargs)  # cast-ok: untyped **kwargs
+        if routes_to_responses_api or anthropic_owns_fallbacks(litellm_kwargs):
+            litellm_kwargs.pop("fallbacks", None)
+        reject_non_list_litellm_fallbacks(litellm_kwargs.get("fallbacks"), original_model)
+        if routes_to_responses_api:
             return LiteLLMMessagesToResponsesAPIHandler.anthropic_messages_handler(
                 max_tokens=max_tokens,
                 messages=messages,

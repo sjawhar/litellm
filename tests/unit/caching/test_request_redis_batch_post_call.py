@@ -281,6 +281,36 @@ async def test_a_slot_released_before_the_response_reaches_redis_at_once_not_on_
 
 
 @pytest.mark.asyncio
+async def test_a_failed_post_call_slot_release_is_retried_until_redis_confirms_it():
+    """The pipelined release failed, so Redis still counts the slot. It is sent again on its own until Redis
+    answers, or every pod would count it against the key until the slot's hour runs out."""
+
+    def replies(command: tuple[object, ...]) -> object:
+        if command[0] == "EVALSHA":
+            return Exception("ERR Lua")
+        return _ok_replies(command)
+
+    redis_cache = DirectScriptFakeRedisCache(FakeClient(replies))
+    dual_cache = DualCache()
+    dual_cache.attach_redis_cache(redis_cache)
+    limiter = PROXY_MaxParallelRequestsHandler_v3(
+        internal_usage_cache=InternalUsageCache(dual_cache=dual_cache), parallel_slot_release_retry_delays=(0.0,)
+    )
+
+    with request_redis_batch_scope():
+        await limiter._release_stashed_parallel_slot(
+            _slot_stash("slot-1", "{api_key:k1}:parallel"), None, in_logging_callback=True
+        )
+        await flush_post_call_redis_batches()
+
+    for _ in range(20):
+        if redis_cache.alone:
+            break
+        await asyncio.sleep(0)
+    assert redis_cache.alone == [("EVALSHA", ("{api_key:k1}:parallel",), ("slot-1",))]
+
+
+@pytest.mark.asyncio
 async def test_a_released_slot_is_free_locally_at_once_and_the_older_redis_count_does_not_overwrite_the_gauge():
     def replies(command: tuple[object, ...]) -> object:
         if command[0] == "EVALSHA":

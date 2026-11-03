@@ -49,6 +49,7 @@ from litellm.proxy.common_request_processing import (
     resolve_litellm_call_id,
     ttft_keepalive_interval,
     _override_openai_response_model,
+    _server_side_fallback_routed_model,
     _parse_event_data_for_error,
     _resolve_per_request_model_group_alias,
     should_return_raw_model_name,
@@ -2994,6 +2995,62 @@ class TestExtractErrorFromSSEChunk:
         # Other fields should be obtained from the original error object (if exists)
 
 
+_SERVER_SIDE_FALLBACK_HEADER = {
+    "custom_llm_provider": "anthropic,bedrock",
+    "extra_headers": {"anthropic-beta": "server-side-fallback-2026-07-01"},
+}
+
+
+def _fallback_request(provider: str, deployment: str, **extra: object) -> dict:
+    return {
+        "litellm_logging_obj": SimpleNamespace(model_call_details={"custom_llm_provider": provider}),
+        "litellm_metadata": {"deployment": deployment},
+        "provider_specific_header": _SERVER_SIDE_FALLBACK_HEADER,
+        **extra,
+    }
+
+
+@pytest.mark.parametrize(
+    ("request_data", "expected"),
+    [
+        pytest.param(
+            _fallback_request("anthropic", "anthropic/claude-fable-5", fallbacks="default"),
+            "anthropic/claude-fable-5",
+            id="fallbacks-direct-anthropic",
+        ),
+        pytest.param(
+            _fallback_request("anthropic", "claude-fable-5", fallbacks="default"),
+            "claude-fable-5",
+            id="fallbacks-direct-anthropic-without-prefix",
+        ),
+        pytest.param(_fallback_request("anthropic", "anthropic/claude-fable-5"), None, id="no-fallbacks"),
+        pytest.param(
+            _fallback_request(
+                "anthropic", "anthropic/claude-fable-5", fallbacks=[{"group": ["other"]}], provider_specific_header=None
+            ),
+            None,
+            id="fallbacks-without-the-beta-are-litellm-fallbacks",
+        ),
+        pytest.param(_fallback_request("openai", "openai/gpt-4o", fallbacks="default"), None, id="not-anthropic"),
+        pytest.param(
+            _fallback_request("bedrock", "bedrock/us.anthropic.claude-sonnet-4-5", fallbacks="default"),
+            None,
+            id="anthropic-on-bedrock",
+        ),
+        pytest.param(
+            {
+                **_fallback_request("bedrock", "bedrock/us.anthropic.claude-sonnet-4-5", fallbacks="default"),
+                "metadata": {"deployment": "anthropic/x"},
+            },
+            None,
+            id="client-metadata-ignored",
+        ),
+    ],
+)
+def test_server_side_fallback_routed_model_only_for_fallbacks_to_direct_anthropic(request_data, expected):
+    assert _server_side_fallback_routed_model(request_data) == expected
+
+
 class TestOverrideOpenAIResponseModel:
     """Tests for _override_openai_response_model function"""
 
@@ -3103,6 +3160,26 @@ class TestOverrideOpenAIResponseModel:
 
         # Verify the model WAS overridden to requested model
         assert response_obj["model"] == requested_model
+
+    @pytest.mark.parametrize(
+        ("provider_model", "client_model"),
+        [
+            pytest.param("claude-opus-4-8", "claude-opus-4-8", id="anthropic-fallback-model-kept"),
+            pytest.param("claude-fable-5", "fable-alias", id="routed-model-restamped"),
+            pytest.param("claude-fable-5-20260607", "fable-alias", id="routed-snapshot-restamped"),
+        ],
+    )
+    def test_override_keeps_a_model_the_provider_fell_back_to(self, provider_model: str, client_model: str):
+        response_obj = {"model": provider_model}
+
+        _override_openai_response_model(
+            response_obj=response_obj,
+            requested_model="fable-alias",
+            log_context="test_context",
+            routed_model="anthropic/claude-fable-5",
+        )
+
+        assert response_obj["model"] == client_model
 
     def test_override_model_overrides_when_no_fallback_object(self):
         """

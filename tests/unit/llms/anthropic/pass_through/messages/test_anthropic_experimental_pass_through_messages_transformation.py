@@ -36,6 +36,11 @@ def test_workload_identity_blocked_for_tencent() -> None:
     assert TencentAnthropicMessagesConfig()._allows_workload_identity is False
 
 
+def test_server_side_fallbacks_are_supported_on_direct_anthropic_only() -> None:
+    assert "fallbacks" in AnthropicMessagesConfig().get_supported_anthropic_messages_params("claude-opus-4-8")
+    assert "fallbacks" not in MinimaxMessagesConfig().get_supported_anthropic_messages_params("MiniMax-M2.1")
+
+
 def test_minimax_validate_environment_never_attaches_anthropic_wif_credential(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
