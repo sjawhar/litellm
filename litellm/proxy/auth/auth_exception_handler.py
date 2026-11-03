@@ -4,6 +4,7 @@ Handles Authentication Errors
 
 import logging
 from collections.abc import Mapping
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final
 
 from fastapi import HTTPException, Request, status
@@ -90,8 +91,8 @@ def _get_user_agent(request: Request) -> str | None:
 _CLIENT_CONTEXT_FIELDS: Final = ("requester_ip_address", "user_agent")
 
 
-def _without_client_context(metadata: Mapping[str, object]) -> dict[str, object]:
-    return {name: value for name, value in metadata.items() if name not in _CLIENT_CONTEXT_FIELDS}
+def _without_client_context(metadata: Mapping[str, object]) -> Mapping[str, object]:
+    return MappingProxyType({name: value for name, value in metadata.items() if name not in _CLIENT_CONTEXT_FIELDS})
 
 
 def _with_client_context(
