@@ -116,7 +116,7 @@ def _with_client_context(
     stamped: Final = {name: value for name, value in zip(_CLIENT_CONTEXT_FIELDS, (requester_ip, user_agent)) if value}
     other_metadata: Final = request_data.get(other)
     other_rewritten: Final = (
-        {other: _without_client_context(other_metadata)} if _is_metadata_bucket(other_metadata) else {}
+        {other: {**_without_client_context(other_metadata)}} if _is_metadata_bucket(other_metadata) else {}
     )
     return {**request_data, key: {**_without_client_context(base), **stamped}, **other_rewritten}
 
