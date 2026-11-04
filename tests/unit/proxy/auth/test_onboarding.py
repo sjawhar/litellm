@@ -10,6 +10,8 @@ Covers the security behavior of:
 
 import hashlib
 from datetime import timedelta
+from types import SimpleNamespace
+from typing import Final
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -707,3 +709,79 @@ async def test_claim_token_fails_open_when_hibp_unreachable(httpx_transport):
 
     assert "token" in result
     prisma.db.litellm_usertable.update.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# POST /onboarding/claim_token - reads pinned to the writer
+# ---------------------------------------------------------------------------
+
+
+def _invitation_table(row: MagicMock | None) -> SimpleNamespace:
+    return SimpleNamespace(find_many=AsyncMock(), find_unique=AsyncMock(return_value=row), create=AsyncMock())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("serve_last_good_entries", "refusal"),
+    [(True, "Invitation link has already been used."), (False, "Invitation link does not exist in db.")],
+)
+async def test_claim_token_reads_its_invitation_from_the_writer_only_while_last_good_entries_are_served(
+    serve_last_good_entries: bool, refusal: str
+):
+    """The claim runs outside user_api_key_auth and its password write revokes the user's UI session keys strictly, so
+    while last good entries are served it pins its own reads to the writer: an invitation the lagging read replica has
+    no row for yet is read from the writer, here one already used. With the setting off it reads from the replica."""
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from litellm.proxy.db.prisma_client import PrismaWrapper
+    from litellm.proxy.db.routing_prisma_wrapper import RoutingPrismaWrapper
+    from litellm.proxy.proxy_server import claim_onboarding_link
+
+    used_invite: Final = _make_invite(is_accepted=True, claimed=True)
+    writer: Final = PrismaWrapper(
+        original_prisma=SimpleNamespace(litellm_invitationlink=_invitation_table(used_invite))
+    )
+    # The replica lags: it has no row yet for the invitation the writer holds
+    reader: Final = PrismaWrapper(original_prisma=SimpleNamespace(litellm_invitationlink=_invitation_table(None)))
+    prisma: Final = SimpleNamespace(db=RoutingPrismaWrapper(writer=writer, reader=reader), writer_db=writer)
+    cache: Final = UserApiKeyCache(serve_last_good_entries=serve_last_good_entries)
+    # The claim is refused at its invitation, before any password check, so the password is a placeholder
+    data: Final = InvitationClaim(invitation_link="invite-abc", user_id="user-123", password="not-a-secret")
+
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", prisma),  # test-quality-ok: the endpoint reads this global
+        patch("litellm.proxy.proxy_server.user_api_key_cache", cache),  # test-quality-ok: the endpoint reads it
+        pytest.raises(HTTPException) as refused,
+    ):
+        await claim_onboarding_link(data=data, request=_make_claim_request())
+
+    assert (refused.value.status_code, refused.value.detail["error"]) == (401, refusal)
+
+
+@pytest.mark.asyncio
+async def test_claim_token_with_a_plain_dual_cache_as_the_auth_cache_reads_its_invitation_as_before():
+    """The auth cache can be a plain DualCache, which keeps no last good entries: the claim pins nothing and reads its
+    invitation where it always did, here the lagging replica that has no row for it yet, rather than failing on the
+    setting only the cache's subclass carries."""
+    from litellm.caching.dual_cache import DualCache
+    from litellm.proxy.db.prisma_client import PrismaWrapper
+    from litellm.proxy.db.routing_prisma_wrapper import RoutingPrismaWrapper
+    from litellm.proxy.proxy_server import claim_onboarding_link
+
+    writer: Final = PrismaWrapper(
+        original_prisma=SimpleNamespace(
+            litellm_invitationlink=_invitation_table(_make_invite(is_accepted=True, claimed=True))
+        )
+    )
+    reader: Final = PrismaWrapper(original_prisma=SimpleNamespace(litellm_invitationlink=_invitation_table(None)))
+    prisma: Final = SimpleNamespace(db=RoutingPrismaWrapper(writer=writer, reader=reader), writer_db=writer)
+    # The claim is refused at its invitation, before any password check, so the password is a placeholder
+    data: Final = InvitationClaim(invitation_link="invite-abc", user_id="user-123", password="not-a-secret")
+
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", prisma),  # test-quality-ok: the endpoint reads this global
+        patch("litellm.proxy.proxy_server.user_api_key_cache", DualCache()),  # test-quality-ok: the endpoint reads it
+        pytest.raises(HTTPException) as refused,
+    ):
+        await claim_onboarding_link(data=data, request=_make_claim_request())
+
+    assert (refused.value.status_code, refused.value.detail["error"]) == (401, "Invitation link does not exist in db.")

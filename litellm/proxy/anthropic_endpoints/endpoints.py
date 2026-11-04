@@ -123,6 +123,21 @@ def _strip_total_tokens_from_anthropic_response(response: Any) -> None:
         usage.pop("total_tokens", None)
 
 
+def _call_headers(
+    user_api_key_dict: UserAPIKeyAuth,
+    litellm_call_id: str | None,
+    request_data: Mapping[str, object],
+    version: str | None,
+) -> Mapping[str, str]:
+    return ProxyBaseLLMRequestProcessing.get_custom_headers(
+        user_api_key_dict=user_api_key_dict,
+        call_id=litellm_call_id,
+        version=version,
+        model_region=getattr(user_api_key_dict, "allowed_model_region", ""),
+        request_data=dict(request_data),
+    )
+
+
 @router.post(
     "/v1/messages",
     tags=["[beta] Anthropic `/v1/messages`"],
@@ -212,6 +227,9 @@ async def anthropic_response(
             stop_reason="end_turn",
             usage=_usage,
         )
+        blocked_headers: Final = _call_headers(
+            user_api_key_dict, base_llm_response_processor.litellm_call_id, _data, version
+        )
 
         if data.get("stream", None) is not None and data["stream"] is True:
             # For streaming, use the standard SSE data generator
@@ -228,9 +246,10 @@ async def anthropic_response(
             return await create_response(
                 generator=selected_data_generator,
                 media_type="text/event-stream",
-                headers={},
+                headers=blocked_headers,
             )
 
+        fastapi_response.headers.update(blocked_headers)
         return _anthropic_response
     except AnthropicContextManagementError as e:
         if e.status_code >= 500:
@@ -246,7 +265,16 @@ async def anthropic_response(
             raw_message=e.message,
             request_id=request.headers.get("x-request-id"),
         )
-        return JSONResponse(status_code=e.status_code, content=body)
+        return JSONResponse(
+            status_code=e.status_code,
+            content=body,
+            headers=_call_headers(
+                user_api_key_dict,
+                base_llm_response_processor.litellm_call_id,
+                base_llm_response_processor.data,
+                version,
+            ),
+        )
     except Exception as e:
         await proxy_logging_obj.post_call_failure_hook(
             user_api_key_dict=user_api_key_dict, original_exception=e, request_data=base_llm_response_processor.data

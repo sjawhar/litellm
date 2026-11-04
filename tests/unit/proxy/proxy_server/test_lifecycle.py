@@ -17,12 +17,14 @@ Pins covered:
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
 import os
 import subprocess
 from collections.abc import Awaitable, Callable
+from typing import Final
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -31,6 +33,7 @@ from pydantic import BaseModel
 from typing_extensions import TypedDict
 
 import litellm.proxy.proxy_server as ps
+from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 from litellm.proxy.proxy_server import (
     ProxyStartupEvent,
     initialize_shared_aiohttp_session,
@@ -47,6 +50,7 @@ from litellm.proxy.proxy_server import (
     run_ollama_serve,
     save_worker_config,
 )
+from litellm.proxy.shutdown.graceful_shutdown_manager import GracefulShutdownManager
 
 from .conftest import normalize
 
@@ -990,6 +994,58 @@ async def test_proxy_startup_event_warns_for_fail_closed_rate_limits_without_red
 
     assert "fail_closed_rate_limit_enforcement" in caplog.text
     assert "rejects nothing" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_stream_logged_as_the_pod_stops_still_reaches_a_spend_commit(monkeypatch):
+    """A stream hands its spend-log write to the logging worker, so the write can finish after the
+    shutdown's first spend commit. The teardown drains the worker between two commits, so that row
+    still reaches the database instead of dying with the process.
+
+    Measured on a terminating gateway pod on 2026-11-26: 8 Anthropic streams had a telemetry span
+    and no spend-log row, all within 150 s of a pod stopping (dispatch://INFRA-6002).
+    """
+    rows: list[str] = []  # mutable-ok: the spend rows the proxy holds in memory
+    commits: list[tuple[str, ...]] = []  # mutable-ok: what each shutdown commit wrote, which is the assertion
+    first_commit: Final = asyncio.Event()
+
+    async def commit_spend_rows(**_kwargs: object) -> None:
+        commits.append(tuple(rows))
+        first_commit.set()
+
+    async def stream_spend_write() -> None:
+        await first_commit.wait()
+        rows.append("msg_01StreamEndedAsThePodStopped")
+
+    fake_prisma = MagicMock()
+    fake_prisma.disconnect = AsyncMock()
+    import litellm.proxy.utils as utils_mod
+
+    monkeypatch.setattr(utils_mod, "drain_spend_logs_queue", commit_spend_rows)
+    monkeypatch.setattr(utils_mod, "update_daily_tag_spend", AsyncMock())
+    monkeypatch.setattr(ps.proxy_logging_obj.db_spend_update_writer, "db_update_spend_transaction_handler", AsyncMock())
+    monkeypatch.setattr(ps, "flush_gateway_requests", AsyncMock(), raising=False)
+    monkeypatch.setattr(ps, "db_writer_client", None, raising=False)
+
+    scheduler = AsyncIOScheduler()
+    clean_env = {k: v for k, v in os.environ.items() if k not in ("DATABASE_URL", "DIRECT_URL")} | {
+        "LITELLM_DANGEROUSLY_PERMIT_WEAK_OR_UNSET_MASTER_KEY": "true"
+    }
+    GracefulShutdownManager.reset()
+    try:
+        with patch.dict(os.environ, clean_env, clear=True), patch.object(ps, "scheduler", scheduler):
+            async with proxy_startup_event(app=None):
+                monkeypatch.setattr(ps, "prisma_client", fake_prisma, raising=False)
+                GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(async_coroutine=stream_spend_write())
+    finally:
+        GracefulShutdownManager.reset()
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
+
+    assert commits, "shutdown committed no spend rows at all"
+    assert commits[-1] == ("msg_01StreamEndedAsThePodStopped",), (
+        f"the shutdown's commits were {commits}: the stream's row was still queued on the logging worker"
+    )
 
 
 def test_proxy_startup_event_warns_for_global_budget_without_database():

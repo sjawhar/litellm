@@ -2,13 +2,16 @@ import importlib.util
 import os
 import re
 import sys
-from collections.abc import Collection, Iterator, Mapping
-from functools import lru_cache
+from collections.abc import Collection, Generator, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
+from functools import lru_cache, partial
 from logging import Logger
 from typing import Any, Final, Protocol
 
 from fastapi import HTTPException, Request, status
 from pydantic import PositiveInt, TypeAdapter, ValidationError
+from typing_extensions import TypeIs  # noqa: TID251  # TypeIs reaches typing only on 3.13
 
 import litellm
 from litellm import Router, constants, provider_list
@@ -17,9 +20,12 @@ from litellm.constants import (
     ADMIN_ONLY_BATCH_LIMIT_METADATA_KEYS,
     EMPTY_MAPPING,
     INVALID_VIRTUAL_KEY_ERROR_MARKER,
+    MAX_FALLBACK_LIST_ENTRIES,
+    MAX_SAVED_FALLBACK_LIST_ENTRIES,
     MINIMUM_CUSTOM_KEY_LENGTH,
     STANDARD_CUSTOMER_ID_HEADERS,
 )
+from litellm.litellm_core_utils.core_helpers import is_object_list, is_object_mapping, is_object_sequence
 from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
 from litellm.litellm_core_utils.safe_json_loads import safe_json_loads
 from litellm.litellm_core_utils.url_utils import (
@@ -32,6 +38,29 @@ from litellm.llms.azure.passthrough.transformation import azure_router_model_in_
 from litellm.llms.nvidia_nim.passthrough.transformation import nvidia_nim_model_group_in_path
 from litellm.proxy._types import *
 from litellm.proxy.common_utils.http_parsing_utils import extract_nested_form_metadata
+from litellm.router_utils.clientside_credential_handler import (
+    reject_fallback_target_credentials,
+    reject_fallback_target_routing,
+)
+from litellm.router_utils.fallback_event_handlers import (
+    CONTEXT_WINDOW_FALLBACK_DICT_FIELD,
+    FALLBACK_LIST_FIELDS,
+    HEADER_CARRIER_KWARGS,
+    NO_CONFIGURED_FALLBACKS,
+    ROUTER_FALLBACKS_KWARG,
+    ROUTER_SETTINGS_OVERRIDE_KWARG,
+    FallbackChecks,
+    FallbackEntry,
+    FallbackListShapeError,
+    FallbackWalk,
+    RequestHeaderFields,
+    charge_request_header_lines,
+    fallback_entry_is_target,
+    fallback_target_model_name,
+    is_anthropic_beta_name,
+    router_configured_fallbacks,
+    walk_fallback_lists,
+)
 from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     LITELLM_PASS_THROUGH_ENDPOINT_MARKER,
 )
@@ -447,24 +476,36 @@ _BANNED_REQUEST_BODY_PARAMS: Final[tuple[str, ...]] = (
     *sorted(CustomPricingLiteLLMParams.model_fields.keys()),
 )
 
+# Call parameters that pick the deployment a call reaches as its model, past every model check: litellm.completion
+# calls the Azure deployment `deployment_id` names (litellm/main.py). Refused with the banned params' status and
+# opt-ins where a call reads them as its parameters: at a body's root, at a target's root, and in
+# litellm_embedding_config, which a vector store spreads into its embedding call. A label of that name in metadata or
+# extra_body reaches no call as the parameter.
+_MODEL_PICKING_CALL_PARAMS: Final[tuple[str, ...]] = ("deployment_id",)
+_CALL_PARAMS_REFUSED: Final[tuple[str, ...]] = (*_BANNED_REQUEST_BODY_PARAMS, *_MODEL_PICKING_CALL_PARAMS)
+# The nested config a call spreads into its own parameters (a vector store's embedding call)
+_CALL_PARAMS_CONFIG_KEYS: Final = frozenset({"litellm_embedding_config"})
+
 
 def _check_banned_params(
-    body: dict,
-    general_settings: dict,
+    body: Mapping[str, object],
+    general_settings: Mapping[str, object],
     llm_router: Router | None,
     model: str,
     *,
     manages_deployments: bool = False,
+    refused: Sequence[str] = _BANNED_REQUEST_BODY_PARAMS,
 ) -> None:
     """Raise ``ValueError`` if ``body`` carries a banned param without admin opt-in.
 
     Shared between the root-level check and the nested-config check so a
-    new banned param only needs to be added in one place.
+    new banned param only needs to be added in one place. ``refused`` adds
+    the call parameters where ``body`` is read as a call's parameters.
     """
     reject_server_owned_wif_params(body)
     if not manages_deployments:
         reject_federated_credential_reference(body)
-    for param in _BANNED_REQUEST_BODY_PARAMS:
+    for param in refused:
         if param not in body:
             continue
         if general_settings.get("allow_client_side_credentials") is True:
@@ -496,64 +537,738 @@ def _check_banned_params(
         )
 
 
-_FALLBACK_FIELDS: Final[tuple[str, ...]] = (
-    "fallbacks",
-    "context_window_fallbacks",
-    "content_policy_fallbacks",
+# A mock param on a target would make the hop answer without the gate that stops a top-level one
+_FALLBACK_TARGET_MOCK_FIELDS: Final = frozenset(
+    {
+        "mock_response",
+        "mock_tool_calls",
+        "mock_testing_fallbacks",
+        "mock_testing_context_fallbacks",
+        "mock_testing_content_policy_fallbacks",
+        "mock_testing_rate_limit_error",
+        "mock_timeout",
+        "mock_delay",
+    }
 )
+# The fields the request setup reads a URL-valued destination from (litellm_pre_call_utils)
+_URL_DESTINATION_FIELDS: Final = ("model", "file_id")
 
 
-def _iter_fallback_field_values(request_body: Mapping[str, object]) -> Iterator[object]:
-    override: Final = request_body.get("router_settings_override")
-    for source in (request_body, override):
-        if isinstance(source, Mapping):
-            for field in _FALLBACK_FIELDS:
-                yield source.get(field)
+def request_fallback_walk(
+    route: str,
+    request: Request | None,
+    request_body: Mapping[str, object],
+    *,
+    llm_router: Router | None,
+    saved_settings: bool = False,
+) -> FallbackWalk:
+    """
+    One walk of every fallback list a request carries, read as the Router gets the call. Every walk but one runs before
+    the request setup: on /v1/messages it reads the beta in the request's own header fields, the HTTP headers and the
+    fields the body carries, as they are (_request_header_fields), and a beta that stands only in body fields the
+    setup can replace is read both ways; the header fields it expects the setup to give the call (_call_header_carriers)
+    only decide what it charges, which is at least what the Router's walk of the call charges for them. With
+    ``saved_settings`` the body is the call the request setup built, the one walk that runs after it, since the key's
+    or team's saved router settings come in only then (common_request_processing): its header fields are read as the
+    setup left them, with no field built again and none expected to be replaced, so the walk reads the call's own
+    reading, and ``request`` is not read. The request's own lists may hold MAX_FALLBACK_LIST_ENTRIES entries in all;
+    with ``saved_settings`` the body's router_settings_override is the key's or team's saved router settings, counted
+    apart against MAX_SAVED_FALLBACK_LIST_ENTRIES. The walk refuses more, or reads past FALLBACK_WALK_READS_PER_ENTRY
+    per entry of either, with a 400 before it reads them, in every reading it reads; it reads no reading a hop cannot
+    take (walk_fallback_lists). On /v1/messages the mappings of ``llm_router``'s own configured lists are hops too: a
+    scan of all three lists, made by this walk and kept by nothing (router_configured_fallbacks), decides with the
+    request's targets whether both readings apply, as in the Router's own walk of the call. The checks of one request
+    walk its lists up to four times, with an await between any two of them, during which the Router's lists or its
+    opt-in can change: so each walk scans them as they are then, and no scan outlives the walk that made it. The body's
+    router_settings_override is read as the call gets it after the proxy promotes it (router_settings_override_fields):
+    the setting that can become the call's own ``fallbacks`` is read as the body's own ``fallbacks`` is. So the walk
+    charges a request's lists, and the saved ones, in every reading the Router can read them in.
+    """
+    messages_call: Final = route.endswith("/v1/messages")
+    built: Final = (
+        _call_header_carriers(request_body, request, llm_router)
+        if messages_call and request is not None and not saved_settings
+        else _CallHeaderFields({key: request_body[key] for key in HEADER_CARRIER_KWARGS if key in request_body})
+    )
+    return walk_fallback_lists(
+        request_body,
+        carriers=built.call,
+        anthropic_messages_call=messages_call,
+        budget=MAX_FALLBACK_LIST_ENTRIES,
+        saved_settings_budget=MAX_SAVED_FALLBACK_LIST_ENTRIES if saved_settings else None,
+        configured=router_configured_fallbacks(llm_router) if messages_call else NO_CONFIGURED_FALLBACKS,
+        router_serves=llm_router is not None,
+        request_fields=_request_header_fields(request_body, built) if messages_call and not saved_settings else None,
+    )
 
 
-def _iter_fallback_targets(value: object, depth: int) -> Iterator[str | Mapping[str, object]]:
-    if depth > 2 * litellm.ROUTER_MAX_FALLBACKS:
-        raise ValueError("Rejected Request: fallback nesting exceeds the allowed validation depth.")
-    if not isinstance(value, list):
-        return
-    for item in value:
-        if isinstance(item, str):
-            yield item
-        elif isinstance(item, Mapping):
-            values = tuple(item.values())
-            if not (values and all(isinstance(v, list) for v in values)):
-                yield item
-            if isinstance(item.get("model"), str):
-                for field in _FALLBACK_FIELDS:
-                    yield from _iter_fallback_targets(item.get(field), depth + 1)
-            else:
-                for target_list in values:
-                    yield from _iter_fallback_targets(target_list, depth + 1)
+@dataclass(frozen=True, slots=True)
+class _CallHeaderFields:
+    """
+    The header fields a walk expects the call of a request to carry, ``call``; the scoped header the request setup
+    builds from the request's HTTP headers alone, ``scoped``, None where they carry no line it scopes; and the HTTP
+    anthropic-beta lines it does not scope, ``unscoped_beta``, those named in another case, which reach the call only in
+    the client headers it forwards, None where there is none
+    """
+
+    call: Mapping[str, object]
+    scoped: object = None
+    unscoped_beta: Mapping[str, object] | None = None
+
+
+def _request_header_fields(request_body: Mapping[str, object], built: _CallHeaderFields) -> RequestHeaderFields:
+    """
+    The request's own header fields, in which the walks before the request setup read the beta, each with whether the
+    setup keeps it in the call. Kept: the scoped header the setup builds from the HTTP headers themselves, which every
+    anthropic-beta line they carry in lower case lands in; ``extra_headers``, to which the setup only adds its
+    traceparent line, never a beta; the body's ``headers`` where no client header forwarding is configured; and an
+    HTTP anthropic-beta line in another case where client headers are forwarded proxy-wide, since every such line is
+    then forwarded. Replaceable: the body's ``headers`` where client header forwarding is configured, proxy-wide or for
+    any model group, whatever the model and the key; the body's ``provider_specific_header``, which the setup replaces
+    with that scoped header whenever the HTTP headers carry a line it scopes; and an HTTP anthropic-beta line in another
+    case where only a model group forwards client headers, since the setup forwards it only for a model the group
+    names. Without forwarding the setup drops such a line, so the call never carries it and it is no beta. Whether the
+    setup will replace a field or forward a line is not guessed: a beta that stands only in replaceable fields is read
+    both ways.
+    """
+    proxy_wide: Final = _proxy_wide_client_header_forwarding()
+    forwarding: Final = _client_header_forwarding_configured()
+    body_headers: Final = (("headers", request_body["headers"]),) if "headers" in request_body else ()
+    unscoped_beta: Final = (("headers", built.unscoped_beta),) if built.unscoped_beta is not None else ()
+    return RequestHeaderFields(
+        kept=(
+            *((("provider_specific_header", built.scoped),) if built.scoped is not None else ()),
+            *((("extra_headers", built.call["extra_headers"]),) if "extra_headers" in built.call else ()),
+            *(() if forwarding else body_headers),
+            *(unscoped_beta if proxy_wide else ()),
+        ),
+        replaceable=(
+            *(body_headers if forwarding else ()),
+            *(
+                (("provider_specific_header", request_body["provider_specific_header"]),)
+                if "provider_specific_header" in request_body
+                else ()
+            ),
+            *(unscoped_beta if forwarding and not proxy_wide else ()),
+        ),
+    )
+
+
+def _proxy_general_settings() -> Mapping[str, object]:
+    """The proxy's general settings as loaded, read by setting name only (proxy_server.general_settings)"""
+    from litellm.proxy.proxy_server import general_settings as proxy_general_settings
+
+    return proxy_general_settings or {}
+
+
+def _proxy_wide_client_header_forwarding() -> bool:
+    """Whether the proxy forwards the client's headers on every call (add_litellm_data_for_backend_llm_call)"""
+    return _proxy_general_settings().get("forward_client_headers_to_llm_api") is True
+
+
+def _client_header_forwarding_configured() -> bool:
+    """
+    Whether the request setup can replace a call's ``headers`` with the client's forwardable headers after the key is
+    read, decided by what the proxy configures and not by the key: the proxy-wide forwarding, or a model group
+    forwarding, which the key's own aliases can bring a request under (add_headers_to_llm_call_by_model_group). The
+    key's information the setup adds to forwarded headers (litellm.add_user_information_to_llm_headers) is added only
+    on these two paths.
+    """
+    group_settings: Final = litellm.model_group_settings
+    return _proxy_wide_client_header_forwarding() or (
+        group_settings is not None and group_settings.forward_client_headers_to_llm_api is not None
+    )
+
+
+def _forwards_client_headers(
+    request_body: Mapping[str, object], llm_router: Router | None, general_settings: Mapping[str, object]
+) -> bool:
+    """
+    Whether the request setup sends the client's forwardable headers as the call's ``headers``: the proxy-wide setting,
+    or a model group setting that names the request's model (add_headers_to_llm_call_by_model_group), read with the
+    model the body names, since the key's own aliases are not read yet. A guess at what the setup will do, so it decides
+    only which header fields a walk charges, never whose list ``fallbacks`` is (_request_header_fields).
+    """
+    from litellm.proxy.auth.auth_checks import check_model_access_helper  # the checks module imports this one
+
+    if general_settings.get("forward_client_headers_to_llm_api") is True:
+        return True
+    group_settings: Final = litellm.model_group_settings
+    model: Final = request_body.get("model")
+    return (
+        isinstance(model, str)
+        and group_settings is not None
+        and group_settings.forward_client_headers_to_llm_api is not None
+        and check_model_access_helper(
+            model=model, llm_router=llm_router, models=group_settings.forward_client_headers_to_llm_api
+        )
+    )
+
+
+def _call_header_carriers(
+    request_body: Mapping[str, object], request: Request, llm_router: Router | None
+) -> _CallHeaderFields:
+    """
+    The header fields the anthropic_messages call of this request carries, built from the request by the request
+    setup's own steps (add_litellm_data_to_request): the body's ``headers``, ``extra_headers`` and
+    ``provider_specific_header``; the scoped headers the setup builds from the request's HTTP headers, its Anthropic
+    ones, an Anthropic OAuth token it forwards and its other scoped ones, in place of the body's
+    (add_provider_specific_headers_to_request); the client's forwardable headers in place of the body's ``headers``
+    when the proxy forwards them; and the traceparent the setup adds to ``extra_headers``. The header control the setup
+    strips before it forwards is neither forwardable nor scoped, so it changes none of these. What the setup decides by
+    the key, which the checks have not read, is left out: the key's information it adds to forwarded headers
+    (litellm.add_user_information_to_llm_headers), and a model group the key's own aliases bring under forwarding.
+    These fields decide what the walk charges; the scoped header is handed back apart too, as the field the HTTP
+    headers' own beta stands in, and so are the anthropic-beta lines the setup does not scope, since it matches that
+    name in lower case only, which reach the call only in forwarded client headers (_request_header_fields).
+
+    The request's HTTP header lines are charged before any step passes over them (charge_request_header_lines), taken
+    with no copy (_request_header_lines), and a header field the body carries is kept by reference, never copied or
+    read here: the walk charges it before it reads it. The traceparent the setup adds to the body's ``extra_headers``
+    is laid over that mapping without a copy.
+    """
+    from litellm.proxy.litellm_pre_call_utils import (  # the setup module imports this one
+        LiteLLMProxyRequestSetup,
+        _add_otel_traceparent_to_data,  # pyright: ignore[reportPrivateUsage]  # the setup's own step
+        add_provider_specific_headers_to_request,
+    )
+
+    charge_request_header_lines(_request_header_lines(request), _SETUP_PASSES_OVER_HEADER_LINES)
+    settings: Final = _proxy_general_settings()
+    cleaned: Final = _cleaned_request_headers(request, settings)
+    scoped: Final[dict[str, object]] = {}  # mutable-ok: the setup's own step writes the scoped header into it
+    _ = add_provider_specific_headers_to_request(scoped, cleaned)
+    unscoped_beta: Final = {
+        name: value for name, value in cleaned.items() if name != "anthropic-beta" and is_anthropic_beta_name(name)
+    }
+    forwarded: Final[Mapping[str, object]] = (
+        LiteLLMProxyRequestSetup._get_forwardable_headers(  # pyright: ignore[reportPrivateUsage]  # the setup's choice
+            dict(cleaned)
+        )
+        if _forwards_client_headers(request_body, llm_router, settings)
+        else {}
+    )
+    added: Final[dict[str, object]] = {}  # mutable-ok: the setup's own step writes its traceparent line into it
+    _add_otel_traceparent_to_data(added, request=request)
+    traced: Final = added.get("extra_headers")
+    traceparent: Final = traced.get("traceparent") if is_object_mapping(traced) else None
+    body_extra_headers: Final = request_body.get("extra_headers")
+    extra_headers: Final = (
+        body_extra_headers
+        if traceparent is None
+        else traced
+        if "extra_headers" not in request_body
+        else _HeadersWithLine(body_extra_headers, "traceparent", traceparent)
+        if is_object_mapping(body_extra_headers) and "traceparent" not in body_extra_headers
+        else body_extra_headers
+    )
+    return _CallHeaderFields(
+        {
+            **{key: request_body[key] for key in HEADER_CARRIER_KWARGS if key in request_body},
+            **({"headers": forwarded} if forwarded else {}),
+            **({"extra_headers": extra_headers} if "extra_headers" in request_body or traceparent is not None else {}),
+            **(
+                {"provider_specific_header": scoped["provider_specific_header"]}
+                if "provider_specific_header" in scoped
+                else {}
+            ),
+        },
+        scoped.get("provider_specific_header"),
+        unscoped_beta or None,
+    )
+
+
+def _cleaned_request_headers(request: Request, settings: Mapping[str, object]) -> Mapping[str, str]:
+    """
+    The request's HTTP headers as the request setup cleans them before it scopes or forwards any (clean_headers), with
+    the header that carried the proxy's key told as the setup tells it, from the same headers: names and values as text
+    """
+    from litellm.proxy.litellm_pre_call_utils import clean_headers  # the setup module imports this one
+
+    authenticated_with: Final = (
+        "x-litellm-api-key"
+        if "x-litellm-api-key" in request.headers
+        else "authorization"
+        if "authorization" in request.headers
+        else "x-api-key"
+    )
+    key_header_name: Final = settings.get("litellm_key_header_name")
+    return clean_headers(
+        request.headers,
+        litellm_key_header_name=key_header_name if isinstance(key_header_name, str) else None,
+        forward_llm_provider_auth_headers=bool(
+            settings.get("forward_llm_provider_auth_headers")
+            or getattr(litellm, "forward_llm_provider_auth_headers", False)
+        ),
+        authenticated_with_header=authenticated_with,
+    )
+
+
+def _request_header_lines(request: Request) -> Collection[object]:
+    """
+    The request's HTTP header lines, taken with no pass and no copy: the list of name and value pairs the server put in
+    the ASGI scope, which Starlette's header mapping holds as its own list, or, for a request without such a list, the
+    items of its header mapping
+    """
+    scope: Final[object] = getattr(request, "scope", None)
+    lines: Final = scope.get("headers") if is_object_mapping(scope) else None
+    return lines if is_object_sequence(lines) else request.headers.items()
+
+
+# The passes the steps of _call_header_carriers make over the request's HTTP header lines, at most: the two header
+# lookups that tell which header carried the key, clean_headers' list of the lines and its loop over it, the two scans
+# for the OAuth token and the typesafe headers, the scan for anthropic-beta lines they leave unscoped, the copy and the
+# scan for forwardable headers, the traceparent step's lookup and read, and the charge's own pass that sizes the lines.
+# The traceparent step's test of whether there is any header takes the length, which Starlette's header mapping holds.
+_SETUP_PASSES_OVER_HEADER_LINES: Final = 12
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _HeadersWithLine(Mapping[object, object]):
+    """
+    A header mapping the body carries, held by reference, with the one line the request setup adds to it: its length
+    is known without a pass, and the walk passes over it only after it charged it
+    """
+
+    headers: Mapping[object, object]
+    name: str
+    value: object
+
+    def __getitem__(self, key: object) -> object:
+        return self.value if key == self.name else self.headers[key]
+
+    def __iter__(self) -> Iterator[object]:
+        yield from self.headers
+        yield self.name
+
+    def __len__(self) -> int:
+        return len(self.headers) + 1
+
+
+def _reject_unreadable_litellm_list(value: object, field: str) -> None:
+    """Every LiteLLM reader of a fallback field iterates a list, so a value that is not one is called by none"""
+    if value is not None and not isinstance(value, list):
+        raise FallbackListShapeError(f"Rejected Request: {field} must be a list of model groups.", field)
+
+
+@dataclass(frozen=True, slots=True)
+class FallbackModelNames:
+    """
+    The models a request's fallback lists name, read once: ``litellm`` the ones a LiteLLM reader calls, ``anthropic``
+    the ones Anthropic gets as sent, and ``read_both_ways`` each name with the key of the model group map of a
+    ``fallbacks`` list it stands under, an entry the checks read both as a group map and as a parameter override.
+    """
+
+    litellm: tuple[str, ...]
+    anthropic: tuple[str, ...]
+    read_both_ways: tuple[tuple[str, str], ...]
+
+    @classmethod
+    def of(cls, entries: Sequence[FallbackEntry]) -> "FallbackModelNames":
+        """The names of the entries a walk of the request's fallback lists reached"""
+        return cls(
+            litellm=_entry_names(entry for entry in entries if not entry.anthropic),
+            anthropic=_entry_names(entry for entry in entries if entry.anthropic),
+            read_both_ways=tuple(
+                (name, entry.group)
+                for entry in entries
+                if entry.group is not None
+                and not entry.is_group_map
+                and (name := fallback_target_model_name(entry.target)) is not None
+            ),
+        )
+
+
+def _entry_names(entries: Iterable[FallbackEntry]) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(name for entry in entries if (name := fallback_target_model_name(entry.target)) is not None)
+    )
+
+
+def key_fallback_model_names(
+    request_body: Mapping[str, object], *, route: str, request: Request | None, llm_router: Router | None
+) -> FallbackModelNames:
+    """
+    The models every fallback list of the request names, through the one walk every check of the lists shares:
+    LiteLLM's lists, and Anthropic's, which are the body's ``fallbacks`` and each target's own ``fallbacks`` that goes
+    to Anthropic on the hop, read in the widest way since Anthropic reads only the ``model`` of each entry. The key or
+    team router settings the proxy applies after auth come through check_request_body, as the body does.
+    """
+    return FallbackModelNames.of(request_fallback_walk(route, request, request_body, llm_router=llm_router).check())
+
+
+# How iter_request_fallback_targets reads a place of a request body: a mapping merged into a call, read for its
+# fallback fields, its router_settings_override and its context_window_fallback_dict; a router_settings_override, read
+# for its fallback fields; a context_window_fallback_dict, read for the models it swaps in; a fallback list, or a
+# mapping a reader iterates as one; and an entry of such a list, a model name or a mapping
+_MERGED_MAPPING: Final = "a mapping merged into a call"
+_SETTINGS_OVERRIDE: Final = "a router_settings_override"
+_SWAPPED_MODELS: Final = "a context_window_fallback_dict"
+_FALLBACK_LIST: Final = "a fallback list"
+_FALLBACK_ENTRY: Final = "a fallback entry"
+# The fallback fields some reader of which merges every mapping of the list into a call, a model group map included:
+# litellm.acompletion's own fallback loop merges each mapping of a ``fallbacks`` list, and the Router each mapping of a
+# list in the client-side format
+_FIELDS_MERGING_EVERY_MAPPING: Final = ("fallbacks", ROUTER_FALLBACKS_KWARG)
+
+
+@dataclass(frozen=True, slots=True)
+class _FallbackPlace:
+    """
+    One place iter_request_fallback_targets reads, how it reads it, and, for a list or an entry of one, whether a
+    reader merges a model group map there into a call
+    """
+
+    kind: str
+    value: object
+    merges_every_mapping: bool = True
+
+
+def _is_request_mapping(
+    value: object,
+) -> TypeIs[Mapping[str, object]]:  # guard-ok: a request body and its fallback entries come from JSON or call kwargs
+    return isinstance(value, Mapping)
+
+
+def _fallback_field_places(source: object) -> tuple[_FallbackPlace, ...]:
+    """The fallback fields a mapping carries, each a list to read"""
+    if not _is_request_mapping(source):
+        return ()
+    return tuple(
+        _FallbackPlace(_FALLBACK_LIST, source[field], field in _FIELDS_MERGING_EVERY_MAPPING)
+        for field in FALLBACK_LIST_FIELDS
+        if field in source
+    )
+
+
+def _merged_mapping_places(mapping: Mapping[str, object]) -> tuple[_FallbackPlace, ...]:
+    """
+    The fallback fields of a mapping merged into a call, then its router_settings_override and its
+    context_window_fallback_dict, each a place of its own, so one the body holds in many mappings is read once, as the
+    walk of a request body reads them (iter_body_fallback_entries)
+    """
+    override: Final = mapping.get(ROUTER_SETTINGS_OVERRIDE_KWARG)
+    swaps: Final = mapping.get(CONTEXT_WINDOW_FALLBACK_DICT_FIELD)
+    return (
+        *_fallback_field_places(mapping),
+        *((_FallbackPlace(_SETTINGS_OVERRIDE, override),) if _is_request_mapping(override) else ()),
+        *((_FallbackPlace(_SWAPPED_MODELS, swaps),) if _is_request_mapping(swaps) else ()),
+    )
+
+
+def _fallback_list_places(value: object, merges_every_mapping: bool) -> tuple[_FallbackPlace, ...]:
+    """
+    The entries of a fallback list. The Router iterates a fallback list, and iterating a mapping walks its keys, so a
+    mapping in a list's place holds each key as a model name, and the lists the keys map to.
+    """
+    if is_object_mapping(value):
+        return (
+            *(_FallbackPlace(_FALLBACK_ENTRY, name) for name in value),
+            *(_FallbackPlace(_FALLBACK_LIST, targets) for targets in value.values()),
+        )
+    if is_object_list(value):
+        return tuple(_FallbackPlace(_FALLBACK_ENTRY, item, merges_every_mapping) for item in value)
+    return ()
+
+
+def _swapped_model_places(swaps: object) -> tuple[_FallbackPlace, ...]:
+    """The models a context_window_fallback_dict swaps in: the client wrapper swaps each value in, a list of targets"""
+    if not _is_request_mapping(swaps):
+        return ()
+    return tuple(_FallbackPlace(_FALLBACK_ENTRY, target) for target in swaps.values())
+
+
+def _fallback_place_contents(
+    place: _FallbackPlace,
+) -> tuple[str | Mapping[str, object] | None, tuple[_FallbackPlace, ...]]:
+    """
+    The target a place is, if it is one, and the places it holds, in the order they stand. Each key or value it takes
+    from a list or a mapping becomes one place, and only the place that holds that list or mapping takes them.
+    """
+    value: Final = place.value
+    if place.kind == _MERGED_MAPPING:
+        return None, (_merged_mapping_places(value) if _is_request_mapping(value) else ())
+    if place.kind == _SETTINGS_OVERRIDE:
+        return None, _fallback_field_places(value)
+    if place.kind == _SWAPPED_MODELS:
+        return None, _swapped_model_places(value)
+    if place.kind == _FALLBACK_LIST:
+        return None, _fallback_list_places(value, place.merges_every_mapping)
+    if isinstance(value, str):
+        return value, ()
+    if not _is_request_mapping(value):
+        # Neither a model name nor a mapping: no reader calls it, and this reading refuses nothing
+        return None, ()
+    if fallback_entry_is_target(value):
+        # A target: merged into the call, its own fallback lists read
+        return value, (_FallbackPlace(_MERGED_MAPPING, value),)
+    # A mapping without a string `model` is a model group map in one reading and merged into the call in another, so
+    # its own fallback lists are read, and its values as lists of targets too
+    members: Final = tuple(value.values())
+    group_map: Final = bool(members) and all(is_object_list(member) for member in members)
+    inside: Final = (
+        _FallbackPlace(_MERGED_MAPPING, value),
+        *(_FallbackPlace(_FALLBACK_LIST, member) for member in members),
+    )
+    return (None if group_map and not place.merges_every_mapping else value), inside
 
 
 def iter_request_fallback_targets(request_body: Mapping[str, object]) -> Iterator[str | Mapping[str, object]]:
-    for value in _iter_fallback_field_values(request_body):
-        yield from _iter_fallback_targets(value, 0)
+    """
+    Every fallback target a request body holds, read the widest way, for code outside this package that applies a
+    rule of its own to each: a model name, or a mapping a reader merges into a call, each handed out once, a name by
+    its text and a mapping by its identity.
+
+    It reads every place the walk of a request's fallback lists reads (walk_fallback_lists), in both readings of every
+    ``fallbacks`` field whatever the route and the headers, since a hop can change the reading: the fallback fields
+    of the body, of its router_settings_override and of every mapping merged into a call, at every depth, the values
+    of every context_window_fallback_dict, and a mapping in a list's place by its keys. A mapping without a string
+    ``model`` is a model group map to the Router and a parameter override to litellm.acompletion's own fallback loop,
+    so its values are read as lists of targets too, and it is handed out itself unless it is a group map, every value
+    a list, in a list only the Router reads as group maps (``context_window_fallbacks``, ``content_policy_fallbacks``,
+    ``default_fallbacks``).
+
+    For a body of built-in containers it refuses nothing and raises nothing, deep nesting included: an entry that is
+    neither a model name nor a mapping is passed by, and no limit applies, since this reading reads values the proxy's
+    checks of the request did not charge, so a limit could refuse a body they passed. Each list and mapping is a place
+    read a fixed number of times, however deep it stands and however many mappings of the body hold it, and only that
+    place takes its keys and values, so the work is linear in the body.
+    """
+    pending: Final[list[_FallbackPlace]] = [  # mutable-ok: the reading's own stack of places
+        _FallbackPlace(_MERGED_MAPPING, request_body)
+    ]
+    read: Final[set[tuple[str, int, bool]]] = set()  # mutable-ok: each place read, by identity, never handed out
+    names: Final[set[str]] = set()  # mutable-ok: the names handed out
+    mappings: Final[set[int]] = set()  # mutable-ok: the identities of the mappings handed out
+    while pending:
+        place = pending.pop()
+        way = (place.kind, id(place.value), place.merges_every_mapping)
+        if way in read:
+            continue
+        read.add(way)
+        target, inside = _fallback_place_contents(place)
+        pending.extend(reversed(inside))
+        if isinstance(target, str):
+            if target not in names:
+                names.add(target)
+                yield target
+        elif target is not None and id(target) not in mappings:
+            mappings.add(id(target))
+            yield target
 
 
-def fallback_target_model_name(target: object) -> str | None:
-    if isinstance(target, str):
-        return target
-    if isinstance(target, Mapping):
-        model: Final = target.get("model")
-        if isinstance(model, str):
-            return model
-    return None
+def _read_both_ways_note(groups: Sequence[str]) -> str:
+    named: Final = ", ".join(repr(group) for group in groups)
+    subject: Final = (
+        f"entry {named} names no model, so it was"
+        if len(groups) == 1
+        else f"entries {named} name no model, so they were"
+    )
+    return (
+        f"The fallbacks {subject} checked both as a model group the Router maps to its fallbacks and as a parameter "
+        "override litellm's own fallback loop merges into the call."
+    )
 
 
-def request_fallback_model_names(request_body: Mapping[str, object]) -> tuple[str, ...]:
-    return tuple(
-        dict.fromkeys(
-            name
-            for target in iter_request_fallback_targets(request_body)
-            if (name := fallback_target_model_name(target)) is not None
+def _http_exception_detail(refusal: HTTPException) -> object:
+    """An HTTPException's detail as it may be: FastAPI takes any value, while Starlette declares a string"""
+    return refusal.detail
+
+
+@contextmanager
+def explained_fallback_name_refusal(names: FallbackModelNames, refused: Sequence[str]) -> Generator[None, None, None]:
+    """
+    Around a check of fallback names: a refusal it raises also says which of the ``refused`` names the request names
+    in a model group map of a ``fallbacks`` list, an entry the checks read both ways, so the caller knows the name may
+    have been meant as a parameter's value
+    """
+    try:
+        yield
+    except (ProxyException, HTTPException) as refusal:
+        wanted: Final = frozenset(refused)
+        groups: Final = tuple(dict.fromkeys(group for name, group in names.read_both_ways if name in wanted))
+        if not groups:
+            raise
+        note: Final = _read_both_ways_note(groups)
+        if isinstance(refusal, ProxyException):
+            refusal.message = f"{refusal.message} {note}"
+            raise
+        detail: Final = _http_exception_detail(refusal)
+        if isinstance(detail, str):
+            refusal.detail = f"{detail} {note}"
+            raise
+        error: Final = detail.get("error") if is_object_mapping(detail) else None
+        if not is_object_mapping(detail) or not isinstance(error, str):
+            raise
+        # A mapping detail: the refusal is raised again with the note in its error, as Starlette types detail a string
+        raise HTTPException(
+            status_code=refusal.status_code,
+            detail={**detail, "error": f"{error} {note}"},
+            headers=dict(refusal.headers) if refusal.headers is not None else None,
+        ) from refusal
+
+
+def request_names_provider_fallback_models(
+    request_body: Mapping[str, object], route: str, request: Request | None
+) -> bool:
+    """
+    Whether a fallback list of the request is Anthropic's server-side fallback list and names a model, which reaches
+    Anthropic as sent: the body's ``fallbacks``, or a target's own on a hop. ``"default"`` names none. A list too
+    malformed to read counts as naming one.
+    """
+    if not route.endswith("/v1/messages"):
+        return False
+    from litellm.proxy.proxy_server import llm_router  # the server module imports this one
+
+    readable_request: Final = request if request is not None and "headers" in request.scope else None
+    try:
+        names: Final = key_fallback_model_names(
+            request_body, route=route, request=readable_request, llm_router=llm_router
+        )
+    except ValueError:
+        return True
+    return bool(names.anthropic)
+
+
+# Keys the Router and the SDK own in a call, which no fallback target sets on its hop
+_ROUTER_OWNED_CALL_FIELDS: Final = frozenset(
+    {
+        # How long the Router cools the deployment the hop fails on: completion puts the call's cooldown_time in its
+        # litellm_params, and the Router's failure callback takes it before the response header and its own default
+        "cooldown_time",
+        # Laid over the call's own litellm_params in what the failure and usage callbacks read, whose model_info names
+        # the deployment a failure counts against and cools
+        "litellm_params",
+    }
+)
+
+
+def _reject_fallback_target_credentials(target: Mapping[str, object], allows_client_credentials: bool) -> None:
+    """
+    A caller credential, endpoint, mock param or Router-owned call field never rides on a fallback target; the opt-in
+    admits only the first two
+    """
+    refused: Final = sorted(
+        field for field in target if field in _FALLBACK_TARGET_MOCK_FIELDS or field in _ROUTER_OWNED_CALL_FIELDS
+    )
+    if refused:
+        raise ValueError(f"Rejected Request: a fallback target may not carry {', '.join(refused)}.")
+    reject_fallback_target_routing(target)
+    if not allows_client_credentials:
+        reject_fallback_target_credentials(target)
+
+
+# Root keys the request setup (litellm_pre_call_utils, and the proxy's pre-call logic in common_request_processing)
+# writes over whatever a body carries at its root with a value that is not the caller's: the key's, team's or end
+# user's settings, or the proxy's own for this call. A target merged into the call on a hop would replace it. The keys
+# the setup copies from the caller's own headers (timeout, stream_timeout, num_retries, keepalive_seconds, ttl, the
+# trace and session ids) stay the caller's parameters, in a target as in a body.
+_SETUP_STAMPED_ROOT_FIELDS: Final = frozenset(
+    {
+        "allowed_model_region",  # the key's or end user's region restriction, which the Router's region check reads
+        "cache",  # the key's cache controls
+        "disable_fallbacks",  # the key's own setting
+        "success_callback",  # the team's callbacks
+        "failure_callback",  # the team's callbacks
+        "router_settings_override",  # the key's or team's saved router settings
+        "litellm_call_id",  # this call's id, which spend logs and the response carry
+        "litellm_logging_obj",  # this call's logging
+        "_litellm_strip_stream_usage",  # the proxy's own stream usage marker
+    }
+)
+# Root keys the setup takes off a body and turns into the request's own decision: its guardrails and policies, its
+# message-logging opt-out, and whether fallback errors are shown to the caller
+_SETUP_DROPPED_ROOT_FIELDS: Final = frozenset(
+    {
+        "guardrails",
+        "guardrail_config",
+        "include_guardrail_response",
+        "policies",
+        "turn_off_message_logging",
+        "include_fallback_errors",
+    }
+)
+
+
+@lru_cache(maxsize=1)
+def _setup_stripped_fields() -> frozenset[str]:
+    """The keys the request setup drops from or writes over at a body's root"""
+    from litellm.proxy.litellm_pre_call_utils import (  # the setup module imports this one
+        _CLIENT_PRICING_CONTROL_FIELDS,  # pyright: ignore[reportPrivateUsage]  # the setup's own strip lists
+        _UNTRUSTED_ROOT_CONTROL_FIELDS,  # pyright: ignore[reportPrivateUsage]  # the setup's own strip lists
+    )
+    from litellm.types.utils import TRUSTED_CALLBACK_VARS_FIELD, StandardCallbackDynamicParams
+
+    return frozenset(
+        (
+            *_UNTRUSTED_ROOT_CONTROL_FIELDS,
+            *_CLIENT_PRICING_CONTROL_FIELDS,
+            TRUSTED_CALLBACK_VARS_FIELD,
+            # The team's callback vars, which the setup writes at the root under these names
+            *StandardCallbackDynamicParams.__annotations__,
+            *_SETUP_STAMPED_ROOT_FIELDS,
+            *_SETUP_DROPPED_ROOT_FIELDS,
         )
     )
+
+
+def _proxy_pinned_call_params() -> frozenset[str]:
+    """
+    The call params the setup writes over a body's from an administrator's setting, read when the check runs: a proxy
+    started for one model from the command line (--temperature, --max_tokens, --api_base, --request_timeout), and the
+    key's hash as `user` under litellm.overwrite_user_with_key_hash
+    """
+    from litellm.proxy import proxy_server
+
+    # proxy_server leaves these command-line globals undeclared, so they are read by name, as the setup reads them:
+    # it writes each one that is set
+    set_on_the_command_line: Final = frozenset(
+        name
+        for name in ("temperature", "max_tokens", "api_base", "request_timeout")
+        if bool(getattr(proxy_server, f"user_{name}", None))
+    )
+    return set_on_the_command_line | (
+        frozenset({"user"}) if litellm.overwrite_user_with_key_hash is True else frozenset()
+    )
+
+
+def _reject_setup_stripped_fields(target: Mapping[str, object], metadata_variable_name: str) -> None:
+    """
+    The request setup drops these keys from a body's root, or writes its own value over a body's, and sanitizes a
+    body's metadata buckets, before the call, so a target merged into the call on a hop may not bring one back or
+    replace the setup's: litellm.acompletion's own fallback loop merges a target as it is. The buckets are not
+    re-listed here: the target goes through the setup's own sanitizer on a copy
+    (client_metadata_the_setup_would_change), and anything it would change is refused.
+    """
+    from litellm.proxy.litellm_pre_call_utils import (  # the setup module imports this one
+        client_metadata_the_setup_would_change,
+    )
+
+    root_fields: Final = _setup_stripped_fields()
+    pinned: Final = _proxy_pinned_call_params()
+    stripped: Final = sorted(
+        {
+            *(field for field in target if field in root_fields or field in pinned),
+            *client_metadata_the_setup_would_change(target, metadata_variable_name),
+        }
+    )
+    if stripped:
+        raise ValueError(
+            f"Rejected Request: a fallback target may not carry {', '.join(stripped)}, "
+            "which the proxy drops from or writes over in a request body."
+        )
+
+
+def _reject_unreadable_metadata(target: Mapping[str, object]) -> None:
+    """A target's metadata gets the request setup's own type check of a body's, with its 400"""
+    from litellm.proxy.litellm_pre_call_utils import (  # the setup module imports this one
+        _normalized_metadata_object,  # pyright: ignore[reportPrivateUsage]  # the setup's own check
+    )
+
+    for bucket in _NESTED_METADATA_KEYS:
+        value = target.get(bucket)
+        if value is not None:
+            _normalized_metadata_object(bucket, value)
 
 
 def _reject_url_valued_fallback_target(value: str) -> None:
@@ -570,6 +1285,59 @@ def _reject_url_valued_fallback_target(value: str) -> None:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _BodyCheckSettings:
+    general_settings: Mapping[str, object]
+    llm_router: Router | None
+    manages_deployments: bool
+    # The bucket the request setup keeps on this request's route; the other one it merges in and drops, or keeps too
+    metadata_variable_name: str
+
+
+def _check_fallback_entry(settings: _BodyCheckSettings, entry: FallbackEntry) -> None:
+    """
+    The one check of a fallback entry, from every source and in every branch. A target gets every check of fields,
+    models and credentials a request body gets: a mapping is merged into the call, so it gets the body's banned-param
+    check, with the opt-in of the model it lands on; it may keep no key the request setup drops from or writes over in
+    a body; and it carries none of the credential, endpoint, routing, Router-owned and mock params no fallback target
+    may carry. A name, and a mapping's model and file_id, may not be a URL. Content guardrails and pre-call hooks read
+    the body's own fields alone, so a target's own messages, input, prompt, system and tools reach the model without
+    them; this check does not cover that.
+    """
+    target: Final = entry.target
+    if not isinstance(target, str):
+        _reject_unreadable_metadata(target)
+        try:
+            _check_banned_params_in_body(
+                target,
+                settings.general_settings,
+                settings.llm_router,
+                # A target without its own model lands on whichever an earlier hop left, so it is read for none
+                fallback_target_model_name(target) or "",
+                manages_deployments=settings.manages_deployments,
+            )
+            _reject_fallback_target_credentials(
+                target, settings.general_settings.get("allow_client_side_credentials") is True
+            )
+            _reject_setup_stripped_fields(target, settings.metadata_variable_name)
+        except ValueError as refusal:
+            if entry.is_group_map and entry.group is not None:
+                raise ValueError(f"{refusal} {_read_both_ways_note((entry.group,))}") from refusal
+            raise
+    destinations: Final = (
+        (target,)
+        if isinstance(target, str)
+        else tuple(value for field in _URL_DESTINATION_FIELDS if isinstance(value := target.get(field), str))
+    )
+    for destination in destinations:
+        try:
+            _reject_url_valued_fallback_target(destination)
+        except ValueError as refusal:
+            if entry.group is not None:
+                raise ValueError(f"{refusal} {_read_both_ways_note((entry.group,))}") from refusal
+            raise
+
+
 def is_request_body_safe(
     request_body: dict,
     general_settings: dict,
@@ -577,6 +1345,7 @@ def is_request_body_safe(
     model: str,
     *,
     route: str | None = None,
+    request: Request | None = None,
 ) -> bool:
     """
     Check if the request body is safe.
@@ -602,36 +1371,101 @@ def is_request_body_safe(
     than recursion) covers nested-config attacks like Milvus's
     ``litellm_embedding_config.api_base`` (VERIA-6) without exposing a
     recursion-depth DoS surface.
+
+    check_request_body runs the checks.
     """
-    if "model_list" in request_body:
-        raise ValueError("Rejected Request: model_list is not allowed in the request body.")
+    check_request_body(
+        request_body,  # pyright: ignore[reportUnknownArgumentType]  # the callers' untyped request body
+        # The proxy's settings dict as loaded, which the checks read by setting name only: not copied, not validated
+        general_settings,  # pyright: ignore[reportUnknownArgumentType]  # see above
+        llm_router,
+        model,
+        route=route,
+        request=request,
+    )
+    return True
+
+
+def check_request_body(
+    request_body: Mapping[str, object],
+    general_settings: Mapping[str, object],
+    llm_router: Router | None,
+    model: str,
+    *,
+    route: str | None = None,
+    request: Request | None = None,
+    saved_settings: bool = False,
+) -> FallbackModelNames:
+    """
+    is_request_body_safe's checks, returning the models the body's fallback lists name. A fallback target is merged
+    into the call, so every entry of every fallback list the body carries goes through _check_fallback_entry. One walk
+    of the lists, the one the Router's own check reads them with, serves whose list each ``fallbacks`` is, the checks
+    and the names. ``saved_settings`` marks a body whose router_settings_override is the key's or team's saved router
+    settings, which the walk counts apart from the request's own lists (request_fallback_walk).
+    """
+    from litellm.proxy.litellm_pre_call_utils import (  # the setup module imports this one
+        metadata_variable_name_for_route,
+    )
+
     manages_deployments: Final = route_manages_deployments(route)
-    _check_banned_params(request_body, general_settings, llm_router, model, manages_deployments=manages_deployments)
+    _check_banned_params_in_body(
+        request_body, general_settings, llm_router, model, manages_deployments=manages_deployments
+    )
+    settings: Final = _BodyCheckSettings(
+        general_settings, llm_router, manages_deployments, metadata_variable_name_for_route(route or "")
+    )
+    checks: Final = FallbackChecks(
+        entry=partial(_check_fallback_entry, settings),
+        litellm_list=_reject_unreadable_litellm_list,
+    )
+    return FallbackModelNames.of(
+        request_fallback_walk(
+            route or "", request, request_body, llm_router=llm_router, saved_settings=saved_settings
+        ).check(checks)
+    )
+
+
+def _check_banned_params_in_body(
+    body: Mapping[str, object],
+    general_settings: Mapping[str, object],
+    llm_router: Router | None,
+    model: str,
+    *,
+    manages_deployments: bool,
+) -> None:
+    """
+    The banned-param checks of one request body, the request's own or a fallback target's: its root, the config and
+    metadata it nests and its litellm_params
+    """
+    if "model_list" in body:
+        raise ValueError("Rejected Request: model_list is not allowed in the request body.")
+    _check_banned_params(
+        body, general_settings, llm_router, model, manages_deployments=manages_deployments, refused=_CALL_PARAMS_REFUSED
+    )
     for nested_key in _NESTED_CONFIG_KEYS:
-        nested = _coerce_metadata_to_dict(request_body.get(nested_key))
+        nested = _coerce_metadata_to_dict(body.get(nested_key))
         if nested is not None:
-            _check_banned_params(nested, general_settings, llm_router, model, manages_deployments=manages_deployments)
+            _check_banned_params(
+                nested,
+                general_settings,
+                llm_router,
+                model,
+                manages_deployments=manages_deployments,
+                refused=_CALL_PARAMS_REFUSED if nested_key in _CALL_PARAMS_CONFIG_KEYS else _BANNED_REQUEST_BODY_PARAMS,
+            )
     for metadata_key in _NESTED_METADATA_KEYS:
-        metadata = _coerce_metadata_to_dict(request_body.get(metadata_key))
+        metadata = _coerce_metadata_to_dict(body.get(metadata_key))
         if metadata is not None:
             _check_banned_params(metadata, general_settings, llm_router, model, manages_deployments=manages_deployments)
-        if any(isinstance(key, str) and key.startswith(f"{metadata_key}[") for key in request_body):
+        if any(isinstance(key, str) and key.startswith(f"{metadata_key}[") for key in body):
             _check_banned_params(
-                extract_nested_form_metadata(form_data=request_body, prefix=f"{metadata_key}["),
+                extract_nested_form_metadata(form_data=body, prefix=f"{metadata_key}["),
                 general_settings,
                 llm_router,
                 model,
                 manages_deployments=manages_deployments,
             )
-    for target in iter_request_fallback_targets(request_body):
-        if isinstance(target, dict):
-            _check_banned_params(target, general_settings, llm_router, model, manages_deployments=manages_deployments)
-            target_model = target.get("model")
-            if isinstance(target_model, str):
-                _reject_url_valued_fallback_target(target_model)
-        elif isinstance(target, str):
-            _reject_url_valued_fallback_target(target)
-    litellm_params: Final = _coerce_metadata_to_dict(request_body.get("litellm_params"))
+    litellm_params: Final = _coerce_metadata_to_dict(body.get("litellm_params"))
     if litellm_params is not None:
         reject_server_owned_wif_params(litellm_params)
         if not manages_deployments:
@@ -645,7 +1479,6 @@ def is_request_body_safe(
                 model,
                 manages_deployments=manages_deployments,
             )
-    return True
 
 
 def _coerce_metadata_to_dict(value: object) -> dict[str, object] | None:
@@ -697,6 +1530,7 @@ async def pre_db_read_auth_checks(
         llm_router=llm_router,
         model=request_data.get("model", ""),  # [TODO] use model passed in url as well (azure openai routes)
         route=route,
+        request=request,
     )
 
     # Check 3. Check if IP address is allowed
@@ -796,8 +1630,6 @@ def get_request_route(request: Request) -> str:
             return str(request.url.path)
         raw_path: Final[str] = str(scope.get("path", request.url.path))
         root_path: Final[str] = str(scope.get("app_root_path", scope.get("root_path", ""))).rstrip("/")
-        if not isinstance(raw_path, str):
-            return str(request.url.path)
         # Strip root_path only when it matches whole path segments — guarding
         # against sibling paths like "/apifoo" being truncated under
         # root_path="/api". Trailing slashes on root_path are stripped above,

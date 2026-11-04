@@ -291,7 +291,7 @@ except (ImportError, AttributeError, TypeError):
 claude_json_str = json.dumps(json_data)
 import importlib.metadata
 from collections.abc import AsyncIterator, Callable, Collection, Iterable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, TypeVar, cast, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, Final, Literal, Protocol, TypeVar, cast, runtime_checkable
 
 from typing_extensions import assert_never
 
@@ -1385,15 +1385,19 @@ def _schedule_async_success_logging(
         return
 
     def _enqueue_async_logging() -> None:
+        from litellm.responses.streaming_iterator import spawn_logging_task
+
         logging_obj.mark_async_success_log_enqueued()
-        asyncio.create_task(
+        spawn_logging_task(
+            asyncio.get_running_loop(),
             _client_async_logging_helper(
                 logging_obj=logging_obj,
                 result=result,
                 start_time=start_time,
                 end_time=end_time,
                 is_completion_with_fallbacks=is_completion_with_fallbacks,
-            )
+            ),
+            task_name="success callback enqueue",
         )
 
     if not logging_obj.defer_async_logging:
@@ -2001,7 +2005,10 @@ def client(original_function):
             kwargs["litellm_call_id"] = str(uuid.uuid4())
 
         model: Final[str | None] = args[0] if len(args) > 0 else kwargs.get("model", None)
-        is_completion_with_fallbacks: Final = kwargs.get("fallbacks") is not None
+        # anthropic_messages has no completion_with_fallbacks parent call, so its own event is the only one to log
+        is_completion_with_fallbacks: Final = (
+            kwargs.get("fallbacks") is not None and call_type != CallTypes.anthropic_messages.value
+        )
         kwargs.pop("_is_litellm_internal_call", None)  # discard if injected
         _is_litellm_internal_call: Final = is_internal_call.get()
         _deployment_call_end_time: datetime.datetime | None = None
@@ -3284,12 +3291,14 @@ def _get_builtin_model_info_for_registration(model: str, custom_llm_provider: st
 
 
 _runtime_registered_model_cost: Final[dict[str, dict[str, object]]] = {}  # mutable-ok: replayed on reload
+
+
 class _RegisteredPricingFields:
     """Explicitly registered rates per cost-map key, tied to the ``litellm.model_cost`` object they were
     registered on so a replaced catalog starts without them, as the entries they describe do."""
 
     cost_map: object = None
-    fields: dict[str, dict[str, object]] = {}  # mutable-ok: rebuilt whenever litellm.model_cost is replaced
+    fields: ClassVar[dict[str, dict[str, object]]] = {}  # mutable-ok: rebuilt whenever litellm.model_cost is replaced
 
 
 def _registered_pricing_fields() -> dict[str, dict[str, object]]:

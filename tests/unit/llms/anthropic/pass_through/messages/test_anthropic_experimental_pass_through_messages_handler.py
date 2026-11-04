@@ -956,6 +956,54 @@ def test_gate_passthrough_skipped_when_only_chat_completions_supported(monkeypat
 
 
 @pytest.mark.parametrize(
+    "fallbacks",
+    [["gpt-4o-mini", {"temperature": 0}], ["gpt-4o-mini", {}]],
+    ids=["parameter-override", "empty-override"],
+)
+def test_chat_bridge_gets_a_fallback_list_litellm_completion_reads_entry_by_entry(monkeypatch, fallbacks):
+    """litellm.acompletion calls every entry of its own `fallbacks` as a target, so a mapping there is an override of
+    the call, never a model group map the Router would refuse"""
+    from litellm.llms.anthropic.pass_through.messages import handler
+
+    sent: dict[str, object] = {}
+
+    def fake_chat_bridge(**kwargs: object) -> str:
+        sent.update(kwargs)
+        return "translated"
+
+    monkeypatch.setattr(litellm, "use_chat_completions_url_for_anthropic_messages", True)
+    monkeypatch.setattr(
+        handler.LiteLLMMessagesToCompletionTransformationHandler,
+        "anthropic_messages_handler",
+        staticmethod(fake_chat_bridge),
+    )
+
+    result = handler.anthropic_messages_handler(
+        max_tokens=100,
+        messages=[{"role": "user", "content": "Hello"}],
+        model="openai/some-model",
+        fallbacks=list(fallbacks),
+    )
+
+    assert result == "translated"
+    assert sent["fallbacks"] == fallbacks
+
+
+def test_chat_bridge_still_refuses_a_fallbacks_value_that_is_not_a_list(monkeypatch):
+    from litellm.llms.anthropic.pass_through.messages import handler
+
+    monkeypatch.setattr(litellm, "use_chat_completions_url_for_anthropic_messages", True)
+    with pytest.raises(litellm.BadRequestError, match="fallbacks must be a list of model groups"):
+        handler.anthropic_messages_handler(
+            max_tokens=100,
+            messages=[{"role": "user", "content": "Hello"}],
+            model="openai/some-model",
+            fallbacks="gpt-4o-mini",
+        )
+
+
+
+@pytest.mark.parametrize(
     "model_info, expected_ttl_support",
     [
         ({"supported_endpoints": ["/v1/messages"]}, False),

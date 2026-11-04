@@ -1,18 +1,25 @@
 import asyncio
 import json
+from collections.abc import Awaitable, Callable, Sequence
 from types import MappingProxyType, SimpleNamespace
-from typing import Final, Mapping, Optional, cast
+from typing import TYPE_CHECKING, Final, Mapping, Optional, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from pydantic import BaseModel
 
 from litellm._uuid import uuid
 from tests.unit.proxy.management_endpoints.jwt_key_mapping_doubles import (
     CascadingJWTMappingTable,
     JWTMappingRow,
 )
+
+if TYPE_CHECKING:
+    from litellm.proxy._types import LiteLLM_OrganizationTable
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from tests.unit.caching.fake_redis_cache import FakeRedisCache
 
 
 @pytest.mark.asyncio
@@ -812,6 +819,7 @@ async def _run_update_organization_v2(
     existing_metadata,
     existing_object_permission_id=None,
     existing_object_permission_row=None,
+    key_rows=(),
 ):
     from litellm.proxy._types import (
         LitellmUserRoles,
@@ -839,6 +847,7 @@ async def _run_update_organization_v2(
         return_value=existing_object_permission_row
     )
     mock_prisma_client.db.litellm_objectpermissiontable.upsert = AsyncMock()
+    mock_prisma_client.db.litellm_verificationtoken.find_many = AsyncMock(return_value=list(key_rows))
 
     tx = MagicMock()
     tx.litellm_organizationtable = mock_prisma_client.db.litellm_organizationtable
@@ -1517,6 +1526,101 @@ def test_organization_routes_reach_their_handler_with_enterprise_license(monkeyp
     )
 
 
+def _column_matches(value: object, condition: object) -> bool:
+    if isinstance(condition, Mapping):
+        allowed: Final = condition.get("in")
+        return isinstance(allowed, (list, tuple)) and value in allowed
+    return value == condition
+
+
+def _row_matches(row: object, where: Mapping[str, object]) -> bool:
+    """Prisma's equality and ``in`` filters, the only ones these endpoints send to the tables below."""
+    return all(_column_matches(getattr(row, column), condition) for column, condition in where.items())
+
+
+class _Rows:
+    """One table as one database holds it: the writer, or a read replica lagging behind it. Each delete notes the rows
+    it takes whose last good entry ``served`` still finds, and the first one can be preceded by a row arriving, as one a
+    concurrent request writes between a read and that delete does."""
+
+    def __init__(
+        self,
+        rows: Sequence[object],
+        *,
+        served: Callable[[object], Awaitable[bool]] | None = None,
+        arrives_before_first_delete: object | None = None,
+    ) -> None:
+        self.rows: tuple[object, ...] = tuple(rows)
+        self.deleted_while_served: list[object] = []
+        self._served = served
+        self._arriving = arrives_before_first_delete
+
+    async def find_many(self, where: Mapping[str, object]) -> list[object]:
+        return [row for row in self.rows if _row_matches(row, where)]
+
+    async def find_unique(self, where: Mapping[str, object]) -> object | None:
+        return next(iter(await self.find_many(where)), None)
+
+    async def delete_many(self, where: Mapping[str, object]) -> int:
+        if self._arriving is not None:
+            self.rows = (*self.rows, self._arriving)
+            self._arriving = None
+        doomed: Final = await self.find_many(where)
+        if self._served is not None:
+            self.deleted_while_served.extend([row for row in doomed if await self._served(row)])
+        self.rows = tuple(row for row in self.rows if row not in doomed)
+        return len(doomed)
+
+    async def delete(self, where: Mapping[str, Mapping[str, object]]) -> object | None:
+        """A delete by one compound unique key, such as a membership's ``user_id_organization_id``."""
+        unique: Final = next(iter(where.values()))
+        doomed: Final = await self.find_unique(unique)
+        await self.delete_many(unique)
+        return doomed
+
+    async def create(self, data: Mapping[str, object]) -> object:
+        raise AssertionError(f"these tests create no row, yet got {data}")
+
+
+def _served_by(
+    cache: "UserApiKeyCache", cache_key_of: Callable[[object], str], model: type[BaseModel]
+) -> Callable[[object], Awaitable[bool]]:
+    """Whether a row's last good entry is still served: not yet revoked."""
+    from litellm.proxy.common_utils.user_api_key_cache import recall_last_good
+
+    async def served(row: object) -> bool:
+        return await recall_last_good(cache, cache_key_of(row), model) is not None
+
+    return served
+
+
+def _routed_database(writer: Mapping[str, object], replica: Mapping[str, object]) -> SimpleNamespace:
+    """A ``PrismaClient`` with ``DATABASE_URL_READ_REPLICA`` set: ``db`` sends writes to the writer, which ``writer_db``
+    is, and reads to the replica unless the context's reads are pinned to the writer."""
+    from litellm.proxy.db.prisma_client import PrismaWrapper
+    from litellm.proxy.db.routing_prisma_wrapper import RoutingPrismaWrapper
+
+    writer_db: Final = PrismaWrapper(original_prisma=SimpleNamespace(**writer), iam_token_db_auth=False)
+    replica_db: Final = PrismaWrapper(original_prisma=SimpleNamespace(**replica), iam_token_db_auth=False)
+    return SimpleNamespace(db=RoutingPrismaWrapper(writer=writer_db, reader=replica_db), writer_db=writer_db)
+
+
+def _org_endpoints_use(monkeypatch: pytest.MonkeyPatch, prisma_client: object, cache: "UserApiKeyCache") -> None:
+    """The proxy globals the organization endpoints read their license, database and auth cache from."""
+    for name, value in (
+        ("premium_user", True),
+        ("prisma_client", prisma_client),
+        ("user_api_key_cache", cache),
+        ("proxy_logging_obj", None),
+    ):
+        # test-quality-ok: the endpoints import these from proxy_server when called; no parameter carries them
+        monkeypatch.setattr(f"litellm.proxy.proxy_server.{name}", value, raising=False)
+
+
+def _deleted_organization_table() -> SimpleNamespace:
+    return SimpleNamespace(delete=AsyncMock(return_value=SimpleNamespace(organization_id="org-doomed")))
+
+
 @pytest.mark.asyncio
 async def test_delete_organization_evicts_the_cache_of_the_keys_it_deletes(monkeypatch):
     """/organization/delete bulk-deletes the org's keys without going through /key/delete, so the
@@ -1573,3 +1677,935 @@ async def test_delete_organization_evicts_the_cache_of_the_keys_it_deletes(monke
     assert all(cache.get_cache(key=cache_key) is None for cache_key in doomed_cache_keys)
     assert all(cache.get_cache(key=cache_key) == {"retained": True} for cache_key in kept_cache_keys)
     assert jwt_table.rows == (kept_row,)
+
+
+@pytest.mark.asyncio
+async def test_delete_organization_drops_the_last_good_entries_of_the_teams_it_deletes(monkeypatch):
+    """A deleted organization's teams must not survive as last good entries a later database outage serves."""
+    from litellm.models.team import LiteLLM_TeamTableCachedObj
+    from litellm.proxy._types import DeleteOrganizationRequest, LitellmUserRoles, UserAPIKeyAuth
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, recall_last_good, remember_last_good
+    from litellm.proxy.management_endpoints.organization_endpoints import delete_organization
+
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    await remember_last_good(cache, "team_id:t-org", LiteLLM_TeamTableCachedObj(team_id="t-org", team_alias="org-lane"))
+    await remember_last_good(cache, "team_alias:org-lane", LiteLLM_TeamTableCachedObj(team_id="t-org"))
+    prisma_client: Final = AsyncMock()
+    prisma_client.db.litellm_teamtable = _Rows(
+        (SimpleNamespace(team_id="t-org", team_alias="org-lane", organization_id="org-doomed"),)
+    )
+    prisma_client.db.litellm_verificationtoken.find_many = AsyncMock(return_value=[])
+    prisma_client.db.litellm_organizationmembership.find_many = AsyncMock(return_value=[])
+    prisma_client.db.litellm_jwtkeymapping = CascadingJWTMappingTable([])
+    prisma_client.db.litellm_organizationtable.delete = AsyncMock(return_value=MagicMock())
+    monkeypatch.setattr("litellm.proxy.proxy_server.premium_user", True, raising=False)
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", prisma_client)
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
+    monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", None)
+
+    await delete_organization(
+        data=DeleteOrganizationRequest(organization_ids=["org-doomed"]),
+        user_api_key_dict=UserAPIKeyAuth(api_key="sk-admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+    )
+    await remember_last_good(cache, "team_id:t-org", LiteLLM_TeamTableCachedObj(team_id="t-org"))
+
+    assert await recall_last_good(cache, "team_id:t-org", LiteLLM_TeamTableCachedObj) is None
+    assert await recall_last_good(cache, "team_alias:org-lane", LiteLLM_TeamTableCachedObj) is None
+
+
+class _OrganizationReads:
+    """Answers the organization lookups auth runs, or fails each the way an unreachable Postgres does once stopped."""
+
+    def __init__(self, org: object) -> None:
+        self.stopped = False
+        self._org = org
+        self.db = SimpleNamespace(litellm_organizationtable=self)
+
+    async def find_unique(self, where: Mapping[str, object], include: object = None) -> object:
+        import httpx
+
+        if self.stopped:
+            raise httpx.ConnectError("All connection attempts failed")
+        return self._org
+
+
+async def _org_read_by_every_lookup(monkeypatch, org_id: str, *, serving: bool):
+    """An auth cache holding the organization as every auth lookup caches it: with and without its budget, as the
+    last known organization, and, while last good entries are served, as their last good entries."""
+    from litellm.proxy._types import LiteLLM_OrganizationTable
+    from litellm.proxy.auth.auth_checks import get_org_object, get_org_object_for_request
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+
+    cache: Final = UserApiKeyCache(serve_last_good_entries=serving)
+    reads: Final = _OrganizationReads(
+        LiteLLM_OrganizationTable(organization_id=org_id, budget_id="b-org", created_by="admin", updated_by="admin")
+    )
+    await get_org_object(org_id=org_id, prisma_client=reads, user_api_key_cache=cache, include_budget_table=False)  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+    await get_org_object_for_request(
+        org_id=org_id,
+        prisma_client=reads,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+        user_api_key_cache=cache,
+        parent_otel_span=None,
+        proxy_logging_obj=None,
+    )
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
+    return cache, reads
+
+
+async def _org_served_while_the_database_is_stopped(
+    cache, reads: _OrganizationReads, org_id: str
+) -> Mapping[str, bool]:
+    """Which auth lookups still answer with the organization once the database stops. A lookup that does not answer
+    raises the unreachable database's error, or refuses for lack of a last good entry."""
+    import httpx
+
+    from litellm.proxy.auth.auth_checks import get_org_object, get_org_object_for_request
+    from litellm.proxy.db.exception_handler import LastGoodEntryMissing
+
+    reads.stopped = True
+    lookups: Final = {
+        "org": lambda: get_org_object(
+            org_id=org_id,
+            prisma_client=reads,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+            user_api_key_cache=cache,
+            include_budget_table=False,
+        ),
+        "org_for_request": lambda: get_org_object_for_request(
+            org_id=org_id,
+            prisma_client=reads,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+            user_api_key_cache=cache,
+            parent_otel_span=None,
+            proxy_logging_obj=None,
+        ),
+    }
+
+    async def served(lookup) -> bool:
+        try:
+            return await lookup() is not None
+        except (httpx.ConnectError, LastGoodEntryMissing):
+            return False
+
+    return {name: await served(lookup) for name, lookup in lookups.items()}
+
+
+_SERVING: Final = pytest.mark.parametrize("serving", [False, True], ids=["cache_only", "last_good_entries"])
+
+
+@pytest.mark.asyncio
+@_SERVING
+async def test_an_organization_nothing_evicted_is_served_while_the_database_is_stopped(monkeypatch, serving: bool):
+    cache, reads = await _org_read_by_every_lookup(monkeypatch, "org-1", serving=serving)
+
+    assert await _org_served_while_the_database_is_stopped(cache, reads, "org-1") == {
+        "org": True,
+        "org_for_request": True,
+    }
+
+
+@pytest.mark.asyncio
+@_SERVING
+async def test_v1_update_evicts_the_organization_and_its_last_good_entries(monkeypatch, serving: bool):
+    """Auth reads the organization cache-first, and its last good entry lasts until it expires: an update that leaves
+    either in place keeps enforcing the old limits, during a database outage until the entry expires."""
+    from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
+    from litellm.proxy.management_endpoints import organization_endpoints
+    from litellm.proxy.utils import jsonify_object
+
+    cache, reads = await _org_read_by_every_lookup(monkeypatch, "org-1", serving=serving)
+    prisma_client: Final = AsyncMock()
+    prisma_client.jsonify_object = jsonify_object
+    prisma_client.db.litellm_organizationtable.find_unique = AsyncMock(
+        return_value=SimpleNamespace(metadata=None, budget_id="b-org", object_permission_id=None)
+    )
+    prisma_client.db.litellm_organizationtable.update = AsyncMock(return_value=MagicMock())
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", prisma_client)
+    monkeypatch.setattr(organization_endpoints, "verify_org_access", AsyncMock())
+    request: Final = MagicMock()
+    request.json = AsyncMock(return_value={"organization_id": "org-1", "organization_alias": "renamed"})
+
+    await organization_endpoints.update_organization(
+        request=request,
+        user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN, user_id="admin-1"),
+    )
+
+    assert not any((await _org_served_while_the_database_is_stopped(cache, reads, "org-1")).values())
+
+
+@pytest.mark.asyncio
+@_SERVING
+async def test_v2_update_evicts_the_organization_and_its_last_good_entries(monkeypatch, serving: bool):
+    cache, reads = await _org_read_by_every_lookup(monkeypatch, "org-1", serving=serving)
+
+    await _run_update_organization_v2(
+        monkeypatch, body={"max_budget": 1.0}, existing_budget_id="b-org", existing_metadata=None
+    )
+
+    assert not any((await _org_served_while_the_database_is_stopped(cache, reads, "org-1")).values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body, evicted",
+    [({"max_budget": 1.0}, True), ({"metadata": {"lane": "a"}}, False)],
+    ids=["budget_changed", "budget_untouched"],
+)
+async def test_v2_budget_change_drops_the_last_good_entries_of_the_organizations_keys(
+    monkeypatch, body: dict, evicted: bool
+):
+    """A key's own entry carries its organization's budget, which a v2 update writes straight to the budget row."""
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, recall_last_good, remember_last_good
+
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    await remember_last_good(
+        cache, "hashed-org-key", UserAPIKeyAuth(token="hashed-org-key", organization_max_budget=50.0)
+    )
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
+
+    await _run_update_organization_v2(
+        monkeypatch,
+        body=body,
+        existing_budget_id="b-org",
+        existing_metadata=None,
+        key_rows=(SimpleNamespace(token="hashed-org-key"),),
+    )
+
+    assert (await recall_last_good(cache, "hashed-org-key", UserAPIKeyAuth) is None) is evicted
+
+
+@pytest.mark.asyncio
+@_SERVING
+async def test_delete_organization_evicts_the_organization_and_its_last_good_entries(monkeypatch, serving: bool):
+    from litellm.proxy._types import DeleteOrganizationRequest, LitellmUserRoles, UserAPIKeyAuth
+    from litellm.proxy.management_endpoints.organization_endpoints import delete_organization
+
+    cache, reads = await _org_read_by_every_lookup(monkeypatch, "org-doomed", serving=serving)
+    prisma_client: Final = AsyncMock()
+    prisma_client.db.litellm_teamtable.find_many = AsyncMock(return_value=[])
+    prisma_client.db.litellm_verificationtoken.find_many = AsyncMock(return_value=[])
+    prisma_client.db.litellm_organizationmembership.find_many = AsyncMock(return_value=[])
+    prisma_client.db.litellm_jwtkeymapping = CascadingJWTMappingTable([])
+    prisma_client.db.litellm_organizationtable.delete = AsyncMock(return_value=MagicMock())
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", prisma_client)
+    monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", None)
+
+    await delete_organization(
+        data=DeleteOrganizationRequest(organization_ids=["org-doomed"]),
+        user_api_key_dict=UserAPIKeyAuth(api_key="sk-admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+    )
+
+    assert not any((await _org_served_while_the_database_is_stopped(cache, reads, "org-doomed")).values())
+
+
+@pytest.mark.asyncio
+async def test_delete_organization_answers_503_and_deletes_nothing_when_redis_cannot_record_it(monkeypatch):
+    """The organization's own entries are revoked with its teams' and keys' before the first delete, so a Redis that
+    cannot record the revocation refuses the delete with nothing deleted, even for an organization with no team and
+    no key."""
+    from litellm.proxy._types import DeleteOrganizationRequest, LitellmUserRoles, UserAPIKeyAuth
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from litellm.proxy.management_endpoints.organization_endpoints import delete_organization
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis: Final = fake_redis_cache()
+    redis.server.connected = False
+    prisma_client: Final = AsyncMock()
+    prisma_client.db.litellm_teamtable.find_many = AsyncMock(return_value=[])
+    prisma_client.db.litellm_verificationtoken.find_many = AsyncMock(return_value=[])
+    prisma_client.db.litellm_jwtkeymapping = CascadingJWTMappingTable([])
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", prisma_client)
+    monkeypatch.setattr(
+        "litellm.proxy.proxy_server.user_api_key_cache",
+        UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True),
+    )
+    monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", None)
+    admin_key: Final = "sk-admin"
+
+    with pytest.raises(HTTPException) as refused:
+        await delete_organization(
+            data=DeleteOrganizationRequest(organization_ids=["org-doomed"]),
+            user_api_key_dict=UserAPIKeyAuth(api_key=admin_key, user_role=LitellmUserRoles.PROXY_ADMIN),
+        )
+
+    assert refused.value.status_code == 503
+    prisma_client.db.litellm_teamtable.delete_many.assert_not_awaited()
+    prisma_client.db.litellm_organizationmembership.delete_many.assert_not_awaited()
+    prisma_client.db.litellm_verificationtoken.delete_many.assert_not_awaited()
+    prisma_client.db.litellm_organizationtable.delete.assert_not_awaited()
+
+
+def _org_member_removal(monkeypatch, *, serves_last_good: bool) -> AsyncMock:
+    """/organization/member_delete's database, behind an unreachable Redis with last good entries served or not."""
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis: Final = fake_redis_cache()
+    redis.server.connected = False
+    prisma_client: Final = AsyncMock()
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", prisma_client)
+    monkeypatch.setattr(
+        "litellm.proxy.proxy_server.user_api_key_cache",
+        UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=serves_last_good),
+    )
+    return prisma_client
+
+
+@pytest.mark.asyncio
+async def test_organization_member_delete_answers_503_and_deletes_nothing_when_redis_cannot_record_it(monkeypatch):
+    """The user's entry carries its organization memberships, which the org admin route checks read, so a removal
+    Redis cannot revoke that entry for is refused with 503 before the delete."""
+    from litellm.proxy._types import LitellmUserRoles, OrganizationMemberDeleteRequest, UserAPIKeyAuth
+    from litellm.proxy.management_endpoints.organization_endpoints import organization_member_delete
+
+    prisma_client: Final = _org_member_removal(monkeypatch, serves_last_good=True)
+
+    with pytest.raises(HTTPException) as refused:
+        await organization_member_delete(
+            data=OrganizationMemberDeleteRequest(organization_id="org-1", user_id="member-1"),
+            user_api_key_dict=UserAPIKeyAuth(user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+        )
+
+    assert refused.value.status_code == 503
+    prisma_client.db.litellm_organizationmembership.delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_organization_member_delete_deletes_while_redis_is_down_with_last_good_entries_off(monkeypatch):
+    """With last good entries off nothing is revoked, so Redis being down does not stop the removal."""
+    from litellm.proxy._types import LitellmUserRoles, OrganizationMemberDeleteRequest, UserAPIKeyAuth
+    from litellm.proxy.management_endpoints.organization_endpoints import organization_member_delete
+
+    prisma_client: Final = _org_member_removal(monkeypatch, serves_last_good=False)
+
+    await organization_member_delete(
+        data=OrganizationMemberDeleteRequest(organization_id="org-1", user_id="member-1"),
+        user_api_key_dict=UserAPIKeyAuth(user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+    )
+
+    prisma_client.db.litellm_organizationmembership.delete.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_organization_member_role_change_drops_the_users_last_good_entry(monkeypatch):
+    """The user's entry carries its organization memberships, which the org admin route checks read, so a role change
+    drops it: a database outage after it cannot serve the old role."""
+    from datetime import datetime, timezone
+
+    from litellm.proxy._types import (
+        LiteLLM_OrganizationMembershipTable,
+        LiteLLM_UserTable,
+        LitellmUserRoles,
+        OrganizationMemberUpdateRequest,
+        UserAPIKeyAuth,
+    )
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, recall_last_good, remember_last_good
+    from litellm.proxy.management_endpoints.organization_endpoints import organization_member_update
+
+    joined: Final = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    admin_membership: Final = LiteLLM_OrganizationMembershipTable(
+        user_id="member-1",
+        organization_id="org-1",
+        user_role=LitellmUserRoles.ORG_ADMIN.value,
+        created_at=joined,
+        updated_at=joined,
+    )
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    await remember_last_good(
+        cache, "member-1", LiteLLM_UserTable(user_id="member-1", organization_memberships=[admin_membership])
+    )
+    prisma_client: Final = AsyncMock()
+    prisma_client.db.litellm_organizationtable.find_unique = AsyncMock(return_value=MagicMock())
+    prisma_client.db.litellm_organizationmembership.find_unique = AsyncMock(return_value=admin_membership)
+    prisma_client.db.litellm_usertable.find_unique = AsyncMock(return_value=LiteLLM_UserTable(user_id="member-1"))
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", prisma_client)
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
+
+    await organization_member_update(
+        data=OrganizationMemberUpdateRequest(
+            organization_id="org-1", user_id="member-1", role=LitellmUserRoles.INTERNAL_USER
+        ),
+        user_api_key_dict=UserAPIKeyAuth(user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+    )
+
+    prisma_client.db.litellm_organizationmembership.update.assert_awaited_once()
+    assert await recall_last_good(cache, "member-1", LiteLLM_UserTable) is None
+
+
+@pytest.mark.asyncio
+async def test_delete_organization_pinned_to_the_writer_revokes_the_children_a_lagging_replica_lacks(monkeypatch):
+    """With a read replica, auth pins the delete's reads to the writer, so a team, key or member that the writer has
+    and a lagging replica lacks is revoked before the delete that takes it, like the ones both have."""
+    from litellm.models.team import LiteLLM_TeamTableCachedObj
+    from litellm.proxy._types import DeleteOrganizationRequest, LiteLLM_UserTable, LitellmUserRoles, UserAPIKeyAuth
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, remember_last_good
+    from litellm.proxy.db.routing_prisma_wrapper import reads_pinned_to_writer
+    from litellm.proxy.management_endpoints.organization_endpoints import delete_organization
+
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    await remember_last_good(cache, "team_id:t-new", LiteLLM_TeamTableCachedObj(team_id="t-new"))
+    await remember_last_good(cache, "hashed-new-key", UserAPIKeyAuth(token="hashed-new-key"))
+    await remember_last_good(cache, "new-member", LiteLLM_UserTable(user_id="new-member"))
+    old_team: Final = SimpleNamespace(team_id="t-old", team_alias=None, organization_id="org-doomed")
+    old_key: Final = SimpleNamespace(token="hashed-old-key", organization_id="org-doomed")
+    old_member: Final = SimpleNamespace(user_id="old-member", organization_id="org-doomed")
+    teams: Final = _Rows(
+        (old_team, SimpleNamespace(team_id="t-new", team_alias=None, organization_id="org-doomed")),
+        served=_served_by(cache, lambda team: f"team_id:{team.team_id}", LiteLLM_TeamTableCachedObj),
+    )
+    keys: Final = _Rows(
+        (old_key, SimpleNamespace(token="hashed-new-key", organization_id="org-doomed")),
+        served=_served_by(cache, lambda key: key.token, UserAPIKeyAuth),
+    )
+    members: Final = _Rows(
+        (old_member, SimpleNamespace(user_id="new-member", organization_id="org-doomed")),
+        served=_served_by(cache, lambda member: member.user_id, LiteLLM_UserTable),
+    )
+    unrouted: Final = {
+        "litellm_jwtkeymapping": CascadingJWTMappingTable([]),
+        "litellm_organizationtable": _deleted_organization_table(),
+    }
+    database: Final = _routed_database(
+        {
+            "litellm_teamtable": teams,
+            "litellm_verificationtoken": keys,
+            "litellm_organizationmembership": members,
+            **unrouted,
+        },
+        {
+            "litellm_teamtable": _Rows((old_team,)),
+            "litellm_verificationtoken": _Rows((old_key,)),
+            "litellm_organizationmembership": _Rows((old_member,)),
+            **unrouted,
+        },
+    )
+    _org_endpoints_use(monkeypatch, database, cache)
+
+    with reads_pinned_to_writer():
+        await delete_organization(
+            data=DeleteOrganizationRequest(organization_ids=["org-doomed"]),
+            user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN),
+        )
+
+    assert (teams.rows, keys.rows, members.rows) == ((), (), ())
+    assert teams.deleted_while_served == []
+    assert keys.deleted_while_served == []
+    assert members.deleted_while_served == []
+
+
+@pytest.mark.asyncio
+async def test_delete_organization_revokes_a_child_added_between_a_read_and_its_delete(monkeypatch):
+    """A team, key or membership added to the organization between a read and the delete that would take it is not
+    deleted unrevoked: each delete takes only the rows read and revoked, and the next read finds the new one."""
+    from litellm.models.team import LiteLLM_TeamTableCachedObj
+    from litellm.proxy._types import DeleteOrganizationRequest, LiteLLM_UserTable, LitellmUserRoles, UserAPIKeyAuth
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, remember_last_good
+    from litellm.proxy.management_endpoints.organization_endpoints import delete_organization
+
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    await remember_last_good(cache, "team_id:t-late", LiteLLM_TeamTableCachedObj(team_id="t-late"))
+    await remember_last_good(cache, "hashed-late-key", UserAPIKeyAuth(token="hashed-late-key"))
+    await remember_last_good(cache, "late-member", LiteLLM_UserTable(user_id="late-member"))
+    teams: Final = _Rows(
+        (SimpleNamespace(team_id="t-org", team_alias=None, organization_id="org-doomed"),),
+        served=_served_by(cache, lambda team: f"team_id:{team.team_id}", LiteLLM_TeamTableCachedObj),
+        arrives_before_first_delete=SimpleNamespace(team_id="t-late", team_alias=None, organization_id="org-doomed"),
+    )
+    keys: Final = _Rows(
+        (SimpleNamespace(token="hashed-org-key", organization_id="org-doomed"),),
+        served=_served_by(cache, lambda key: key.token, UserAPIKeyAuth),
+        arrives_before_first_delete=SimpleNamespace(token="hashed-late-key", organization_id="org-doomed"),
+    )
+    members: Final = _Rows(
+        (SimpleNamespace(user_id="org-member", organization_id="org-doomed"),),
+        served=_served_by(cache, lambda member: member.user_id, LiteLLM_UserTable),
+        arrives_before_first_delete=SimpleNamespace(user_id="late-member", organization_id="org-doomed"),
+    )
+    database: Final = SimpleNamespace(
+        db=SimpleNamespace(
+            litellm_teamtable=teams,
+            litellm_verificationtoken=keys,
+            litellm_organizationmembership=members,
+            litellm_jwtkeymapping=CascadingJWTMappingTable([]),
+            litellm_organizationtable=_deleted_organization_table(),
+        )
+    )
+    _org_endpoints_use(monkeypatch, database, cache)
+
+    await delete_organization(
+        data=DeleteOrganizationRequest(organization_ids=["org-doomed"]),
+        user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN),
+    )
+
+    assert (teams.rows, keys.rows, members.rows) == ((), (), ())
+    assert teams.deleted_while_served == []
+    assert keys.deleted_while_served == []
+    assert members.deleted_while_served == []
+
+
+class _JWTMappingTableNotingReads(CascadingJWTMappingTable):
+    """The mapping table, with the tokens each read asks for noted in ``reads``, in order."""
+
+    def __init__(self, rows: Sequence[JWTMappingRow]) -> None:
+        super().__init__(rows)
+        self.reads: Final[list[tuple[str, ...]]] = []  # mutable-ok: one entry per read, in order
+
+    async def find_many(self, where: Mapping[str, Mapping[str, Sequence[str]]]) -> list[JWTMappingRow]:
+        self.reads.append(tuple(where["token"]["in"]))
+        return await super().find_many(where)
+
+
+@pytest.mark.asyncio
+async def test_delete_organization_reads_the_jwt_mappings_of_its_keys_one_chunk_at_a_time(monkeypatch):
+    """While last good entries are served, the keys' JWT mappings are read chunk by chunk, right before each chunk's
+    revocation, so no mapping read's ``in`` list holds more than one chunk's tokens; every mapping is still evicted
+    once the keys are gone."""
+    from functools import partial
+
+    from litellm.proxy._types import (
+        DeleteOrganizationRequest,
+        LitellmUserRoles,
+        UserAPIKeyAuth,
+    )
+    from litellm.proxy.auth.auth_checks import jwt_key_mapping_cache_key
+    from litellm.proxy.common_utils.user_api_key_cache import (
+        UserApiKeyCache,
+        remember_last_good,
+        revoke_and_delete_read_rows,
+    )
+    from litellm.proxy.management_endpoints.organization_endpoints import delete_organization
+
+    tokens: Final = tuple(f"hashed-org-key-{n}" for n in range(5))
+    doomed_mapping_keys: Final = tuple(jwt_key_mapping_cache_key("sub", f"svc-{token}", None) for token in tokens)
+    kept_mapping_key: Final = jwt_key_mapping_cache_key("sub", "other-account", None)
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    for token in tokens:
+        await remember_last_good(cache, token, UserAPIKeyAuth(token=token))
+    for cache_key in (*doomed_mapping_keys, kept_mapping_key):
+        cache.set_cache(key=cache_key, value={"retained": True})
+    keys: Final = _Rows(
+        # The key rows the endpoint reads are the database's, with their organization_id column, which the proxy's
+        # LiteLLM_VerificationToken does not carry (it has org_id)
+        tuple(SimpleNamespace(token=token, organization_id="org-doomed") for token in tokens),
+        served=_served_by(cache, lambda key: key.token, UserAPIKeyAuth),
+    )
+    jwt_table: Final = _JWTMappingTableNotingReads(
+        (
+            *(JWTMappingRow(token, "sub", f"svc-{token}") for token in tokens),
+            JWTMappingRow("hashed-other-key", "sub", "other-account"),
+        )
+    )
+    database: Final = SimpleNamespace(
+        db=SimpleNamespace(
+            litellm_teamtable=_Rows(()),
+            litellm_verificationtoken=keys,
+            litellm_organizationmembership=_Rows(()),
+            litellm_jwtkeymapping=jwt_table,
+            litellm_organizationtable=_deleted_organization_table(),
+        )
+    )
+    _org_endpoints_use(monkeypatch, database, cache)
+    # Chunks of two, so five keys make three chunks without writing 5,001 rows
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.organization_endpoints.revoke_and_delete_read_rows",
+        partial(revoke_and_delete_read_rows, chunk_size=2),
+    )
+
+    await delete_organization(
+        data=DeleteOrganizationRequest(organization_ids=["org-doomed"]),
+        user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN),
+    )
+
+    assert jwt_table.reads == [tokens[:2], tokens[2:4], tokens[4:]]
+    assert all(cache.get_cache(key=cache_key) is None for cache_key in doomed_mapping_keys)
+    assert cache.get_cache(key=kept_mapping_key) == {"retained": True}
+    assert keys.rows == ()
+    assert keys.deleted_while_served == []
+
+
+@pytest.mark.asyncio
+async def test_organization_member_delete_by_email_pinned_to_the_writer_removes_the_user_the_writer_maps_it_to(
+    monkeypatch,
+):
+    """The email is resolved where the removal writes: a lagging replica that still maps it to the user who held it
+    before would revoke and remove that user instead, leaving the current holder's membership and entry in place."""
+    from litellm.proxy._types import (
+        LiteLLM_UserTable,
+        LitellmUserRoles,
+        OrganizationMemberDeleteRequest,
+        UserAPIKeyAuth,
+    )
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, recall_last_good, remember_last_good
+    from litellm.proxy.db.routing_prisma_wrapper import reads_pinned_to_writer
+    from litellm.proxy.management_endpoints.organization_endpoints import organization_member_delete
+
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    await remember_last_good(cache, "u-current", LiteLLM_UserTable(user_id="u-current"))
+    await remember_last_good(cache, "u-former", LiteLLM_UserTable(user_id="u-former"))
+    memberships: Final = _Rows(
+        (
+            SimpleNamespace(user_id="u-current", organization_id="org-1"),
+            SimpleNamespace(user_id="u-former", organization_id="org-1"),
+        )
+    )
+    database: Final = _routed_database(
+        {
+            "litellm_usertable": _Rows(
+                (
+                    LiteLLM_UserTable(user_id="u-current", user_email="member@example.com"),
+                    LiteLLM_UserTable(user_id="u-former", user_email="former@example.com"),
+                )
+            ),
+            "litellm_organizationmembership": memberships,
+        },
+        {
+            "litellm_usertable": _Rows((LiteLLM_UserTable(user_id="u-former", user_email="member@example.com"),)),
+            "litellm_organizationmembership": memberships,
+        },
+    )
+    _org_endpoints_use(monkeypatch, database, cache)
+
+    with reads_pinned_to_writer():
+        await organization_member_delete(
+            data=OrganizationMemberDeleteRequest(organization_id="org-1", user_email="member@example.com"),
+            user_api_key_dict=UserAPIKeyAuth(user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+        )
+
+    assert [membership.user_id for membership in memberships.rows] == ["u-former"]
+    assert await recall_last_good(cache, "u-current", LiteLLM_UserTable) is None
+    assert await recall_last_good(cache, "u-former", LiteLLM_UserTable) is not None
+
+
+_FIRST_ORG: Final = "org-first"
+_SECOND_ORG: Final = "org-second"
+
+
+class _DrivenClock:
+    """The last good entries' clock, which a test moves instead of waiting."""
+
+    def __init__(self) -> None:
+        self.now: float = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+async def _outlast_the_tombstones(redis: "FakeRedisCache", clock: _DrivenClock, *, loses_redis: bool) -> None:
+    """A write that takes past the time the request's record of its revocations allows, so the request revokes those
+    keys through Redis again: the tombstones in Redis lapse meanwhile, and Redis is lost once the write lands when
+    ``loses_redis``."""
+    from litellm.constants import LAST_GOOD_TOMBSTONE_TTL_SECONDS
+    from litellm.proxy.common_utils.user_api_key_cache import LAST_GOOD_LATE_STORE_MARGIN_SECONDS
+
+    clock.now += LAST_GOOD_TOMBSTONE_TTL_SECONDS - LAST_GOOD_LATE_STORE_MARGIN_SECONDS + 1
+    client: Final = redis.cache.init_async_client()
+    lapsed: Final = await client.keys("last_good_tombstone:*")
+    if lapsed:
+        await client.delete(*lapsed)
+    if loses_redis:
+        redis.server.connected = False
+
+
+async def _tombstones_standing(redis: "FakeRedisCache", cache_keys: Sequence[str]) -> tuple[str, ...]:
+    """Which of ``cache_keys`` have a tombstone in Redis now; none while Redis is lost."""
+    if not redis.server.connected:
+        return ()
+    client: Final = redis.cache.init_async_client()
+    return tuple(
+        [cache_key for cache_key in cache_keys if await client.exists(f"last_good_tombstone:{cache_key}") == 1]
+    )
+
+
+class _LoggedTable:
+    """``table`` with each read and delete the endpoint awaits noted in ``log`` as ``<name>.<method>``, in order."""
+
+    def __init__(self, name: str, table: _Rows, log: list[str]) -> None:
+        self._name: Final = name
+        self._table: Final = table
+        self._log: Final = log
+
+    async def find_many(self, where: Mapping[str, object]) -> list[object]:
+        self._log.append(f"{self._name}.find_many")
+        return await self._table.find_many(where)
+
+    async def delete_many(self, where: Mapping[str, object]) -> int:
+        self._log.append(f"{self._name}.delete_many")
+        return await self._table.delete_many(where)
+
+
+class _OrganizationTable:
+    """The organization table holding ``org_ids``. Each delete is noted in ``log``, and in ``deletes`` with which of
+    the organization's cache keys had a tombstone in Redis as it ran; deleting ``slow_org`` then outlasts the
+    tombstones (``_outlast_the_tombstones``)."""
+
+    def __init__(
+        self,
+        org_ids: Sequence[str],
+        redis: "FakeRedisCache",
+        clock: _DrivenClock,
+        log: list[str],
+        *,
+        slow_org: str,
+        loses_redis: bool,
+    ) -> None:
+        self.org_ids: Final[list[str]] = list(org_ids)  # mutable-ok: a delete takes its row
+        self.deletes: Final[list[tuple[str, tuple[str, ...]]]] = []  # mutable-ok: one entry per delete, in order
+        self._redis: Final = redis
+        self._clock: Final = clock
+        self._log: Final = log
+        self._slow_org: Final = slow_org
+        self._loses_redis: Final = loses_redis
+
+    async def delete(
+        self, where: Mapping[str, str], include: Mapping[str, bool] | None = None
+    ) -> "LiteLLM_OrganizationTable | None":
+        from litellm.proxy._types import LiteLLM_OrganizationTable
+        from litellm.proxy.auth.auth_checks import organization_cache_keys
+
+        org_id: Final = where["organization_id"]
+        self._log.append("organizations.delete")
+        if org_id not in self.org_ids:
+            return None
+        self.deletes.append((org_id, await _tombstones_standing(self._redis, organization_cache_keys(org_id))))
+        self.org_ids.remove(org_id)
+        if org_id == self._slow_org:
+            await _outlast_the_tombstones(self._redis, self._clock, loses_redis=self._loses_redis)
+        return LiteLLM_OrganizationTable(
+            organization_id=org_id, budget_id=f"budget-{org_id}", created_by="admin", updated_by="admin"
+        )
+
+
+def _two_organizations_the_first_outlasting(
+    monkeypatch: pytest.MonkeyPatch, *, serving: bool, loses_redis: bool, log: list[str]
+) -> tuple[_OrganizationTable, tuple[_Rows, _Rows, _Rows]]:
+    """Two organizations behind Redis, on a driven clock, with last good entries served or not: the first holds a
+    team, a key and a member, the second nothing, and the first's row delete outlasts the tombstones, Redis lost once
+    it lands when ``loses_redis``. Every read and delete is noted in ``log``. Returns the organization table and the
+    team, key and member tables."""
+    from datetime import datetime, timezone
+
+    from litellm.proxy._types import (
+        LiteLLM_OrganizationMembershipTable,
+        LiteLLM_TeamTable,
+    )
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    joined: Final = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    teams: Final = _Rows((LiteLLM_TeamTable(team_id="t-first", organization_id=_FIRST_ORG),))
+    # The key row the endpoint reads is the database's, with its organization_id column, which the proxy's
+    # LiteLLM_VerificationToken does not carry (it has org_id)
+    keys: Final = _Rows((SimpleNamespace(token="hashed-first-key", organization_id=_FIRST_ORG),))
+    members: Final = _Rows(
+        (
+            LiteLLM_OrganizationMembershipTable(
+                user_id="first-member", organization_id=_FIRST_ORG, created_at=joined, updated_at=joined
+            ),
+        )
+    )
+    organizations: Final = _OrganizationTable(
+        (_FIRST_ORG, _SECOND_ORG), redis, clock, log, slow_org=_FIRST_ORG, loses_redis=loses_redis
+    )
+    database: Final = SimpleNamespace(
+        db=SimpleNamespace(
+            litellm_teamtable=_LoggedTable("teams", teams, log),
+            litellm_verificationtoken=_LoggedTable("keys", keys, log),
+            litellm_organizationmembership=_LoggedTable("members", members, log),
+            litellm_jwtkeymapping=CascadingJWTMappingTable([]),
+            litellm_organizationtable=organizations,
+        )
+    )
+    cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=serving, last_good_clock=clock)
+    _org_endpoints_use(monkeypatch, database, cache)
+    return organizations, (teams, keys, members)
+
+
+@pytest.mark.asyncio
+async def test_delete_organization_revokes_the_second_organization_again_after_the_first_outlasts_the_tombstones(
+    monkeypatch,
+):
+    """The request revokes both organizations before its first delete, then the first organization's deletes take past
+    the time the request's record of that revocation allows and the tombstones lapse meanwhile, so another pod may
+    store the second organization's entries again. The second organization's delete revokes them again right before
+    it: its tombstones stand in Redis when its row is deleted."""
+    from litellm.proxy._types import DeleteOrganizationRequest, LitellmUserRoles, UserAPIKeyAuth
+    from litellm.proxy.auth.auth_checks import organization_cache_keys
+    from litellm.proxy.management_endpoints.organization_endpoints import delete_organization
+
+    organizations, _children = _two_organizations_the_first_outlasting(
+        monkeypatch, serving=True, loses_redis=False, log=[]
+    )
+
+    deleted: Final = await delete_organization(
+        data=DeleteOrganizationRequest(organization_ids=[_FIRST_ORG, _SECOND_ORG]),
+        user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN),
+    )
+
+    assert [org.organization_id for org in deleted] == [_FIRST_ORG, _SECOND_ORG]
+    assert organizations.deletes == [
+        (_FIRST_ORG, organization_cache_keys(_FIRST_ORG)),
+        (_SECOND_ORG, organization_cache_keys(_SECOND_ORG)),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_delete_organization_answers_503_with_the_second_organization_kept_when_redis_is_lost_after_the_first(
+    monkeypatch,
+):
+    """The same slow first organization, with Redis lost once its row is deleted: the second organization's revocation
+    has to reach Redis again and cannot, so the request answers 503 with the second organization's row not deleted."""
+    from litellm.proxy._types import DeleteOrganizationRequest, LitellmUserRoles, UserAPIKeyAuth
+    from litellm.proxy.management_endpoints.organization_endpoints import delete_organization
+
+    organizations, _children = _two_organizations_the_first_outlasting(
+        monkeypatch, serving=True, loses_redis=True, log=[]
+    )
+
+    with pytest.raises(HTTPException) as refused:
+        await delete_organization(
+            data=DeleteOrganizationRequest(organization_ids=[_FIRST_ORG, _SECOND_ORG]),
+            user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN),
+        )
+
+    assert refused.value.status_code == 503
+    assert [org_id for org_id, _standing in organizations.deletes] == [_FIRST_ORG]
+    assert organizations.org_ids == [_SECOND_ORG]
+
+
+@pytest.mark.asyncio
+async def test_delete_organization_with_last_good_entries_off_reads_nothing_before_its_first_delete(monkeypatch):
+    """With the setting off nothing is revoked, so no read runs before the first organization's tables, which are read
+    and deleted in the order they were before last good entries existed: the team and member reads, which find what
+    the cache evictions after their deletes drop, are the only additions. Redis lost after the first organization
+    stops nothing."""
+    from litellm.proxy._types import DeleteOrganizationRequest, LitellmUserRoles, UserAPIKeyAuth
+    from litellm.proxy.management_endpoints.organization_endpoints import delete_organization
+
+    log: Final[list[str]] = []  # mutable-ok: every read and delete, in order
+    organizations, children = _two_organizations_the_first_outlasting(
+        monkeypatch, serving=False, loses_redis=True, log=log
+    )
+
+    await delete_organization(
+        data=DeleteOrganizationRequest(organization_ids=[_FIRST_ORG, _SECOND_ORG]),
+        user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN),
+    )
+
+    each_organization: Final = (
+        "teams.find_many",
+        "teams.delete_many",
+        "members.find_many",
+        "members.delete_many",
+        "keys.find_many",
+        "keys.delete_many",
+        "organizations.delete",
+    )
+    assert log == [*each_organization, *each_organization]
+    assert organizations.org_ids == []
+    assert [table.rows for table in children] == [(), (), ()]
+
+
+@pytest.mark.asyncio
+async def test_delete_organization_records_its_tombstones_again_after_the_row_delete_so_no_outage_serves_the_old_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The request first revokes organization org-doomed's entries at t=0, with a 30 s tombstone. Its delete runs at
+    t=19, when the request's record shows those tombstones standing, so neither the revocation before its first delete
+    nor the one paired with the organization's row delete sends Redis anything. Another pod's read began at t=19,
+    before the row delete committed, and got the organization; it stores that row at t=31, once the first tombstones
+    lapsed at t=30. The delete records the organization's tombstones again once its row delete returns, standing until
+    t=49, so that store keeps nothing and an outage that follows serves no entry for the deleted organization, rather
+    than its old row."""
+    from litellm.proxy._types import (
+        DeleteOrganizationRequest,
+        LiteLLM_OrganizationTable,
+        LitellmUserRoles,
+        UserAPIKeyAuth,
+    )
+    from litellm.proxy.auth.auth_checks import organization_cache_keys
+    from litellm.proxy.management_endpoints.organization_endpoints import delete_organization
+    from tests.unit.proxy.last_good_tombstone_race import (
+        revoked_before_the_write,
+        served_after_another_pod_stores,
+        tombstone_race,
+    )
+
+    race: Final = tombstone_race(monkeypatch)
+    old_row: Final = LiteLLM_OrganizationTable(
+        organization_id="org-doomed", budget_id="budget-org-doomed", created_by="admin", updated_by="admin"
+    )
+    organizations: Final = _deleted_organization_table()
+    database: Final = SimpleNamespace(
+        db=SimpleNamespace(
+            litellm_teamtable=_Rows(()),
+            litellm_verificationtoken=_Rows(()),
+            litellm_organizationmembership=_Rows(()),
+            litellm_jwtkeymapping=CascadingJWTMappingTable([]),
+            litellm_organizationtable=organizations,
+        )
+    )
+    _org_endpoints_use(monkeypatch, database, race.cache)
+    await revoked_before_the_write(race, organization_cache_keys("org-doomed"))
+
+    deleted: Final = await delete_organization(
+        data=DeleteOrganizationRequest(organization_ids=["org-doomed"]),
+        user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN),
+    )
+
+    assert [org.organization_id for org in deleted] == ["org-doomed"]
+    organizations.delete.assert_awaited_once()
+    served: Final = await served_after_another_pod_stores(race, organization_cache_keys("org-doomed")[0], old_row)
+    assert served is None
+
+
+@pytest.mark.asyncio
+async def test_organization_member_delete_records_the_tombstone_again_so_no_outage_serves_the_removed_membership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The request first revokes member-1's entry at t=0, with a 30 s tombstone. The removal of member-1 from org-1
+    runs at t=19, when the request's record shows that tombstone standing, so the revocation paired with the
+    membership's delete sends Redis nothing. Another pod's read began at t=19, before the delete committed, and got
+    member-1 as an admin of org-1; it stores that row at t=31, once the first tombstone lapsed at t=30. The removal
+    records member-1's tombstone again once its delete returns, standing until t=49, so that store keeps nothing and an
+    outage that follows serves no entry for member-1, rather than the row that still makes it an admin of org-1."""
+    from datetime import datetime, timezone
+
+    from litellm.proxy._types import (
+        LiteLLM_OrganizationMembershipTable,
+        LiteLLM_UserTable,
+        LitellmUserRoles,
+        OrganizationMemberDeleteRequest,
+        UserAPIKeyAuth,
+    )
+    from litellm.proxy.management_endpoints.organization_endpoints import organization_member_delete
+    from tests.unit.proxy.last_good_tombstone_race import (
+        revoked_before_the_write,
+        served_after_another_pod_stores,
+        tombstone_race,
+    )
+
+    race: Final = tombstone_race(monkeypatch)
+    joined: Final = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    admin_membership: Final = LiteLLM_OrganizationMembershipTable(
+        user_id="member-1",
+        organization_id="org-1",
+        user_role=LitellmUserRoles.ORG_ADMIN.value,
+        created_at=joined,
+        updated_at=joined,
+    )
+    memberships: Final = _Rows((admin_membership,))
+    database: Final = SimpleNamespace(db=SimpleNamespace(litellm_organizationmembership=memberships))
+    _org_endpoints_use(monkeypatch, database, race.cache)
+    await revoked_before_the_write(race, ("member-1",))
+
+    removed: Final = await organization_member_delete(
+        data=OrganizationMemberDeleteRequest(organization_id="org-1", user_id="member-1"),
+        user_api_key_dict=UserAPIKeyAuth(user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+    )
+
+    assert (removed, memberships.rows) == (admin_membership, ())
+    served: Final = await served_after_another_pod_stores(
+        race, "member-1", LiteLLM_UserTable(user_id="member-1", organization_memberships=[admin_membership])
+    )
+    assert served is None

@@ -112,11 +112,13 @@ from litellm.proxy.common_utils.sse_keepalive import (
     wrap_passthrough_sse_bytes_with_keepalive_pings,
 )
 from litellm.proxy.litellm_pre_call_utils import (  # noqa: F401  # legacy module exports
+    ROUTER_OWNED_REQUEST_FIELDS,
     LiteLLMProxyRequestSetup,
     _get_dynamic_logging_metadata,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
     _key_or_team_allows_client_pricing_override,  # pyright: ignore[reportPrivateUsage]  # reuse the proxy's pricing trust policy
     _strip_client_pricing_overrides,  # pyright: ignore[reportPrivateUsage]  # sanitize before trusted hooks add guardrail costs
     get_dynamic_logging_metadata,  # pyright: ignore[reportPrivateUsage]  # shared proxy helper, same import style as _read_request_body above
+    strip_client_guardrail_information,
 )
 from litellm.proxy.route_llm_request import ProxyModelNotFoundError
 from litellm.proxy.utils import normalize_route_for_root_path
@@ -153,7 +155,11 @@ router: Final = APIRouter()
 pass_through_endpoint_logging: Final = PassThroughEndpointLogging()
 
 _METADATA_KEYS: Final = frozenset(("litellm_metadata", "metadata"))
-_KEPT_OUT_OF_LITELLM_PARAMS: Final = _METADATA_KEYS | frozenset(wire_names(ProxyRequestState))
+# Router-owned deployment fields leave the forwarded body like every litellm-owned name, but never reach the logging
+# object, whose success callbacks would count usage against the deployment a body names.
+_KEPT_OUT_OF_LITELLM_PARAMS: Final = (
+    _METADATA_KEYS | frozenset(wire_names(ProxyRequestState)) | ROUTER_OWNED_REQUEST_FIELDS
+)
 
 # Global registry to track registered pass-through routes and prevent memory leaks
 _registered_pass_through_routes: Final[dict[str, dict[str, str | bool | list[str] | Mapping[str, object]]]] = {}
@@ -1186,10 +1192,11 @@ async def pass_through_request(
             _parsed_body,
         )
 
+        client_body: Final = TypeAdapter(dict[str, object]).validate_python(_parsed_body)
+        strip_client_guardrail_information(client_body)
         if not _key_or_team_allows_client_pricing_override(user_api_key_dict):
-            pricing_body: Final = TypeAdapter(dict[str, object]).validate_python(_parsed_body)
-            _strip_client_pricing_overrides(pricing_body)
-            _parsed_body = pricing_body
+            _strip_client_pricing_overrides(client_body)
+        _parsed_body = client_body
         if custom_llm_provider in ("laya", "bespoke"):
             decision_request: Final = TypeAdapter(Mapping[str, object]).validate_python(_parsed_body)
             checkpoint: Final = validate_oss_request(custom_llm_provider, decision_request)

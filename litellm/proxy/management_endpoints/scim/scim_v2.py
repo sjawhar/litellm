@@ -48,12 +48,21 @@ from litellm.proxy._types import (
 from litellm.proxy.auth.auth_checks import (  # noqa: F401  # legacy module exports
     _delete_cache_key_object,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
     delete_cache_key_object,
+    delete_cache_team_object,
+    team_cache_keys,
 )
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_broadcast
 from litellm.proxy.common_utils.http_parsing_utils import (  # noqa: F401  # legacy module exports
     _safe_get_request_headers,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
     safe_get_request_headers,
+)
+from litellm.proxy.common_utils.user_api_key_cache import (
+    revoke_and_delete_read_rows,
+    revoke_last_good,
+    revoke_last_good_then,
+    serves_last_good_entries,
+    team_membership_auth_cache_key,
 )
 from litellm.proxy.management_endpoints.internal_user_endpoints import new_user
 from litellm.proxy.management_endpoints.scim.scim_transformations import (
@@ -70,6 +79,7 @@ from litellm.proxy.utils import (  # noqa: F401  # legacy module exports
     handle_exception_on_proxy,
     premium_user_check,
 )
+from litellm.repositories.chunked_in import find_many_in
 from litellm.repositories.table_repositories import (
     InvitationLinkRepository,
     OrganizationMembershipRepository,
@@ -84,6 +94,7 @@ from litellm.types.llms.base import LiteLLMBaseModel
 from litellm.types.proxy.management_endpoints.scim_v2 import *
 
 if TYPE_CHECKING:
+    from prisma.models import LiteLLM_TeamMembership as PrismaTeamMembership
     from prisma.models import LiteLLM_VerificationToken as PrismaVerificationToken
 
 
@@ -137,6 +148,10 @@ class _UserReferencingTableClient(Protocol):
     async def delete_many(self, where: Mapping[str, object]) -> int: ...
 
 
+class _TeamMembershipTableClient(_UserReferencingTableClient, Protocol):
+    async def find_many(self, where: Mapping[str, object]) -> "Sequence[PrismaTeamMembership]": ...
+
+
 @overload
 def _table(repository: UserRepository) -> _UserTableClient: ...
 
@@ -150,9 +165,11 @@ def _table(repository: VerificationTokenRepository) -> _VerificationTokenTableCl
 
 
 @overload
-def _table(
-    repository: InvitationLinkRepository | OrganizationMembershipRepository | TeamMembershipRepository,
-) -> _UserReferencingTableClient: ...
+def _table(repository: TeamMembershipRepository) -> _TeamMembershipTableClient: ...
+
+
+@overload
+def _table(repository: InvitationLinkRepository | OrganizationMembershipRepository) -> _UserReferencingTableClient: ...
 
 
 def _table(
@@ -1005,37 +1022,98 @@ def _key_was_scim_blocked(metadata: object) -> bool:
     return isinstance(metadata, dict) and metadata.get(SCIM_BLOCKED_METADATA_KEY) is True
 
 
-async def _set_user_keys_blocked(user_id: str, blocked: bool) -> int:
+def _unblocked_keys_filter(user_id: str) -> Mapping[str, object]:
+    # `blocked` is a nullable column with no default, so existing rows
+    # typically hold NULL; treat NULL as "not blocked" since SQL equality
+    # on NULL would otherwise silently skip them.
+    return {"user_id": user_id, "OR": [{"blocked": False}, {"blocked": None}]}
+
+
+async def _revoke_scim_user(
+    prisma_client: PrismaClient, user_id: str, *, ends_user: bool, left_team_ids: Iterable[str]
+) -> "Sequence[PrismaVerificationToken] | None":
+    """Revoke, before the request's first write and while last good entries are served, everything the request ends: a
+    deactivation's or a delete's (the user's own, from which auth refuses an inactive user, and its unblocked keys) and
+    what ``team_member_delete`` revokes for each team left, as these reads find them.
+
+    Each later write that ends one of these revokes its own entries again immediately before it, with no other write
+    in between (``revoke_last_good_then``), through the request's record of revoked keys: that costs no Redis while
+    the tombstones written here still stand, and revokes again, or answers 503 with that write not made, once a slow
+    step outlasted them. Returns the unblocked keys it read when ``ends_user``, the exact set ``_set_user_keys_blocked``
+    blocks. ``team_member_delete`` reads the team and the user's keys in it again, so what it finds that these reads
+    did not (a key created since, a roster or alias changed since) goes to Redis then. With last good entries not
+    served this reads nothing and returns None, and the block reads the keys itself."""
+    from litellm.proxy.proxy_server import user_api_key_cache
+
+    left: Final = sorted(set(left_team_ids))
+    if not (ends_user or left) or not serves_last_good_entries(user_api_key_cache):
+        return None
+    found: Final = [
+        await _table(TeamRepository(prisma_client)).find_unique(where={"team_id": team_id}) for team_id in left
+    ]
+    teams: Final = tuple(LiteLLM_TeamTable.model_validate(team.model_dump()) for team in found if team)
+    keys: Final = _table(VerificationTokenRepository(prisma_client))
+    to_block: Final = await keys.find_many(where=_unblocked_keys_filter(user_id)) if ends_user else None
+    in_left_teams: Final = await find_many_in(keys, "team_id", left, where={"user_id": user_id})
+    rosters_naming_user: Final = (
+        team_cache_keys(team.team_id, team.team_alias)
+        for team in teams
+        if user_id in team.members or any(member.user_id == user_id for member in team.members_with_roles)
+    )
+    memberships: Final = (team_membership_auth_cache_key(team_id=team_id, user_id=user_id) for team_id in left)
+    tokens: Final = (key_row.token for key_row in (*(to_block or ()), *in_left_teams))
+    await revoke_last_good(
+        user_api_key_cache, (user_id, *chain.from_iterable(rosters_naming_user), *memberships, *tokens)
+    )
+    return to_block
+
+
+async def _keys_to_set_blocked(
+    prisma_client: PrismaClient,
+    user_id: str,
+    blocked: bool,
+    revoked_keys: "Sequence[PrismaVerificationToken] | None",
+) -> "Sequence[PrismaVerificationToken]":
+    """The keys ``_set_user_keys_blocked`` writes: for a block given ``revoked_keys``, the current rows of those keys
+    still unblocked; for any other block, the user's unblocked keys; for an unblock, the user's keys SCIM blocked."""
+    keys: Final = _table(VerificationTokenRepository(prisma_client))
+    if blocked and revoked_keys is not None:
+        # Current rows, so the merge keeps an edit made since; no key outside the preflight's is read
+        return await find_many_in(
+            keys, "token", (key_row.token for key_row in revoked_keys), where=_unblocked_keys_filter(user_id)
+        )
+    if blocked:
+        return await keys.find_many(where=_unblocked_keys_filter(user_id))
+    candidates: Final = await keys.find_many(where={"user_id": user_id, "blocked": True})
+    return [k for k in candidates if _key_was_scim_blocked(k.metadata)]
+
+
+async def _set_user_keys_blocked(
+    user_id: str, blocked: bool, *, revoked_keys: "Sequence[PrismaVerificationToken] | None" = None
+) -> int:
     """
     Block or unblock virtual keys owned by a user and invalidate them in the
     in-memory/redis caches so the change takes effect immediately.
+
+    A block given ``revoked_keys``, the unblocked keys ``_revoke_scim_user`` read and revoked before the request's first
+    write, reads again only the current rows of those keys that are still unblocked: it reads no other key, the
+    metadata it writes is the current row's with the marker, and a key deleted or blocked since is not found, so not
+    written. A block given none, as when last good entries are not served, reads the user's unblocked keys. Either way
+    each key is revoked immediately before its own update, so a slow update of one key cannot outlast another's
+    tombstone; for the preflight's keys the request's record skips Redis while their tombstones stand. Reactivation
+    always reads its keys and revokes nothing.
 
     Each key SCIM blocks is tagged with ``metadata.scim_blocked = True``. On
     reactivation we only unblock keys carrying that marker, so a key an admin
     blocked manually for unrelated reasons is left alone.
 
-    Returns the number of keys whose state was flipped.
+    Returns the number of keys it blocked or unblocked.
     """
     from litellm.proxy.proxy_server import proxy_logging_obj, user_api_key_cache
 
     prisma_client: Final = await _get_prisma_client_or_raise_exception()
 
-    if blocked:
-        # `blocked` is a nullable column with no default, so existing rows
-        # typically hold NULL; treat NULL as "not blocked" since SQL equality
-        # on NULL would otherwise silently skip them.
-        candidates = await _table(VerificationTokenRepository(prisma_client)).find_many(
-            where={
-                "user_id": user_id,
-                "OR": [{"blocked": False}, {"blocked": None}],
-            },
-        )
-        affected_keys = candidates
-    else:
-        candidates = await _table(VerificationTokenRepository(prisma_client)).find_many(
-            where={"user_id": user_id, "blocked": True},
-        )
-        affected_keys = [k for k in candidates if _key_was_scim_blocked(k.metadata)]
+    affected_keys: Final = await _keys_to_set_blocked(prisma_client, user_id, blocked, revoked_keys)
 
     if not affected_keys:
         return 0
@@ -1046,9 +1124,15 @@ async def _set_user_keys_blocked(user_id: str, blocked: bool) -> int:
             new_metadata = {**current_metadata, SCIM_BLOCKED_METADATA_KEY: True}
         else:
             new_metadata = {k: v for k, v in current_metadata.items() if k != SCIM_BLOCKED_METADATA_KEY}
-        await _table(VerificationTokenRepository(prisma_client)).update(
-            where={"token": key_row.token},
-            data={"blocked": blocked, "metadata": safe_dumps(new_metadata)},
+        # A block ends the key, so its entry is revoked immediately before its own update; an unblock ends nothing
+        await revoke_last_good_then(
+            user_api_key_cache,
+            (key_row.token,) if blocked else (),
+            partial(
+                _table(VerificationTokenRepository(prisma_client)).update,
+                where={"token": key_row.token},
+                data={"blocked": blocked, "metadata": safe_dumps(new_metadata)},
+            ),
         )
 
     for key_row in affected_keys:
@@ -1056,6 +1140,7 @@ async def _set_user_keys_blocked(user_id: str, blocked: bool) -> int:
             hashed_token=key_row.token,
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
+            revoked=blocked,
         )
 
     verbose_proxy_logger.info(
@@ -1073,7 +1158,15 @@ async def _delete_rows_referencing_user(prisma_client: PrismaClient, *, user_id:
     Required before deleting the user row itself, otherwise Postgres rejects
     the user delete with an FK constraint violation (e.g.
     ``LiteLLM_InvitationLink_user_id_fkey``).
+
+    While last good entries are served, each delete that ends an access revokes the entries holding it immediately
+    before it: the user's own entry carries its organization memberships, so its revocation covers every one of them,
+    and each team membership has its own entry, so only the team memberships read and revoked are deleted, round by
+    round until a read finds none (``revoke_and_delete_read_rows``). Invitations are held by no last good entry. A
+    team membership left by a refused round stays with the user, whose delete is then not reached.
     """
+    from litellm.proxy.proxy_server import user_api_key_cache
+
     await _table(InvitationLinkRepository(prisma_client)).delete_many(
         where={
             "OR": [
@@ -1083,8 +1176,24 @@ async def _delete_rows_referencing_user(prisma_client: PrismaClient, *, user_id:
             ]
         }
     )
-    await _table(OrganizationMembershipRepository(prisma_client)).delete_many(where={"user_id": user_id})
-    await _table(TeamMembershipRepository(prisma_client)).delete_many(where={"user_id": user_id})
+    await revoke_last_good_then(
+        user_api_key_cache,
+        (user_id,),
+        partial(_table(OrganizationMembershipRepository(prisma_client)).delete_many, where={"user_id": user_id}),
+    )
+    team_memberships: Final = _table(TeamMembershipRepository(prisma_client))
+    if not serves_last_good_entries(user_api_key_cache):
+        await team_memberships.delete_many(where={"user_id": user_id})
+        return
+    await revoke_and_delete_read_rows(
+        user_api_key_cache,
+        partial(team_memberships.find_many, where={"user_id": user_id}),
+        lambda rows: tuple(team_membership_auth_cache_key(team_id=row.team_id, user_id=user_id) for row in rows),
+        lambda rows: team_memberships.delete_many(
+            # bounded-ok: revoke_and_delete_read_rows hands each call at most IN_LIST_CHUNK_SIZE rows
+            where={"user_id": user_id, "team_id": {"in": [row.team_id for row in rows]}}
+        ),
+    )
 
 
 def _scim_active_value(metadata: Mapping[str, object] | None) -> bool | None:
@@ -1789,6 +1898,13 @@ async def update_user(
         # SCIM User.groups is readOnly (RFC 7643 4.1.2): IdPs sync membership via /Groups and send
         # no groups or `groups: []` on profile PUTs, so empty means unspecified, not "remove from every team"
         target_teams: Final = user_data["teams"] or existing_user.teams
+        ends_user: Final = client_set_active and _scim_active_value(metadata) is False and prev_active is not False
+        left_team_ids: Final = set(existing_user.teams) - set(target_teams)
+        # A deactivation blocks the user's keys and auth refuses an inactive user from its entry, and leaving a team
+        # revokes the member's entries: all of them are revoked before the first write, and the block takes these keys
+        revoked_keys: Final = await _revoke_scim_user(
+            prisma_client, user_id, ends_user=ends_user, left_team_ids=left_team_ids
+        )
         await _handle_team_membership_changes(
             user_id=user_id,
             existing_teams=existing_user.teams,
@@ -1809,18 +1925,23 @@ async def update_user(
                 user.groups or [], admin_group, _default_scim_user_role()
             )
 
-        updated_user: Final = await _table(UserRepository(prisma_client)).update(
-            where={"user_id": user_id},
-            data=update_data,
-        )
         from litellm.proxy.proxy_server import user_api_key_cache
+
+        # A team removal above revokes its own set. This write ends the user when it deactivates it, and takes the
+        # teams it left off the user's entry, so the user is revoked again immediately before it, which the request's
+        # record answers without Redis while the preflight's tombstone stands
+        updated_user: Final = await revoke_last_good_then(
+            user_api_key_cache,
+            (user_id,) if ends_user or left_team_ids else (),
+            partial(_table(UserRepository(prisma_client)).update, where={"user_id": user_id}, data=update_data),
+        )
 
         await evict_and_broadcast(cache_keys=(user_id,), user_api_key_cache=user_api_key_cache)
 
         if client_set_active:
             new_active: Final = _scim_active_value(metadata)
             if new_active is not None and new_active != (True if prev_active is None else prev_active):
-                await _set_user_keys_blocked(user_id=user_id, blocked=not new_active)
+                await _set_user_keys_blocked(user_id=user_id, blocked=not new_active, revoked_keys=revoked_keys)
 
         # Convert back to SCIM format
         scim_user: Final = await ScimTransformations.transform_litellm_user_to_scim_user(updated_user)
@@ -1855,31 +1976,47 @@ async def delete_user(
             ]
         )
         teams: Final = tuple(team for team in found_teams if team)
+        team_rows: Final = tuple(LiteLLM_TeamTable.model_validate(team.model_dump()) for team in teams)
+        # Revoked before the first write: the user's entry, its keys' and all that removing it from its teams revokes
+        revoked_keys: Final = await _revoke_scim_user(
+            prisma_client, user_id, ends_user=True, left_team_ids=existing_user.teams or []
+        )
 
-        # Remove user from all teams
-        for team in teams:
+        from litellm.proxy.proxy_server import user_api_key_cache
+
+        # Remove user from all teams. Each write that ends an access revokes it again immediately before it, which the
+        # request's record answers without Redis while the preflight's tombstones stand; team_member_delete does so too
+        for team, team_row in zip(teams, team_rows, strict=True):
             current_members: Sequence[str] = team.members or []
             if user_id in current_members:
                 new_members = [m for m in current_members if m != user_id]
-                await _table(TeamRepository(prisma_client)).update(
-                    where={"team_id": team.team_id}, data={"members": new_members}
+                await revoke_last_good_then(
+                    user_api_key_cache,
+                    team_cache_keys(team_row.team_id, team_row.team_alias),
+                    partial(
+                        _table(TeamRepository(prisma_client)).update,
+                        where={"team_id": team.team_id},
+                        data={"members": new_members},
+                    ),
                 )
 
-            team_row = LiteLLM_TeamTable.model_validate(team.model_dump())
             if any(member.user_id == user_id for member in team_row.members_with_roles or []):
                 await team_member_delete(
                     data=TeamMemberDeleteRequest(team_id=team_row.team_id, user_id=user_id),
                     user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN),
                 )
 
-        await _set_user_keys_blocked(user_id=user_id, blocked=True)
+        # The keys revoked above while last good entries are served; one a team removal deleted since is not found
+        await _set_user_keys_blocked(user_id=user_id, blocked=True, revoked_keys=revoked_keys)
 
+        # Revokes the entries of the memberships it deletes immediately before each delete
         await _delete_rows_referencing_user(prisma_client, user_id=user_id)
 
-        # Delete user
-        await _table(UserRepository(prisma_client)).delete(where={"user_id": user_id})
-
-        from litellm.proxy.proxy_server import user_api_key_cache
+        await revoke_last_good_then(
+            user_api_key_cache,
+            (user_id,),
+            partial(_table(UserRepository(prisma_client)).delete, where={"user_id": user_id}),
+        )
 
         await evict_and_broadcast(cache_keys=(user_id,), user_api_key_cache=user_api_key_cache)
 
@@ -2364,6 +2501,14 @@ async def patch_user(
         patched_metadata: Final = update_data.get("metadata")
         new_active: Final = _scim_active_value(patched_metadata if isinstance(patched_metadata, Mapping) else None)
 
+        ends_user: Final = new_active is False and prev_active is not False
+        left_team_ids: Final = set(existing_user.teams or []) - final_team_set
+        # A deactivation blocks the user's keys and auth refuses an inactive user from its entry, and leaving a team
+        # revokes the member's entries: all of them are revoked before the first write, and the block takes these keys
+        revoked_keys: Final = await _revoke_scim_user(
+            prisma_client, user_id, ends_user=ends_user, left_team_ids=left_team_ids
+        )
+
         # Handle team membership changes
         await _handle_team_membership_changes(
             user_id=user_id,
@@ -2387,16 +2532,21 @@ async def patch_user(
 
             update_data["metadata"] = safe_dumps(update_data["metadata"])
 
-        updated_user: Final = await _table(UserRepository(prisma_client)).update(
-            where={"user_id": user_id},
-            data=update_data,
-        )
         from litellm.proxy.proxy_server import user_api_key_cache
+
+        # A team removal above revokes its own set. This write ends the user when it deactivates it, and takes the
+        # teams it left off the user's entry, so the user is revoked again immediately before it, which the request's
+        # record answers without Redis while the preflight's tombstone stands
+        updated_user: Final = await revoke_last_good_then(
+            user_api_key_cache,
+            (user_id,) if ends_user or left_team_ids else (),
+            partial(_table(UserRepository(prisma_client)).update, where={"user_id": user_id}, data=update_data),
+        )
 
         await evict_and_broadcast(cache_keys=(user_id,), user_api_key_cache=user_api_key_cache)
 
         if new_active is not None and new_active != (True if prev_active is None else prev_active):
-            await _set_user_keys_blocked(user_id=user_id, blocked=not new_active)
+            await _set_user_keys_blocked(user_id=user_id, blocked=not new_active, revoked_keys=revoked_keys)
 
         scim_user: Final = await ScimTransformations.transform_litellm_user_to_scim_user(updated_user)
 
@@ -2647,6 +2797,7 @@ async def update_group(
             where={"team_id": group_id},
             data=update_data,
         )
+        await _evict_patched_team(group_id, existing_team.team_alias, group.displayName)
 
         # Handle user-team relationship changes
         current_members: Final = set(await _get_team_member_user_ids_from_team(existing_team))
@@ -2694,6 +2845,7 @@ async def delete_group(
         existing_team: Final = await _check_team_exists(group_id)
 
         member_ids: Final = await _get_team_member_user_ids_from_team(existing_team)
+        await _revoke_team_before_delete(group_id, existing_team.team_alias)
 
         # For each member, remove this team from their teams list
         for member_id in member_ids:
@@ -2708,8 +2860,16 @@ async def delete_group(
 
         await _recompute_scim_member_roles(prisma_client, member_ids)
 
-        # Delete team
-        await _table(TeamRepository(prisma_client)).delete(where={"team_id": group_id})
+        from litellm.proxy.proxy_server import user_api_key_cache
+
+        # Delete team. The member writes since the first revocation can outlast its tombstones, so the team's entries
+        # are revoked again right before its delete: no Redis while those tombstones stand
+        await revoke_last_good_then(
+            user_api_key_cache,
+            team_cache_keys(group_id, existing_team.team_alias),
+            partial(_table(TeamRepository(prisma_client)).delete, where={"team_id": group_id}),
+        )
+        await _evict_patched_team(group_id, existing_team.team_alias, None, revoked=True)
 
         return Response(status_code=204)
 
@@ -2918,6 +3078,27 @@ async def _apply_group_patch_updates(group_id: str, update_data: dict[str, objec
     return await TeamRepository(prisma_client).table.find_unique(where={"team_id": group_id})
 
 
+async def _evict_patched_team(team_id: str, old_alias: str | None, new_alias: object, *, revoked: bool = False) -> None:
+    """Evict the team a group patch rewrote, by id and by both its aliases, its last good entries included."""
+    from litellm.proxy.proxy_server import proxy_logging_obj, user_api_key_cache
+
+    aliases: Final = tuple(dict.fromkeys(alias for alias in (old_alias, new_alias) if isinstance(alias, str) and alias))
+    for alias in aliases or (None,):
+        await delete_cache_team_object(
+            team_id=team_id,
+            team_alias=alias,
+            user_api_key_cache=user_api_key_cache,
+            proxy_logging_obj=proxy_logging_obj,
+            revoked=revoked,
+        )
+
+
+async def _revoke_team_before_delete(team_id: str, team_alias: str | None) -> None:
+    from litellm.proxy.proxy_server import user_api_key_cache
+
+    await revoke_last_good(user_api_key_cache, team_cache_keys(team_id, team_alias))
+
+
 async def _handle_group_membership_changes(group_id: str, current_members: set[str], final_members: set[str]) -> None:
     """Reconcile the group roster, attempting every member before reporting failures.
 
@@ -3000,6 +3181,8 @@ async def patch_group(
 
         # Apply the metadata/displayName updates to the database
         updated_team = await _apply_group_patch_updates(group_id, update_data, prisma_client)
+        if update_data:
+            await _evict_patched_team(group_id, existing_team.team_alias, update_data.get("team_alias"))
 
         refreshed_team: Final = await _table(TeamRepository(prisma_client)).find_unique(where={"team_id": group_id})
         refreshed_current: Final = (

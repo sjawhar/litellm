@@ -581,6 +581,28 @@ async def test_native_baseline_identity_keeps_the_actual_transformed_body(
     assert estimates[0].provenance == "observed_identical" and estimates[0].usage == observed.usage
 
 
+async def test_native_baseline_identity_keeps_anthropic_server_side_fallbacks(monkeypatch: pytest.MonkeyPatch) -> None:
+    fallbacks: Final = [{"model": "claude-sonnet-5"}]
+    rig: Final = _Rig(monkeypatch)
+    with _transport(_upstream) as route:
+        await rig.router.anthropic_messages(
+            model="test-router",
+            max_tokens=16,
+            messages=_MESSAGES.validate_json(_MESSAGES_JSON.replace("question", "question USE_OPUS")),
+            litellm_logging_obj=rig.logging(),
+            litellm_call_id=rig.call_id,
+            litellm_metadata={"user_api_key_hash": "test-caller-hash"},
+            litellm_session_id="native-server-side-fallbacks",
+            fallbacks=fallbacks,
+            extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"},
+        )
+        observed: Final = _observation(await rig.capture.payload()).observation
+        wire: Final = _JSON_OBJECT.validate_json(route.calls.last.request.content)
+    assert wire["fallbacks"] == fallbacks
+    assert (observed.outcome, observed.reason) == ("complete", "unsupported_request_headers")
+    assert observed.baseline_equivalent and observed.usage is not None
+
+
 @pytest.mark.parametrize("tier_limit", (8, 16))
 @pytest.mark.parametrize("extra", ({}, {"max_tokens": 8}))
 async def test_native_baseline_identity_respects_caller_limit_and_tier_override(

@@ -75,7 +75,7 @@ def test_tpm_only_model_returns_429_to_priority_key_once_recorded_tokens_reach_m
             api_key="synthetic-openai-key",
             tpm=MODEL_TPM,
         )
-        key: Final = scenario.key(metadata={"priority": "premium"})
+        key: Final = scenario.key(team_id=scenario.team(metadata={"priority": "premium"}))
         responses: Final[SimpleQueue[httpx.Response]] = SimpleQueue()
 
         def attempt() -> httpx.Response:
