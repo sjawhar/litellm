@@ -5785,6 +5785,26 @@ def test_azure_spillover_absent_without_spillover_headers():
     assert metadata["azure_spillover"] is None
 
 
+@pytest.mark.parametrize("auth_entries", ["fresh", "last_good", None])
+def test_auth_entries_reach_the_spend_log_row(auth_entries):
+    user_api_key_dict: Final = UserAPIKeyAuth()
+    user_api_key_dict.auth_entries = auth_entries
+    payload = get_logging_payload(
+        kwargs={
+            "call_type": "acompletion",
+            "model": "gpt-5.4-nano",
+            "litellm_params": {
+                "metadata": dict(LiteLLMProxyRequestSetup.get_sanitized_user_information_from_key(user_api_key_dict))
+            },
+        },
+        response_obj=litellm.ModelResponse(id="chatcmpl-auth-entries", choices=[], usage=litellm.Usage()),
+        start_time=datetime.datetime.now(timezone.utc),
+        end_time=datetime.datetime.now(timezone.utc),
+    )
+
+    assert json.loads(payload["metadata"])["user_api_key_auth_entries"] == auth_entries
+
+
 def test_baseline_estimate_metadata_comes_from_the_logging_stamp() -> None:
     supplied: Final = MappingProxyType({"version": 1, "status": "estimated", "reason": "caller_supplied"})
     recorded: Final = MappingProxyType({"version": 1, "status": "unknown", "reason": "history_unavailable"})

@@ -14,6 +14,7 @@ ownership checks can reject low-privilege roles, and a self-revoke endpoint
 that takes no body cannot be aimed at other keys.
 """
 
+from functools import partial
 from typing import TYPE_CHECKING, Annotated, Final, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Response
@@ -30,6 +31,7 @@ from litellm.proxy._types import (
 )
 from litellm.proxy.auth.auth_checks import delete_cache_key_objects
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+from litellm.proxy.common_utils.user_api_key_cache import revoke_last_good, revoke_last_good_then
 from litellm.proxy.management_endpoints.key_management_endpoints import (  # noqa: F401  # legacy module exports
     _persist_deleted_verification_tokens,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
     persist_deleted_verification_tokens,
@@ -87,6 +89,7 @@ async def revoke_ui_session_keys(
             return 0
         revoked_tokens: Final = _TOKEN_LIST.validate_python(tuple(row.token for row in revoked_rows))
 
+        await revoke_last_good(user_api_key_cache, revoked_tokens)
         await persist_deleted_verification_tokens(
             keys=revoked_rows,
             prisma_client=prisma_client,
@@ -94,11 +97,17 @@ async def revoke_ui_session_keys(
             litellm_changed_by=litellm_changed_by,
         )
         where_revoked: Final[prisma_types.LiteLLM_VerificationTokenWhereInput] = {"token": {"in": revoked_tokens}}
-        await VerificationTokenRepository(prisma_client).table.delete_many(where=where_revoked)
+        # The archive may outlast the tombstones recorded before it, so the delete revokes its tokens again first
+        await revoke_last_good_then(
+            user_api_key_cache,
+            revoked_tokens,
+            partial(VerificationTokenRepository(prisma_client).table.delete_many, where=where_revoked),
+        )
         await delete_cache_key_objects(
             hashed_tokens=revoked_tokens,
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
+            revoked=True,
         )
         verbose_proxy_logger.info(
             "Revoked %s UI session key(s) for user_id=%s after password change",
@@ -155,17 +164,24 @@ async def session_logout(
             caller_row: Final = cast(  # cast-ok: find_unique returns a prisma row shaped like the pydantic model
                 "LiteLLM_VerificationToken", row
             )
+            await revoke_last_good(user_api_key_cache, (hashed_token,))
             await persist_deleted_verification_tokens(
                 keys=(caller_row,),
                 prisma_client=prisma_client,
                 user_api_key_dict=user_api_key_dict,
             )
-            await VerificationTokenRepository(prisma_client).table.delete_many(where=where_token)
+            # The archive may outlast the tombstone recorded before it, so the delete revokes the token again first
+            await revoke_last_good_then(
+                user_api_key_cache,
+                (hashed_token,),
+                partial(VerificationTokenRepository(prisma_client).table.delete_many, where=where_token),
+            )
             revoked = True
         await delete_cache_key_objects(
             hashed_tokens=(hashed_token,),
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
+            revoked=True,
         )
 
     # The server set this cookie at login (set_session_token_cookie); clear it

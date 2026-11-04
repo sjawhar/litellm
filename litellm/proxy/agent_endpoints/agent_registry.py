@@ -3,6 +3,7 @@ import hashlib
 import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import datetime, timezone
+from functools import partial
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, NamedTuple, Protocol, TypedDict
 
@@ -31,6 +32,7 @@ from litellm.types.agents import AgentConfig, AgentKillSwitchConfig, AgentRespon
 from litellm.types.proxy.agent_identity import AgentIdentityFailure
 
 if TYPE_CHECKING:
+    from prisma import Prisma
     from prisma import models as prisma_models
     from prisma.types import LiteLLM_RetiredAgentIdentityWhereUniqueInput
 
@@ -421,6 +423,57 @@ class GrantMigrationResult(NamedTuple):
     missed: int
 
 
+async def _retire_identity_managed_agent(tx: "Prisma", agent_id: str) -> tuple[str, ...]:
+    """Record the retired identity and delete the agent's keys, in one transaction. Returns the deleted tokens.
+
+    While last good entries are served, only the keys a read found are deleted, each round right after the revocation
+    of their entries, until a read finds none (``revoke_and_delete_read_rows``): a key given to the agent between a
+    read and its delete is revoked before its delete too. Redis failing to record a revocation (503), or keys that keep
+    appearing (409), refuse the whole transaction."""
+    from prisma.types import (
+        LiteLLM_RetiredAgentCreateInput,
+        LiteLLM_RetiredAgentUpsertInput,
+        LiteLLM_RetiredAgentWhereUniqueInput,
+        LiteLLM_VerificationTokenWhereInput,
+    )
+
+    from litellm.proxy.common_utils.user_api_key_cache import revoke_and_delete_read_rows, serves_last_good_entries
+    from litellm.proxy.proxy_server import user_api_key_cache
+
+    keys_where: Final[LiteLLM_VerificationTokenWhereInput] = {"agent_id": agent_id}
+    history_where: Final[LiteLLM_RetiredAgentWhereUniqueInput] = {"original_agent_id": agent_id}
+    history_create: Final = LiteLLM_RetiredAgentCreateInput(original_agent_id=agent_id)
+    history_data: Final[LiteLLM_RetiredAgentUpsertInput] = {"create": history_create, "update": {}}
+    # The history row ends nothing a last good entry holds, and a refused round rolls it back with the transaction
+    await tx.litellm_retiredagent.upsert(where=history_where, data=history_data)
+    if not serves_last_good_entries(user_api_key_cache):
+        # No last good entry to revoke, so the agent's keys go in one delete, as without that setting
+        tokens: Final = tuple(key.token for key in await tx.litellm_verificationtoken.find_many(where=keys_where))
+        await tx.litellm_verificationtoken.delete_many(where=keys_where)
+        return tokens
+    deleted_keys: Final = await revoke_and_delete_read_rows(
+        user_api_key_cache,
+        partial(tx.litellm_verificationtoken.find_many, where=keys_where),
+        lambda keys: tuple(key.token for key in keys),
+        lambda keys: tx.litellm_verificationtoken.delete_many(
+            # bounded-ok: revoke_and_delete_read_rows hands each call at most IN_LIST_CHUNK_SIZE rows
+            where={"agent_id": agent_id, "token": {"in": [key.token for key in keys]}}
+        ),
+    )
+    return tuple(key.token for key in deleted_keys)
+
+
+async def _evict_deleted_agent_keys(tokens: Sequence[str]) -> None:
+    if not tokens:
+        return
+    from litellm.proxy.auth.auth_checks import delete_cache_key_objects
+    from litellm.proxy.proxy_server import proxy_logging_obj, user_api_key_cache
+
+    await delete_cache_key_objects(
+        hashed_tokens=tokens, user_api_key_cache=user_api_key_cache, proxy_logging_obj=proxy_logging_obj, revoked=True
+    )
+
+
 class AgentRegistry:
     def __init__(self):
         self.agent_list: list[AgentResponse] = []
@@ -669,30 +722,25 @@ class AgentRegistry:
         """
         Delete an agent from the database
         """
-        from prisma.types import (
-            LiteLLM_AgentsTableWhereUniqueInput,
-            LiteLLM_RetiredAgentCreateInput,
-            LiteLLM_RetiredAgentUpsertInput,
-            LiteLLM_RetiredAgentWhereUniqueInput,
-            LiteLLM_VerificationTokenWhereInput,
-        )
+        from prisma.types import LiteLLM_AgentsTableWhereUniqueInput
+
+        from litellm.proxy.common_utils.user_api_key_cache import last_good_recorded_after_transaction
+        from litellm.proxy.proxy_server import user_api_key_cache
 
         where: Final[LiteLLM_AgentsTableWhereUniqueInput] = {"agent_id": agent_id}
-        async with prisma_client.tx() as tx:
+        # The keys its rounds revoke are recorded again once the transaction ends, returned or raised
+        async with last_good_recorded_after_transaction(user_api_key_cache), prisma_client.tx() as tx:
             existing: Final = await tx.litellm_agentstable.find_unique(where=where)
             if existing is None:
                 raise ValueError(f"Agent not found, passed agent_id={agent_id}")
-            if existing.identity_managed:
-                history_where: Final[LiteLLM_RetiredAgentWhereUniqueInput] = {"original_agent_id": agent_id}
-                history_create: Final = LiteLLM_RetiredAgentCreateInput(original_agent_id=agent_id)
-                history_data: Final[LiteLLM_RetiredAgentUpsertInput] = {"create": history_create, "update": {}}
-                await tx.litellm_retiredagent.upsert(where=history_where, data=history_data)
-                keys_where: Final[LiteLLM_VerificationTokenWhereInput] = {"agent_id": agent_id}
-                await tx.litellm_verificationtoken.delete_many(where=keys_where)
+            deleted_key_tokens: Final = (
+                await _retire_identity_managed_agent(tx, agent_id) if existing.identity_managed else ()
+            )
             deleted_agent: Final = await tx.litellm_agentstable.delete(where=where)
             if deleted_agent is None:
                 raise ValueError(f"Agent not found, passed agent_id={agent_id}")
-            return deleted_agent.model_dump()
+        await _evict_deleted_agent_keys(deleted_key_tokens)
+        return deleted_agent.model_dump()
 
     async def patch_agent_in_db(
         self,

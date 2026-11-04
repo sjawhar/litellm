@@ -1,19 +1,32 @@
+import asyncio
 from contextlib import contextmanager
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from typing import Final
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
+from litellm.constants import LAST_GOOD_TOMBSTONE_TTL_SECONDS
 from litellm.proxy._types import (
+    BlockUsers,
+    LiteLLM_BudgetTable,
+    LiteLLM_BudgetTableFull,
     LiteLLM_EndUserTable,
     LitellmUserRoles,
+    NewCustomerRequest,
     ProxyException,
+    UpdateCustomerRequest,
 )
 from litellm.proxy.auth.user_api_key_auth import UserAPIKeyAuth, user_api_key_auth
+from litellm.proxy.common_utils.user_api_key_cache import LAST_GOOD_LATE_STORE_MARGIN_SECONDS, UserApiKeyCache
 from litellm.proxy.management_endpoints.customer_endpoints import _should_update_field, router
+from tests.unit.caching.fake_redis_cache import FakeRedisCache, fake_redis_cache
 from litellm.types.proxy.management_endpoints.common_daily_activity import (
     SpendAnalyticsPaginatedResponse,
 )
@@ -1073,8 +1086,8 @@ def test_customer_new_invalidates_end_user_and_registry_caches(mock_prisma_clien
         )
 
     assert response.status_code == 200, response.text
-    assert recording_cache.deleted == ["end_user_id:c1", "end_user_restricted_registry"]
-    assert _published_keys(mock_publish) == ["end_user_id:c1", "end_user_restricted_registry"]
+    assert recording_cache.deleted == ["end_user_id:c1", "end_user_validation:c1", "end_user_restricted_registry"]
+    assert _published_keys(mock_publish) == ["end_user_id:c1", "end_user_validation:c1", "end_user_restricted_registry"]
 
 
 def test_customer_update_invalidates_end_user_and_registry_caches(mock_prisma_client, mock_user_api_key_auth):
@@ -1092,8 +1105,8 @@ def test_customer_update_invalidates_end_user_and_registry_caches(mock_prisma_cl
         )
 
     assert response.status_code == 200, response.text
-    assert recording_cache.deleted == ["end_user_id:c1", "end_user_restricted_registry"]
-    assert _published_keys(mock_publish) == ["end_user_id:c1", "end_user_restricted_registry"]
+    assert recording_cache.deleted == ["end_user_id:c1", "end_user_validation:c1", "end_user_restricted_registry"]
+    assert _published_keys(mock_publish) == ["end_user_id:c1", "end_user_validation:c1", "end_user_restricted_registry"]
 
 
 def test_customer_block_invalidates_end_user_and_registry_caches(mock_prisma_client, mock_user_api_key_auth):
@@ -1112,12 +1125,16 @@ def test_customer_block_invalidates_end_user_and_registry_caches(mock_prisma_cli
     assert response.status_code == 200, response.text
     assert recording_cache.deleted == [
         "end_user_id:c1",
+        "end_user_validation:c1",
         "end_user_id:c2",
+        "end_user_validation:c2",
         "end_user_restricted_registry",
     ]
     assert _published_keys(mock_publish) == [
         "end_user_id:c1",
+        "end_user_validation:c1",
         "end_user_id:c2",
+        "end_user_validation:c2",
         "end_user_restricted_registry",
     ]
 
@@ -1142,11 +1159,833 @@ def test_customer_delete_invalidates_end_user_and_registry_caches(mock_prisma_cl
     assert response.status_code == 200, response.text
     assert recording_cache.deleted == [
         "end_user_id:c1",
+        "end_user_validation:c1",
         "end_user_id:c2",
+        "end_user_validation:c2",
         "end_user_restricted_registry",
     ]
     assert _published_keys(mock_publish) == [
         "end_user_id:c1",
+        "end_user_validation:c1",
         "end_user_id:c2",
+        "end_user_validation:c2",
         "end_user_restricted_registry",
     ]
+
+
+class _EndUserRows:
+    """The end-user table a block, a create or an update writes and auth reads. While ``stopped`` every read fails the
+    way an unreachable Postgres does; ``pause_next_registry_read`` holds the next restricted-registry read once it has
+    its rows."""
+
+    def __init__(self, *rows: LiteLLM_EndUserTable) -> None:
+        self.rows = {row.user_id: row for row in rows}
+        self.stopped = False
+        self.registry_read_held = asyncio.Event()
+        self._release: asyncio.Event | None = None
+
+    def _answer(self) -> None:
+        if self.stopped:
+            raise httpx.ConnectError("All connection attempts failed")
+
+    def pause_next_registry_read(self) -> asyncio.Event:
+        self._release = asyncio.Event()
+        return self._release
+
+    async def upsert(self, where: dict[str, str], data: dict[str, dict[str, object]]) -> LiteLLM_EndUserTable:
+        self._answer()
+        row = LiteLLM_EndUserTable(user_id=where["user_id"], blocked=True)
+        self.rows[row.user_id] = row
+        return row
+
+    async def create(self, data: dict[str, object], include: object = None) -> LiteLLM_EndUserTable:
+        self._answer()
+        row = LiteLLM_EndUserTable.model_validate(data)
+        self.rows[row.user_id] = row
+        return row
+
+    async def update(
+        self, where: dict[str, str], data: dict[str, object], include: object = None
+    ) -> LiteLLM_EndUserTable:
+        self._answer()
+        row = self.rows[where["user_id"]].model_copy(update=data)
+        self.rows[row.user_id] = row
+        return row
+
+    async def find_first(self, where: dict[str, str], include: object = None) -> LiteLLM_EndUserTable | None:
+        self._answer()
+        return self.rows.get(where["user_id"])
+
+    async def find_unique(self, where: dict[str, str], include: object = None) -> LiteLLM_EndUserTable | None:
+        return await self.find_first(where)
+
+    async def find_many(self, where: object = None, take: int | None = None) -> list[LiteLLM_EndUserTable]:
+        self._answer()
+        restricted = [row for row in self.rows.values() if row.blocked or row.models or row.budget_id]
+        release = self._release
+        if release is not None:
+            self._release = None
+            self.registry_read_held.set()
+            await release.wait()
+        return restricted
+
+    async def delete_many(self, where: dict[str, dict[str, list[str]]]) -> int:
+        self._answer()
+        doomed: Final = [user_id for user_id in self.rows if user_id in where["user_id"]["in"]]
+        for user_id in doomed:
+            del self.rows[user_id]
+        return len(doomed)
+
+
+class _BudgetRows:
+    """The budget table a customer update writes."""
+
+    def __init__(self, *rows: LiteLLM_BudgetTable) -> None:
+        self.rows = {row.budget_id: row for row in rows}
+
+    async def update(self, where: dict[str, str], data: dict[str, object]) -> LiteLLM_BudgetTable:
+        row = self.rows[where["budget_id"]].model_copy(update=data)
+        self.rows[where["budget_id"]] = row
+        return row
+
+
+class _EmptyTable:
+    """A table with no row for any lookup: the user table, which end-user id validation also reads."""
+
+    async def find_unique(self, where: object = None, include: object = None) -> None:
+        return None
+
+
+def _serve_end_user_rows(
+    monkeypatch: pytest.MonkeyPatch, rows: _EndUserRows, cache: UserApiKeyCache, budgets: _BudgetRows | None = None
+) -> None:
+    monkeypatch.setattr(
+        "litellm.proxy.proxy_server.prisma_client",
+        SimpleNamespace(db=SimpleNamespace(litellm_endusertable=rows, litellm_budgettable=budgets)),
+    )
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
+
+
+@pytest.mark.asyncio
+async def test_customer_block_answers_503_and_writes_nothing_when_redis_cannot_record_it(monkeypatch):
+    from litellm.proxy.management_endpoints.customer_endpoints import block_user
+
+    redis = fake_redis_cache()
+    redis.server.connected = False
+    rows = _EndUserRows(LiteLLM_EndUserTable(user_id="c1", blocked=False))
+    _serve_end_user_rows(monkeypatch, rows, UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True))
+
+    with pytest.raises(HTTPException) as refused:
+        await block_user(data=BlockUsers(user_ids=["c1"]))
+
+    assert (refused.value.status_code, rows.rows["c1"].blocked) == (503, False)
+
+
+@pytest.mark.asyncio
+async def test_customer_delete_answers_503_and_deletes_nothing_when_redis_cannot_record_it(monkeypatch):
+    """A deleted customer falls back to the default end-user budget and leaves the restricted registry, so its entries
+    are revoked before the delete: a Redis that cannot record that refuses the delete and the customer stays."""
+    from litellm.proxy.management_endpoints.customer_endpoints import DeleteCustomerRequest, delete_end_user
+
+    redis: Final = fake_redis_cache()
+    redis.server.connected = False
+    rows: Final = _EndUserRows(LiteLLM_EndUserTable(user_id="c1", blocked=True))
+    _serve_end_user_rows(monkeypatch, rows, UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True))
+
+    with pytest.raises(ProxyException) as refused:
+        await delete_end_user(data=DeleteCustomerRequest(user_ids=["c1"]), user_api_key_dict=_ADMIN)
+
+    assert (str(refused.value.code), sorted(rows.rows)) == ("503", ["c1"])
+
+
+@pytest.mark.asyncio
+async def test_customer_update_that_blocks_answers_503_and_writes_nothing_when_redis_cannot_record_it(monkeypatch):
+    from litellm.proxy.management_endpoints.customer_endpoints import update_end_user
+
+    redis = fake_redis_cache()
+    redis.server.connected = False
+    rows = _EndUserRows(LiteLLM_EndUserTable(user_id="c1", blocked=False))
+    _serve_end_user_rows(monkeypatch, rows, UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True))
+
+    with pytest.raises(ProxyException) as refused:
+        await update_end_user(
+            data=UpdateCustomerRequest(user_id="c1", blocked=True),
+            user_api_key_dict=UserAPIKeyAuth(user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+        )
+
+    assert (str(refused.value.code), rows.rows["c1"].blocked) == ("503", False)
+
+
+@pytest.mark.asyncio
+async def test_after_a_customer_block_a_registry_read_in_flight_cannot_vouch_for_the_customer_in_an_outage(monkeypatch):
+    """The restricted registry the database last returned left the customer out, which lets an outage serve it
+    unchecked. A registry read that took its rows before the block and finishes after it must not keep that answer:
+    the outage refuses the customer instead."""
+    from litellm.proxy.auth.auth_checks import get_end_user_object
+    from litellm.proxy.db.exception_handler import LastGoodEntryMissing
+    from litellm.proxy.management_endpoints.customer_endpoints import block_user
+
+    rows = _EndUserRows(LiteLLM_EndUserTable(user_id="c1", blocked=False))
+    cache = UserApiKeyCache(serve_last_good_entries=True)
+    _serve_end_user_rows(monkeypatch, rows, cache)
+
+    database = SimpleNamespace(db=SimpleNamespace(litellm_endusertable=rows))
+
+    async def customer() -> LiteLLM_EndUserTable | None:
+        return await get_end_user_object(
+            end_user_id="c1",
+            prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+            user_api_key_cache=cache,
+        )
+
+    assert await customer() is None
+    await cache.async_delete_cache("end_user_restricted_registry")
+    release = rows.pause_next_registry_read()
+    in_flight = asyncio.create_task(customer())
+    await rows.registry_read_held.wait()
+    await block_user(data=BlockUsers(user_ids=["c1"]))
+    release.set()
+    assert await in_flight is None
+    for key in ("end_user_id:c1", "end_user_restricted_registry"):
+        await cache.async_delete_cache(key)
+    rows.stopped = True
+
+    with pytest.raises(LastGoodEntryMissing):
+        await customer()
+
+
+_ADMIN: Final = UserAPIKeyAuth(user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "restriction", [{"models": ["m1"]}, {"budget_id": "b-paid"}, {"blocked": True}], ids=["models", "budget", "blocked"]
+)
+async def test_customer_created_with_a_restriction_answers_503_and_writes_nothing_when_redis_cannot_record_it(
+    monkeypatch, restriction: dict[str, object]
+):
+    """A restricted customer belongs in the restricted registry, whose copy would still leave it out: the create is
+    refused, as a block is, while Redis cannot record the revocation of that copy."""
+    from litellm.proxy.management_endpoints.customer_endpoints import new_end_user
+
+    redis = fake_redis_cache()
+    redis.server.connected = False
+    rows = _EndUserRows()
+    _serve_end_user_rows(monkeypatch, rows, UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True))
+
+    with pytest.raises(ProxyException) as refused:
+        await new_end_user(data=NewCustomerRequest(user_id="c-new", **restriction), user_api_key_dict=_ADMIN)
+
+    assert (str(refused.value.code), rows.rows) == ("503", {})
+
+
+@pytest.mark.asyncio
+async def test_customer_created_without_a_restriction_is_written_while_redis_cannot_record_a_revocation(monkeypatch):
+    """A customer that restricts nothing is not in the restricted registry, so its create revokes nothing."""
+    from litellm.proxy.management_endpoints.customer_endpoints import new_end_user
+
+    redis = fake_redis_cache()
+    redis.server.connected = False
+    rows = _EndUserRows()
+    _serve_end_user_rows(monkeypatch, rows, UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True))
+
+    await new_end_user(data=NewCustomerRequest(user_id="c-free", alias="free"), user_api_key_dict=_ADMIN)
+
+    assert list(rows.rows) == ["c-free"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "restriction",
+    [{"models": ["m1"]}, {"budget_id": "b-paid"}, {"allowed_model_region": "eu"}],
+    ids=["models", "budget", "region"],
+)
+async def test_customer_update_that_adds_a_restriction_answers_503_and_writes_nothing_when_redis_cannot_record_it(
+    monkeypatch, restriction: dict[str, object]
+):
+    from litellm.proxy.management_endpoints.customer_endpoints import update_end_user
+
+    redis = fake_redis_cache()
+    redis.server.connected = False
+    unrestricted: Final = LiteLLM_EndUserTable(user_id="c1", blocked=False)
+    rows = _EndUserRows(unrestricted)
+    _serve_end_user_rows(monkeypatch, rows, UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True))
+
+    with pytest.raises(ProxyException) as refused:
+        await update_end_user(data=UpdateCustomerRequest(user_id="c1", **restriction), user_api_key_dict=_ADMIN)
+
+    assert (str(refused.value.code), rows.rows["c1"]) == ("503", unrestricted)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("write", ["create", "update"])
+async def test_after_a_customer_gains_a_restriction_a_registry_read_in_flight_cannot_vouch_for_it_in_an_outage(
+    monkeypatch, write: str
+):
+    """A customer created with a restriction, or given one by an update, joins the restricted registry. A registry read
+    that took its rows before the write and finishes after it must not keep its copy without the customer: the outage
+    refuses the customer instead of serving it as one that restricts nothing."""
+    from litellm.proxy.auth.auth_checks import get_end_user_object
+    from litellm.proxy.db.exception_handler import LastGoodEntryMissing
+    from litellm.proxy.management_endpoints.customer_endpoints import new_end_user, update_end_user
+
+    rows = _EndUserRows(*([LiteLLM_EndUserTable(user_id="c1", blocked=False)] if write == "update" else []))
+    cache = UserApiKeyCache(serve_last_good_entries=True)
+    _serve_end_user_rows(monkeypatch, rows, cache)
+
+    database = SimpleNamespace(db=SimpleNamespace(litellm_endusertable=rows))
+
+    async def customer() -> LiteLLM_EndUserTable | None:
+        return await get_end_user_object(
+            end_user_id="c1",
+            prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+            user_api_key_cache=cache,
+        )
+
+    assert await customer() is None
+    await cache.async_delete_cache("end_user_restricted_registry")
+    release = rows.pause_next_registry_read()
+    in_flight = asyncio.create_task(customer())
+    await rows.registry_read_held.wait()
+    if write == "create":
+        await new_end_user(data=NewCustomerRequest(user_id="c1", models=["m1"]), user_api_key_dict=_ADMIN)
+    else:
+        await update_end_user(data=UpdateCustomerRequest(user_id="c1", models=["m1"]), user_api_key_dict=_ADMIN)
+    release.set()
+    assert await in_flight is None
+    for key in ("end_user_id:c1", "end_user_restricted_registry"):
+        await cache.async_delete_cache(key)
+    rows.stopped = True
+
+    with pytest.raises(LastGoodEntryMissing):
+        await customer()
+
+
+class _DbBudgetRow(LiteLLM_BudgetTableFull):
+    """A budget row with every column the database returns: each row has its audit columns, and the customer response
+    requires ``created_at``."""
+
+    created_by: str
+    updated_at: datetime
+    updated_by: str
+
+
+class _CustomerRowWithBudget(LiteLLM_EndUserTable):
+    """A customer row as a read or write with ``include={"litellm_budget_table": True}`` returns it: with its whole
+    budget row, which a dump of ``LiteLLM_EndUserTable`` would cut down to the writable budget fields."""
+
+    litellm_budget_table: _DbBudgetRow | None = None  # pyright: ignore[reportIncompatibleVariableOverride]  # whole row
+
+
+def _budgeted_customer() -> tuple[_EndUserRows, _BudgetRows]:
+    """Customer c1 on its own budget b1 with max_budget 10, as the database returns them."""
+    created: Final = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    budget: Final = _DbBudgetRow(
+        budget_id="b1",
+        max_budget=10.0,
+        created_at=created,
+        created_by="admin",
+        updated_at=created,
+        updated_by="admin",
+    )
+    return (
+        _EndUserRows(_CustomerRowWithBudget(user_id="c1", blocked=False, budget_id="b1", litellm_budget_table=budget)),
+        _BudgetRows(budget),
+    )
+
+
+@pytest.mark.asyncio
+async def test_customer_update_of_its_existing_budget_is_written_while_redis_is_down(monkeypatch):
+    """Lowering a customer's existing budget moves it into or out of no restricted registry, so it revokes nothing
+    before the write: it writes, then evicts the customer's entries best effort, and a Redis that is down refuses
+    nothing."""
+    from litellm.proxy.management_endpoints.customer_endpoints import update_end_user
+
+    redis: Final = fake_redis_cache()
+    redis.server.connected = False
+    rows, budgets = _budgeted_customer()
+    _serve_end_user_rows(
+        monkeypatch, rows, UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True), budgets
+    )
+
+    updated: Final = await update_end_user(
+        data=UpdateCustomerRequest(user_id="c1", max_budget=5.0), user_api_key_dict=_ADMIN
+    )
+
+    assert (updated.user_id, budgets.rows["b1"].max_budget) == ("c1", 5.0)
+
+
+@pytest.mark.asyncio
+async def test_a_customer_budget_lowered_while_redis_is_down_drops_the_entry_this_pod_kept_with_the_higher_limit(
+    monkeypatch,
+):
+    """The eviction after the budget write is best effort: Redis failing there does not fail the update, and this pod
+    still drops the customer's cached row and last good entry, so the next outage refuses the customer instead of
+    serving the higher limit."""
+    from litellm.proxy.auth.auth_checks import get_end_user_object
+    from litellm.proxy.db.exception_handler import LastGoodEntryMissing
+    from litellm.proxy.management_endpoints.customer_endpoints import update_end_user
+
+    redis: Final = fake_redis_cache()
+    redis.server.connected = False
+    rows, budgets = _budgeted_customer()
+    cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+    _serve_end_user_rows(monkeypatch, rows, cache, budgets)
+    database: Final = SimpleNamespace(db=SimpleNamespace(litellm_endusertable=rows))
+
+    async def customer() -> LiteLLM_EndUserTable | None:
+        return await get_end_user_object(
+            end_user_id="c1",
+            prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+            user_api_key_cache=cache,
+        )
+
+    before: Final = await customer()
+    assert before is not None and before.litellm_budget_table is not None
+    assert before.litellm_budget_table.max_budget == 10.0
+    await update_end_user(data=UpdateCustomerRequest(user_id="c1", max_budget=5.0), user_api_key_dict=_ADMIN)
+    rows.stopped = True
+
+    with pytest.raises(LastGoodEntryMissing):
+        await customer()
+
+
+@pytest.mark.asyncio
+async def test_a_customer_created_after_a_request_found_its_id_invalid_is_kept_by_the_next_request(monkeypatch):
+    """With end-user ids validated and no default budget, a request naming an id no row holds caches the verdict
+    "invalid" and drops the id. Creating that customer with a model restriction evicts the verdict, so the next request
+    keeps the id and the restriction applies, rather than the id being dropped until the verdict lapses."""
+    from litellm.proxy.auth.auth_checks import resolve_and_validate_end_user_id
+    from litellm.proxy.management_endpoints.customer_endpoints import new_end_user
+
+    monkeypatch.setattr("litellm.validate_end_user_id_in_db", True)
+    monkeypatch.setattr("litellm.max_end_user_budget_id", None)
+    rows: Final = _EndUserRows()
+    cache: Final = UserApiKeyCache()
+    _serve_end_user_rows(monkeypatch, rows, cache)
+    database: Final = SimpleNamespace(db=SimpleNamespace(litellm_endusertable=rows, litellm_usertable=_EmptyTable()))
+
+    async def resolve() -> str | None:
+        return await resolve_and_validate_end_user_id(
+            raw_end_user_id="c1",
+            prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+            user_api_key_cache=cache,
+        )
+
+    assert (await resolve(), await cache.async_get_cache("end_user_validation:c1")) == (None, "invalid")
+    await new_end_user(data=NewCustomerRequest(user_id="c1", models=["m1"]), user_api_key_dict=_ADMIN)
+
+    assert await resolve() == "c1"
+
+
+@pytest.mark.asyncio
+async def test_a_customer_block_drops_the_verdict_and_registry_copies_last_good_entries_answered(monkeypatch):
+    """In an outage the customer's last good entry vouches for its id and the restricted registry's entry leaves it
+    out. This pod keeps both answers in its memory only, never in Redis; a block once the database answers again drops
+    both, so the next request reads the blocked customer instead of either copy."""
+    from litellm.proxy.auth.auth_checks import _load_end_user_restricted_registry, resolve_and_validate_end_user_id
+    from litellm.proxy.management_endpoints.customer_endpoints import block_user
+
+    monkeypatch.setattr("litellm.validate_end_user_id_in_db", True)
+    monkeypatch.setattr("litellm.max_end_user_budget_id", None)
+    rows: Final = _EndUserRows(LiteLLM_EndUserTable(user_id="c1", blocked=False))
+    redis: Final = fake_redis_cache()
+    cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+    _serve_end_user_rows(monkeypatch, rows, cache)
+    database: Final = SimpleNamespace(db=SimpleNamespace(litellm_endusertable=rows, litellm_usertable=_EmptyTable()))
+    copy_keys: Final = ("end_user_validation:c1", "end_user_restricted_registry")
+
+    async def registry() -> frozenset[str] | None:
+        return await _load_end_user_restricted_registry(
+            prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+            user_api_key_cache=cache,
+        )
+
+    async def resolve() -> str | None:
+        return await resolve_and_validate_end_user_id(
+            raw_end_user_id="c1",
+            prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+            user_api_key_cache=cache,
+        )
+
+    assert (await registry(), await resolve()) == (frozenset(), "c1")
+    for key in ("end_user_id:c1", *copy_keys):
+        await cache.async_delete_cache(key)
+    rows.stopped = True
+    assert (await registry(), await resolve()) == (frozenset(), "c1")
+    assert [cache.in_memory_cache.get_cache(key=key) for key in copy_keys] == ["valid_from_last_good", {"ids": []}]
+    assert [await redis.cache.async_get_cache(key) for key in copy_keys] == [None, None]
+    rows.stopped = False
+
+    await block_user(data=BlockUsers(user_ids=["c1"]))
+
+    assert [cache.in_memory_cache.get_cache(key=key) for key in copy_keys] == [None, None]
+
+
+class _DrivenClock:
+    """The last good entries' clock, which a test moves instead of waiting."""
+
+    def __init__(self) -> None:
+        self.now: float = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+# Past this since a revocation, the request's record no longer skips Redis for the key: its tombstone may lapse first
+_PAST_THE_RECORD: Final = LAST_GOOD_TOMBSTONE_TTL_SECONDS - LAST_GOOD_LATE_STORE_MARGIN_SECONDS + 1
+
+
+async def _outlast_the_tombstones(redis: FakeRedisCache, clock: _DrivenClock, *, loses_redis: bool) -> None:
+    """A step that takes past the time the request's record of its revocations allows: the tombstones in Redis lapse
+    meanwhile, and Redis is lost once the step ends when ``loses_redis``."""
+    clock.now += _PAST_THE_RECORD
+    client: Final = redis.cache.init_async_client()
+    lapsed: Final = await client.keys("last_good_tombstone:*")
+    if lapsed:
+        await client.delete(*lapsed)
+    if loses_redis:
+        redis.server.connected = False
+
+
+def _driven_cache(redis: FakeRedisCache, clock: _DrivenClock, *, serves_last_good: bool) -> UserApiKeyCache:
+    return UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=serves_last_good, last_good_clock=clock)
+
+
+def _customer_cache_keys(user_id: str) -> tuple[str, ...]:
+    """What a write that blocks or restricts customer ``user_id`` ends: its entry, its id's validation verdict, and the
+    restricted registry."""
+    return (f"end_user_id:{user_id}", f"end_user_validation:{user_id}", "end_user_restricted_registry")
+
+
+class _WitnessedEndUserRows(_EndUserRows):
+    """End-user rows that record, for each upsert, create and update in turn, the customer's id and which of the cache
+    keys its write ends have a tombstone in Redis as the write runs, none while Redis is lost. The upsert of
+    ``outlasting`` then takes past the time the request's record of its revocations allows."""
+
+    def __init__(
+        self,
+        redis: FakeRedisCache,
+        clock: _DrivenClock,
+        *rows: LiteLLM_EndUserTable,
+        outlasting: str | None = None,
+        loses_redis: bool = False,
+    ) -> None:
+        super().__init__(*rows)
+        self.standing: Final[list[tuple[str, tuple[str, ...]]]] = []  # mutable-ok: one entry per end-user row write
+        self._redis: Final = redis
+        self._clock: Final = clock
+        self._outlasting: Final = outlasting
+        self._loses_redis: Final = loses_redis
+
+    async def _witness(self, user_id: str) -> None:
+        connected: Final = self._redis.server.connected
+        client: Final = self._redis.cache.init_async_client()
+        self.standing.append(
+            (
+                user_id,
+                tuple(
+                    [
+                        cache_key
+                        for cache_key in _customer_cache_keys(user_id)
+                        if connected and await client.exists(f"last_good_tombstone:{cache_key}") == 1
+                    ]
+                ),
+            )
+        )
+
+    async def upsert(self, where: dict[str, str], data: dict[str, dict[str, object]]) -> LiteLLM_EndUserTable:
+        await self._witness(where["user_id"])
+        row: Final = await super().upsert(where, data)
+        if where["user_id"] == self._outlasting:
+            await _outlast_the_tombstones(self._redis, self._clock, loses_redis=self._loses_redis)
+        return row
+
+    async def create(self, data: dict[str, object], include: object = None) -> LiteLLM_EndUserTable:
+        await self._witness(str(data["user_id"]))
+        return await super().create(data, include)
+
+    async def update(
+        self, where: dict[str, str], data: dict[str, object], include: object = None
+    ) -> LiteLLM_EndUserTable:
+        await self._witness(where["user_id"])
+        return await super().update(where, data, include)
+
+
+class _OutlastingBudgetRows(_BudgetRows):
+    """The budget table a customer create or update adds a budget to: each create takes past the time the request's
+    record of its revocations allows, then answers with the new row as the database returns it."""
+
+    def __init__(self, redis: FakeRedisCache, clock: _DrivenClock, *, loses_redis: bool) -> None:
+        super().__init__()
+        self._redis: Final = redis
+        self._clock: Final = clock
+        self._loses_redis: Final = loses_redis
+
+    async def create(self, data: dict[str, object], include: object = None) -> _DbBudgetRow:
+        await _outlast_the_tombstones(self._redis, self._clock, loses_redis=self._loses_redis)
+        created: Final = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        row: Final = _DbBudgetRow.model_validate(
+            {**data, "budget_id": f"budget-{len(self.rows) + 1}", "created_at": created, "updated_at": created}
+        )
+        self.rows[row.budget_id] = row
+        return row
+
+
+def _two_unblocked_customers(
+    redis: FakeRedisCache, clock: _DrivenClock, *, loses_redis: bool
+) -> tuple[_WitnessedEndUserRows, _OutlastingBudgetRows]:
+    """Customers c1 and c2, neither restricted, whose block's upsert of c1 and whose budget creates each outlast the
+    tombstones."""
+    return (
+        _WitnessedEndUserRows(
+            redis,
+            clock,
+            LiteLLM_EndUserTable(user_id="c1", blocked=False),
+            LiteLLM_EndUserTable(user_id="c2", blocked=False),
+            outlasting="c1",
+            loses_redis=loses_redis,
+        ),
+        _OutlastingBudgetRows(redis, clock, loses_redis=loses_redis),
+    )
+
+
+@pytest.mark.asyncio
+async def test_customer_block_revokes_a_later_customer_again_when_an_earlier_upsert_outlasts_the_tombstones(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The block revokes every customer before its first upsert, then upserts them one by one. The first upsert takes
+    past the time the request's record of that revocation allows and the tombstones lapse meanwhile, so another pod may
+    store the second customer's entry, its verdict or the registry again: the second upsert revokes them again right
+    before it writes, so their tombstones stand in Redis as it runs."""
+    from litellm.proxy.management_endpoints.customer_endpoints import block_user
+
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    rows, budgets = _two_unblocked_customers(redis, clock, loses_redis=False)
+    _serve_end_user_rows(monkeypatch, rows, _driven_cache(redis, clock, serves_last_good=True), budgets)
+
+    await block_user(data=BlockUsers(user_ids=["c1", "c2"]))
+
+    assert rows.standing == [("c1", _customer_cache_keys("c1")), ("c2", _customer_cache_keys("c2"))]
+
+
+@pytest.mark.asyncio
+async def test_customer_block_answers_503_before_a_later_upsert_when_redis_is_lost_after_an_earlier_one_outlasts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Redis is lost once the first upsert has outlasted the tombstones: the second customer's revocation cannot be
+    recorded again, so the block answers 503 before that customer's upsert and it stays unblocked, rather than its
+    entry outliving the lapsed tombstone into an outage."""
+    from litellm.proxy.management_endpoints.customer_endpoints import block_user
+
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    rows, budgets = _two_unblocked_customers(redis, clock, loses_redis=True)
+    _serve_end_user_rows(monkeypatch, rows, _driven_cache(redis, clock, serves_last_good=True), budgets)
+
+    with pytest.raises(HTTPException) as refused:
+        await block_user(data=BlockUsers(user_ids=["c1", "c2"]))
+
+    assert (refused.value.status_code, rows.standing, rows.rows["c2"].blocked) == (
+        503,
+        [("c1", _customer_cache_keys("c1"))],
+        False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_restricted_customer_create_revokes_it_again_when_its_budget_create_outlasts_the_tombstones(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A customer created with a budget joins the restricted registry, so it is revoked before the budget's create.
+    That create takes past the time the request's record allows and the tombstones lapse meanwhile: the customer's
+    create revokes its entry, its verdict and the registry again right before it writes, so their tombstones stand."""
+    from litellm.proxy.management_endpoints.customer_endpoints import new_end_user
+
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    rows, budgets = _two_unblocked_customers(redis, clock, loses_redis=False)
+    _serve_end_user_rows(monkeypatch, rows, _driven_cache(redis, clock, serves_last_good=True), budgets)
+
+    created: Final = await new_end_user(
+        data=NewCustomerRequest(user_id="c-new", max_budget=5.0), user_api_key_dict=_ADMIN
+    )
+
+    assert (created.budget_id, rows.standing) == ("budget-1", [("c-new", _customer_cache_keys("c-new"))])
+
+
+@pytest.mark.asyncio
+async def test_restricted_customer_create_answers_503_and_writes_no_customer_when_redis_is_lost_after_its_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Redis is lost once the budget's create has outlasted the tombstones: the customer's revocation cannot be
+    recorded again, so the create answers 503 with no customer written, and the new budget stays linked to none."""
+    from litellm.proxy.management_endpoints.customer_endpoints import new_end_user
+
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    rows, budgets = _two_unblocked_customers(redis, clock, loses_redis=True)
+    _serve_end_user_rows(monkeypatch, rows, _driven_cache(redis, clock, serves_last_good=True), budgets)
+
+    with pytest.raises(ProxyException) as refused:
+        await new_end_user(data=NewCustomerRequest(user_id="c-new", max_budget=5.0), user_api_key_dict=_ADMIN)
+
+    assert (str(refused.value.code), rows.standing, sorted(rows.rows), sorted(budgets.rows)) == (
+        "503",
+        [],
+        ["c1", "c2"],
+        ["budget-1"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_customer_update_giving_a_budget_revokes_it_again_when_the_budget_create_outlasts_the_tombstones(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An update that gives an unrestricted customer a new budget moves it into the restricted registry, so it is
+    revoked before the budget's create. That create takes past the time the request's record allows and the tombstones
+    lapse meanwhile: the customer's update revokes its entry, its verdict and the registry again right before it
+    writes, so their tombstones stand."""
+    from litellm.proxy.management_endpoints.customer_endpoints import update_end_user
+
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    rows, budgets = _two_unblocked_customers(redis, clock, loses_redis=False)
+    _serve_end_user_rows(monkeypatch, rows, _driven_cache(redis, clock, serves_last_good=True), budgets)
+
+    updated: Final = await update_end_user(
+        data=UpdateCustomerRequest(user_id="c1", max_budget=5.0), user_api_key_dict=_ADMIN
+    )
+
+    assert (updated.budget_id, rows.standing) == ("budget-1", [("c1", _customer_cache_keys("c1"))])
+
+
+@pytest.mark.asyncio
+async def test_customer_update_giving_a_budget_answers_503_and_leaves_the_customer_when_redis_is_lost_after_the_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Redis is lost once the budget's create has outlasted the tombstones: the customer's revocation cannot be
+    recorded again, so the update answers 503 and the customer's row is left as it was."""
+    from litellm.proxy.management_endpoints.customer_endpoints import update_end_user
+
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    rows, budgets = _two_unblocked_customers(redis, clock, loses_redis=True)
+    _serve_end_user_rows(monkeypatch, rows, _driven_cache(redis, clock, serves_last_good=True), budgets)
+
+    with pytest.raises(ProxyException) as refused:
+        await update_end_user(data=UpdateCustomerRequest(user_id="c1", max_budget=5.0), user_api_key_dict=_ADMIN)
+
+    assert (str(refused.value.code), rows.standing, rows.rows["c1"]) == (
+        "503",
+        [],
+        LiteLLM_EndUserTable(user_id="c1", blocked=False),
+    )
+
+
+async def _customer_write(write: str) -> object:
+    """The customer write a test names: a block of c1 then c2, the create of c-new with a budget, or an update that
+    gives c1 a budget."""
+    from litellm.proxy.management_endpoints.customer_endpoints import block_user, new_end_user, update_end_user
+
+    if write == "block":
+        return await block_user(data=BlockUsers(user_ids=["c1", "c2"]))
+    if write == "create":
+        return await new_end_user(data=NewCustomerRequest(user_id="c-new", max_budget=5.0), user_api_key_dict=_ADMIN)
+    return await update_end_user(data=UpdateCustomerRequest(user_id="c1", max_budget=5.0), user_api_key_dict=_ADMIN)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("write", "written"),
+    [
+        ("block", [("c1", True, None), ("c2", True, None)]),
+        ("create", [("c-new", False, "budget-1")]),
+        ("update", [("c1", False, "budget-1")]),
+    ],
+)
+async def test_with_last_good_entries_off_each_customer_write_runs_in_its_order_while_redis_is_lost(
+    monkeypatch: pytest.MonkeyPatch, write: str, written: list[tuple[str, bool, str | None]]
+) -> None:
+    """With ``serve_last_good_auth_entries`` off nothing is revoked: a block, a restricted create and an update that
+    gives a budget write every row in their order, as they always have, though Redis is lost after a step that outlasts
+    the tombstone time."""
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    rows, budgets = _two_unblocked_customers(redis, clock, loses_redis=True)
+    _serve_end_user_rows(monkeypatch, rows, _driven_cache(redis, clock, serves_last_good=False), budgets)
+
+    await _customer_write(write)
+
+    assert [
+        (user_id, rows.rows[user_id].blocked, rows.rows[user_id].budget_id) for user_id, _ in rows.standing
+    ] == written
+
+
+@pytest.mark.asyncio
+async def test_customer_block_records_its_tombstone_again_after_the_upsert_so_no_outage_serves_the_unblocked_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The request first revokes customer c1's entry, its id's verdict and the restricted registry at t=0, with a 30 s
+    tombstone. The block of c1 runs at t=19, when the request's record shows that tombstone standing, so neither its
+    revocation nor the one paired with c1's upsert sends Redis anything. Another pod's read began at t=19, before the
+    upsert committed, and got c1 unblocked; it stores that row at t=31, once the first tombstone lapsed at t=30. The
+    block records c1's tombstone again once its upsert returns, standing until t=49, so that store keeps nothing and an
+    outage that follows serves no entry for c1, rather than the unblocked row."""
+    from litellm.proxy.common_utils.user_api_key_cache import end_user_cache_key
+    from litellm.proxy.management_endpoints.customer_endpoints import block_user
+    from tests.unit.proxy.last_good_tombstone_race import (
+        revoked_before_the_write,
+        served_after_another_pod_stores,
+        tombstone_race,
+    )
+
+    race: Final = tombstone_race(monkeypatch)
+    unblocked: Final = LiteLLM_EndUserTable(user_id="c1", blocked=False)
+    rows: Final = _EndUserRows(unblocked)
+    _serve_end_user_rows(monkeypatch, rows, race.cache)
+    await revoked_before_the_write(race, _customer_cache_keys("c1"))
+
+    blocked: Final = await block_user(data=BlockUsers(user_ids=["c1"]))
+
+    assert (blocked, rows.rows["c1"].blocked) == (
+        {"blocked_users": [LiteLLM_EndUserTable(user_id="c1", blocked=True)]},
+        True,
+    )
+    served: Final = await served_after_another_pod_stores(race, end_user_cache_key("c1"), unblocked)
+    assert served is None
+
+
+@pytest.mark.asyncio
+async def test_restricting_customer_update_records_its_tombstone_again_so_no_outage_serves_the_unrestricted_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An update that gives customer c1 a model allowlist moves it into the restricted registry, so it revokes c1's
+    entry, its id's verdict and the registry, then writes the row paired with a second revocation of them. The request
+    first revokes them at t=0, with a 30 s tombstone. The update runs at t=19, when the request's record shows that
+    tombstone standing, so neither of its revocations sends Redis anything. Another pod's read began at t=19, before
+    the update committed, and got c1 with no allowlist; it stores that row at t=31, once the first tombstone lapsed at
+    t=30. The update records c1's tombstone again once its write returns, standing until t=49, so that store keeps
+    nothing and an outage that follows serves no entry for c1, rather than the row that restricts no model."""
+    from litellm.proxy.common_utils.user_api_key_cache import end_user_cache_key
+    from litellm.proxy.management_endpoints.customer_endpoints import update_end_user
+    from tests.unit.proxy.last_good_tombstone_race import (
+        revoked_before_the_write,
+        served_after_another_pod_stores,
+        tombstone_race,
+    )
+
+    race: Final = tombstone_race(monkeypatch)
+    unrestricted: Final = LiteLLM_EndUserTable(user_id="c1", blocked=False)
+    rows: Final = _EndUserRows(unrestricted)
+    _serve_end_user_rows(monkeypatch, rows, race.cache)
+    await revoked_before_the_write(race, _customer_cache_keys("c1"))
+
+    updated: Final = await update_end_user(
+        data=UpdateCustomerRequest(user_id="c1", models=["m1"]), user_api_key_dict=_ADMIN
+    )
+
+    assert (updated.user_id, updated.models, rows.rows["c1"].models) == ("c1", ["m1"], ["m1"])
+    served: Final = await served_after_another_pod_stores(race, end_user_cache_key("c1"), unrestricted)
+    assert served is None

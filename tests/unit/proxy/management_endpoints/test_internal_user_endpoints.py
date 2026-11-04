@@ -2,18 +2,20 @@ import asyncio
 import hashlib
 import json
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Final, cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import DEFAULT, AsyncMock, MagicMock
 
 import httpx
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from pydantic import BaseModel
 from pytest_mock import MockerFixture
 
+from litellm.constants import LAST_GOOD_TOMBSTONE_TTL_SECONDS
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.proxy._types import (
     LiteLLM_UserTable,
@@ -27,7 +29,13 @@ from litellm.proxy._types import (
     UserAPIKeyAuth,
 )
 from litellm.proxy.auth import auth_checks
-from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+from litellm.proxy.common_utils.user_api_key_cache import (
+    UserApiKeyCache,
+    last_good_reads_started_at,
+    remember_last_good,
+    team_membership_auth_cache_key,
+)
+from litellm.proxy.db.routing_prisma_wrapper import RoutingPrismaWrapper
 from litellm.proxy.management_endpoints.internal_user_endpoints import (
     _authorize_user_list_request,
     _resolve_org_filter_for_user_search,
@@ -50,6 +58,7 @@ client = TestClient(app)
 if TYPE_CHECKING:
     from litellm.caching.redis_cache import RedisCache
     from litellm.proxy.utils import PrismaClient
+    from tests.unit.caching.fake_redis_cache import FakeRedisCache
 
 
 @pytest.mark.asyncio
@@ -4928,6 +4937,61 @@ async def test_delete_user_evicts_cached_user_rows(mocker: MockerFixture) -> Non
     broadcast.assert_awaited_once_with(cache_key=deleted.user_id)
 
 
+@pytest.mark.asyncio
+async def test_delete_user_answers_503_and_writes_nothing_when_redis_cannot_record_it(mocker: MockerFixture) -> None:
+    """A deleted user's entry carries its teams, and the team's entry lists it on the roster, so both are revoked with
+    the user's keys and memberships before the first write: a Redis that cannot record that refuses /user/delete with
+    nothing written, even for a user holding no key."""
+    from litellm.proxy._types import DeleteUserRequest, LiteLLM_TeamTable, LiteLLM_UserTable, Member
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from litellm.proxy.management_endpoints.internal_user_endpoints import delete_user
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    doomed: Final = LiteLLM_UserTable(user_id="user-gone", user_email="gone@example.test", teams=["team-1"])
+    team: Final = LiteLLM_TeamTable(
+        team_id="team-1", team_alias="lanes", members_with_roles=[Member(user_id="user-gone", role="user")]
+    )
+    prisma_client: Final = mocker.MagicMock()
+    prisma_client.db.litellm_usertable.find_unique = mocker.AsyncMock(return_value=doomed)
+    prisma_client.db.litellm_teamtable.find_many = mocker.AsyncMock(return_value=[team])
+    prisma_client.db.litellm_verificationtoken.find_many = mocker.AsyncMock(return_value=[])
+    prisma_client.db.litellm_teammembership.find_many = mocker.AsyncMock(return_value=[])
+    prisma_client.db.litellm_jwtkeymapping.find_many = mocker.AsyncMock(return_value=[])
+    prisma_client.db.litellm_teamtable.update = mocker.AsyncMock()
+    for table in ("verificationtoken", "invitationlink", "organizationmembership", "teammembership", "usertable"):
+        getattr(prisma_client.db, f"litellm_{table}").delete_many = mocker.AsyncMock(return_value=0)
+    writes: Final = (
+        prisma_client.db.litellm_teamtable.update,
+        prisma_client.db.litellm_verificationtoken.delete_many,
+        prisma_client.db.litellm_invitationlink.delete_many,
+        prisma_client.db.litellm_organizationmembership.delete_many,
+        prisma_client.db.litellm_teammembership.delete_many,
+        prisma_client.db.litellm_usertable.delete_many,
+    )
+    mocker.patch(  # test-quality-ok: substitute the database dependency
+        "litellm.proxy.proxy_server.prisma_client", prisma_client
+    )
+    redis: Final = fake_redis_cache()
+    redis.server.connected = False
+    mocker.patch(  # test-quality-ok: a real cache over an unreachable Redis
+        "litellm.proxy.proxy_server.user_api_key_cache",
+        UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True),
+    )
+    mocker.patch(  # test-quality-ok: delete_user reads it off proxy_server at call time
+        "litellm.proxy.proxy_server.proxy_logging_obj", None
+    )
+
+    with pytest.raises(HTTPException) as refused:
+        await delete_user(
+            data=DeleteUserRequest(user_ids=[doomed.user_id]),
+            user_api_key_dict=UserAPIKeyAuth(user_id="proxy-admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+        )
+
+    assert refused.value.status_code == 503
+    for write in writes:
+        write.assert_not_awaited()
+
+
 _DB_OUTAGE_503_BODY: Final = {
     "error": {
         "message": "Service Unavailable, the authentication database is temporarily unreachable. Please retry shortly.",
@@ -5172,3 +5236,564 @@ async def test_user_update_without_password_revokes_nothing(_admin_prisma, mocke
     await _update_single_user_helper(user_request=user_request, user_api_key_dict=admin_caller)
 
     revoke_mock.assert_not_awaited()
+
+
+def _column_matches(value: object, wanted: object) -> bool:
+    if isinstance(wanted, Mapping):
+        allowed: Final = wanted.get("in")
+        return isinstance(allowed, Sequence) and value in allowed
+    return value == wanted
+
+
+def _row_matches(row: Mapping[str, object], where: Mapping[str, object]) -> bool:
+    """The equality, ``in`` and ``OR`` filters /user/delete issues, over one row's columns."""
+    clauses: Final = where.get("OR")
+    if isinstance(clauses, Sequence):
+        return any(isinstance(clause, Mapping) and _row_matches(row, clause) for clause in clauses)
+    return all(_column_matches(row.get(field), wanted) for field, wanted in where.items())
+
+
+class _ReplicaTable:
+    """One table of one database, the writer's or a lagging replica's. ``find_many`` and ``create`` are what
+    ``RoutingPrismaWrapper`` routes reads by, so both are here. Each read counts on its database, and each delete
+    records the cache keys of the rows it removes with those of them that had a tombstone in Redis as it ran."""
+
+    def __init__(
+        self, db: "_ReplicaDb", rows: Sequence[BaseModel], cache_key_of: Callable[[Mapping[str, object]], str]
+    ) -> None:
+        self._db = db
+        self._cache_key_of = cache_key_of
+        self.rows: list[BaseModel] = list(rows)
+        self.deletes: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+
+    async def find_unique(self, where: Mapping[str, object]) -> BaseModel | None:
+        found: Final = await self.find_many(where=where)
+        return found[0] if found else None
+
+    async def find_many(self, where: Mapping[str, object] | None = None) -> list[BaseModel]:
+        self._db.reads += 1
+        return [row for row in self.rows if where is None or _row_matches(row.model_dump(), where)]
+
+    async def create(self, data: Mapping[str, object]) -> BaseModel:
+        raise AssertionError(f"/user/delete creates no row, not {data}")
+
+    async def delete_many(self, where: Mapping[str, object] | None = None) -> int:
+        doomed: Final = [row for row in self.rows if where is None or _row_matches(row.model_dump(), where)]
+        cache_keys: Final = tuple(self._cache_key_of(row.model_dump()) for row in doomed)
+        self.deletes.append((cache_keys, await self._db.tombstoned(cache_keys)))
+        self.rows = [row for row in self.rows if all(row is not gone for gone in doomed)]
+        return len(doomed)
+
+
+class _ReplicaDb:
+    """The tables /user/delete reads and writes, on one database: the writer, whose deletes look up the tombstones
+    standing in ``redis``, or a lagging replica."""
+
+    def __init__(
+        self,
+        users: Sequence[LiteLLM_UserTable],
+        keys: Sequence[BaseModel],
+        memberships: Sequence[BaseModel],
+        redis: "FakeRedisCache | None" = None,
+    ) -> None:
+        self.reads = 0
+        self._redis = redis
+        self.litellm_usertable = _ReplicaTable(self, users, lambda row: str(row["user_id"]))
+        self.litellm_teamtable = _ReplicaTable(self, (), lambda row: f"team_id:{row['team_id']}")
+        self.litellm_verificationtoken = _ReplicaTable(self, keys, lambda row: str(row["token"]))
+        self.litellm_teammembership = _ReplicaTable(
+            self,
+            memberships,
+            lambda row: team_membership_auth_cache_key(team_id=str(row["team_id"]), user_id=str(row["user_id"])),
+        )
+        self.litellm_organizationmembership = _ReplicaTable(self, (), lambda row: str(row["user_id"]))
+        self.litellm_invitationlink = _ReplicaTable(self, (), lambda row: str(row["id"]))
+        self.litellm_jwtkeymapping = _ReplicaTable(self, (), lambda row: str(row["token"]))
+
+    async def tombstoned(self, cache_keys: Sequence[str]) -> tuple[str, ...]:
+        if self._redis is None:
+            return ()
+        client: Final = self._redis.cache.init_async_client()
+        return tuple([key for key in cache_keys if await client.exists(f"last_good_tombstone:{key}") == 1])
+
+
+class _ReplicatedPrismaClient:
+    """A client with ``DATABASE_URL_READ_REPLICA`` set: ``db`` sends reads to the replica, unless the context is pinned
+    to the writer, and writes to the writer."""
+
+    def __init__(self, writer: _ReplicaDb, replica: _ReplicaDb) -> None:
+        self.db = RoutingPrismaWrapper(
+            writer=writer,  # pyright: ignore[reportArgumentType]  # a fake database stands in for PrismaWrapper
+            reader=replica,  # pyright: ignore[reportArgumentType]  # a fake database stands in for PrismaWrapper
+        )
+        self.writer_db = writer
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("serves_last_good", [True, False], ids=["serving_pinned", "not_serving"])
+async def test_delete_user_revokes_the_key_and_membership_a_lagging_replica_lacks_before_deleting_them(
+    mocker: MockerFixture, serves_last_good: bool
+) -> None:
+    """With a read replica, auth pins the reads of a /user/delete request to the writer while last good entries are
+    served (``reads_pinned_to_writer`` stands for it here), so a key and a team membership the lagging replica lacks
+    are read, and their tombstones stand in Redis when their deletes run; the membership names a team the user's row
+    does not. With the setting off nothing is pinned: the reads go to the replica, and one delete by user id removes
+    both, revoking nothing."""
+    from litellm.models.team_membership import LiteLLM_TeamMembership
+    from litellm.proxy._types import DeleteUserRequest, LiteLLM_VerificationToken
+    from litellm.proxy.db.routing_prisma_wrapper import reads_pinned_to_writer
+    from litellm.proxy.management_endpoints.internal_user_endpoints import delete_user
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis: Final = fake_redis_cache()
+    doomed: Final = LiteLLM_UserTable(user_id="user-gone", user_email="gone@example.test", teams=[])
+    writer: Final = _ReplicaDb(
+        users=[doomed],
+        keys=[LiteLLM_VerificationToken(token="hashed-new-key", user_id=doomed.user_id)],
+        memberships=[LiteLLM_TeamMembership(user_id=doomed.user_id, team_id="team-new")],
+        redis=redis,
+    )
+    replica: Final = _ReplicaDb(users=[doomed], keys=[], memberships=[])
+    mocker.patch(  # test-quality-ok: substitute the database dependency
+        "litellm.proxy.proxy_server.prisma_client", _ReplicatedPrismaClient(writer, replica)
+    )
+    mocker.patch(  # test-quality-ok: a real cache over a fake Redis
+        "litellm.proxy.proxy_server.user_api_key_cache",
+        UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=serves_last_good),
+    )
+    mocker.patch(  # test-quality-ok: delete_user reads it off proxy_server at call time
+        "litellm.proxy.proxy_server.proxy_logging_obj", None
+    )
+
+    with reads_pinned_to_writer(serves_last_good):
+        await delete_user(
+            data=DeleteUserRequest(user_ids=[doomed.user_id]),
+            user_api_key_dict=UserAPIKeyAuth(user_id="proxy-admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+        )
+
+    membership: Final = team_membership_auth_cache_key(team_id="team-new", user_id=doomed.user_id)
+    assert (writer.litellm_verificationtoken.rows, writer.litellm_teammembership.rows) == ([], [])
+    if serves_last_good:
+        assert (writer.reads > 0, replica.reads) == (True, 0)
+        assert writer.litellm_verificationtoken.deletes == [(("hashed-new-key",), ("hashed-new-key",))]
+        assert writer.litellm_teammembership.deletes == [((membership,), (membership,))]
+        return
+    assert (writer.reads, replica.reads > 0) == (0, True)
+    assert writer.litellm_verificationtoken.deletes == [(("hashed-new-key",), ())]
+    assert writer.litellm_teammembership.deletes == [((membership,), ())]
+
+
+class _DrivenClock:
+    """The last good entries' clock, which a test moves instead of waiting. ``wall`` moves with it, for
+    ``last_good_wall_clock`` and for fake Redis (``drive_fake_redis_time``), so a tombstone lapses once the test moves
+    the clock past its time."""
+
+    def __init__(self) -> None:
+        self.now: float = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def wall(self) -> float:
+        return self.now + 1_700_000_000.0
+
+
+# Three roster writes this long each outlast the tombstones the revocation before the first of them wrote
+_ROSTER_WRITE_SECONDS: Final = LAST_GOOD_TOMBSTONE_TTL_SECONDS / 3 + 1
+_LEAVER: Final = "user-leaves"
+_LEAVERS_KEY: Final = "hashed-leaver-key"
+
+
+def _serving_last_good(redis: "FakeRedisCache", clock: _DrivenClock) -> UserApiKeyCache:
+    """An auth cache serving last good entries over ``redis``, on ``clock``."""
+    return UserApiKeyCache(
+        redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=clock, last_good_wall_clock=clock.wall
+    )
+
+
+def _leaving_user(
+    mocker: MockerFixture, cache: UserApiKeyCache, team_ids: Sequence[str]
+) -> tuple[MagicMock, LiteLLM_UserTable]:
+    """User ``_LEAVER`` on the rosters of ``team_ids``, with an organization membership, no key and no team membership
+    row, for /user/delete to delete with ``cache``, which serves last good entries, as its auth cache. Every read and
+    write is a mock the test can check. Returns the client and the user's row."""
+    from litellm.proxy._types import LiteLLM_TeamTable, Member
+
+    leaver: Final = LiteLLM_UserTable(user_id=_LEAVER, user_email="leaves@example.test", teams=list(team_ids))
+    teams: Final = [
+        LiteLLM_TeamTable(
+            team_id=team_id, team_alias=f"{team_id}-lanes", members_with_roles=[Member(user_id=_LEAVER, role="user")]
+        )
+        for team_id in team_ids
+    ]
+    prisma_client: Final = mocker.MagicMock()
+    prisma_client.db.litellm_usertable.find_unique = mocker.AsyncMock(return_value=leaver)
+    prisma_client.db.litellm_teamtable.find_many = mocker.AsyncMock(return_value=teams)
+    prisma_client.db.litellm_teamtable.update = mocker.AsyncMock()
+    prisma_client.db.litellm_verificationtoken.find_many = mocker.AsyncMock(return_value=[])
+    prisma_client.db.litellm_jwtkeymapping.find_many = mocker.AsyncMock(return_value=[])
+    prisma_client.db.litellm_teammembership.find_many = mocker.AsyncMock(return_value=[])
+    for table, deleted in (
+        ("verificationtoken", 0),
+        ("invitationlink", 0),
+        ("organizationmembership", 1),
+        ("teammembership", 0),
+        ("usertable", 1),
+    ):
+        getattr(prisma_client.db, f"litellm_{table}").delete_many = mocker.AsyncMock(return_value=deleted)
+    mocker.patch(  # test-quality-ok: substitute the database dependency
+        "litellm.proxy.proxy_server.prisma_client", prisma_client
+    )
+    mocker.patch(  # test-quality-ok: a real cache serving last good entries over a fake Redis, on the test's clock
+        "litellm.proxy.proxy_server.user_api_key_cache", cache
+    )
+    mocker.patch(  # test-quality-ok: delete_user reads it off proxy_server at call time
+        "litellm.proxy.proxy_server.proxy_logging_obj", None
+    )
+    return prisma_client, leaver
+
+
+async def _in_redis(redis: "FakeRedisCache", cache_key: str) -> tuple[bool, bool]:
+    """Whether Redis holds the tombstone of ``cache_key`` and its last good entry; neither while Redis is lost."""
+    if not redis.server.connected:
+        return (False, False)
+    client: Final = redis.cache.init_async_client()
+    return (
+        await client.exists(f"last_good_tombstone:{cache_key}") == 1,
+        await client.exists(f"last_good:{cache_key}") == 1,
+    )
+
+
+def _recording_in_redis(
+    redis: "FakeRedisCache", cache_key: str, call: str, seen: list[tuple[str, bool, bool]]
+) -> Callable[..., Awaitable[object]]:
+    """A database mock's side effect: records under ``call`` what ``_in_redis`` finds for ``cache_key`` as the call
+    runs. The call then answers as configured."""
+
+    async def record(*_args: object, **_kwargs: object) -> object:
+        seen.append((call, *await _in_redis(redis, cache_key)))
+        return DEFAULT
+
+    return record
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loses_redis", [False, True], ids=["redis_up", "redis_lost"])
+async def test_delete_user_revokes_the_user_again_before_its_ending_writes_once_its_roster_writes_outlast_the_tombstone(
+    mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch, loses_redis: bool
+) -> None:
+    """The revocation before the first write revokes the user, then its three roster writes each take a third of the
+    tombstone time and a second: the user's tombstone lapses, and another pod stores the entry of the user's row, which
+    still exists. The organization membership delete and the user delete each revoke the user again right before
+    them, so the user's tombstone stands in Redis when each runs and the entry the other pod stored is gone. With
+    Redis lost before the organization membership delete, that revocation cannot reach Redis: the request answers 503
+    with the organization membership and the user row kept."""
+    from litellm.proxy._types import DeleteUserRequest
+    from litellm.proxy.management_endpoints.internal_user_endpoints import delete_user
+    from tests.unit.caching.fake_redis_cache import drive_fake_redis_time, fake_redis_cache
+
+    clock: Final = _DrivenClock()
+    drive_fake_redis_time(monkeypatch, clock.wall)
+    redis: Final = fake_redis_cache()
+    prisma_client, leaver = _leaving_user(mocker, _serving_last_good(redis, clock), ("team-1", "team-2", "team-3"))
+    first_roster_write: Final[list[tuple[bool, bool]]] = []  # mutable-ok: the user in Redis at the first roster write
+
+    async def slow_roster_write(*_args: object, **_kwargs: object) -> object:
+        if not first_roster_write:
+            first_roster_write.append(await _in_redis(redis, _LEAVER))
+        clock.now += _ROSTER_WRITE_SECONDS
+        return DEFAULT
+
+    other_pod: Final = UserApiKeyCache(
+        redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=clock, last_good_wall_clock=clock.wall
+    )
+    stored: Final[list[tuple[bool, bool]]] = []  # mutable-ok: the user in Redis once the other pod stored its entry
+
+    async def another_pod_stores_the_user(*_args: object, **_kwargs: object) -> object:
+        with last_good_reads_started_at(clock.now):
+            await remember_last_good(other_pod, _LEAVER, leaver)
+        stored.append(await _in_redis(redis, _LEAVER))
+        if loses_redis:
+            redis.server.connected = False
+        return DEFAULT
+
+    seen: Final[list[tuple[str, bool, bool]]] = []  # mutable-ok: the user in Redis at each ending write
+    prisma_client.db.litellm_teamtable.update.side_effect = slow_roster_write
+    prisma_client.db.litellm_invitationlink.delete_many.side_effect = another_pod_stores_the_user
+    prisma_client.db.litellm_organizationmembership.delete_many.side_effect = _recording_in_redis(
+        redis, _LEAVER, "organization membership delete", seen
+    )
+    prisma_client.db.litellm_usertable.delete_many.side_effect = _recording_in_redis(
+        redis, _LEAVER, "user delete", seen
+    )
+    deleting: Final = delete_user(
+        data=DeleteUserRequest(user_ids=[_LEAVER]),
+        user_api_key_dict=UserAPIKeyAuth(user_id="proxy-admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+    )
+
+    if loses_redis:
+        with pytest.raises(HTTPException) as refused:
+            await deleting
+        assert refused.value.status_code == 503
+    else:
+        await deleting
+
+    # The first revocation recorded the user's tombstone, which had lapsed when the other pod stored the entry
+    assert (first_roster_write, stored) == ([(True, False)], [(False, True)])
+    assert prisma_client.db.litellm_teamtable.update.await_count == 3
+    if loses_redis:
+        assert seen == []
+        prisma_client.db.litellm_organizationmembership.delete_many.assert_not_awaited()
+        prisma_client.db.litellm_usertable.delete_many.assert_not_awaited()
+        return
+    assert seen == [("organization membership delete", True, False), ("user delete", True, False)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loses_redis", [False, True], ids=["redis_up", "redis_lost"])
+async def test_delete_user_revokes_the_user_again_before_its_row_delete_once_a_membership_round_outlasts_the_tombstone(
+    mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch, loses_redis: bool
+) -> None:
+    """The user's tombstone, recorded by the revocation before the first write, still stands at the organization
+    membership delete, so that delete's revocation skips the user; then the round deleting the user's team membership
+    takes the tombstone time and a second, and the tombstone lapses. The user delete revokes the user again right
+    before it, so the tombstone stands in Redis when it runs. With Redis lost once that round's delete lands, that
+    revocation cannot reach Redis: the request answers 503 with the user row kept."""
+    from litellm.models.team_membership import LiteLLM_TeamMembership
+    from litellm.proxy._types import DeleteUserRequest
+    from litellm.proxy.management_endpoints.internal_user_endpoints import delete_user
+    from tests.unit.caching.fake_redis_cache import drive_fake_redis_time, fake_redis_cache
+
+    clock: Final = _DrivenClock()
+    drive_fake_redis_time(monkeypatch, clock.wall)
+    redis: Final = fake_redis_cache()
+    prisma_client, _ = _leaving_user(mocker, _serving_last_good(redis, clock), ("team-1",))
+    memberships: Final = [  # mutable-ok: the round's delete empties it
+        LiteLLM_TeamMembership(user_id=_LEAVER, team_id="team-1")
+    ]
+    seen: Final[list[tuple[str, bool, bool]]] = []  # mutable-ok: the user in Redis at each ending write
+    record_membership_delete: Final = _recording_in_redis(redis, _LEAVER, "team membership delete", seen)
+    record_membership_deleted: Final = _recording_in_redis(redis, _LEAVER, "team membership deleted", seen)
+
+    async def slow_membership_delete(*_args: object, **_kwargs: object) -> object:
+        await record_membership_delete()
+        clock.now += LAST_GOOD_TOMBSTONE_TTL_SECONDS + 1
+        await record_membership_deleted()
+        memberships.clear()
+        if loses_redis:
+            redis.server.connected = False
+        return DEFAULT
+
+    prisma_client.db.litellm_teammembership.find_many.side_effect = lambda **_where: list(memberships)
+    prisma_client.db.litellm_teammembership.delete_many.side_effect = slow_membership_delete
+    prisma_client.db.litellm_organizationmembership.delete_many.side_effect = _recording_in_redis(
+        redis, _LEAVER, "organization membership delete", seen
+    )
+    prisma_client.db.litellm_usertable.delete_many.side_effect = _recording_in_redis(
+        redis, _LEAVER, "user delete", seen
+    )
+    deleting: Final = delete_user(
+        data=DeleteUserRequest(user_ids=[_LEAVER]),
+        user_api_key_dict=UserAPIKeyAuth(user_id="proxy-admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+    )
+
+    # Standing at the organization membership delete, the user's tombstone lapsed during the team membership's
+    before_the_user_delete: Final = (
+        ("organization membership delete", True, False),
+        ("team membership delete", True, False),
+        ("team membership deleted", False, False),
+    )
+    if not loses_redis:
+        await deleting
+        assert seen == [*before_the_user_delete, ("user delete", True, False)]
+        return
+    with pytest.raises(HTTPException) as refused:
+        await deleting
+    assert (refused.value.status_code, refused.value.detail) == (
+        503,
+        {
+            "error": "The auth cache could not record this revocation, so nothing was changed. "
+            "Retry once Redis is reachable."
+        },
+    )
+    assert seen == list(before_the_user_delete)
+    prisma_client.db.litellm_usertable.delete_many.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loses_redis", [False, True], ids=["redis_up", "redis_lost"])
+async def test_delete_user_reads_a_key_rounds_jwt_mappings_before_the_rounds_revocation(
+    mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch, loses_redis: bool
+) -> None:
+    """The user's roster write outlasts the tombstone, so the key round revokes the user's key again in Redis. The
+    round reads the key's JWT mappings before that revocation, which the key's delete then follows with nothing
+    awaited between: the key's tombstone has lapsed when the mappings are read, and stands again when the key is
+    deleted. With Redis lost once the roster write lands, the mappings are read, and the revocation answers 503 with
+    the key and the user kept."""
+    from litellm.proxy._types import DeleteUserRequest, LiteLLM_VerificationToken
+    from litellm.proxy.management_endpoints.internal_user_endpoints import delete_user
+    from tests.unit.caching.fake_redis_cache import drive_fake_redis_time, fake_redis_cache
+
+    clock: Final = _DrivenClock()
+    drive_fake_redis_time(monkeypatch, clock.wall)
+    redis: Final = fake_redis_cache()
+    prisma_client, _ = _leaving_user(mocker, _serving_last_good(redis, clock), ("team-1",))
+    keys: Final = [LiteLLM_VerificationToken(token=_LEAVERS_KEY, user_id=_LEAVER)]  # mutable-ok: its delete empties it
+
+    async def slow_roster_write(*_args: object, **_kwargs: object) -> object:
+        clock.now += LAST_GOOD_TOMBSTONE_TTL_SECONDS + 1
+        if loses_redis:
+            redis.server.connected = False
+        return DEFAULT
+
+    seen: Final[list[tuple[str, bool, bool]]] = []  # mutable-ok: the key in Redis at its mapping read and its delete
+    record_key_delete: Final = _recording_in_redis(redis, _LEAVERS_KEY, "key delete", seen)
+
+    async def delete_key(*_args: object, **_kwargs: object) -> object:
+        await record_key_delete()
+        keys.clear()
+        return DEFAULT
+
+    prisma_client.db.litellm_teamtable.update.side_effect = slow_roster_write
+    prisma_client.db.litellm_verificationtoken.find_many.side_effect = lambda **_where: list(keys)
+    prisma_client.db.litellm_jwtkeymapping.find_many.side_effect = _recording_in_redis(
+        redis, _LEAVERS_KEY, "JWT mapping read", seen
+    )
+    prisma_client.db.litellm_verificationtoken.delete_many.side_effect = delete_key
+    deleting: Final = delete_user(
+        data=DeleteUserRequest(user_ids=[_LEAVER]),
+        user_api_key_dict=UserAPIKeyAuth(user_id="proxy-admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+    )
+
+    if not loses_redis:
+        await deleting
+        assert seen == [("JWT mapping read", False, False), ("key delete", True, False)]
+        return
+    with pytest.raises(HTTPException) as refused:
+        await deleting
+    assert refused.value.status_code == 503
+    assert seen == [("JWT mapping read", False, False)]
+    prisma_client.db.litellm_verificationtoken.delete_many.assert_not_awaited()
+    prisma_client.db.litellm_usertable.delete_many.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_delete_user_records_the_users_tombstone_again_after_its_delete_so_an_older_read_cannot_store_its_row(
+    mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The request revokes the user at t=0, with a 30 s tombstone, and deletes it at t=19. Its organization memberships
+    delete, paired with the user's revocation, sends nothing to Redis then, the request's record showing the
+    tombstone standing, and records the user's tombstone again at t=19, until t=49. The team memberships' rounds take
+    until t=24.5, and the user row delete, its revocation still skipped (24.5 s is under the tombstone time less 5 s),
+    records it again at t=24.5, until t=54.5. Another pod's read began at t=24.4, before the row delete committed, and
+    got the user's row; it stores that row at t=49.2, 24.8 s after it began, so not late, and once the earlier records
+    lapsed. Only the record after the user row delete refuses that store, and a database outage after it serves no
+    entry for the deleted user."""
+    from litellm.proxy._types import DeleteUserRequest
+    from litellm.proxy.management_endpoints.internal_user_endpoints import delete_user
+    from tests.unit.proxy.last_good_tombstone_race import (
+        revoked_before_the_write,
+        served_after_another_pod_stores,
+        tombstone_race,
+    )
+
+    race: Final = tombstone_race(monkeypatch)
+    prisma_client, leaver = _leaving_user(mocker, race.cache, ("team-1",))
+    membership_reads: Final = [0]  # mutable-ok: counts the team membership reads
+
+    async def memberships_rounds_take_until_the_row_delete(*_args: object, **_kwargs: object) -> list[object]:
+        # The first read is the one before the first write; the second is the rounds', after the memberships delete
+        membership_reads[0] += 1
+        if membership_reads[0] == 2:
+            race.clock.now = 24.5
+        return []
+
+    prisma_client.db.litellm_teammembership.find_many = mocker.AsyncMock(
+        side_effect=memberships_rounds_take_until_the_row_delete
+    )
+    await revoked_before_the_write(race, (_LEAVER,))
+
+    deleted: Final = await delete_user(
+        data=DeleteUserRequest(user_ids=[_LEAVER]),
+        user_api_key_dict=UserAPIKeyAuth(user_id="proxy-admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+    )
+
+    assert deleted == 1
+    prisma_client.db.litellm_usertable.delete_many.assert_awaited_once_with(where={"user_id": {"in": [_LEAVER]}})
+    served: Final = await served_after_another_pod_stores(race, _LEAVER, leaver, read_began_at=24.4, stored_at=49.2)
+    assert served is None
+
+
+@pytest.mark.asyncio
+async def test_delete_user_without_last_good_entries_reads_and_writes_in_the_order_it_did_before_them(
+    mocker: MockerFixture,
+) -> None:
+    """With last good entries off nothing is revoked, so /user/delete keeps the order it had before them: each user is
+    read and taken off its team's roster in turn, then the users' keys are read with their JWT mappings and go in one
+    delete, then the invitations, the organization and team memberships, and the users."""
+    from litellm.proxy._types import DeleteUserRequest, LiteLLM_TeamTable, LiteLLM_VerificationToken, Member
+    from litellm.proxy.management_endpoints.internal_user_endpoints import delete_user
+
+    users: Final = tuple(
+        LiteLLM_UserTable(user_id=user_id, user_email=f"{user_id}@example.test", teams=[f"team-of-{user_id}"])
+        for user_id in ("user-1", "user-2")
+    )
+    teams: Final = tuple(
+        LiteLLM_TeamTable(
+            team_id=f"team-of-{user.user_id}", members_with_roles=[Member(user_id=user.user_id, role="user")]
+        )
+        for user in users
+    )
+    keys: Final = tuple(LiteLLM_VerificationToken(token=f"hashed-key-of-{u.user_id}", user_id=u.user_id) for u in users)
+    calls: Final[list[str]] = []  # mutable-ok: each database call, in order
+
+    def recorded(call: str, answer: Callable[[Mapping[str, object]], object]) -> AsyncMock:
+        async def record_and_answer(*, where: Mapping[str, object], **_data: object) -> object:
+            calls.append(call)
+            return answer(where)
+
+        return mocker.AsyncMock(side_effect=record_and_answer)
+
+    prisma_client: Final = mocker.MagicMock()
+    prisma_client.db.litellm_usertable.find_unique = recorded(
+        "read user", lambda where: next(u for u in users if _row_matches(u.model_dump(), where))
+    )
+    prisma_client.db.litellm_teamtable.find_many = recorded(
+        "read teams", lambda where: [t for t in teams if _row_matches(t.model_dump(), where)]
+    )
+    prisma_client.db.litellm_teamtable.update = recorded("write roster", lambda _where: None)
+    prisma_client.db.litellm_verificationtoken.find_many = recorded("read keys", lambda _where: list(keys))
+    prisma_client.db.litellm_jwtkeymapping.find_many = recorded("read JWT mappings", lambda _where: [])
+    for table, call in (
+        ("verificationtoken", "delete keys"),
+        ("invitationlink", "delete invitations"),
+        ("organizationmembership", "delete organization memberships"),
+        ("teammembership", "delete team memberships"),
+        ("usertable", "delete users"),
+    ):
+        getattr(prisma_client.db, f"litellm_{table}").delete_many = recorded(call, lambda _where: 0)
+    mocker.patch(  # test-quality-ok: substitute the database dependency
+        "litellm.proxy.proxy_server.prisma_client", prisma_client
+    )
+    mocker.patch(  # test-quality-ok: a real cache that serves no last good entry
+        "litellm.proxy.proxy_server.user_api_key_cache", UserApiKeyCache()
+    )
+    mocker.patch(  # test-quality-ok: delete_user reads it off proxy_server at call time
+        "litellm.proxy.proxy_server.proxy_logging_obj", None
+    )
+
+    await delete_user(
+        data=DeleteUserRequest(user_ids=[u.user_id for u in users]),
+        user_api_key_dict=UserAPIKeyAuth(user_id="proxy-admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+    )
+
+    assert calls == [
+        *("read user", "read teams", "write roster") * 2,
+        "read keys",
+        "read JWT mappings",
+        "delete keys",
+        "delete invitations",
+        "delete organization memberships",
+        "delete team memberships",
+        "delete users",
+    ]

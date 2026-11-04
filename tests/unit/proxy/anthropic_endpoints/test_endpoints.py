@@ -305,6 +305,52 @@ class TestHttpExceptionDictDetail:
         mock_logging.post_call_failure_hook.assert_awaited_once()
 
 
+class TestRateLimitErrorHeaders:
+    @pytest.mark.asyncio
+    async def test_messages_rate_limit_refusal_keeps_its_retry_after_and_limit_headers(self):
+        import litellm.proxy.anthropic_endpoints.endpoints as ep
+        import litellm.proxy.proxy_server as proxy_server
+        from litellm.proxy._types import UserAPIKeyAuth
+        from litellm.proxy.common_utils.proxy_rate_limit_error import ProxyRateLimitError
+
+        refusal = ProxyRateLimitError(
+            detail={"error": "Priority-based rate limit exceeded"},
+            headers={
+                "retry-after": 60,
+                "rate_limit_type": "requests",
+                "x-litellm-priority": "default_pool",
+                "x-litellm-saturation": "0.9",
+            },
+        )
+        request = MagicMock()
+        request.headers = {}
+
+        with (
+            patch.object(ep, "read_request_body", new=AsyncMock(return_value={})),  # test-quality-ok: endpoint reads the body via a module function; no injection seam
+            patch.object(  # test-quality-ok: the limiter raise happens deep inside this call; the test targets the endpoint's except block
+                ep.ProxyBaseLLMRequestProcessing,
+                "base_process_llm_request",
+                new=AsyncMock(side_effect=refusal),
+            ),
+            patch.object(
+                proxy_server, "proxy_logging_obj"
+            ) as mock_logging,  # test-quality-ok: module global imported at call time; no injection seam
+        ):
+            mock_logging.post_call_failure_hook = AsyncMock()
+            response = await ep.anthropic_response(
+                fastapi_response=MagicMock(),
+                request=request,
+                user_api_key_dict=UserAPIKeyAuth(),
+            )
+
+        assert response.status_code == 429
+        assert json.loads(response.body)["error"]["type"] == "rate_limit_error"
+        assert response.headers["retry-after"] == "60"
+        assert response.headers["rate_limit_type"] == "requests"
+        assert response.headers["x-litellm-priority"] == "default_pool"
+        assert response.headers["x-litellm-saturation"] == "0.9"
+
+
 class TestFailureHookRequestData:
     @pytest.mark.asyncio
     async def test_failure_hook_gets_post_setup_data_with_logging_obj(self):
@@ -561,3 +607,107 @@ class TestStripTotalTokensFeatureFlag(unittest.TestCase):
         import litellm
 
         assert litellm.strip_anthropic_total_tokens is False
+
+
+class TestAuthEntriesHeaderOnResponsesBuiltOutsideTheMainPath:
+    """A guardrail-blocked or context-management response of /v1/messages carries the call headers, the
+    x-litellm-auth-entries mark included, like the responses base_process_llm_request builds."""
+
+    @staticmethod
+    def _served_from_last_good():
+        from litellm.proxy._types import UserAPIKeyAuth
+
+        user_api_key_dict = UserAPIKeyAuth(token="hashed-token")
+        user_api_key_dict.auth_entries = "last_good"
+        return user_api_key_dict
+
+    @staticmethod
+    def _blocked():
+        from litellm.integrations.custom_guardrail import ModifyResponseException
+
+        return ModifyResponseException(
+            message="blocked by guardrail",
+            model="claude-sonnet-5",
+            request_data={"messages": [{"role": "user", "content": "hi"}]},
+            guardrail_name="content-filter",
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_blocked_response_carries_the_mark(self):
+        from fastapi import Response
+
+        import litellm.proxy.anthropic_endpoints.endpoints as ep
+        import litellm.proxy.proxy_server as proxy_server
+
+        fastapi_response = Response()
+        with (
+            patch.object(ep, "read_request_body", new=AsyncMock(return_value={})),
+            patch.object(
+                ep.ProxyBaseLLMRequestProcessing, "base_process_llm_request", new=AsyncMock(side_effect=self._blocked())
+            ),
+            patch.object(proxy_server, "proxy_logging_obj") as mock_logging,
+        ):
+            mock_logging.post_call_failure_hook = AsyncMock()
+            response = await ep.anthropic_response(
+                fastapi_response=fastapi_response,
+                request=MagicMock(),
+                user_api_key_dict=self._served_from_last_good(),
+            )
+
+        assert response["content"][0]["text"] == "blocked by guardrail"
+        assert fastapi_response.headers["x-litellm-auth-entries"] == "last_good"
+
+    @pytest.mark.asyncio
+    async def test_a_blocked_streaming_response_carries_the_mark(self):
+        from fastapi import Response
+
+        import litellm.proxy.anthropic_endpoints.endpoints as ep
+        import litellm.proxy.proxy_server as proxy_server
+
+        async def blocked_stream(**_kwargs):
+            yield "data: blocked\n\n"
+
+        with (
+            patch.object(ep, "read_request_body", new=AsyncMock(return_value={"stream": True})),
+            patch.object(
+                ep.ProxyBaseLLMRequestProcessing, "base_process_llm_request", new=AsyncMock(side_effect=self._blocked())
+            ),
+            patch.object(ep.ProxyBaseLLMRequestProcessing, "async_sse_data_generator", new=blocked_stream),
+            patch.object(proxy_server, "proxy_logging_obj") as mock_logging,
+        ):
+            mock_logging.post_call_failure_hook = AsyncMock()
+            response = await ep.anthropic_response(
+                fastapi_response=Response(),
+                request=MagicMock(),
+                user_api_key_dict=self._served_from_last_good(),
+            )
+
+        assert response.headers["x-litellm-auth-entries"] == "last_good"
+
+    @pytest.mark.asyncio
+    async def test_a_context_management_error_response_carries_the_mark(self):
+        from fastapi import Response
+
+        import litellm.proxy.anthropic_endpoints.endpoints as ep
+        import litellm.proxy.proxy_server as proxy_server
+        from litellm.llms.anthropic.pass_through.context_management import AnthropicContextManagementError
+
+        request = MagicMock()
+        request.headers = {}
+        with (
+            patch.object(ep, "read_request_body", new=AsyncMock(return_value={})),
+            patch.object(
+                ep.ProxyBaseLLMRequestProcessing,
+                "base_process_llm_request",
+                new=AsyncMock(side_effect=AnthropicContextManagementError(status_code=400, message="bad edit")),
+            ),
+            patch.object(proxy_server, "proxy_logging_obj") as mock_logging,
+        ):
+            mock_logging.post_call_failure_hook = AsyncMock()
+            response = await ep.anthropic_response(
+                fastapi_response=Response(),
+                request=request,
+                user_api_key_dict=self._served_from_last_good(),
+            )
+
+        assert (response.status_code, response.headers["x-litellm-auth-entries"]) == (400, "last_good")

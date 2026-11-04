@@ -11,6 +11,7 @@ import pytest
 import litellm
 from litellm._service_logger import ServiceLogging
 from litellm.caching.redis_cache import RedisCache, RedisCircuitBreakerOpenError
+from tests.unit.caching.fake_redis_cache import ScriptedPipelines, drive_fake_redis_time, fake_redis_cache
 
 
 @pytest.fixture
@@ -1637,3 +1638,167 @@ def test_call_stack_info_skips_native_lifecycle_frames():
         return native_drive()
 
     assert anthropic_messages() == "anthropic_messages <- test_call_stack_info_skips_native_lifecycle_frames"
+
+
+@pytest.mark.asyncio
+async def test_set_cache_or_raise_without_a_ttl_stores_a_key_redis_never_expires():
+    redis: Final = fake_redis_cache(namespace="gateway")
+
+    await redis.cache.async_set_cache_or_raise("last_good:team_id:t1", {"team_id": "t1"})
+    await redis.cache.async_set_cache_or_raise("last_good_tombstone:team_id:t1", 1, ttl=600)
+
+    client = redis.cache.init_async_client()
+    assert await client.ttl("gateway:last_good:team_id:t1") == -1
+    assert 0 < await client.ttl("gateway:last_good_tombstone:team_id:t1") <= 600
+    assert await redis.cache.async_get_cache_or_raise("last_good:team_id:t1") == {"team_id": "t1"}
+
+
+@pytest.mark.asyncio
+async def test_set_cache_or_raise_with_expire_at_ends_the_key_at_that_unix_second(monkeypatch: pytest.MonkeyPatch):
+    """``expire_at`` goes to Redis as SET EXAT, so the key ends at that second on the server's clock and Redis reports
+    that absolute expiry; a ``ttl`` given with it is refused before anything is sent."""
+    now: Final = [1_700_000_000.25]  # mutable-ok: the test moves the fake server's clock
+    drive_fake_redis_time(monkeypatch, lambda: now[0])
+    redis: Final = fake_redis_cache(namespace="gateway")
+    expire_at: Final = 1_700_000_600
+
+    await redis.cache.async_set_cache_or_raise("last_good:team_id:t1", {"team_id": "t1"}, expire_at=expire_at)
+    with pytest.raises(ValueError, match="not both"):
+        await redis.cache.async_set_cache_or_raise(
+            "last_good:team_id:t2", {"team_id": "t2"}, ttl=600, expire_at=expire_at
+        )
+
+    client: Final = redis.cache.init_async_client()
+    assert await client.expiretime("gateway:last_good:team_id:t1") == expire_at
+    assert await client.exists("gateway:last_good:team_id:t2") == 0
+    now[0] = expire_at - 0.01
+    assert await redis.cache.async_get_cache_or_raise("last_good:team_id:t1") == {"team_id": "t1"}
+    now[0] = expire_at + 0.01
+    assert await redis.cache.async_get_cache_or_raise("last_good:team_id:t1") is None
+
+
+@pytest.mark.asyncio
+async def test_server_version_is_the_redis_version_from_info_and_raises_without_one():
+    """fakeredis has no INFO command, so its client's ``info`` is patched; with the server away, the call raises."""
+    from redis.exceptions import ConnectionError as RedisConnectionError
+
+    redis: Final = fake_redis_cache()
+    client: Final = redis.cache.init_async_client()
+
+    with patch.object(client, "info", AsyncMock(return_value={"redis_version": "7.2.4"})) as info:
+        assert await redis.cache.async_server_version() == "7.2.4"
+    info.assert_awaited_once_with("server")
+    with patch.object(client, "info", AsyncMock(return_value={"redis_mode": "standalone"})):
+        with pytest.raises(ValueError, match="without redis_version"):
+            await redis.cache.async_server_version()
+    redis.server.connected = False
+    with pytest.raises(RedisConnectionError):
+        await redis.cache.async_server_version()
+
+
+@pytest.mark.asyncio
+async def test_get_cache_or_raise_tells_a_miss_from_an_unreachable_redis():
+    from redis.exceptions import ConnectionError as RedisConnectionError
+
+    redis: Final = fake_redis_cache()
+    assert await redis.cache.async_get_cache_or_raise("absent") is None
+
+    redis.server.connected = False
+
+    with pytest.raises(RedisConnectionError):
+        await redis.cache.async_get_cache_or_raise("absent")
+    with pytest.raises(RedisConnectionError):
+        await redis.cache.async_set_cache_or_raise("absent", {"a": 1})
+
+
+@pytest.mark.asyncio
+async def test_set_then_delete_sets_every_key_for_its_ttl_then_deletes_in_two_round_trips():
+    """However many keys, one pipeline of the SETs and one of the DELs after it, each key in the cache's namespace."""
+    redis: Final = fake_redis_cache(namespace="gateway")
+    client: Final = redis.cache.init_async_client()
+    for name in ("a", "b", "c"):
+        await client.set(f"gateway:last_good:{name}", "entry")
+
+    with patch.object(client, "pipeline", wraps=client.pipeline) as pipeline:
+        await redis.cache.async_set_then_delete_or_raise(
+            tuple(f"last_good_tombstone:{name}" for name in "abc"), 1, 600, tuple(f"last_good:{name}" for name in "abc")
+        )
+
+    assert pipeline.call_count == 2
+    for name in "abc":
+        assert await client.get(f"gateway:last_good_tombstone:{name}") == b"1"
+        assert 599 <= await client.ttl(f"gateway:last_good_tombstone:{name}") <= 600
+        assert await client.exists(f"gateway:last_good:{name}") == 0
+
+
+@pytest.mark.asyncio
+async def test_set_then_delete_raises_and_sends_no_delete_when_redis_cannot_take_the_sets():
+    """With the server away the SET pipeline raises, and the DELs, which must follow every SET, are never sent."""
+    from redis.exceptions import ConnectionError as RedisConnectionError
+
+    redis: Final = fake_redis_cache()
+    client: Final = redis.cache.init_async_client()
+    await client.set("last_good:a", "entry")
+    redis.server.connected = False
+
+    with patch.object(client, "pipeline", wraps=client.pipeline) as pipeline, pytest.raises(RedisConnectionError):
+        await redis.cache.async_set_then_delete_or_raise(("last_good_tombstone:a",), 1, 600, ("last_good:a",))
+
+    redis.server.connected = True
+    assert pipeline.call_count == 1
+    assert await client.get("last_good:a") == b"entry"
+    assert await client.exists("last_good_tombstone:a") == 0
+
+
+@pytest.mark.asyncio
+async def test_set_then_delete_raises_a_refused_set_once_the_server_ran_the_others_and_sends_no_delete(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The server refuses one SET of the pipeline and runs the others, as Redis does in a pipeline that is not a
+    transaction; ``execute()`` raises the refusal once every answer is in, and the DELs, which must follow every SET,
+    are never sent."""
+    from redis.exceptions import ResponseError
+
+    redis: Final = fake_redis_cache()
+    client: Final = redis.cache.init_async_client()
+    for name in "abc":
+        await client.set(f"last_good:{name}", "entry")
+    pipelines: Final = ScriptedPipelines(monkeypatch, redis.cache, refused_sets=frozenset({"last_good_tombstone:b"}))
+
+    with pytest.raises(ResponseError, match="invalid expire time"):
+        await redis.cache.async_set_then_delete_or_raise(
+            tuple(f"last_good_tombstone:{name}" for name in "abc"), 1, 600, tuple(f"last_good:{name}" for name in "abc")
+        )
+
+    assert pipelines.executions == 0
+    assert [await client.get(f"last_good_tombstone:{name}") for name in "abc"] == [b"1", None, b"1"]
+    assert [await client.get(f"last_good:{name}") for name in "abc"] == [b"entry", b"entry", b"entry"]
+
+
+@pytest.mark.asyncio
+async def test_set_then_delete_raises_when_redis_is_lost_after_the_sets_with_every_tombstone_recorded(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Redis is lost once the SET pipeline is answered: the DEL pipeline raises, with every tombstone recorded and
+    every entry still there."""
+    from redis.exceptions import ConnectionError as RedisConnectionError
+
+    redis: Final = fake_redis_cache()
+    client: Final = redis.cache.init_async_client()
+    for name in "ab":
+        await client.set(f"last_good:{name}", "entry")
+
+    async def lose_redis(execution: int) -> None:
+        redis.server.connected = False
+
+    pipelines: Final = ScriptedPipelines(monkeypatch, redis.cache, after_execution=lose_redis)
+
+    with pytest.raises(RedisConnectionError):
+        await redis.cache.async_set_then_delete_or_raise(
+            tuple(f"last_good_tombstone:{name}" for name in "ab"), 1, 600, tuple(f"last_good:{name}" for name in "ab")
+        )
+
+    redis.server.connected = True
+    assert pipelines.executions == 1
+    assert [await client.get(f"last_good_tombstone:{name}") for name in "ab"] == [b"1", b"1"]
+    assert [await client.get(f"last_good:{name}") for name in "ab"] == [b"entry", b"entry"]

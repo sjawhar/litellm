@@ -475,11 +475,12 @@ async def test_add_litellm_data_to_request_strips_admin_injection_slots():
 
 @pytest.mark.asyncio
 async def test_add_litellm_data_to_request_strips_all_user_api_key_prefix_keys():
-    """Strip must cover the full user_api_key_* family, not a hand-maintained
-    list of 2-3 names. Proxy writes a dozen such fields (user_id, alias,
-    spend, team_id, request_route, …) and an attacker populating any of them
+    """Strip must cover the full user_api_key family, the bare key included, not a
+    hand-maintained list of 2-3 names. Proxy writes a dozen such fields (user_id,
+    alias, spend, team_id, request_route, …) and an attacker populating any of them
     in the non-authoritative metadata key would otherwise forge identity /
-    spend in audit logs and guardrails."""
+    spend in audit logs and guardrails. The bare user_api_key is the one every
+    standard-logging payload falls back to for user_api_key_hash."""
     from litellm.proxy.litellm_pre_call_utils import add_litellm_data_to_request
 
     request_mock = MagicMock(spec=Request)
@@ -493,6 +494,7 @@ async def test_add_litellm_data_to_request_strips_all_user_api_key_prefix_keys()
     request_mock.client.host = "127.0.0.1"
 
     attacker_injected = {
+        "user_api_key": "f" * 64,
         "user_api_key_user_id": "victim",
         "user_api_key_alias": "admin-key",
         "user_api_key_spend": 0.0,
@@ -528,11 +530,53 @@ async def test_add_litellm_data_to_request_strips_all_user_api_key_prefix_keys()
         version="test-version",
     )
 
-    # The non-authoritative metadata dict must not retain ANY attacker-injected
-    # user_api_key_* key.
+    # Neither the non-authoritative metadata dict nor the authoritative one may
+    # retain an attacker-injected user_api_key key.
     other = updated.get("litellm_metadata") or {}
-    attacker_leaks = [k for k in other if k.startswith("user_api_key_")]
+    attacker_leaks = [k for k in other if k.startswith("user_api_key")]
     assert attacker_leaks == [], f"Unexpected leaked keys: {attacker_leaks}"
+    assert (updated.get("metadata") or {}).get("user_api_key") == user_api_key_dict.api_key
+
+
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_strips_the_bare_user_api_key_the_proxy_does_not_own():
+    """On /v1/messages the proxy stamps litellm_metadata, so a caller's
+    metadata.user_api_key outlives the strip unless it covers the bare name too.
+    get_standard_logging_metadata turns a sha256-shaped one into the standard
+    logging payload's user_api_key_hash, which its consumers log, label metrics
+    with and file spend rows under."""
+    from litellm.proxy.litellm_pre_call_utils import add_litellm_data_to_request
+
+    request_mock = MagicMock(spec=Request)
+    request_mock.url = MagicMock()
+    request_mock.url.path = "/v1/messages"
+    request_mock.url.__str__.return_value = "http://localhost/v1/messages"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {"Content-Type": "application/json"}
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    user_api_key_dict = UserAPIKeyAuth(api_key="hashed-key", user_id="real-user", metadata={}, team_metadata={})
+
+    updated = await add_litellm_data_to_request(
+        data={
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"user_api_key": "f" * 64},
+            "litellm_metadata": {},
+        },
+        request=request_mock,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    assert {
+        "metadata": (updated.get("metadata") or {}).get("user_api_key"),
+        "litellm_metadata": (updated.get("litellm_metadata") or {}).get("user_api_key"),
+    } == {"metadata": None, "litellm_metadata": user_api_key_dict.api_key}
 
 
 @pytest.mark.asyncio
@@ -1282,6 +1326,7 @@ async def test_key_metadata_enable_prompt_caching_promoted_to_request_root(key_v
         "_code_interpreter_interception_sandbox_key",
         "_headroom_interception_converted_stream",
         "max_agentic_loops",
+        "router_fallbacks",
     ],
 )
 async def test_add_litellm_data_to_request_strips_callback_control_fields(
@@ -1317,6 +1362,7 @@ async def test_add_litellm_data_to_request_strips_callback_control_fields(
         "_code_interpreter_interception_sandbox_key": "forged-key",
         "_headroom_interception_converted_stream": True,
         "max_agentic_loops": 9999,
+        "router_fallbacks": [{"model": "gpt-3.5-turbo", "api_base": "https://attacker.example"}],
     }
     sample_value = sample_values[control_field]
 
@@ -1371,7 +1417,7 @@ async def test_add_litellm_data_to_request_marks_body_timeout_as_client_side(tim
         version="test-version",
     )
 
-    assert updated["client_side_timeout"] is True
+    assert updated["client_side_timeout"] == (timeout_field,)
 
 
 @pytest.mark.asyncio
@@ -1437,7 +1483,7 @@ async def test_client_side_timeout_marker_never_reaches_the_provider():
         general_settings={},
         version="test-version",
     )
-    assert updated["client_side_timeout"] is True
+    assert updated["client_side_timeout"] == ("timeout",)
 
     converse_response = MagicMock()
     converse_response.status_code = 200
@@ -4157,6 +4203,28 @@ def test_user_and_team_spend_and_budget_default_to_none_in_standard_logging_meta
     assert logging_metadata["user_api_key_user_max_budget"] is None
     assert logging_metadata["user_api_key_team_spend"] is None
     assert logging_metadata["user_api_key_team_max_budget"] is None
+
+
+@pytest.mark.parametrize("auth_entries", ["fresh", "last_good", None])
+def test_auth_entries_reach_the_request_metadata_and_the_standard_logging_metadata(auth_entries):
+    """
+    The proxy's own mark replaces whatever the caller sent under the same metadata key
+    """
+    from litellm.litellm_core_utils.litellm_logging import StandardLoggingPayloadSetup
+
+    user_api_key_dict = UserAPIKeyAuth()
+    user_api_key_dict.auth_entries = auth_entries
+
+    data = LiteLLMProxyRequestSetup.add_user_api_key_auth_to_request_metadata(
+        data={"metadata": {"user_api_key_auth_entries": "forged"}},
+        user_api_key_dict=user_api_key_dict,
+        _metadata_variable_name="metadata",
+    )
+    logging_metadata = StandardLoggingPayloadSetup.get_standard_logging_metadata(data["metadata"])
+
+    assert data["metadata"]["user_api_key_auth_entries"] == auth_entries
+    assert logging_metadata["user_api_key_auth_entries"] == auth_entries
+
 
 
 @pytest.mark.asyncio
@@ -7173,7 +7241,7 @@ async def test_add_litellm_data_to_request_strips_caller_supplied_callback_crede
     assert "litellm_metadata" not in updated
     assert "dd_site" not in updated["metadata"]
     assert "dd_agent_host" not in updated["metadata"]
-    assert "dd_site" not in updated["litellm_params"]["metadata"]
+    assert "litellm_params" not in updated
     assert updated["metadata"]["safe_user_metadata"] == "kept"
 
 
@@ -9044,3 +9112,28 @@ def test_arize_otlp_protocol_on_a_key_logging_entry_reaches_the_destination(monk
         assert destinations[0].endpoint == "https://arize.internal.example/v1/traces"
     finally:
         is_otel_v2_enabled.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "beta_lines",
+    [
+        pytest.param(("server-side-fallback-2026-07-01", "prompt-caching-2024-07-31"), id="opt-in-first"),
+        pytest.param(("prompt-caching-2024-07-31", "server-side-fallback-2026-07-01"), id="opt-in-last"),
+    ],
+)
+def test_repeated_anthropic_beta_lines_reach_routing_as_auth_sees_them(beta_lines):
+    from starlette.datastructures import Headers
+
+    from litellm.llms.anthropic.common_utils import (
+        anthropic_beta_opts_into_server_side_fallback,
+        anthropic_owns_fallbacks,
+    )
+    from litellm.proxy.litellm_pre_call_utils import add_provider_specific_headers_to_request, clean_headers
+
+    headers = Headers(raw=[(b"anthropic-beta", line.encode()) for line in beta_lines])
+    data: dict = {}
+    add_provider_specific_headers_to_request(data=data, headers=clean_headers(headers))
+
+    assert anthropic_beta_opts_into_server_side_fallback(headers) is True
+    assert anthropic_owns_fallbacks(data) is True
+    assert data["provider_specific_header"]["extra_headers"]["anthropic-beta"].split(",") == list(beta_lines)

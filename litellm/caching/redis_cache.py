@@ -18,7 +18,7 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import timedelta
@@ -80,6 +80,12 @@ class _AsyncRedisCommands(Protocol):
     def ping(self) -> Awaitable[bool]: ...
 
     def delete(self, *names: str) -> Awaitable[int]: ...
+
+    def get(self, name: str) -> Awaitable[bytes | str | None]: ...
+
+    def set(self, name: str, value: str, ex: int | None = None, exat: int | None = None) -> Awaitable[object]: ...
+
+    def info(self, section: str | None = None) -> Awaitable[Mapping[str, object]]: ...
 
     def ttl(self, name: str) -> Awaitable[int]: ...
 
@@ -1994,6 +2000,58 @@ class RedisCache(BaseCache):
         key = self.check_and_fix_namespace(key=key)
         # keys is str
         return await _redis_client.delete(key)
+
+    @_redis_circuit_breaker_guard
+    async def async_get_cache_or_raise(self, key: str) -> object:
+        """Like ``async_get_cache``, but a Redis that cannot answer raises instead of reading as a miss."""
+        raw: Final = await self._async_commands().get(self.check_and_fix_namespace(key=key))
+        return self._get_cache_logic(cached_response=raw)
+
+    @_redis_circuit_breaker_guard
+    async def async_set_cache_or_raise(
+        self, key: str, value: object, ttl: int | None = None, *, expire_at: int | None = None
+    ) -> None:
+        """SET that raises when Redis cannot take the write. ``ttl=None`` means the key never expires, where
+        ``async_set_cache`` would apply the default TTL. ``expire_at`` ends the key at that Unix second on the
+        server's clock (SET EXAT, Redis 6.2 or later) instead; the two are exclusive."""
+        if ttl is not None and expire_at is not None:
+            raise ValueError("async_set_cache_or_raise takes ttl or expire_at, not both")
+        _ = await self._async_commands().set(
+            self.check_and_fix_namespace(key=key), json.dumps(value), ex=ttl, exat=expire_at
+        )
+
+    @_redis_circuit_breaker_guard
+    async def async_set_then_delete_or_raise(
+        self, set_keys: Sequence[str], value: object, ttl: int, delete_keys: Sequence[str]
+    ) -> None:
+        """SET each of ``set_keys`` to ``value`` for ``ttl`` seconds (SET EX), then DEL each of ``delete_keys``, raising
+        when Redis cannot take a command. Two round trips however many keys: one pipeline of the SETs, and once every
+        SET is acknowledged, one pipeline of the DELs. A cluster's pipeline sends each node its share at the same time,
+        so a single pipeline could run a DEL on its node before a SET on another; the second pipeline keeps every DEL
+        after every SET on any deployment. When the first pipeline raises, some SETs may have landed and no DEL is sent;
+        when the second raises, every SET landed and some DELs may have."""
+        client: Final = self._async_commands()
+        payload: Final = json.dumps(value)
+        async with client.pipeline(transaction=False) as pipe:
+            for key in set_keys:
+                _ = pipe.set(self.check_and_fix_namespace(key=key), payload, ex=ttl)
+            _ = await pipe.execute()  # pyright: ignore[reportUnknownMemberType]  # stubs give execute no return type
+        if not delete_keys:
+            return
+        async with client.pipeline(transaction=False) as pipe:
+            for key in delete_keys:
+                _ = pipe.delete(self.check_and_fix_namespace(key=key))
+            _ = await pipe.execute()  # pyright: ignore[reportUnknownMemberType]  # stubs give execute no return type
+
+    @_redis_circuit_breaker_guard
+    async def async_server_version(self) -> str:
+        """The ``redis_version`` the server reports in INFO; raises when Redis cannot answer or reports none. A cluster
+        client asks one node (redis-py sends INFO to its default node)."""
+        info: Final = await self._async_commands().info("server")
+        version: Final = info.get("redis_version")
+        if version is None:
+            raise ValueError("Redis answered INFO without redis_version")
+        return str(version)
 
     def delete_cache(self, key):
         key = self.check_and_fix_namespace(key=key)

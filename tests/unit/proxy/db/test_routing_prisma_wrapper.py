@@ -1136,3 +1136,108 @@ def test_prisma_client_premints_an_entra_token_for_the_reader(monkeypatch):
     assert isinstance(client.db._reader.token_auth, AzureEntraTokenAuth)
     assert isinstance(client.db._writer.token_auth, AzureEntraTokenAuth)
     assert isinstance(client.db._writer, PrismaWrapper)
+
+
+# ---------------------------------------------------------------------------
+# Reads pinned to the writer
+# ---------------------------------------------------------------------------
+
+
+def _routed_with_key_tables():
+    """A routed wrapper whose writer and reader each hold a key table, with the inner client of each."""
+    from litellm.proxy.db.routing_prisma_wrapper import RoutingPrismaWrapper
+
+    writer, writer_inner, reader, reader_inner = _make_wrappers()
+    writer_inner.litellm_verificationtoken = _model_actions_mock("writer_keys")
+    reader_inner.litellm_verificationtoken = _model_actions_mock("reader_keys")
+    return RoutingPrismaWrapper(writer=writer, reader=reader), writer_inner, reader_inner
+
+
+def test_reads_pinned_to_the_writer_go_to_the_writer_and_unpinned_reads_go_to_the_reader():
+    """A pinned context reads rows and top-level raw SQL from the writer, so the rows that pick what a write revokes
+    come from where that write lands, not a lagging read replica; outside the pin the same reads go to the reader."""
+    from litellm.proxy.db.routing_prisma_wrapper import reads_pinned_to_writer
+
+    routing, writer_inner, reader_inner = _routed_with_key_tables()
+    # Taken before the pin: the accessor chooses the reader or the writer on every read
+    keys: Final = routing.litellm_verificationtoken
+
+    with reads_pinned_to_writer():
+        assert keys.find_many is writer_inner.litellm_verificationtoken.find_many
+        assert keys.find_unique is writer_inner.litellm_verificationtoken.find_unique
+        assert routing.query_raw is writer_inner.query_raw
+        assert routing.read_target is routing.writer
+
+    assert keys.find_many is reader_inner.litellm_verificationtoken.find_many
+    assert keys.find_unique is reader_inner.litellm_verificationtoken.find_unique
+    assert routing.query_raw is reader_inner.query_raw
+    assert routing.read_target is routing.reader
+
+
+def test_a_pinned_context_reads_from_the_reader_while_the_writer_is_degraded():
+    """While the writer is degraded its writes fail, so no write ends access; the pin yields to the reader, as
+    ``WriterPinnedClient`` does, and a proxy started during a primary outage keeps reading from the replica."""
+    from litellm.proxy.db.routing_prisma_wrapper import reads_pinned_to_writer
+
+    routing, _, reader_inner = _routed_with_key_tables()
+    routing._writer_unavailable = True
+    keys: Final = routing.litellm_verificationtoken
+
+    with reads_pinned_to_writer():
+        assert keys.find_many is reader_inner.litellm_verificationtoken.find_many
+        assert keys.find_unique is reader_inner.litellm_verificationtoken.find_unique
+        assert routing.query_raw is reader_inner.query_raw
+        assert routing.read_target is routing.reader
+
+
+def test_a_pinned_context_reads_from_the_writer_while_the_reader_is_degraded():
+    """A degraded reader sends every read to the writer, pinned or not."""
+    from litellm.proxy.db.routing_prisma_wrapper import reads_pinned_to_writer
+
+    routing, writer_inner, _ = _routed_with_key_tables()
+    routing._reader_unavailable = True
+    keys: Final = routing.litellm_verificationtoken
+
+    with reads_pinned_to_writer():
+        assert keys.find_many is writer_inner.litellm_verificationtoken.find_many
+        assert keys.find_unique is writer_inner.litellm_verificationtoken.find_unique
+        assert routing.query_raw is writer_inner.query_raw
+        assert routing.read_target is routing.writer
+    assert routing.read_target is routing.writer
+
+
+def test_the_pin_does_not_leak_out_of_its_block():
+    """A block restores the choice from before it, even where code in it pins again as auth does where a request
+    begins, and an inner block's choice ends with the inner block."""
+    from litellm.proxy.db.routing_prisma_wrapper import pin_reads_to_writer, reads_pinned_to_writer
+
+    routing, _, _ = _routed_with_key_tables()
+
+    with reads_pinned_to_writer(False):
+        pin_reads_to_writer(True)
+        assert routing.read_target is routing.writer
+    assert routing.read_target is routing.reader
+    with reads_pinned_to_writer():
+        with reads_pinned_to_writer(False):
+            assert routing.read_target is routing.reader
+        assert routing.read_target is routing.writer
+    assert routing.read_target is routing.reader
+
+
+@pytest.mark.asyncio
+async def test_a_task_created_in_a_pinned_context_reads_from_the_writer():
+    """A task copies the context it is created in, so a task a pinned request starts reads from the writer too, even
+    when it runs after the pinned block has ended; a task created outside the pin reads from the reader."""
+    from litellm.proxy.db.routing_prisma_wrapper import reads_pinned_to_writer
+
+    routing, writer_inner, reader_inner = _routed_with_key_tables()
+
+    async def where_reads_go() -> tuple[object, object]:
+        return routing.read_target, routing.litellm_verificationtoken.find_many
+
+    with reads_pinned_to_writer():
+        pinned_task: Final = asyncio.create_task(where_reads_go())
+    unpinned_task: Final = asyncio.create_task(where_reads_go())
+
+    assert await pinned_task == (routing.writer, writer_inner.litellm_verificationtoken.find_many)
+    assert await unpinned_task == (routing.reader, reader_inner.litellm_verificationtoken.find_many)

@@ -377,7 +377,7 @@ class ProxyRequestState:
     trusted_callback_vars: Mapping[str, str] | None = field(default=None, metadata=wire(TRUSTED_CALLBACK_VARS_FIELD))
     addressed_response_id: str | None = field(default=None, metadata=wire(ADDRESSED_RESPONSE_ID_FIELD))
     strip_stream_usage: bool | None = field(default=None, metadata=wire("_litellm_strip_stream_usage"))
-    client_side_timeout: bool | None = None
+    client_side_timeout: tuple[str, ...] | None = None
     model_file_id_mapping: Mapping[str, Mapping[str, str]] | None = None
 
 

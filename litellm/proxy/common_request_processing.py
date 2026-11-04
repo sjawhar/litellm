@@ -37,6 +37,7 @@ from litellm.anthropic_interface.exceptions import AnthropicErrorSseFrame, anthr
 from litellm.constants import (
     DD_TRACER_STREAMING_CHUNK_YIELD_RESOURCE,
     DEFAULT_MAX_RECURSE_DEPTH,
+    LITELLM_CLIENT_DISCONNECT_DETAIL,
     LITELLM_DETAILED_TIMING,
     LITELLM_HTTP_STATUS_CLIENT_DISCONNECTED,
     MAX_LITELLM_CALL_ID_LENGTH,
@@ -56,6 +57,7 @@ from litellm.litellm_core_utils.bug_report import (
     strip_bug_report_notice,
 )
 from litellm.litellm_core_utils.core_helpers import (
+    caller_timeouts_left,
     get_or_create_metadata_bucket,
     independent_snapshot,
     is_expected_client_error,
@@ -232,6 +234,7 @@ ProxyRouteType: TypeAlias = Literal[
     "adelete_run",
 ]
 from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+from litellm.llms.anthropic.common_utils import anthropic_owns_fallbacks, validated_object_mapping
 
 # Type alias for streaming chunk serializer (chunk after hooks + cost injection -> wire format)
 StreamChunkSerializer = Callable[[object], str]
@@ -246,6 +249,7 @@ else:
     ProxyConfig = Any
 from litellm.proxy.anthropic_endpoints.streaming_model_restamp import (
     AnthropicStreamModelRestamper,
+    provider_model_is_routed,
 )
 from litellm.proxy.litellm_pre_call_utils import (
     add_litellm_data_to_request,
@@ -640,13 +644,19 @@ def proxy_exception_from_http_exception(exc: HTTPException, headers: dict[str, s
     existing_fields: Final = getattr(exc, "provider_specific_fields", None) or {}
     merged_fields: Final = {**existing_fields, **structured_fields} if structured_fields else (existing_fields or None)
     error_status: Final = error_status_code(exc, status.HTTP_400_BAD_REQUEST)
+    carried_headers: Final = exc.headers or {}
     return ProxyException(
         message=message,
         type=openai_error_type(exc, error_status),
         param=openai_error_param(exc),
         code=error_status,
         provider_specific_fields=merged_fields,
-        headers=headers,
+        headers={
+            **{
+                key: value for key, value in carried_headers.items() if key.lower() not in UNSAFE_PROXY_RESPONSE_HEADERS
+            },
+            **headers,
+        },
     )
 
 
@@ -1369,12 +1379,38 @@ def is_azure_model_router_request(model: str, hidden_params: Mapping[str, object
 _is_azure_model_router_request: Final = is_azure_model_router_request
 
 
+def _resolved_provider(request_data: Mapping[str, object]) -> object:
+    call_details: Final = validated_object_mapping(
+        getattr(request_data.get("litellm_logging_obj"), "model_call_details", None)
+    )
+    return call_details.get("custom_llm_provider") if call_details is not None else None
+
+
+def _server_side_fallback_routed_model(request_data: Mapping[str, object]) -> str | None:
+    """
+    The routed deployment's provider model (litellm_params.model, recorded by the Router in its own request metadata
+    bucket), on a request that carries Anthropic's server-side `fallbacks` (its anthropic-beta header opts in) to the
+    direct Anthropic provider: the only request where the provider can answer with another model. The provider is the
+    resolved one, the value the request filter forwards `fallbacks` on. None for every other request, whose response
+    model is restamped as always.
+    """
+    if (
+        request_data.get("fallbacks") is None
+        or not anthropic_owns_fallbacks(request_data)
+        or _resolved_provider(request_data) != "anthropic"
+    ):
+        return None
+    deployment: Final = (validated_object_mapping(request_data.get("litellm_metadata")) or {}).get("deployment")
+    return deployment if isinstance(deployment, str) and deployment else None
+
+
 def _override_openai_response_model(
     *,
     response_obj: object,
     requested_model: str,
     log_context: str,
     return_raw_model_name: bool = False,
+    routed_model: str | None = None,
 ) -> None:
     """
     Force the OpenAI-compatible `model` field in the response to match what the client requested.
@@ -1397,6 +1433,8 @@ def _override_openai_response_model(
        that was used (e.g., gpt-5-nano-2025-08-07) instead of the router model.
     3. If this was a fastest_response batch completion, use the winning model's
        model group name instead of the comma-separated list the client sent.
+    4. If ``routed_model`` is given and the provider answered with another model (Anthropic's
+       server-side fallback), we preserve the provider's model.
     """
     if return_raw_model_name or not requested_model:
         return
@@ -1445,6 +1483,8 @@ def _override_openai_response_model(
         if "model" not in response_obj:
             return
         downstream_model = response_obj.get("model")
+        if isinstance(downstream_model, str) and not provider_model_is_routed(downstream_model, routed_model):
+            return
         if downstream_model != requested_model:
             verbose_proxy_logger.debug(
                 "%s: response model mismatch - requested=%r downstream=%r. Overriding response['model'] to requested model.",
@@ -1459,6 +1499,8 @@ def _override_openai_response_model(
         return
 
     downstream_model = getattr(response_obj, "model", None)
+    if isinstance(downstream_model, str) and not provider_model_is_routed(downstream_model, routed_model):
+        return
     if downstream_model != requested_model:
         verbose_proxy_logger.debug(
             "%s: response model mismatch - requested=%r downstream=%r. Overriding response.model to requested model.",
@@ -1655,7 +1697,7 @@ def _has_attribute_error_in_chain(exc: Exception) -> bool:
     return False
 
 
-_CLIENT_DISCONNECT_DETAIL: Final = "Client disconnected the request"
+_CLIENT_DISCONNECT_DETAIL: Final = LITELLM_CLIENT_DISCONNECT_DETAIL
 
 
 @runtime_checkable
@@ -1880,6 +1922,7 @@ class ProxyBaseLLMRequestProcessing:
             "x-litellm-key-rpm-limit": str(user_api_key_dict.rpm_limit),
             "x-litellm-key-max-budget": str(user_api_key_dict.max_budget),
             "x-litellm-key-spend": str(updated_spend),
+            "x-litellm-auth-entries": getattr(user_api_key_dict, "auth_entries", None),
             "x-litellm-response-duration-ms": str(timing_values.get("_response_ms")),
             "x-litellm-overhead-duration-ms": str(timing_values.get("litellm_overhead_time_ms")),
             "x-litellm-callback-duration-ms": str(hidden_params.get("callback_duration_ms", None)),
@@ -2146,6 +2189,15 @@ class ProxyBaseLLMRequestProcessing:
             self.data["temperature"] = user_temperature
         if user_request_timeout:
             self.data["request_timeout"] = user_request_timeout
+            # The administrator's request_timeout replaced the caller's, so the timeout mark no longer names it
+            marked: Final[object] = self.data.pop(  # pyright: ignore[reportUnknownMemberType]  # untyped request body
+                "client_side_timeout", None
+            )
+            caller_timeouts: Final = caller_timeouts_left(marked, "request_timeout")
+            if caller_timeouts:
+                self.data["client_side_timeout"] = (  # pyright: ignore[reportUnknownMemberType]  # untyped body
+                    caller_timeouts
+                )
         if user_max_tokens:
             self.data["max_tokens"] = user_max_tokens
         if user_api_base:
@@ -2173,6 +2225,7 @@ class ProxyBaseLLMRequestProcessing:
         # group -- model-level guardrails, per-model budgets and rate limits,
         # the logging object -- sees the group that will actually serve.
         if llm_router is not None and proxy_config is not None:
+            from litellm.proxy.auth.user_api_key_auth import enforce_router_settings_fallback_access
             from litellm.proxy.proxy_server import prisma_client
 
             router_settings: Final = await proxy_config._get_hierarchical_router_settings(
@@ -2186,6 +2239,16 @@ class ProxyBaseLLMRequestProcessing:
             # This avoids expensive Router instantiation on each request
             if router_settings is not None:
                 self.data["router_settings_override"] = router_settings
+                await enforce_router_settings_fallback_access(
+                    request_data=(
+                        self.data  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # untyped body
+                    ),
+                    valid_token=user_api_key_dict,
+                    # The proxy's settings dict as loaded, read by setting name only: not copied, not validated
+                    general_settings=general_settings,  # pyright: ignore[reportUnknownArgumentType]  # see above
+                    llm_router=llm_router,
+                    request=request,
+                )
                 try:
                     self.data["_router_weights"] = validate_router_weights(router_settings.get("weights"))
                 except ValidationError:
@@ -2201,6 +2264,16 @@ class ProxyBaseLLMRequestProcessing:
                 )
                 if alias_target is not None:
                     self.data["model"] = alias_target
+            elif route_type == "anthropic_messages" and anthropic_owns_fallbacks(
+                self.data  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # untyped request body
+            ):
+                # Under the beta a client sends no LiteLLM fallback list of its own: its body `fallbacks` goes to
+                # Anthropic, so its own router_settings_override may not carry one to the Router either.
+                client_override: Final[object] = self.data.get(  # pyright: ignore[reportUnknownMemberType]  # untyped
+                    "router_settings_override"
+                )
+                if isinstance(client_override, dict):
+                    client_override.pop("fallbacks", None)  # pyright: ignore[reportUnknownMemberType]  # a client dict
 
         self.data["litellm_call_id"] = resolve_litellm_call_id(request.headers.get("x-litellm-call-id"))
         DDSpanTagger.tag_call_id(self.data.get("litellm_call_id"))
@@ -2318,6 +2391,7 @@ class ProxyBaseLLMRequestProcessing:
         llm_router: Router | None,
     ) -> tuple[dict, LiteLLMLoggingObj]:
         from litellm.proxy.common_utils.proxy_rate_limit_error import ProxyRateLimitError
+        from litellm.router_utils.fallback_event_handlers import reject_non_list_litellm_fallbacks
 
         configured_fallbacks: Final = (
             self._configured_fallbacks(llm_router=llm_router, user_api_key_dict=user_api_key_dict)
@@ -2348,12 +2422,15 @@ class ProxyBaseLLMRequestProcessing:
             original_model: Final = rate_limited_data.get("model")
             if (
                 pristine is None
+                or llm_router is None
                 or not configured_fallbacks
                 or rate_limited_data.get("disable_fallbacks")
                 or not isinstance(original_model, str)
             ):
                 raise
 
+            # The configured list reaches no Router refusal when the request sends its own `fallbacks`
+            reject_non_list_litellm_fallbacks(configured_fallbacks, original_model)
             fallback_models: Final = self._resolve_fallback_models(
                 model=original_model,
                 fallbacks=configured_fallbacks,
@@ -2368,7 +2445,10 @@ class ProxyBaseLLMRequestProcessing:
             )
             try:
                 for fallback_model in fallback_models:
-                    if fallback_model == original_model:
+                    # This failover rewrites the request's model name, so it takes only a name
+                    if not isinstance(fallback_model, str) or fallback_model == original_model:
+                        continue
+                    if not await self._fallback_model_allowed(fallback_model, llm_router, user_api_key_dict):
                         continue
                     self.data = independent_snapshot(pristine)
                     self.data["model"] = fallback_model
@@ -2400,6 +2480,20 @@ class ProxyBaseLLMRequestProcessing:
             raise original_exc
 
     @staticmethod
+    async def _fallback_model_allowed(model: str, llm_router: Router, user_api_key_dict: UserAPIKeyAuth) -> bool:
+        """The check a router fallback hop runs on its target, for the key the hop's request carries"""
+        from litellm.proxy.auth.fallback_model_access import router_fallback_access_check
+
+        allowed: Final = await router_fallback_access_check(
+            model=model,
+            request_kwargs=MappingProxyType({"metadata": {"user_api_key_auth": user_api_key_dict}}),
+            llm_router=llm_router,
+        )
+        if not allowed:
+            verbose_proxy_logger.info("Skipping fallback to model=%s: caller is not authorized to call it", model)
+        return allowed
+
+    @staticmethod
     def _configured_fallbacks(llm_router: Router, user_api_key_dict: UserAPIKeyAuth) -> list | None:
         key_router_settings: Final = user_api_key_dict.router_settings
         key_fallbacks: Final = key_router_settings.get("fallbacks") if isinstance(key_router_settings, dict) else None
@@ -2407,7 +2501,7 @@ class ProxyBaseLLMRequestProcessing:
         return fallbacks if isinstance(fallbacks, list) and fallbacks else None
 
     @staticmethod
-    def _resolve_fallback_models(model: str, fallbacks: list) -> list[str] | None:
+    def _resolve_fallback_models(model: str, fallbacks: list) -> Sequence[object] | None:
         from litellm.router_utils.fallback_event_handlers import get_fallback_model_group
 
         fallback_model_group, generic_fallback_idx = get_fallback_model_group(
@@ -2990,6 +3084,13 @@ class ProxyBaseLLMRequestProcessing:
                 requested_model=requested_model_from_client,
                 log_context=f"litellm_call_id={logging_obj.litellm_call_id}",
                 return_raw_model_name=should_return_raw_model_name(self.data),
+                routed_model=(
+                    _server_side_fallback_routed_model(
+                        self.data  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # untyped body
+                    )
+                    if route_type == "anthropic_messages"
+                    else None
+                ),
             )
 
         fastapi_response.headers.update(
@@ -4106,7 +4207,16 @@ class ProxyBaseLLMRequestProcessing:
         event in place of the provider's model, matching what the non-streaming
         response reports.
         """
-        restamper: Final = AnthropicStreamModelRestamper(restamp_model) if restamp_model else None
+        restamper: Final = (
+            AnthropicStreamModelRestamper(
+                restamp_model,
+                routed_model=_server_side_fallback_routed_model(
+                    request_data  # pyright: ignore[reportUnknownArgumentType]  # this method's untyped request dict
+                ),
+            )
+            if restamp_model
+            else None
+        )
         return ProxyBaseLLMRequestProcessing.async_streaming_data_generator(
             response=response,
             user_api_key_dict=user_api_key_dict,
