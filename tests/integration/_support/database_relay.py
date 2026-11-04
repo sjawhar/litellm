@@ -220,6 +220,78 @@ def _relayed_url(database_url: str, port: int) -> str:
     return urlunsplit(parts._replace(netloc=f"{credentials}127.0.0.1:{port}"))
 
 
+class OutageRelay:
+    """A TCP relay to one service that a test takes down and brings back: ``cut`` drops every open
+    connection and refuses new ones, as a stopped server does; ``restore`` forwards again."""
+
+    def __init__(self, upstream_host: str, upstream_port: int) -> None:
+        self.port: Final = _free_port()
+        self._upstream_host: Final = upstream_host
+        self._upstream_port: Final = upstream_port
+        self._loop: Final = asyncio.new_event_loop()
+        self._down: Final = threading.Event()
+        self._writers: tuple[asyncio.StreamWriter, ...] = ()
+        self._ready: Final = threading.Event()
+        self._thread: Final = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+        assert self._ready.wait(10), "Outage relay did not start"
+
+    def stop(self) -> None:
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(10)
+
+    def cut(self) -> None:
+        self._down.set()
+        self._loop.call_soon_threadsafe(self._drop_all)
+
+    def restore(self) -> None:
+        self._down.clear()
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_until_complete(asyncio.start_server(self._serve, "127.0.0.1", self.port))
+        self._ready.set()
+        self._loop.run_forever()
+
+    def _drop_all(self) -> None:
+        for writer in self._writers:
+            writer.close()
+        self._writers = ()
+
+    async def _serve(self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter) -> None:
+        if self._down.is_set():
+            client_writer.close()
+            return
+        server_reader, server_writer = await asyncio.open_connection(self._upstream_host, self._upstream_port)
+        self._writers = (*self._writers, client_writer, server_writer)
+
+        async def forward(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            try:
+                while chunk := await reader.read(65536):
+                    if self._down.is_set():
+                        return
+                    writer.write(chunk)
+                    await writer.drain()
+            except (ConnectionError, asyncio.IncompleteReadError):
+                return
+            finally:
+                writer.close()
+
+        await asyncio.gather(forward(client_reader, server_writer), forward(server_reader, client_writer))
+
+
+@contextmanager
+def outage_relay(host: str, port: int) -> Generator[OutageRelay]:
+    relay: Final = OutageRelay(host, port)
+    relay.start()
+    try:
+        yield relay
+    finally:
+        relay.stop()
+
+
 @contextmanager
 def database_relay(database_url: str, trigger: bytes) -> Generator[tuple[DatabaseRelay, str]]:
     parts: Final = urlsplit(database_url)

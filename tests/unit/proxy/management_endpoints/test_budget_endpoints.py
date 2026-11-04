@@ -13,6 +13,22 @@ from litellm.proxy.proxy_server import app
 from litellm.proxy._types import UserAPIKeyAuth, LitellmUserRoles, CommonProxyErrors
 
 
+class _KeyRows:
+    """The key table, answering a column filter, or the OR of column filters a budget change selects keys with."""
+
+    def __init__(self, *rows: types.SimpleNamespace) -> None:
+        self._rows = rows
+
+    async def find_many(self, where: dict) -> list[types.SimpleNamespace]:
+        def matches(row: types.SimpleNamespace, clause: dict) -> bool:
+            return all(
+                getattr(row, column) in wanted["in"] if isinstance(wanted, dict) else getattr(row, column) == wanted
+                for column, wanted in clause.items()
+            )
+
+        clauses = where["OR"] if "OR" in where else [where]
+        return [row for row in self._rows if any(matches(row, clause) for clause in clauses)]
+
 
 @pytest.fixture
 def client_and_mocks(monkeypatch):
@@ -25,6 +41,13 @@ def client_and_mocks(monkeypatch):
     mock_prisma.db = types.SimpleNamespace(
         litellm_budgettable=mock_table,
         litellm_dailyspend=mock_table,
+        litellm_teammembership=types.SimpleNamespace(find_many=AsyncMock(return_value=[])),
+        litellm_organizationtable=types.SimpleNamespace(find_many=AsyncMock(return_value=[])),
+        litellm_projecttable=types.SimpleNamespace(find_many=AsyncMock(return_value=[])),
+        litellm_endusertable=types.SimpleNamespace(find_many=AsyncMock(return_value=[])),
+        litellm_tagtable=types.SimpleNamespace(find_many=AsyncMock(return_value=[])),
+        litellm_modelaccessgroupbudgettable=types.SimpleNamespace(find_many=AsyncMock(return_value=[])),
+        litellm_verificationtoken=_KeyRows(),
     )
 
     # Monkeypatch Mocked Prisma client into the server module
@@ -67,6 +90,116 @@ async def test_new_budget_success(client_and_mocks):
     assert body["updated_by"] == "test_user"
 
     mock_table.create.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_update_budget_drops_the_last_good_entries_of_everything_on_it(client_and_mocks, monkeypatch):
+    """Keys, memberships, organizations, projects, customers, tags and model access groups carry their budget row, a
+    key also carries its organization's and its team membership's, and the default customer and team-member budgets
+    are cached by id. A last good entry never expires, so a changed budget must evict all of them, or a database
+    outage enforces the old limits."""
+    from litellm.proxy._types import LiteLLM_BudgetTable
+    from litellm.proxy.common_utils.user_api_key_cache import (
+        UserApiKeyCache,
+        default_end_user_budget_cache_key,
+        end_user_cache_key,
+        model_access_group_cache_key,
+        project_cache_key,
+        recall_last_good,
+        remember_last_good,
+        tag_cache_key,
+        team_member_default_budget_cache_key,
+        team_membership_auth_cache_key,
+    )
+
+    client, mock_prisma, _ = client_and_mocks
+    mock_prisma.db.litellm_teammembership.find_many = AsyncMock(
+        return_value=[types.SimpleNamespace(user_id="u1", team_id="t1")]
+    )
+    mock_prisma.db.litellm_organizationtable.find_many = AsyncMock(
+        return_value=[types.SimpleNamespace(organization_id="o1")]
+    )
+    mock_prisma.db.litellm_projecttable.find_many = AsyncMock(return_value=[types.SimpleNamespace(project_id="p1")])
+    mock_prisma.db.litellm_endusertable.find_many = AsyncMock(return_value=[types.SimpleNamespace(user_id="c1")])
+    mock_prisma.db.litellm_tagtable.find_many = AsyncMock(return_value=[types.SimpleNamespace(tag_name="tag-1")])
+    mock_prisma.db.litellm_modelaccessgroupbudgettable.find_many = AsyncMock(
+        return_value=[types.SimpleNamespace(access_group_name="group-1")]
+    )
+
+    def key(token: str, budget_id: str | None, organization_id: str | None, team_id: str | None, user_id: str | None):
+        return types.SimpleNamespace(
+            token=token, budget_id=budget_id, organization_id=organization_id, team_id=team_id, user_id=user_id
+        )
+
+    mock_prisma.db.litellm_verificationtoken = _KeyRows(
+        key("hashed-own-budget", "budget_shared", None, None, None),
+        key("hashed-org-budget", None, "o1", None, "u9"),
+        key("hashed-member-budget", None, None, "t1", "u1"),
+        key("hashed-unrelated", "budget_other", "o2", "t1", "u2"),
+    )
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    keys: Final = (
+        team_membership_auth_cache_key(team_id="t1", user_id="u1"),
+        "org_id:o1:with_budget",
+        project_cache_key("p1"),
+        end_user_cache_key("c1"),
+        tag_cache_key("tag-1"),
+        model_access_group_cache_key("group-1"),
+        default_end_user_budget_cache_key("budget_shared"),
+        team_member_default_budget_cache_key("budget_shared"),
+        "hashed-own-budget",
+        "hashed-org-budget",
+        "hashed-member-budget",
+    )
+    for key_name in (*keys, "hashed-unrelated"):
+        await remember_last_good(cache, key_name, LiteLLM_BudgetTable(budget_id="budget_shared", max_budget=50.0))
+    monkeypatch.setattr(ps, "user_api_key_cache", cache)
+
+    resp = client.post("/budget/update", json={"budget_id": "budget_shared", "max_budget": 5.0})
+
+    assert resp.status_code == 200, resp.text
+    assert {
+        key_name: await recall_last_good(cache, key_name, LiteLLM_BudgetTable) for key_name in keys
+    } == dict.fromkeys(keys)
+    assert await recall_last_good(cache, "hashed-unrelated", LiteLLM_BudgetTable) is not None
+    for table in (
+        "litellm_teammembership",
+        "litellm_organizationtable",
+        "litellm_projecttable",
+        "litellm_endusertable",
+        "litellm_tagtable",
+        "litellm_modelaccessgroupbudgettable",
+    ):
+        getattr(mock_prisma.db, table).find_many.assert_awaited_once_with(where={"budget_id": "budget_shared"})
+
+
+@pytest.mark.asyncio
+async def test_update_budget_evicts_the_other_holders_when_one_table_cannot_be_read(client_and_mocks, monkeypatch):
+    """A budget update reads seven tables. One of them failing must not leave the keys on the budget serving their
+    old limits from a last good entry that never expires."""
+    from litellm.proxy._types import LiteLLM_BudgetTable
+    from litellm.proxy.common_utils.user_api_key_cache import (
+        UserApiKeyCache,
+        recall_last_good,
+        remember_last_good,
+    )
+
+    client, mock_prisma, _ = client_and_mocks
+    mock_prisma.db.litellm_tagtable.find_many = AsyncMock(side_effect=Exception("tag table is unreadable"))
+    mock_prisma.db.litellm_verificationtoken = _KeyRows(
+        types.SimpleNamespace(
+            token="hashed-own-budget", budget_id="budget_shared", organization_id=None, team_id=None, user_id=None
+        )
+    )
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    budget: Final = LiteLLM_BudgetTable(budget_id="budget_shared", max_budget=50.0)
+    await remember_last_good(cache, "hashed-own-budget", budget)
+    monkeypatch.setattr(ps, "user_api_key_cache", cache)
+
+    resp = client.post("/budget/update", json={"budget_id": "budget_shared", "max_budget": 5.0})
+
+    assert resp.status_code == 200, resp.text
+    assert await recall_last_good(cache, "hashed-own-budget", LiteLLM_BudgetTable) is None
 
 
 @pytest.mark.parametrize("bad_duration", ["0s", "-5m"])

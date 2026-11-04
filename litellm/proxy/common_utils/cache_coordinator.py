@@ -6,8 +6,9 @@ expiry or restart). Without coordination, they would all run the expensive
 load (DB query, API call) in parallel and overload the backend.
 
 This module ensures only one request performs the load; the rest wait for a
-signal and then read the freshly cached value. Reuse it for any cache-aside
-pattern: global spend, feature flags, config, or other shared read-through data.
+signal and then read the freshly cached value, or raise the load's error when
+it failed. Reuse it for any cache-aside pattern: global spend, feature flags,
+config, or other shared read-through data.
 """
 
 import asyncio
@@ -44,13 +45,25 @@ class AsyncCacheProtocol(Protocol[T]):
     ) -> object: ...
 
 
+class _InFlightLoad:
+    """One load in flight. Its waiters wake on ``done``, then raise ``failure`` when the load raised, or load again
+    when the loader was cancelled before it finished."""
+
+    __slots__ = ("abandoned", "done", "failure")
+
+    def __init__(self) -> None:
+        self.done: Final = asyncio.Event()
+        self.failure: Exception | None = None
+        self.abandoned: bool = False
+
+
 class EventDrivenCacheCoordinator:
     """
     Coordinates a single in-flight load per logical resource to prevent cache stampede.
 
     Pattern:
     - First request: loads data (e.g. DB query), caches it, then signals waiters.
-    - Other requests: wait for the signal, then read from cache.
+    - Other requests: wait for the signal, then read from cache, or raise the error the load raised.
 
     Create one instance per resource (e.g. one for global spend, one for feature flags).
 
@@ -60,8 +73,7 @@ class EventDrivenCacheCoordinator:
 
     def __init__(self, log_prefix: str = "[CACHE]"):
         self._lock = asyncio.Lock()
-        self._event: asyncio.Event | None = None
-        self._query_in_progress = False
+        self._in_flight: _InFlightLoad | None = None
         self._log_prefix = log_prefix
 
     async def _get_cached(self, cache_key: str, cache: AsyncCacheProtocol[T]) -> T | None:
@@ -76,17 +88,16 @@ class EventDrivenCacheCoordinator:
         if self._log_prefix:
             verbose_proxy_logger.debug("%s Cache miss", self._log_prefix)
 
-    async def _claim_role(self) -> asyncio.Event | None:
+    async def _claim_role(self) -> _InFlightLoad | None:
         """
-        Under lock: return event to wait on if load is in progress, else set us as loader and return None.
+        Under lock: return the load to wait on if one is in flight, else start one for the caller and return None.
         """
         async with self._lock:
-            if self._query_in_progress and self._event is not None:
+            if self._in_flight is not None:
                 if self._log_prefix:
                     verbose_proxy_logger.debug("%s Load in flight, waiting for signal", self._log_prefix)
-                return self._event
-            self._query_in_progress = True
-            self._event = asyncio.Event()
+                return self._in_flight
+            self._in_flight = _InFlightLoad()
             if self._log_prefix:
                 verbose_proxy_logger.debug(
                     "%s Starting load (will signal others when done)",
@@ -96,12 +107,17 @@ class EventDrivenCacheCoordinator:
 
     async def _wait_for_signal_and_get(
         self,
-        event: asyncio.Event,
+        load: _InFlightLoad,
         cache_key: str,
         cache: AsyncCacheProtocol[T],
+        load_fn: Callable[[], Awaitable[T]],
     ) -> T | None:
-        """Wait for loader to finish, then read from cache."""
-        await event.wait()
+        """Wait for loader to finish, then raise its error, load again if it was cancelled, or read from cache."""
+        await load.done.wait()
+        if load.failure is not None:
+            raise load.failure
+        if load.abandoned:
+            return await self.get_or_load(cache_key, cache, load_fn)
         if self._log_prefix:
             verbose_proxy_logger.debug("%s Signal received, reading from cache", self._log_prefix)
         value: Final[T | None] = await cache.async_get_cache(key=cache_key)
@@ -121,7 +137,7 @@ class EventDrivenCacheCoordinator:
         cache: AsyncCacheProtocol[T],
         load_fn: Callable[[], Awaitable[T]],
     ) -> T | None:
-        """Double-check cache, run load_fn, set cache, return value. Caller must call _signal_done in finally."""
+        """Double-check cache, run load_fn, set cache, return value. Caller must call _signal_done afterwards."""
         value = await cache.async_get_cache(key=cache_key)
         if value is not None:
             if self._log_prefix:
@@ -150,15 +166,16 @@ class EventDrivenCacheCoordinator:
             verbose_proxy_logger.debug("%s Result cached", self._log_prefix)
         return value
 
-    async def _signal_done(self) -> None:
-        """Reset loader state and signal all waiters."""
+    async def _signal_done(self, failure: Exception | None = None, abandoned: bool = False) -> None:
+        """Hand the loader's outcome to its waiters, reset loader state and signal them."""
         async with self._lock:
-            self._query_in_progress = False
-            if self._event is not None:
+            if self._in_flight is not None:
                 if self._log_prefix:
                     verbose_proxy_logger.debug("%s Signaling all waiting requests", self._log_prefix)
-                self._event.set()
-                self._event = None
+                self._in_flight.failure = failure
+                self._in_flight.abandoned = abandoned
+                self._in_flight.done.set()
+                self._in_flight = None
 
     async def get_or_load(
         self,
@@ -172,11 +189,12 @@ class EventDrivenCacheCoordinator:
         - cache_key: Key to read/write in the cache.
         - cache: Object with async_get_cache(key) and async_set_cache(key, value).
         - load_fn: Async callable that performs the load (e.g. DB query). No args.
-                   Return value is cached and returned. If it raises, waiters are
-                   still signaled so they can retry or handle empty cache.
+                   Return value is cached and returned. If it raises, every waiter
+                   raises the same error; a waiter must never read the empty cache
+                   as the answer. If the loader is cancelled, its waiters load again.
 
-        Returns the value from cache or from load_fn, or None if load failed or
-        cache was still empty after waiting.
+        Returns the value from cache or from load_fn, or None when the load
+        answered None.
         """
         value: Final = await self._get_cached(cache_key, cache)
         if value is not None:
@@ -184,13 +202,18 @@ class EventDrivenCacheCoordinator:
             return value
 
         self._log_cache_miss()
-        event_to_wait: Final = await self._claim_role()
+        load_to_wait: Final = await self._claim_role()
 
-        if event_to_wait is not None:
-            return await self._wait_for_signal_and_get(event_to_wait, cache_key, cache)
+        if load_to_wait is not None:
+            return await self._wait_for_signal_and_get(load_to_wait, cache_key, cache, load_fn)
 
         try:
             result: Final = await self._load_and_cache(cache_key, cache, load_fn)
-            return result
-        finally:
-            await self._signal_done()
+        except Exception as e:
+            await self._signal_done(failure=e)
+            raise
+        except BaseException:
+            await self._signal_done(abandoned=True)
+            raise
+        await self._signal_done()
+        return result

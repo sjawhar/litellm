@@ -81,6 +81,10 @@ class _AsyncRedisCommands(Protocol):
 
     def delete(self, *names: str) -> Awaitable[int]: ...
 
+    def get(self, name: str) -> Awaitable[bytes | str | None]: ...
+
+    def set(self, name: str, value: str, ex: int | None = None) -> Awaitable[object]: ...
+
     def ttl(self, name: str) -> Awaitable[int]: ...
 
     def expire(self, name: str, time: int) -> Awaitable[bool]: ...
@@ -1994,6 +1998,18 @@ class RedisCache(BaseCache):
         key = self.check_and_fix_namespace(key=key)
         # keys is str
         return await _redis_client.delete(key)
+
+    @_redis_circuit_breaker_guard
+    async def async_get_cache_or_raise(self, key: str) -> object:
+        """Like ``async_get_cache``, but a Redis that cannot answer raises instead of reading as a miss."""
+        raw: Final = await self._async_commands().get(self.check_and_fix_namespace(key=key))
+        return self._get_cache_logic(cached_response=raw)
+
+    @_redis_circuit_breaker_guard
+    async def async_set_cache_or_raise(self, key: str, value: object, ttl: int | None = None) -> None:
+        """SET that raises when Redis cannot take the write. ``ttl=None`` means the key never expires, where
+        ``async_set_cache`` would apply the default TTL."""
+        _ = await self._async_commands().set(self.check_and_fix_namespace(key=key), json.dumps(value), ex=ttl)
 
     def delete_cache(self, key):
         key = self.check_and_fix_namespace(key=key)

@@ -65,8 +65,8 @@ async def test_set_user_keys_blocked_flips_state_and_invalidates_cache():
 
     cache_deletions = []
 
-    async def fake_delete(hashed_token, user_api_key_cache, proxy_logging_obj):
-        cache_deletions.append(hashed_token)
+    async def fake_delete(hashed_token, user_api_key_cache, proxy_logging_obj, *, revoked=False):
+        cache_deletions.append((hashed_token, revoked))
 
     with (
         patch("litellm.proxy.proxy_server.prisma_client", mock_client),
@@ -91,7 +91,7 @@ async def test_set_user_keys_blocked_flips_state_and_invalidates_cache():
         assert kwargs["data"]["blocked"] is True
         assert '"scim_blocked": true' in kwargs["data"]["metadata"]
     assert seen_tokens == {"hash-1", "hash-2"}
-    assert sorted(cache_deletions) == ["hash-1", "hash-2"]
+    assert sorted(cache_deletions) == [("hash-1", True), ("hash-2", True)]
 
 
 @pytest.mark.asyncio
@@ -131,8 +131,8 @@ async def test_set_user_keys_unblocked_skips_admin_blocked_keys():
 
     cache_deletions = []
 
-    async def fake_delete(hashed_token, user_api_key_cache, proxy_logging_obj):
-        cache_deletions.append(hashed_token)
+    async def fake_delete(hashed_token, user_api_key_cache, proxy_logging_obj, *, revoked=False):
+        cache_deletions.append((hashed_token, revoked))
 
     with (
         patch("litellm.proxy.proxy_server.prisma_client", mock_client),
@@ -150,7 +150,7 @@ async def test_set_user_keys_unblocked_skips_admin_blocked_keys():
     update_kwargs = mock_db.litellm_verificationtoken.update.await_args.kwargs
     assert update_kwargs["where"] == {"token": "hash-scim"}
     assert update_kwargs["data"]["blocked"] is False
-    assert cache_deletions == ["hash-scim"]
+    assert cache_deletions == [("hash-scim", False)]
 
 
 @pytest.mark.asyncio

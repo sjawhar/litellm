@@ -28,7 +28,7 @@ from litellm.proxy.auth.auth_utils import (  # noqa: F401  # legacy module expor
     normalize_request_route,
 )
 from litellm.proxy.auth.model_access_denied import ModelAccessDeniedHTTPException
-from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
+from litellm.proxy.db.exception_handler import LastGoodEntryMissing, PrismaDBExceptionHandler
 from litellm.types.services import ServiceTypes
 
 # Sentinel user_id for the synthetic UserAPIKeyAuth issued during a DB
@@ -157,6 +157,7 @@ class UserAPIKeyAuthExceptionHandler:
         if (
             PrismaDBExceptionHandler.should_allow_request_on_db_unavailable()
             and PrismaDBExceptionHandler.is_database_connection_error(e)
+            and not isinstance(e, LastGoodEntryMissing)
         ):
             # log this as a DB failure on prometheus
             proxy_logging_obj.service_logging_obj.service_failure_hook(

@@ -31,6 +31,7 @@ from litellm.types.agents import AgentConfig, AgentKillSwitchConfig, AgentRespon
 from litellm.types.proxy.agent_identity import AgentIdentityFailure
 
 if TYPE_CHECKING:
+    from prisma import Prisma
     from prisma import models as prisma_models
     from prisma.types import LiteLLM_RetiredAgentIdentityWhereUniqueInput
 
@@ -421,6 +422,41 @@ class GrantMigrationResult(NamedTuple):
     missed: int
 
 
+async def _retire_identity_managed_agent(tx: "Prisma", agent_id: str) -> tuple[str, ...]:
+    """Record the retired identity and delete the agent's keys, after recording the revocation of their last good
+    entries, which refuses the whole transaction with 503 when Redis cannot take it. Returns the deleted tokens."""
+    from prisma.types import (
+        LiteLLM_RetiredAgentCreateInput,
+        LiteLLM_RetiredAgentUpsertInput,
+        LiteLLM_RetiredAgentWhereUniqueInput,
+        LiteLLM_VerificationTokenWhereInput,
+    )
+
+    from litellm.proxy.common_utils.user_api_key_cache import revoke_last_good
+    from litellm.proxy.proxy_server import user_api_key_cache
+
+    keys_where: Final[LiteLLM_VerificationTokenWhereInput] = {"agent_id": agent_id}
+    tokens: Final = tuple(key.token for key in await tx.litellm_verificationtoken.find_many(where=keys_where))
+    await revoke_last_good(user_api_key_cache, tokens)
+    history_where: Final[LiteLLM_RetiredAgentWhereUniqueInput] = {"original_agent_id": agent_id}
+    history_create: Final = LiteLLM_RetiredAgentCreateInput(original_agent_id=agent_id)
+    history_data: Final[LiteLLM_RetiredAgentUpsertInput] = {"create": history_create, "update": {}}
+    await tx.litellm_retiredagent.upsert(where=history_where, data=history_data)
+    await tx.litellm_verificationtoken.delete_many(where=keys_where)
+    return tokens
+
+
+async def _evict_deleted_agent_keys(tokens: Sequence[str]) -> None:
+    if not tokens:
+        return
+    from litellm.proxy.auth.auth_checks import delete_cache_key_objects
+    from litellm.proxy.proxy_server import proxy_logging_obj, user_api_key_cache
+
+    await delete_cache_key_objects(
+        hashed_tokens=tokens, user_api_key_cache=user_api_key_cache, proxy_logging_obj=proxy_logging_obj, revoked=True
+    )
+
+
 class AgentRegistry:
     def __init__(self):
         self.agent_list: list[AgentResponse] = []
@@ -669,30 +705,21 @@ class AgentRegistry:
         """
         Delete an agent from the database
         """
-        from prisma.types import (
-            LiteLLM_AgentsTableWhereUniqueInput,
-            LiteLLM_RetiredAgentCreateInput,
-            LiteLLM_RetiredAgentUpsertInput,
-            LiteLLM_RetiredAgentWhereUniqueInput,
-            LiteLLM_VerificationTokenWhereInput,
-        )
+        from prisma.types import LiteLLM_AgentsTableWhereUniqueInput
 
         where: Final[LiteLLM_AgentsTableWhereUniqueInput] = {"agent_id": agent_id}
         async with prisma_client.tx() as tx:
             existing: Final = await tx.litellm_agentstable.find_unique(where=where)
             if existing is None:
                 raise ValueError(f"Agent not found, passed agent_id={agent_id}")
-            if existing.identity_managed:
-                history_where: Final[LiteLLM_RetiredAgentWhereUniqueInput] = {"original_agent_id": agent_id}
-                history_create: Final = LiteLLM_RetiredAgentCreateInput(original_agent_id=agent_id)
-                history_data: Final[LiteLLM_RetiredAgentUpsertInput] = {"create": history_create, "update": {}}
-                await tx.litellm_retiredagent.upsert(where=history_where, data=history_data)
-                keys_where: Final[LiteLLM_VerificationTokenWhereInput] = {"agent_id": agent_id}
-                await tx.litellm_verificationtoken.delete_many(where=keys_where)
+            deleted_key_tokens: Final = (
+                await _retire_identity_managed_agent(tx, agent_id) if existing.identity_managed else ()
+            )
             deleted_agent: Final = await tx.litellm_agentstable.delete(where=where)
             if deleted_agent is None:
                 raise ValueError(f"Agent not found, passed agent_id={agent_id}")
-            return deleted_agent.model_dump()
+        await _evict_deleted_agent_keys(deleted_key_tokens)
+        return deleted_agent.model_dump()
 
     async def patch_agent_in_db(
         self,
