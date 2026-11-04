@@ -91,7 +91,6 @@ litellm/proxy/management_endpoints/team_endpoints.py _sweep_deleted_team_referen
 litellm/proxy/management_endpoints/team_endpoints.py _sweep_deleted_team_references_tx prisma team_id.in `tuple(team_ids)` 0
 litellm/proxy/management_endpoints/team_endpoints.py _team_member_delete prisma user_id.in `sorted(addressed_user_ids)` 0
 litellm/proxy/management_endpoints/team_endpoints.py _team_member_delete prisma user_id.in `sorted(user_ids_to_delete)` 0
-litellm/proxy/management_endpoints/team_endpoints.py _team_member_delete prisma user_id.in `sorted(user_ids_to_delete)` 1
 litellm/proxy/management_endpoints/team_endpoints.py _team_user_spend_sql raw-sql sl.team_id.IN `IN ({team_placeholders})` 0
 litellm/proxy/management_endpoints/team_endpoints.py delete_team prisma team_id.in `data.team_ids` 0
 litellm/proxy/management_endpoints/team_endpoints.py delete_team prisma team_id.in `data.team_ids` 1

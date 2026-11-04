@@ -395,3 +395,45 @@ def test_internal_is_async_marker_bypasses_native() -> None:
     )
 
     assert response is expected
+
+
+_SERVER_SIDE_FALLBACK_BETA: Final = {"anthropic-beta": "server-side-fallback-2026-07-01"}
+_FALLBACK_KWARGS: Final[Mapping[str, object]] = {
+    "model": "claude-test",
+    "messages": MESSAGES,
+    "max_tokens": 10,
+    "custom_llm_provider": "anthropic",
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"fallbacks": "default", "extra_headers": _SERVER_SIDE_FALLBACK_BETA},
+        {"fallbacks": [{"model": "claude-opus-4-8"}], "extra_headers": _SERVER_SIDE_FALLBACK_BETA},
+        {"fallbacks": ["anthropic/claude-opus-4-8"]},
+        {"thinking": {"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "error"}}},
+    ],
+    ids=["anthropic-fallbacks-default", "anthropic-fallbacks-list", "litellm-fallbacks", "thinking-pinned"],
+)
+async def test_async_calls_with_fallbacks_or_a_thinking_pin_stay_on_python(extra: Mapping[str, object]) -> None:
+    expected: Final = response()
+
+    async def python(*args: object, **kwargs: object) -> AnthropicMessagesResponse:
+        return expected
+
+    async def native(request: NativeCall) -> AnthropicMessagesResponse:
+        pytest.fail(
+            "the native route drops `fallbacks`, skips the log of a call with `fallbacks`, and drops pinned thinking"
+        )
+
+    result: Final = await _ADISPATCH.arun(
+        (),
+        {**_FALLBACK_KWARGS, **extra},
+        python=python,
+        binding=amessages_binding(native),
+        native=lambda hook, request, args, kwargs: hook(request),
+        rules=RUST_RULES,
+    )
+    assert result is expected

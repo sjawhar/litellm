@@ -12,10 +12,15 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 from functools import partial
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, Protocol, TypeAlias, TypeVar, cast
+from typing import TYPE_CHECKING, Annotated, Any, Final, Generic, Literal, Protocol, TypeAlias, TypeVar, cast
 
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
-from typing_extensions import ReadOnly, TypedDict, assert_never
+from typing_extensions import (
+    ReadOnly,
+    TypedDict,
+    TypeIs,  # noqa: TID251  # TypeIs reaches typing only on 3.13
+    assert_never,
+)
 
 import litellm
 from litellm._internal_context import with_service_target
@@ -62,12 +67,19 @@ from litellm.repositories.organization_repository import OrganizationRepository
 from litellm.repositories.table_repositories import EndUserRepository
 from litellm.repositories.team_repository import TeamRepository
 from litellm.repositories.user_repository import UserRepository
+from litellm.router_utils.admission_refusal import is_admission_refusal
 from litellm.types.guardrails import GuardrailEventHooks
 from litellm.types.integrations.prometheus import *
 from litellm.types.integrations.prometheus import (
+    priority_of_team_metadata,
     sanitize_prometheus_label_name,
     sanitize_prometheus_label_value,
+    team_priority_label,
     validate_prometheus_deployment_and_latency_caller_identity,
+)
+from litellm.types.proxy.auth.client_context import (
+    VERIFIED_CLIENT_CONTEXT_KEY,
+    VerifiedClientContext,
 )
 from litellm.types.proxy.carried_budget_state import (
     KeyBudgetSnapshot,
@@ -173,7 +185,11 @@ def _customer_budget_metrics_enabled() -> bool:
     return litellm.enable_end_user_cost_tracking_prometheus_only is True and not litellm.disable_end_user_cost_tracking
 
 
-class _LabeledMetric:
+_MetricT: Final = TypeVar("_MetricT", bound="MetricWrapperBase")
+_MetricT_co: Final = TypeVar("_MetricT_co", bound="MetricWrapperBase", covariant=True)
+
+
+class _LabeledMetric(Generic[_MetricT_co]):
     """Proxies a labeled prometheus metric. Globally excluded labels are dropped from every ``labels(...)``
     call so the emitted arguments match the metric's real label set. With ``limits.max_series`` set, only that
     many label sets get a series of their own: a counter or histogram records every later label set on one
@@ -193,7 +209,7 @@ class _LabeledMetric:
 
     def __init__(
         self,
-        metric: MetricWrapperBase,
+        metric: _MetricT_co,
         metric_name: str,
         original_labelnames: tuple[str, ...],
         excluded_labels: frozenset[str],
@@ -208,13 +224,13 @@ class _LabeledMetric:
         self._excluded_labels = excluded_labels
         self._tracker = tracker
         self._limits = limits
-        self._overflow_child: Callable[[], MetricWrapperBase | NoOpMetric] = (
+        self._overflow_child: Callable[[], _MetricT_co | NoOpMetric] = (
             partial(metric.labels, *(PROMETHEUS_OVERFLOW_SERIES_LABEL_VALUE,) * kept_label_count)
             if shares_overflow_series
             else NoOpMetric
         )
 
-    def labels(self, *labelvalues: object, **labelkwargs: object) -> MetricWrapperBase | NoOpMetric:
+    def labels(self, *labelvalues: object, **labelkwargs: object) -> _MetricT_co | NoOpMetric:
         values: Final = labelvalues or tuple(labelkwargs[name] for name in self._original_labelnames)
         kept_values: Final = self._kept_values(values)
         if not kept_values:
@@ -253,7 +269,7 @@ class _LabeledMetric:
         )
 
 
-_MetricLike: TypeAlias = "NoOpMetric | _LabeledMetric | MetricWrapperBase"
+_MetricLike: TypeAlias = "NoOpMetric | _LabeledMetric[MetricWrapperBase] | MetricWrapperBase"
 
 _SeriesLimitT: Final = TypeVar("_SeriesLimitT", int, float)
 _POSITIVE_SERIES_CAP: Final[TypeAdapter[int]] = TypeAdapter(Annotated[int, Field(gt=0)])
@@ -359,6 +375,33 @@ def _bounded_requested_model_label(requested_model: object, router_originated: b
     ):
         return requested_model
     return UNRECOGNIZED_REQUESTED_MODEL_LABEL
+
+
+def _as_label(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _is_metadata_bucket(value: object) -> TypeIs[Mapping[str, object]]:  # guard-ok: request metadata keys are str
+    return isinstance(value, dict)
+
+
+def _trusted_client_context(
+    request_data: object,
+    stamped_bucket_of: Callable[[Mapping[str, object]], Mapping[str, object] | None],
+) -> tuple[str | None, str | None]:
+    """The caller's address and User-Agent as the proxy resolved them, never as the body sent them. They come
+    from the bucket the proxy stamped its identity into, or from the object the auth gate attaches when it
+    rejects a request before that stamp exists. A body can send either name but neither of those two things."""
+    if not _is_metadata_bucket(request_data):
+        return None, None
+    stamped: Final = stamped_bucket_of(request_data)
+    if stamped is not None:
+        return _as_label(stamped.get("requester_ip_address")), _as_label(stamped.get("user_agent"))
+    for bucket in (request_data.get("metadata"), request_data.get("litellm_metadata")):
+        verified = bucket.get(VERIFIED_CLIENT_CONTEXT_KEY) if _is_metadata_bucket(bucket) else None
+        if isinstance(verified, VerifiedClientContext):
+            return _as_label(verified.requester_ip_address), _as_label(verified.user_agent)
+    return None, None
 
 
 class PrometheusLogger(CustomLogger):
@@ -793,6 +836,14 @@ class PrometheusLogger(CustomLogger):
                 "litellm_deployment_rpm_limit",
                 "Deployment RPM limit found in config",
                 labelnames=self.get_labels_for_metric("litellm_deployment_rpm_limit"),
+            )
+
+            self.litellm_model_group_saturation_ratio = self._gauge_factory(
+                "litellm_model_group_saturation_ratio",
+                "Model group saturation ratio from the dynamic rate limiter",
+                labelnames=self.get_labels_for_metric("litellm_model_group_saturation_ratio"),
+                # workers read one shared window: keep the latest reading and drop an exited worker's
+                multiprocess_mode="livemostrecent",
             )
 
             self.litellm_deployment_cooled_down = self._counter_factory(
@@ -1317,7 +1368,9 @@ class PrometheusLogger(CustomLogger):
 
         return metric_name in self.enabled_metrics
 
-    def _create_metric_factory(self, metric_class, shares_overflow_series: bool = True):
+    def _create_metric_factory(
+        self, metric_class: type[_MetricT], shares_overflow_series: bool = True
+    ) -> Callable[..., _MetricT | NoOpMetric | _LabeledMetric[_MetricT]]:
         """Create a factory function that returns either a real metric or a no-op metric"""
 
         def factory(*args, **kwargs):
@@ -1574,7 +1627,9 @@ class PrometheusLogger(CustomLogger):
             api_provider=standard_logging_payload["custom_llm_provider"],
             exception_status=None,
             exception_class=None,
-            custom_metadata_labels=get_custom_labels_from_metadata(metadata=combined_metadata),
+            custom_metadata_labels=_with_team_priority_label(
+                get_custom_labels_from_metadata(metadata=combined_metadata), team_priority_label(litellm_params)
+            ),
             route=standard_logging_payload["metadata"].get("user_api_key_request_route"),
             client_ip=standard_logging_payload["metadata"].get("requester_ip_address"),
             user_agent=standard_logging_payload["metadata"].get("user_agent"),
@@ -2440,10 +2495,13 @@ class PrometheusLogger(CustomLogger):
             api_key_alias=user_api_key_alias,
             model=model_group,
             model_id=model_id,
-            custom_metadata_labels=get_custom_labels_from_metadata(
-                metadata=_get_combined_custom_metadata_from_standard_logging_payload(
-                    standard_logging_payload=kwargs.get("standard_logging_object")
-                )
+            custom_metadata_labels=_with_team_priority_label(
+                get_custom_labels_from_metadata(
+                    metadata=_get_combined_custom_metadata_from_standard_logging_payload(
+                        standard_logging_payload=kwargs.get("standard_logging_object")
+                    )
+                ),
+                team_priority_label(kwargs.get("litellm_params")),
             ),
         )
         label_context: Final = PrometheusLabelFactoryContext(enum_values)
@@ -2613,6 +2671,9 @@ class PrometheusLogger(CustomLogger):
 
         if self._should_skip_metrics_for_invalid_key(kwargs=kwargs, standard_logging_payload=standard_logging_payload):
             return
+        exception: Final = kwargs.get("exception")
+        if isinstance(exception, BaseException) and is_admission_refusal(exception):
+            return
 
         model: Final = kwargs.get("model", "")
 
@@ -2639,10 +2700,13 @@ class PrometheusLogger(CustomLogger):
                 model_id=standard_logging_payload.get("model_id", ""),
                 requested_model=standard_logging_payload.get("model_group"),
                 api_provider=standard_logging_payload.get("custom_llm_provider"),
-                custom_metadata_labels=get_custom_labels_from_metadata(
-                    metadata=_get_combined_custom_metadata_from_standard_logging_payload(
-                        standard_logging_payload=standard_logging_payload
-                    )
+                custom_metadata_labels=_with_team_priority_label(
+                    get_custom_labels_from_metadata(
+                        metadata=_get_combined_custom_metadata_from_standard_logging_payload(
+                            standard_logging_payload=standard_logging_payload
+                        )
+                    ),
+                    team_priority_label(litellm_params),
                 ),
             )
             PrometheusLogger._inc_labeled_counter(
@@ -2865,6 +2929,7 @@ class PrometheusLogger(CustomLogger):
             StandardLoggingPayloadSetup,
         )
         from litellm.proxy.litellm_pre_call_utils import LiteLLMProxyRequestSetup
+        from litellm.proxy.utils import proxy_stamped_metadata_bucket
 
         status_code: Final = self._extract_status_code(exception=original_exception)
 
@@ -2874,6 +2939,10 @@ class PrometheusLogger(CustomLogger):
                 proxy_server_request=request_data.get("proxy_server_request", {}),
             )
             _metadata: Final = request_data.get("metadata", {}) or {}
+            request_view: Final = cast(  # cast-ok: the proxy request body is keyed by str
+                Mapping[str, object], request_data
+            )
+            _client_ip, _user_agent = _trusted_client_context(request_view, proxy_stamped_metadata_bucket)
             model_id: Final = _metadata.get("model_info", {}).get("id") or request_data.get("model_info", {}).get("id")
             rate_limit_category, rate_limit_type = self._extract_rate_limit_labels(original_exception)
             api_provider: Final = self._extract_api_provider_from_request_data(
@@ -2899,11 +2968,14 @@ class PrometheusLogger(CustomLogger):
                 rate_limit_type=rate_limit_type,
                 tags=_tags,
                 route=user_api_key_dict.request_route,
-                client_ip=_metadata.get("requester_ip_address"),
-                user_agent=_metadata.get("user_agent"),
+                client_ip=_client_ip,
+                user_agent=_user_agent,
                 model_id=model_id,
                 api_provider=api_provider,
                 stream=(str(request_data.get("stream")) if litellm.prometheus_emit_stream_label else None),
+                custom_metadata_labels=_with_team_priority_label(
+                    {}, priority_of_team_metadata(user_api_key_dict.team_metadata)
+                ),
             )
             _label_ctx: Final = PrometheusLabelFactoryContext(enum_values)
             PrometheusLogger._inc_labeled_counter(
@@ -3141,6 +3213,7 @@ class PrometheusLogger(CustomLogger):
                 tags=standard_logging_payload.get("request_tags", []),
                 client_ip=client_ip,
                 user_agent=user_agent,
+                custom_metadata_labels=_with_team_priority_label({}, team_priority_label(_litellm_params)),
             )
 
             """
@@ -3228,6 +3301,24 @@ class PrometheusLogger(CustomLogger):
                 ),
             )
             self.litellm_deployment_rpm_limit.labels(**_labels).set(rpm)
+
+    def set_model_group_saturation_ratio(
+        self,
+        model_group: str,
+        saturation: float,
+        litellm_params: Mapping[str, object],
+    ) -> None:
+        try:
+            labels: Final = prometheus_label_factory(
+                supported_enum_labels=self.get_labels_for_metric("litellm_model_group_saturation_ratio"),
+                enum_values=UserAPIKeyLabelValues(
+                    model_group=model_group,
+                    priority=team_priority_label(litellm_params),
+                ),
+            )
+            self.litellm_model_group_saturation_ratio.labels(**labels).set(min(max(saturation, 0.0), 1.0))
+        except Exception as e:  # noqa: BLE001  # metrics labeling must never break rate limiting
+            verbose_logger.debug("Prometheus Error: set_model_group_saturation_ratio. Exception occured - %s", e)
 
     async def _async_set_router_remaining_metrics(
         self,
@@ -4871,7 +4962,7 @@ def prometheus_label_factory(
     tag: str | None = None,
     *,
     label_context: PrometheusLabelFactoryContext | None = None,
-) -> dict:
+) -> dict[str, str | None]:
     """
     Returns a dictionary of label + values for prometheus.
 
@@ -4955,6 +5046,12 @@ def get_custom_labels_from_metadata(metadata: dict) -> dict[str, str]:
             result[original_key.replace(".", "_")] = value
 
     return result
+
+
+def _with_team_priority_label(custom_labels: Mapping[str, str], team_priority: str) -> Mapping[str, str]:
+    if UserAPIKeyLabelNames.PRIORITY.value not in litellm.custom_prometheus_metadata_labels:
+        return custom_labels
+    return MappingProxyType({**custom_labels, UserAPIKeyLabelNames.PRIORITY.value: team_priority})
 
 
 def _get_combined_custom_metadata_from_standard_logging_payload(

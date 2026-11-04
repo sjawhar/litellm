@@ -5761,6 +5761,9 @@ def completion(
                 if key in kwargs
             },
         )
+        # Written even when absent: the router reuses one logging object across retries and fallbacks,
+        # and update_environment_variables keeps any key this dict leaves out.
+        requested_litellm_params["anthropic_organization_id"] = kwargs.get("anthropic_organization_id")
         litellm_params: Final = with_control_options(requested_litellm_params, control_options)
         if litellm_params.get("provider_affinity_header") is not None:
             try:

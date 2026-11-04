@@ -13,7 +13,7 @@ model/{model_id}/update - PATCH endpoint for model update.
 import asyncio
 import datetime
 import json
-from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
@@ -27,7 +27,8 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError,
 import litellm
 from litellm._logging import verbose_proxy_logger
 from litellm._uuid import uuid
-from litellm.constants import LITELLM_PROXY_ADMIN_NAME
+from litellm.constants import DEFAULT_MAX_RECURSE_DEPTH, LITELLM_PROXY_ADMIN_NAME
+from litellm.litellm_core_utils.core_helpers import is_object_mapping, is_object_sequence
 from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
 from litellm.litellm_core_utils.get_model_cost_map import GetModelCostMap
 from litellm.litellm_core_utils.ptu_pricing import (
@@ -139,7 +140,6 @@ from litellm.router_utils.auto_router_model_naming import (
 )
 from litellm.router_utils.auto_router_tuning_baseline import is_mutable_tuned_candidate, tuning_quota_violation
 from litellm.types.llms.base import LiteLLMBaseModel
-from litellm.types.llms.bedrock import AwsSessionTag
 from litellm.types.proxy.management_endpoints.model_management_endpoints import (
     AutoRouterClassifierDefaultPromptResponse,
     UpdateUsefulLinksRequest,
@@ -392,11 +392,17 @@ def _reject_non_admin_blocked_flag_on_create(
         )
 
 
-def _stored_credential_name(existing_litellm_params: GenericLiteLLMParams | None) -> str | None:
-    if existing_litellm_params is None or existing_litellm_params.litellm_credential_name is None:
+def _stored_params(litellm_params: GenericLiteLLMParams | None) -> Mapping[str, object] | None:
+    """A deployment's params as the write routes store them"""
+    return None if litellm_params is None else litellm_params.model_dump(exclude_none=True)
+
+
+def _stored_credential_name(existing_litellm_params: Mapping[str, object] | None) -> str | None:
+    stored: Final = None if existing_litellm_params is None else existing_litellm_params.get("litellm_credential_name")
+    if not isinstance(stored, str):
         return None
     return decrypt_value_helper(
-        value=existing_litellm_params.litellm_credential_name,
+        value=stored,
         key="litellm_credential_name",
         exception_type="debug",
         return_original_value=True,
@@ -420,7 +426,7 @@ async def _raise_on_invalid_credential_name(
             code=status.HTTP_400_BAD_REQUEST,
             param="litellm_credential_name",
         )
-    if credential_name == _stored_credential_name(existing_litellm_params):
+    if credential_name == _stored_credential_name(_stored_params(existing_litellm_params)):
         return
     if CredentialAccessor.find_credential(credential_name) is not None:
         return
@@ -479,6 +485,55 @@ def _decrypted_litellm_params(litellm_params: GenericLiteLLMParams) -> Mapping[s
             for name, value in dumped.items()
         }
     )
+
+
+# The one nested mapping where a rule's field names mean something else: the complexity router's classifier connection
+# (OpenSourceClassifierConfig, which forbids any other field). Its api_key and api_base are the classifier's own
+# endpoint, where no federated token goes, so the federation rule would refuse a team admin's classifier for nothing.
+_CLASSIFIER_CONNECTION_PATHS: Final = frozenset(
+    {
+        ("complexity_router_config", "opensource_classifier_config"),
+        ("complexity_router_config", "jev_classifier_config"),
+    }
+)
+
+
+def _nested_param_mappings(
+    stored: Mapping[str, object] | None,
+) -> tuple[tuple[tuple[str | int, ...], Mapping[str, object]], ...]:
+    """
+    Every mapping reachable inside a deployment's params, under any key and inside any list, at every depth, with its
+    path from the root of the params (a key for a mapping, an index for a list), read from the dict the write routes
+    store (_stored_params), never from a validated copy. Readers merge some into a call: an entry of `fallbacks`, the
+    `litellm_params` of a `model_list` entry. The rest no reader merges, and a writer who is not a proxy admin has no
+    reason to put an admin-only field in any of them. The classifier connection is left out
+    (_CLASSIFIER_CONNECTION_PATHS).
+    """
+    return () if stored is None else tuple(_iter_nested_param_mappings(stored))
+
+
+def _iter_nested_param_mappings(
+    stored: Mapping[str, object],
+) -> Iterator[tuple[tuple[str | int, ...], Mapping[str, object]]]:
+    pending: Final[list[tuple[object, tuple[str | int, ...]]]] = [  # mutable-ok: the walk's own stack, never handed out
+        (value, (key,)) for key, value in stored.items()
+    ]
+    while pending:
+        value, path = pending.pop()
+        if len(path) > DEFAULT_MAX_RECURSE_DEPTH:
+            raise ProxyException(
+                message="litellm_params nests deeper than the proxy reads.",
+                type=ProxyErrorTypes.bad_request_error.value,
+                code=status.HTTP_400_BAD_REQUEST,
+                param="litellm_params",
+            )
+        if path in _CLASSIFIER_CONNECTION_PATHS:
+            continue
+        if is_object_mapping(value):
+            yield path, {key: item for key, item in value.items() if isinstance(key, str)}
+            pending.extend((item, (*path, str(key))) for key, item in value.items())
+        elif is_object_sequence(value):
+            pending.extend((item, (*path, index)) for index, item in enumerate(value))
 
 
 def _effective_model(
@@ -1259,19 +1314,15 @@ async def patch_model(
                 param="blocked",
             )
 
-        ModelManagementAuthChecks.can_user_attach_credential(
+        await ModelManagementAuthChecks.reject_what_a_non_admin_may_not_set(
+            model_params=db_model,
             litellm_params=patch_data.litellm_params,
             user_api_key_dict=user_api_key_dict,
+            prisma_client=prisma_client,
             existing_litellm_params=db_model.litellm_params,
             null_detaches=True,
         )
         await _raise_on_invalid_credential_name(patch_data.litellm_params, db_model.litellm_params, prisma_client)
-
-        ModelManagementAuthChecks.can_user_set_aws_session_tags(
-            litellm_params=patch_data.litellm_params,
-            user_api_key_dict=user_api_key_dict,
-            existing_litellm_params=db_model.litellm_params,
-        )
 
         _raise_on_strategy_router_write_violation(
             incoming_params=patch_data.litellm_params,
@@ -2055,8 +2106,13 @@ async def _update_existing_team_model_assignment(
     # No team_model_add/delete calls required; public name is already registered
 
 
-def _canonical_session_tags(tags: Sequence[AwsSessionTag]) -> tuple[tuple[str, str], ...]:
-    return tuple(sorted((tag["Key"], tag["Value"]) for tag in tags))
+def _canonical_session_tags(tags: object) -> tuple[tuple[str, str], ...] | None:
+    """The tags as sorted (Key, Value) pairs, or None when the value is not a list of tags"""
+    if not is_object_sequence(tags):
+        return None
+    pairs: Final = tuple((tag.get("Key"), tag.get("Value")) for tag in tags if is_object_mapping(tag))
+    named: Final = tuple((key, value) for key, value in pairs if isinstance(key, str) and isinstance(value, str))
+    return tuple(sorted(named)) if len(named) == len(tags) else None
 
 
 class ModelManagementAuthChecks:
@@ -2089,19 +2145,23 @@ class ModelManagementAuthChecks:
 
     @staticmethod
     def can_user_attach_credential(
-        litellm_params: GenericLiteLLMParams | None,
+        litellm_params: Mapping[str, object] | None,
         user_api_key_dict: UserAPIKeyAuth,
-        existing_litellm_params: GenericLiteLLMParams | None = None,
+        existing_litellm_params: Mapping[str, object] | None = None,
         *,
         null_detaches: bool = False,
     ) -> Literal[True]:
+        """
+        ``litellm_params`` holds the keys the write sets, as written; ``existing_litellm_params`` the stored
+        deployment's, as stored. Key membership on those mappings decides: no model is built from them.
+        """
         if litellm_params is None:
             return True
-        if "litellm_credential_name" not in litellm_params.model_fields_set:
+        if "litellm_credential_name" not in litellm_params:
             return True
-        if litellm_params.litellm_credential_name is None and not null_detaches:
+        requested_credential_name: Final = litellm_params["litellm_credential_name"]
+        if requested_credential_name is None and not null_detaches:
             return True
-        requested_credential_name: Final = litellm_params.litellm_credential_name
         if requested_credential_name == _stored_credential_name(existing_litellm_params):
             return True
         if user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN:
@@ -2116,18 +2176,21 @@ class ModelManagementAuthChecks:
 
     @staticmethod
     def can_user_set_aws_session_tags(
-        litellm_params: GenericLiteLLMParams | None,
+        litellm_params: Mapping[str, object] | None,
         user_api_key_dict: UserAPIKeyAuth,
-        existing_litellm_params: GenericLiteLLMParams | None = None,
+        existing_litellm_params: Mapping[str, object] | None = None,
     ) -> Literal[True]:
-        if litellm_params is None or litellm_params.aws_session_tags is None:
+        """The same mappings as can_user_attach_credential: what the write sets, and what is stored"""
+        requested_tags: Final = None if litellm_params is None else litellm_params.get("aws_session_tags")
+        if requested_tags is None:
             return True
         if user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN:
             return True
-        existing_tags: Final = existing_litellm_params.aws_session_tags if existing_litellm_params is not None else None
-        if existing_tags is not None and _canonical_session_tags(existing_tags) == _canonical_session_tags(
-            litellm_params.aws_session_tags
-        ):
+        stored_tags: Final = (
+            None if existing_litellm_params is None else existing_litellm_params.get("aws_session_tags")
+        )
+        existing_tags: Final = _canonical_session_tags(stored_tags)
+        if existing_tags is not None and existing_tags == _canonical_session_tags(requested_tags):
             return True
         raise ProxyException(
             message=f"Only a proxy admin can set aws_session_tags on a model. Your role={user_api_key_dict.user_role}.",
@@ -2206,6 +2269,64 @@ class ModelManagementAuthChecks:
                 code=status.HTTP_400_BAD_REQUEST,
                 param="litellm_credential_name",
             )
+
+    @staticmethod
+    async def reject_what_a_non_admin_may_not_set(
+        *,
+        model_params: Deployment,
+        litellm_params: GenericLiteLLMParams | None,
+        user_api_key_dict: UserAPIKeyAuth,
+        prisma_client: PrismaClient,
+        existing_litellm_params: GenericLiteLLMParams | None = None,
+        null_detaches: bool = False,
+    ) -> Literal[True]:
+        """
+        What a non-proxy-admin may not set on a deployment, decided for its own litellm_params and for every mapping
+        reachable inside them, under any key, at every depth, by the same rules: readers merge such a mapping into a
+        call (a `fallbacks` entry, a `model_list` entry's `litellm_params`), so it may set no more than the params may.
+        Each field keeps its one rule, with its status, message and exceptions: a stored credential
+        (can_user_attach_credential), aws_session_tags (can_user_set_aws_session_tags), and a federation field or a
+        federated deployment's destination (_reject_non_admin_wif_write, which can_user_make_model_call already ran on
+        the params). Every rule reads mappings, never a model built from one: the keys this write sets
+        (submitted_litellm_params) against the stored deployment's, and each nested mapping as it is stored, so a key
+        such as `_fields_set` is one more key of the mapping, not an argument of a constructor. A nested mapping the
+        write leaves unchanged where it is passes, as an unchanged field does: the stored deployment holds an equal
+        mapping at the same path, the same keys from the root of the params and the same index in every list. An equal
+        mapping anywhere else counts for nothing, so one moved, into a fallback list or to another index, is checked.
+        ``model_params`` is the deployment the write lands on, the stored one on an update.
+        """
+        written: Final = submitted_litellm_params(litellm_params)
+        stored: Final = _stored_params(existing_litellm_params)
+        ModelManagementAuthChecks.can_user_attach_credential(
+            litellm_params=written,
+            user_api_key_dict=user_api_key_dict,
+            existing_litellm_params=stored,
+            null_detaches=null_detaches,
+        )
+        ModelManagementAuthChecks.can_user_set_aws_session_tags(
+            litellm_params=written,
+            user_api_key_dict=user_api_key_dict,
+            existing_litellm_params=stored,
+        )
+        if user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN:
+            return True
+        stored_mappings: Final = dict(_nested_param_mappings(stored))
+        for path, mapping in _nested_param_mappings(_stored_params(litellm_params)):
+            if stored_mappings.get(path) == mapping:
+                continue
+            ModelManagementAuthChecks.can_user_attach_credential(
+                litellm_params=mapping, user_api_key_dict=user_api_key_dict
+            )
+            ModelManagementAuthChecks.can_user_set_aws_session_tags(
+                litellm_params=mapping, user_api_key_dict=user_api_key_dict
+            )
+            await ModelManagementAuthChecks._reject_non_admin_wif_write(
+                model_params=model_params,
+                incoming_params=mapping,
+                user_api_key_dict=user_api_key_dict,
+                prisma_client=prisma_client,
+            )
+        return True
 
     @staticmethod
     async def can_user_make_model_call(
@@ -2561,14 +2682,11 @@ async def add_new_model(
 
         _reject_non_admin_blocked_flag_on_create(model_params.blocked, user_api_key_dict)
 
-        ModelManagementAuthChecks.can_user_attach_credential(
+        await ModelManagementAuthChecks.reject_what_a_non_admin_may_not_set(
+            model_params=model_params,
             litellm_params=model_params.litellm_params,
             user_api_key_dict=user_api_key_dict,
-        )
-
-        ModelManagementAuthChecks.can_user_set_aws_session_tags(
-            litellm_params=model_params.litellm_params,
-            user_api_key_dict=user_api_key_dict,
+            prisma_client=prisma_client,
         )
 
         _raise_on_strategy_router_write_violation(
@@ -2764,15 +2882,11 @@ async def update_model(
         )
         member_write: Final = write_authorization if isinstance(write_authorization, MemberAutoRouterWrite) else None
 
-        ModelManagementAuthChecks.can_user_attach_credential(
+        await ModelManagementAuthChecks.reject_what_a_non_admin_may_not_set(
+            model_params=deployment,
             litellm_params=model_params.litellm_params,
             user_api_key_dict=user_api_key_dict,
-            existing_litellm_params=deployment.litellm_params,
-        )
-
-        ModelManagementAuthChecks.can_user_set_aws_session_tags(
-            litellm_params=model_params.litellm_params,
-            user_api_key_dict=user_api_key_dict,
+            prisma_client=prisma_client,
             existing_litellm_params=deployment.litellm_params,
         )
 

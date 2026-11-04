@@ -11,6 +11,7 @@ If given, generate a unique model_id for the deployment.
 Ensures cooldowns are applied correctly.
 """
 
+from collections.abc import Mapping
 from typing import Final
 
 from litellm.types.utils import server_owned_wif_litellm_params
@@ -80,6 +81,56 @@ def _admin_config_fields_to_clear_on_base_override() -> list[str]:
 
 
 _ADMIN_CONFIG_FIELDS_TO_CLEAR_ON_BASE_OVERRIDE: Final = _admin_config_fields_to_clear_on_base_override()
+CREDENTIAL_AND_ENDPOINT_FIELDS: Final = frozenset(
+    (*clientside_credential_keys, *_ADMIN_CONFIG_FIELDS_TO_CLEAR_ON_BASE_OVERRIDE)
+)
+# Fields that swap in a caller's own credential or endpoint on a fallback hop: the credential and endpoint fields, and
+# the header carriers, token endpoints and stored-credential name a caller key rides in on the deployment's endpoint.
+FALLBACK_TARGET_CREDENTIAL_FIELDS: Final = CREDENTIAL_AND_ENDPOINT_FIELDS | frozenset(
+    {
+        "headers",
+        "provider_specific_header",
+        "litellm_credential_name",
+        "gigachat_auth_url",
+        "gigachat_access_token",
+        "gigachat_scope",
+        "use_xai_oauth",
+    }
+)
+# Neither a credential nor an endpoint, but each picks the provider, deployment, path or TLS check the deployment's
+# key is sent with, so no opt-in admits one on a fallback target.
+FALLBACK_TARGET_ROUTING_FIELDS: Final = frozenset(
+    {
+        "custom_llm_provider",
+        "azure",
+        "use_litellm_proxy",
+        "specific_deployment",
+        "model_info",
+        "model_file_id_mapping",
+        "endpoint",
+        "passthrough_on_no_deployment",
+        "ssl_verify",
+    }
+)
+
+
+def reject_fallback_target_routing(target: Mapping[str, object]) -> None:
+    carried: Final = sorted(field for field in target if field in FALLBACK_TARGET_ROUTING_FIELDS)
+    if carried:
+        raise ValueError(f"Rejected Request: a fallback target may not carry {', '.join(carried)}.")
+
+
+def reject_fallback_target_credentials(target: Mapping[str, object]) -> None:
+    """
+    Raise ``ValueError`` if a fallback target carries a credential or endpoint field. A hop lays the target over the
+    deployment's own params, so any of them would run the hop under the deployment's identity.
+    """
+    carried: Final = sorted(field for field in target if field in FALLBACK_TARGET_CREDENTIAL_FIELDS)
+    if carried:
+        raise ValueError(
+            f"Rejected Request: a fallback target may not carry {', '.join(carried)}. "
+            "Clientside credentials on a fallback need `general_settings.allow_client_side_credentials = true`."
+        )
 
 
 def is_clientside_credential(request_kwargs: dict) -> bool:

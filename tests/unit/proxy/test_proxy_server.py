@@ -1256,6 +1256,7 @@ async def test_team_update_redis():
             team_table=LiteLLM_TeamTableCachedObj(team_id="1234"),
             user_api_key_cache=DualCache(redis_cache=redis_cache),
             proxy_logging_obj=proxy_logging_obj,
+            keep_last_good=True,
         )
 
         mock_client.assert_called()
@@ -2864,7 +2865,7 @@ def test_get_timeout_from_request():
 
 
 def test_add_litellm_data_for_backend_llm_call_marks_client_side_timeout():
-    """A caller-supplied x-litellm-timeout must be marked with client_side_timeout=True,
+    """A caller-supplied x-litellm-timeout must be named in client_side_timeout,
     so the router's fallback-cooldown trigger can tell it apart from a deployment
     actually timing out (a caller could otherwise force every deployment in a fallback
     chain to look unhealthy with a single near-zero timeout request)."""
@@ -2879,7 +2880,7 @@ def test_add_litellm_data_for_backend_llm_call_marks_client_side_timeout():
         user_api_key_dict=user_api_key_dict,
     )
     assert data["timeout"] == 0.001
-    assert data["client_side_timeout"] is True
+    assert data["client_side_timeout"] == ("timeout",)
 
     data_without_header = LiteLLMProxyRequestSetup.add_litellm_data_for_backend_llm_call(
         headers={},
@@ -2916,7 +2917,7 @@ def test_add_litellm_data_for_backend_llm_call_marks_client_side_timeout_from_bo
         request_data=request_data,
         user_api_key_dict=user_api_key_dict,
     )
-    assert data["client_side_timeout"] is True
+    assert data["client_side_timeout"] == tuple(request_data)
 
 
 def test_add_litellm_data_for_backend_llm_call_ignores_forged_client_side_timeout():

@@ -169,6 +169,7 @@ from litellm.router_utils.add_retry_fallback_headers import (
     replace_complexity_router_headers,
     response_total_token_count,
 )
+from litellm.router_utils.admission_refusal import is_admission_refusal
 from litellm.router_utils.auto_router_model_naming import (
     AUTO_ROUTER_MODEL_PREFIX,
     STRATEGY_ROUTER_PARAM_FIELDS,
@@ -219,6 +220,7 @@ from litellm.router_utils.fallback_event_handlers import (
     MID_STREAM_FALLBACK_CONTROLS_KEY,
     AttemptedFallbackTargets,
     attempted_retries_for_request,
+    call_fallbacks,
     carry_over_pre_routing_selection,
     carry_over_routed_deployment,
     check_non_standard_fallback_format,
@@ -233,9 +235,12 @@ from litellm.router_utils.fallback_event_handlers import (
     mid_stream_fallback_snapshot_kwargs,
     mid_stream_retry_kwargs,
     per_request_fallback_controls,
+    pop_request_fallbacks,
     record_disable_fallbacks,
     record_pre_routing_selection,
     record_retry_attempt,
+    reject_non_list_litellm_fallbacks,
+    request_fallbacks,
     routed_deployment_id,
     run_async_fallback,
 )
@@ -682,7 +687,9 @@ def _deployment_num_retries(deployment: "Deployment | None") -> int | None:
 def _request_fallback_list(
     kwargs: Mapping[str, object], key: str, router_default: "list[object] | None"
 ) -> "list[object] | None":  # mutable-ok: should_retry_this_error's own parameter type
-    return cast("list[object] | None", kwargs.get(key, router_default))  # cast-ok: same type as the router attribute
+    fallbacks: Final = kwargs.get(key, router_default)
+    reject_non_list_litellm_fallbacks(fallbacks, kwargs.get("model"), field=key, call_kwargs=kwargs)
+    return cast("list[object] | None", fallbacks)  # cast-ok: checked a list or None above
 
 
 def _request_model_group(kwargs: Mapping[str, object]) -> str | None:
@@ -1069,6 +1076,7 @@ class Router:
         self.auto_router_capability_limit = auto_router_capability_limit
         self.fallback_access_check: Final = fallback_access_check
         self.fallback_budget_check: Final = fallback_budget_check
+        self.fallback_target_credentials_allowed: Callable[[], bool] | None = None
         self.debug_level = debug_level
         self.enable_pre_call_checks = enable_pre_call_checks
         self.enable_tag_filtering = enable_tag_filtering
@@ -5930,10 +5938,10 @@ class Router:
                     "content_policy_fallbacks",
                     cast("list[object] | None", self.content_policy_fallbacks),  # cast-ok: untyped router attribute
                 ),
-                regular_fallbacks=_request_fallback_list(
+                regular_fallbacks=request_fallbacks(
                     kwargs,
-                    "fallbacks",
                     cast("list[object] | None", self.fallbacks),  # cast-ok: untyped router attribute
+                    anthropic_messages_call=True,
                 ),
             )
         except Exception:  # noqa: BLE001  # should_retry_this_error declines by raising the error it was given
@@ -6048,8 +6056,10 @@ class Router:
 
         try:
             model_group: Final = cast(str, initial_kwargs.get("model"))  # cast-ok: model group
-            fallbacks: Final[list | None] = initial_kwargs.get(  # mutable-ok: matches the common_utils list|None param
-                "fallbacks", self.fallbacks
+            fallbacks: Final[list | None] = request_fallbacks(  # mutable-ok: matches the common_utils list|None param
+                initial_kwargs,
+                cast("list[object] | None", self.fallbacks),  # cast-ok: untyped router attribute
+                anthropic_messages_call=True,
             )
             context_window_fallbacks: Final[list | None] = initial_kwargs.get(  # mutable-ok: matches the param below
                 "context_window_fallbacks", self.context_window_fallbacks
@@ -7620,7 +7630,9 @@ class Router:
         }
         try:
             return await run_async_fallback(*args, **failover_kwargs)
-        except (openai.APIError, RouterRateLimitError, RouterRateLimitErrorBasic):
+        except (openai.APIError, RouterRateLimitError, RouterRateLimitErrorBasic) as failover_error:
+            if is_admission_refusal(failover_error):
+                raise
             # Expected model-level failure on the retried deployment. All
             # litellm provider errors derive from openai.APIError; if every
             # remaining deployment in the group is in cooldown the router
@@ -7645,7 +7657,20 @@ class Router:
         """
         Common utilities for async_function_with_fallbacks
         """
-        if verbose_router_logger.isEnabledFor(logging.DEBUG):
+        reject_non_list_litellm_fallbacks(
+            cast(object, context_window_fallbacks),  # cast-ok: public Router kwargs are untyped
+            model_group,
+            field="context_window_fallbacks",
+            call_kwargs=kwargs,
+        )
+        reject_non_list_litellm_fallbacks(
+            cast(object, content_policy_fallbacks),  # cast-ok: public Router kwargs are untyped
+            model_group,
+            field="content_policy_fallbacks",
+            call_kwargs=kwargs,
+        )
+
+        if verbose_router_logger.isEnabledFor(logging.DEBUG) and not is_admission_refusal(e):
             verbose_router_logger.debug("Traceback%s", redact_string(traceback.format_exc()))
         original_exception: Final = e
         fallback_model_group = None
@@ -7658,7 +7683,12 @@ class Router:
         hop_depth: Final = kwargs.get("fallback_depth")
         nested_fallback_hop: Final = isinstance(hop_depth, int) and hop_depth > 0
 
-        if disable_fallbacks is True or original_model_group is None or is_guardrail_intervention(e):
+        if (
+            disable_fallbacks is True
+            or original_model_group is None
+            or is_guardrail_intervention(e)
+            or is_admission_refusal(e)
+        ):
             raise e
 
         input_kwargs: Final = {
@@ -7872,6 +7902,8 @@ class Router:
 
                 return response
         except Exception as new_exception:
+            if is_admission_refusal(new_exception):
+                raise
             parent_otel_span: Final = get_parent_otel_span_from_kwargs(kwargs)
             fallback_failure_exception_str = truncate_fallback_error_detail(redact_string(str(new_exception)))
             cooldown_info: Final = await async_get_cooldown_deployments_with_debug_info(
@@ -7931,7 +7963,10 @@ class Router:
         include_fallback_errors: Final = kwargs.get("include_fallback_errors", False) is True
         disable_fallbacks: Final[bool | None] = kwargs.pop("disable_fallbacks", False)
         record_disable_fallbacks(kwargs, disable_fallbacks is True)
-        fallbacks: Final[list | None] = kwargs.get("fallbacks", self.fallbacks)
+        fallbacks: Final[list | None] = call_fallbacks(
+            kwargs,  # pyright: ignore[reportUnknownArgumentType]  # the Router's untyped call kwargs
+            self,
+        )
         context_window_fallbacks: list | None = kwargs.get("context_window_fallbacks", self.context_window_fallbacks)
         content_policy_fallbacks: list | None = kwargs.get("content_policy_fallbacks", self.content_policy_fallbacks)
 
@@ -8038,7 +8073,10 @@ class Router:
     async def async_function_with_retries(self, *args, **kwargs):
         verbose_router_logger.debug("Inside async function with retries.")
         original_function: Final = kwargs.pop("original_function")
-        fallbacks: Final = kwargs.pop("fallbacks", self.fallbacks)
+        fallbacks: Final = pop_request_fallbacks(
+            kwargs,  # pyright: ignore[reportUnknownArgumentType]  # the Router's untyped call kwargs
+            cast("list[object] | None", self.fallbacks),  # cast-ok: untyped router attribute
+        )
         parent_otel_span: Final = get_parent_otel_span_from_kwargs(kwargs)
         context_window_fallbacks: Final = kwargs.pop("context_window_fallbacks", self.context_window_fallbacks)
         content_policy_fallbacks: Final = kwargs.pop("content_policy_fallbacks", self.content_policy_fallbacks)
@@ -8072,7 +8110,7 @@ class Router:
             response = add_retry_headers_to_response(response=response, attempted_retries=0, max_retries=None)
             return response
         except Exception as e:
-            if is_guardrail_intervention(e):
+            if is_guardrail_intervention(e) or is_admission_refusal(e):
                 raise
             current_attempt = None
             original_exception = e
@@ -8170,6 +8208,8 @@ class Router:
                     return response
 
                 except Exception as e:
+                    if is_admission_refusal(e):
+                        raise
                     # Always track the latest error so we raise the most
                     # recent exception instead of the first one.
                     original_exception = e
@@ -8880,7 +8920,11 @@ class Router:
             return self._has_content_policy_fallback(model_group, kwargs)
         if self._has_default_fallbacks():
             return True
-        fallbacks: Final = kwargs.get("fallbacks", self.fallbacks)
+        fallbacks: Final = request_fallbacks(
+            kwargs,
+            cast("list[object] | None", self.fallbacks),  # cast-ok: untyped router attribute
+            anthropic_messages_call=True,
+        )
         if fallbacks is None:
             return False
         resolved, _ = get_fallback_model_group_for_lookup_groups(
@@ -8928,7 +8972,11 @@ class Router:
         content_policy_fallbacks: Final = kwargs.get("content_policy_fallbacks", self.content_policy_fallbacks)
         if content_policy_fallbacks is not None and self._has_content_policy_fallback(model_group, kwargs):
             return True
-        fallbacks: Final = kwargs.get("fallbacks", self.fallbacks)
+        fallbacks: Final = request_fallbacks(
+            kwargs,
+            cast("list[object] | None", self.fallbacks),  # cast-ok: untyped router attribute
+            anthropic_messages_call=True,
+        )
         if not fallbacks:
             return False
         if check_non_standard_fallback_format(fallbacks=fallbacks):
@@ -9059,25 +9107,9 @@ class Router:
             if isinstance(_callback, CustomLogger):
                 try:
                     await _callback.async_pre_call_check(deployment, parent_otel_span)
-                except litellm.RateLimitError as e:
-                    ## LOG FAILURE EVENT
-                    if logging_obj is not None:
-                        asyncio.create_task(
-                            logging_obj.dispatch_failure_handlers(
-                                exception=e,
-                                traceback_exception=traceback.format_exc(),
-                                prefer_async_handlers=True,
-                            )
-                        )
-                    set_cooldown_deployments(
-                        litellm_router_instance=self,
-                        exception_status=e.status_code,
-                        original_exception=e,
-                        deployment=deployment["model_info"]["id"],
-                        time_to_cooldown=self.cooldown_time,
-                    )
-                    raise e
                 except Exception as e:
+                    if is_admission_refusal(e):
+                        raise
                     ## LOG FAILURE EVENT
                     if logging_obj is not None:
                         asyncio.create_task(
@@ -9087,7 +9119,15 @@ class Router:
                                 prefer_async_handlers=True,
                             )
                         )
-                    raise e
+                    if isinstance(e, litellm.RateLimitError):
+                        set_cooldown_deployments(
+                            litellm_router_instance=self,
+                            exception_status=e.status_code,
+                            original_exception=e,
+                            deployment=deployment["model_info"]["id"],
+                            time_to_cooldown=self.cooldown_time,
+                        )
+                    raise
 
     @contextlib.asynccontextmanager
     async def _deployment_slot(

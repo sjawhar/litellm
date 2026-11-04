@@ -5,6 +5,7 @@ from typing import Final, TypeAlias, cast  # noqa: TID251  # native binding sele
 from litellm.exceptions import BadRequestError
 from litellm.litellm_core_utils.get_llm_provider_logic import get_llm_provider
 from litellm.llms.anthropic.pass_through.messages import handler as main
+from litellm.llms.anthropic.pass_through.messages.utils import thinking_pinned_after_drops
 from litellm.rust_bridge.catalog import Route, RouteContext
 from litellm.rust_bridge.dispatch import PublicDispatch
 from litellm.rust_bridge.messages.entrypoints import (
@@ -80,6 +81,19 @@ def _context(request: NativeCall) -> RouteContext:
     )
 
 
+def _stays_on_python(request: NativeCall) -> bool:
+    """
+    The native route neither forwards Anthropic's `fallbacks` nor logs a call that carries `fallbacks` of either kind,
+    and it drops thinking blocks that a `thinking.block_binding` "error" pin asks to keep, so an async call with either
+    stays on Python. A sync call has no Python route (the Python handler serves async calls only), so it keeps the
+    native route.
+    """
+    resolved: Final = request.resolved
+    return resolved.get("fallbacks") is not None or thinking_pinned_after_drops(
+        resolved.get("thinking"), resolved.get("additional_drop_params")
+    )
+
+
 _DISPATCH: Final = PublicDispatch(
     route=Route.MESSAGES,
     request=lambda args, kwargs: _public_request(_MESSAGES, args, kwargs),
@@ -91,6 +105,7 @@ _ADISPATCH: Final = PublicDispatch(
     route=Route.MESSAGES,
     request=lambda args, kwargs: _public_request(_AMESSAGES, args, kwargs),
     context=_context,
+    bypass=_stays_on_python,
 )
 
 

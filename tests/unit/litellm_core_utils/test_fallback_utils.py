@@ -1,10 +1,12 @@
 """Tests for litellm.litellm_core_utils.fallback_utils."""
 
+from typing import Final
+
 import pytest
 import httpx
 
 import litellm
-from litellm.litellm_core_utils.core_helpers import process_response_headers
+from litellm.litellm_core_utils.core_helpers import fallback_target_params_over_call, process_response_headers
 from litellm.litellm_core_utils.fallback_utils import (
     async_completion_with_fallbacks,
 )
@@ -108,6 +110,143 @@ async def test_async_completion_with_fallbacks_header_is_zero_when_primary_succe
     headers = hidden_params.get("additional_headers") or {}
     assert headers.get("x-litellm-attempted-fallbacks") == 0
     assert response.choices[0].message.content == "primary-resp"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket", ["metadata", "litellm_metadata"])
+async def test_a_targets_metadata_keeps_the_calls_keys_and_adds_no_identity(monkeypatch, bucket: str):
+    """
+    litellm.acompletion's own fallback loop merges a target as the Router's hop does: the call's metadata keys win,
+    the target adds its own, and an identity key never comes from the target
+    """
+    received: list[dict] = []
+
+    async def _fake_acompletion(*, model: str, **kwargs):
+        received.append({"model": model, **kwargs})
+        if model == "primary-model":
+            raise Exception("primary failed")
+        return {"model": model}
+
+    monkeypatch.setattr(litellm, "acompletion", _fake_acompletion)
+    target_metadata = {"added": "by-target", "tags": ["target-tag"], "user_api_key_hash": "forged"}
+
+    await async_completion_with_fallbacks(
+        model="primary-model",
+        **{bucket: {"user_api_key_hash": "caller-hash", "tags": ["call-tag"]}},
+        kwargs={"fallbacks": [{"model": "fallback-model", bucket: target_metadata}]},
+    )
+
+    hop_metadata = received[-1][bucket]
+    assert received[-1]["model"] == "fallback-model"
+    assert hop_metadata["user_api_key_hash"] == "caller-hash"
+    assert hop_metadata["tags"] == ["call-tag"]
+    assert hop_metadata["added"] == "by-target"
+
+
+@pytest.mark.asyncio
+async def test_a_targets_stream_options_keep_the_usage_the_proxy_asked_for(monkeypatch):
+    """
+    The proxy sets include_usage in a streamed call's stream_options to track its spend; a target's stream_options
+    only add keys, as its metadata does, so the hop still reports usage
+    """
+    received: list[dict] = []
+
+    async def _fake_acompletion(*, model: str, **kwargs):
+        received.append({"model": model, **kwargs})
+        if model == "primary-model":
+            raise Exception("primary failed")
+        return {"model": model}
+
+    monkeypatch.setattr(litellm, "acompletion", _fake_acompletion)
+
+    await async_completion_with_fallbacks(
+        model="primary-model",
+        stream=True,
+        stream_options={"include_usage": True},
+        kwargs={"fallbacks": [{"model": "fallback-model", "stream_options": {"include_usage": False, "added": 1}}]},
+    )
+
+    assert received[-1]["model"] == "fallback-model"
+    assert received[-1]["stream_options"] == {"include_usage": True, "added": 1}
+
+
+@pytest.mark.parametrize(
+    ("target", "marked"),
+    [
+        pytest.param({"model": "fallback-model", "timeout": 0.01}, ("timeout",), id="timeout"),
+        pytest.param({"model": "fallback-model", "request_timeout": 0.01}, ("request_timeout",), id="request-timeout"),
+        pytest.param({"model": "fallback-model", "stream_timeout": 0.01}, ("stream_timeout",), id="stream-timeout"),
+        # A body's own null sets no mark, so a target's sets none either
+        pytest.param({"model": "fallback-model", "timeout": None}, (), id="null-timeout"),
+        pytest.param({"model": "fallback-model"}, None, id="no-timeout"),
+    ],
+)
+def test_a_targets_own_timeout_marks_the_hop_as_the_proxy_marks_a_requests(
+    target: dict, marked: tuple[str, ...] | None
+):
+    """
+    The proxy marks a request with the names of the timeouts its caller set (client_side_timeout), so the Router's
+    cooldown reads a 408 under them as the caller's timeout and not the deployment's health; a target's own timeout
+    marks the hop the same way, and a target that sets no timeout leaves the call's mark as it is
+    """
+    hop: Final = fallback_target_params_over_call({"model": "primary-model"}, target)
+
+    assert hop.get("client_side_timeout") == marked
+
+
+@pytest.mark.parametrize(
+    ("call", "targets", "marks"),
+    [
+        # No caller timeout in the request, a target sets one, a later target clears it
+        pytest.param(
+            {"model": "primary-model"},
+            ({"model": "first", "timeout": 0.01}, {"model": "second", "timeout": None}),
+            (("timeout",), ()),
+            id="cleared-by-a-later-target",
+        ),
+        # The request's own stream timeout is still the caller's after a target clears its plain timeout
+        pytest.param(
+            {"model": "primary-model", "stream_timeout": 5, "client_side_timeout": ("stream_timeout",)},
+            ({"model": "first", "timeout": 0.01}, {"model": "second", "timeout": None}),
+            (("stream_timeout", "timeout"), ("stream_timeout",)),
+            id="the-requests-own-timeout-remains",
+        ),
+        # The reader's sequence: the caller's stream timeout marks the request, the proxy pins its own
+        # request_timeout, and a target clears the stream timeout: what is left is the administrator's
+        pytest.param(
+            {
+                "model": "primary-model",
+                "stream_timeout": 5,
+                "request_timeout": 30,
+                "client_side_timeout": ("stream_timeout",),
+            },
+            ({"model": "backup", "stream_timeout": None},),
+            ((),),
+            id="only-the-administrators-timeout-remains",
+        ),
+        # A body that starts with a null stream timeout is unmarked, and a target that sets none leaves it so
+        pytest.param(
+            {"model": "primary-model", "stream_timeout": None},
+            ({"model": "backup"},),
+            (None,),
+            id="null-body-timeout-and-a-target-without-one",
+        ),
+    ],
+)
+def test_the_timeout_mark_follows_the_timeout_in_effect_on_each_hop(
+    call: dict, targets: tuple[dict, ...], marks: tuple[tuple[str, ...] | None, ...]
+):
+    """
+    The Router lays each target over the same call, so a mark one target set stays for the next; the mark names the
+    caller's timeouts still in the call, so a hop that runs on its deployment's or the administrator's timeout is
+    unmarked and its 408 counts for the cooldown
+    """
+    seen: list[object] = []
+    for target in targets:
+        call.update(fallback_target_params_over_call(call, target))
+        seen.append(call.get("client_side_timeout"))
+
+    assert tuple(seen) == marks
 
 
 def test_process_response_headers_preserves_x_litellm_headers_when_internal():

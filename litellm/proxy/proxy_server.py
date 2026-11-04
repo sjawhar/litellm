@@ -310,6 +310,8 @@ from litellm.constants import (
     DEFAULT_MAX_LRU_CACHE_SIZE,
     DEFAULT_MODEL_CREATED_AT_TIME,
     GLOBAL_PROXY_SPEND_CACHE_KEY,
+    LAST_GOOD_ENTRY_TTL_SECONDS,
+    LAST_GOOD_TOMBSTONE_TTL_SECONDS,
     LITELLM_PROXY_ADMIN_NAME,
     LITELLM_PROXY_BUDGET_NAME,
     MONTHLY_SPEND_REPORT_JOB_ID,
@@ -380,7 +382,10 @@ from litellm.proxy.auth.auth_utils import (
     warn_once_if_custom_auth_skips_common_checks,
 )
 from litellm.proxy.auth.fallback_budget import router_fallback_budget_check
-from litellm.proxy.auth.fallback_model_access import router_fallback_access_check
+from litellm.proxy.auth.fallback_model_access import (
+    fallback_target_credentials_allowed,
+    router_fallback_access_check,
+)
 from litellm.proxy.auth.handle_jwt import JWTHandler
 from litellm.proxy.auth.litellm_license import AUTO_ROUTER_LICENSE_REMEDY, LicenseCheck
 from litellm.proxy.auth.login_throttle import (
@@ -519,6 +524,7 @@ from litellm.proxy.common_utils.timezone_utils import (
     get_budget_reset_time,
 )
 from litellm.proxy.common_utils.user_api_key_cache import (
+    LAST_GOOD_LATE_STORE_MARGIN_SECONDS,
     UserApiKeyCache,
     end_user_cache_key,
     get_management_object_ttl,
@@ -526,6 +532,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     model_access_group_spend_counter_key,
     project_cache_key,
     project_spend_counter_key,
+    serves_last_good_entries,
     tag_cache_key,
 )
 from litellm.proxy.common_utils.validation_error_body import public_validation_errors
@@ -5198,6 +5205,55 @@ def _attach_redis_usage_cache(redis_cache: RedisCache, enable_redis_auth_cache: 
     litellm_config_cache.redis_cache = redis_cache
 
 
+# SET EXAT, by which a last good auth entry's Redis copy ends at its deadline, came in Redis 6.2
+_LAST_GOOD_MIN_REDIS_VERSION: Final = (6, 2)
+_REDIS_VERSION_MAJOR_MINOR: Final = re.compile(r"(\d+)\.(\d+)")
+
+
+def _redis_major_minor(version: str) -> tuple[int, int]:
+    """``(7, 2)`` for ``7.2.4``, ``7.2`` or ``7.2.4-rc1``; raises ``ValueError`` when ``version`` does not start with
+    major.minor."""
+    parsed: Final = _REDIS_VERSION_MAJOR_MINOR.match(version)
+    if parsed is None:
+        raise ValueError(f"redis_version {version!r} does not start with major.minor")
+    return int(parsed.group(1)), int(parsed.group(2))
+
+
+async def _last_good_redis_version_ok(cache: UserApiKeyCache) -> bool:
+    """
+    False, with an error naming both versions, when the auth cache's Redis is older than 6.2: a last good entry's Redis
+    copy ends at its deadline by SET EXAT, which an older server rejects, so the caller turns
+    ``serve_last_good_entries`` off. Reads nothing, and is True, when the setting is off or the auth cache has no Redis.
+
+    A version that cannot be read is True, with a warning, since keeping the setting on is safe: a store against a
+    server that rejects EXAT fails, keeps nothing in Redis or in memory, and logs a warning.
+    """
+    redis: Final = cache.redis_cache
+    if not serves_last_good_entries(cache) or redis is None:
+        return True
+    try:
+        version: Final = await redis.async_server_version()
+        found: Final = _redis_major_minor(version)
+    except Exception as e:  # noqa: BLE001  # an unread version must not stop start-up; a failed EXAT SET keeps nothing
+        verbose_proxy_logger.warning(
+            "general_settings.serve_last_good_auth_entries stays on, but the Redis version could not be read from "
+            "INFO (%s): last good auth entries need Redis %s.%s or later for SET EXAT, and on an older Redis each "
+            "store fails with a warning and keeps nothing",
+            e,
+            *_LAST_GOOD_MIN_REDIS_VERSION,
+        )
+        return True
+    if found >= _LAST_GOOD_MIN_REDIS_VERSION:
+        return True
+    verbose_proxy_logger.error(
+        "general_settings.serve_last_good_auth_entries is turned off: Redis %s does not support SET EXAT, which "
+        "last good auth entries need to end at their deadline; it needs Redis %s.%s or later",
+        version,
+        *_LAST_GOOD_MIN_REDIS_VERSION,
+    )
+    return False
+
+
 def resolve_routing_plugins(
     plugin_paths: list,
     config_file_path: str | None,
@@ -6969,6 +7025,60 @@ class ProxyConfig:
                     default_redis_ttl=ttl,
                 )
 
+            ### LAST GOOD AUTH ENTRIES (served while the database is unreachable) ###
+            user_api_key_cache.serve_last_good_entries = ConfigGeneralSettings.model_validate(
+                MappingProxyType(
+                    {"serve_last_good_auth_entries": typed_general_settings.get("serve_last_good_auth_entries", False)}
+                )
+            ).serve_last_good_auth_entries
+            # An entry that expires as it is written keeps nothing; one shorter than the auth cache lapses between reads
+            if user_api_key_cache.serve_last_good_entries and LAST_GOOD_ENTRY_TTL_SECONDS <= 0:
+                verbose_proxy_logger.error(
+                    "general_settings.serve_last_good_auth_entries is turned off: LAST_GOOD_ENTRY_TTL_SECONDS=%s, the "
+                    "seconds a last good auth entry may be served after the database read that produced it, must be "
+                    "above 0",
+                    LAST_GOOD_ENTRY_TTL_SECONDS,
+                )
+                user_api_key_cache.serve_last_good_entries = False
+            # A store must complete within the tombstone time less the margin of its read, or it keeps nothing at all
+            if (
+                user_api_key_cache.serve_last_good_entries
+                and LAST_GOOD_TOMBSTONE_TTL_SECONDS <= LAST_GOOD_LATE_STORE_MARGIN_SECONDS
+            ):
+                verbose_proxy_logger.error(
+                    "general_settings.serve_last_good_auth_entries is turned off: LAST_GOOD_TOMBSTONE_TTL_SECONDS=%s "
+                    "must be above LAST_GOOD_LATE_STORE_MARGIN_SECONDS=%s, or every last good auth entry is refused",
+                    LAST_GOOD_TOMBSTONE_TTL_SECONDS,
+                    LAST_GOOD_LATE_STORE_MARGIN_SECONDS,
+                )
+                user_api_key_cache.serve_last_good_entries = False
+            # A last good entry's Redis copy ends at its deadline by SET EXAT, which Redis before 6.2 rejects
+            if not await _last_good_redis_version_ok(user_api_key_cache):
+                user_api_key_cache.serve_last_good_entries = False
+            cached_object_ttl: Final = get_management_object_ttl(user_api_key_cache)
+            if user_api_key_cache.serve_last_good_entries and LAST_GOOD_ENTRY_TTL_SECONDS < cached_object_ttl:
+                verbose_proxy_logger.warning(
+                    "general_settings.serve_last_good_auth_entries: LAST_GOOD_ENTRY_TTL_SECONDS=%s is below "
+                    "user_api_key_cache_ttl=%s, so callers in steady use lose their last good entry between database "
+                    "reads and a database outage then refuses them; set it above user_api_key_cache_ttl plus the "
+                    "longest outage to ride out",
+                    LAST_GOOD_ENTRY_TTL_SECONDS,
+                    cached_object_ttl,
+                )
+            verbose_proxy_logger.info(
+                "general_settings.serve_last_good_auth_entries=%s: the last good team and key entries are %s",
+                user_api_key_cache.serve_last_good_entries,
+                "served while the database is unreachable"
+                if user_api_key_cache.serve_last_good_entries
+                else "not kept, so a database outage refuses every caller whose cached entry has expired",
+            )
+            if user_api_key_cache.serve_last_good_entries and user_api_key_cache.redis_cache is None:
+                verbose_proxy_logger.warning(
+                    "general_settings.serve_last_good_auth_entries is on but the auth cache has no Redis "
+                    "(litellm_settings.enable_redis_auth_cache): each worker keeps its own last good entries, and a "
+                    "delete or block on one worker does not drop the copies another worker holds"
+                )
+
             ### USER API KEY CACHE MAX SIZE (in-memory tier shared by keys, teams, users, end users, ...) ###
             if "user_api_key_cache_max_size" in general_settings:
                 user_api_key_cache.update_in_memory_max_size(
@@ -7259,6 +7369,9 @@ class ProxyConfig:
             fallback_access_check=router_fallback_access_check,
             fallback_budget_check=router_fallback_budget_check,
             auto_router_capability_limit=_license_check.auto_router_capability_limit,
+        )
+        router.fallback_target_credentials_allowed = (  # rebind-ok: config router_settings must not set this predicate
+            fallback_target_credentials_allowed
         )
 
         if redis_usage_cache is not None and router.cache.redis_cache is None:
@@ -7755,6 +7868,7 @@ class ProxyConfig:
                         fallback_budget_check=router_fallback_budget_check,
                         auto_router_capability_limit=_license_check.auto_router_capability_limit,
                     )
+                    llm_router.fallback_target_credentials_allowed = fallback_target_credentials_allowed
                     verbose_proxy_logger.debug("updated llm_router: %s", llm_router)
             else:
                 verbose_proxy_logger.debug("len new_models: %s", len(models_list))
@@ -10595,6 +10709,11 @@ class ProxyStartupEvent:
             coordination_redis_cache,
             enable_redis_auth_cache=litellm_settings.get("enable_redis_auth_cache", False) is True,
         )
+        # load_config checked the Redis the auth cache had then; a Redis attached to it only now needs the same check
+        if user_api_key_cache.redis_cache is coordination_redis_cache and not await _last_good_redis_version_ok(
+            user_api_key_cache
+        ):
+            user_api_key_cache.serve_last_good_entries = False
         if llm_router is not None and llm_router.cache.redis_cache is None:
             llm_router.update_redis_cache(cache=coordination_redis_cache)
         verbose_proxy_logger.info(
@@ -18132,6 +18251,10 @@ async def claim_onboarding_link(data: InvitationClaim, request: Request):
     This route can only update user password.
     """
     global prisma_client, master_key, general_settings
+    from litellm.proxy.db.routing_prisma_wrapper import pin_reads_to_writer
+
+    # A public route, outside user_api_key_auth, whose password write revokes the user's UI session keys strictly
+    pin_reads_to_writer(serves_last_good_entries(user_api_key_cache))
     ### VALIDATE INVITE LINK ###
     if prisma_client is None:
         raise HTTPException(

@@ -6333,6 +6333,7 @@ async def test_cache_team_object_writes_team_id_and_invalidates_team_alias():
         team_table=team_table,
         user_api_key_cache=cache,
         proxy_logging_obj=logging_obj,
+        keep_last_good=True,
     )
 
     # (1) team_id-keyed write fires with the refreshed object
@@ -6370,6 +6371,7 @@ async def test_cache_team_object_writes_team_id_and_invalidates_team_alias():
         team_table=aliasless,
         user_api_key_cache=cache2,
         proxy_logging_obj=logging_obj2,
+        keep_last_good=True,
     )
 
     cache2.async_delete_cache.assert_not_awaited()
@@ -6444,6 +6446,7 @@ async def test_team_update_not_shadowed_by_internal_usage_cache_lit_4391():
         team_table=LiteLLM_TeamTableCachedObj(team_id=team_id, models=["model-a"]),
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
+        keep_last_good=True,
     )
 
     primed = await get_team_object(
@@ -6459,6 +6462,7 @@ async def test_team_update_not_shadowed_by_internal_usage_cache_lit_4391():
         team_table=LiteLLM_TeamTableCachedObj(team_id=team_id, models=["model-a", "model-b"]),
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
+        keep_last_good=True,
     )
 
     refreshed = await get_team_object(
@@ -6531,6 +6535,7 @@ async def test_warm_team_object_reads_issue_no_redis_ops_lit_5944():
         team_table=LiteLLM_TeamTableCachedObj(team_id=team_id, models=["model-a"]),
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
+        keep_last_good=True,
     )
 
     for _ in range(4):
@@ -6577,6 +6582,7 @@ async def test_cache_team_object_tolerates_cache_invalidation_failures():
         ),
         user_api_key_cache=cache,
         proxy_logging_obj=logging_obj,
+        keep_last_good=True,
     )
 
     written_keys = [(c.kwargs.get("key") or c.args[0]) for c in cache.async_set_cache.await_args_list]

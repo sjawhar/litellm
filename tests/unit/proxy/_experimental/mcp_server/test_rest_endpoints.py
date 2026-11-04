@@ -2559,6 +2559,114 @@ class TestCallToolRestAPI:
             "name": "demo-tool", "mcp_server_name": "Example server",
         }
 
+    @pytest.mark.parametrize("refusal", ["server-denied", "key-over-limit"])
+    async def test_refused_call_does_not_count_or_cool_the_deployment_the_body_names(self, monkeypatch, refusal):
+        """The REST tool call builds its logging object from the request body and runs its failure handlers, and
+        with them the router's failure callbacks, before post_call_failure_hook. A body naming a real deployment's
+        ``model_info.id`` and a ``cooldown_time`` must not count a failure or RPM against it, or cool it down, when
+        the key may not use the server or is over its own limit."""
+        import litellm
+        from litellm.proxy import proxy_server
+        from litellm.proxy.common_utils.proxy_rate_limit_error import ProxyRateLimitError
+        from litellm.router_utils.router_callbacks.track_deployment_metrics import (
+            get_deployment_failures_for_current_minute,
+        )
+
+        for callback_list in (
+            "callbacks",
+            "success_callback",
+            "failure_callback",
+            "_async_success_callback",
+            "_async_failure_callback",
+        ):
+            monkeypatch.setattr(litellm, callback_list, [])
+        named_deployment: Final = "victim-deployment"
+        router: Final = litellm.Router(
+            model_list=[
+                {
+                    "model_name": "internal-model",
+                    "litellm_params": {"model": "openai/gpt-4.1", "api_key": "sk-test"},
+                    "model_info": {"id": named_deployment},
+                },
+                {
+                    "model_name": "internal-model",
+                    "litellm_params": {"model": "openai/gpt-4.1-mini", "api_key": "sk-test"},
+                    "model_info": {"id": "sibling-deployment"},
+                },
+            ]
+        )
+
+        async def fake_contexts(user_api_key_auth):
+            return [user_api_key_auth]
+
+        async def no_allowed_mcp_servers(*args, **kwargs):
+            return []
+
+        async def over_its_own_limit(user_api_key_dict, data, call_type, skip_guardrails=False):
+            raise ProxyRateLimitError(detail="key over its rate limit")
+
+        forbidden_server = MagicMock()
+        forbidden_server.server_id = "forbidden-server"
+        forbidden_server.name = "Forbidden server"
+        monkeypatch.setattr(rest_endpoints, "build_effective_auth_contexts", fake_contexts, raising=False)
+        monkeypatch.setattr(
+            rest_endpoints.global_mcp_server_manager, "get_allowed_mcp_servers", no_allowed_mcp_servers, raising=False
+        )
+        monkeypatch.setattr(
+            rest_endpoints.global_mcp_server_manager,
+            "get_mcp_server_by_id",
+            lambda server_id: forbidden_server if server_id == "forbidden-server" else None,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            rest_endpoints.global_mcp_server_manager,
+            "get_mcp_server_by_name",
+            lambda *args, **kwargs: None,
+            raising=False,
+        )
+        if refusal == "key-over-limit":
+            monkeypatch.setattr(proxy_server.proxy_logging_obj, "pre_call_hook", over_its_own_limit)
+        post_call_failure_hook = AsyncMock(return_value=None)
+        monkeypatch.setattr(proxy_server.proxy_logging_obj, "post_call_failure_hook", post_call_failure_hook)
+        monkeypatch.setattr(rest_endpoints, "execute_mcp_tool", AsyncMock())
+
+        request = _build_request(
+            path="/mcp-rest/tools/call",
+            method="POST",
+            json_body={
+                "server_id": "forbidden-server",
+                "name": "demo-tool",
+                "arguments": {},
+                "model_info": {"id": named_deployment},
+                "cooldown_time": 3600,
+                "metadata": {"deployment": "victim-model"},
+            },
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await rest_endpoints.call_tool_rest_api(request, user_api_key_dict=UserAPIKeyAuth())
+        pending = asyncio.all_tasks() - {asyncio.current_task()}
+        await asyncio.gather(*pending, return_exceptions=True)
+
+        logged = post_call_failure_hook.await_args.kwargs["request_data"]["litellm_logging_obj"].model_call_details
+        assert {
+            "status_code": exc_info.value.status_code,
+            "failure_handled": logged.get("exception") is exc_info.value,
+            "failures": get_deployment_failures_for_current_minute(
+                litellm_router_instance=router, deployment_id=named_deployment
+            ),
+            "cooldowns": router.cooldown_cache.get_active_cooldowns(
+                model_ids=[named_deployment], parent_otel_span=None
+            ),
+            "counters": [key for key in router.cache.in_memory_cache.cache_dict if named_deployment in key],
+        } == {
+            "status_code": 403 if refusal == "server-denied" else 429,
+            "failure_handled": True,
+            "failures": 0,
+            "cooldowns": [],
+            "counters": [],
+        }
+
     async def test_executes_tool_when_allowed(self, monkeypatch):
         async def fake_contexts(user_api_key_auth):
             return [user_api_key_auth]

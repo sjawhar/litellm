@@ -5,7 +5,9 @@ Verifies that PodLockManager is correctly used to prevent concurrent
 key rotation across multiple pods in a distributed deployment.
 """
 
-from unittest.mock import AsyncMock, MagicMock
+from types import SimpleNamespace
+from typing import Final
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -224,3 +226,86 @@ class TestKeyRotationLock:
 
         # Verify lock was NOT released (lock_acquired is False)
         mock_pod_lock_manager.release_lock.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("serve_last_good_entries", "reads_from_writer"), [(True, True), (False, False)])
+async def test_a_rotation_run_picks_its_due_keys_from_the_writer_only_while_last_good_entries_are_served(
+    serve_last_good_entries: bool, reads_from_writer: bool
+):
+    """Each rotation revokes its old token strictly and the run is outside any request, so while last good entries are
+    served it pins its own reads to the writer: a key due on the writer is rotated though the lagging read replica
+    does not list it yet. With the setting off the run reads from the replica as before."""
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from litellm.proxy.db.prisma_client import PrismaWrapper
+    from litellm.proxy.db.routing_prisma_wrapper import RoutingPrismaWrapper
+
+    due_key: Final = LiteLLM_VerificationToken(
+        token="due-token", auto_rotate=True, rotation_interval="30d", key_rotation_at=None, key_name="due-key"
+    )
+    writer: Final = PrismaWrapper(
+        original_prisma=SimpleNamespace(
+            litellm_verificationtoken=SimpleNamespace(find_many=AsyncMock(return_value=[due_key]), create=AsyncMock()),
+            litellm_deprecatedverificationtoken=SimpleNamespace(delete_many=AsyncMock(return_value=0)),
+        )
+    )
+    # The replica lags: it does not list the key the writer holds as due
+    reader: Final = PrismaWrapper(
+        original_prisma=SimpleNamespace(
+            litellm_verificationtoken=SimpleNamespace(find_many=AsyncMock(return_value=[]), create=AsyncMock())
+        )
+    )
+    prisma: Final = SimpleNamespace(db=RoutingPrismaWrapper(writer=writer, reader=reader), writer_db=writer)
+    manager: Final = KeyRotationManager(prisma)  # pyright: ignore[reportArgumentType]  # a fake for PrismaClient
+    rotate_key: Final = AsyncMock()
+    manager._rotate_key = rotate_key
+    cache: Final = UserApiKeyCache(serve_last_good_entries=serve_last_good_entries)
+
+    with patch(  # test-quality-ok: the run reads the setting off this proxy_server global; no injection seam
+        "litellm.proxy.proxy_server.user_api_key_cache", cache
+    ):
+        await manager.process_rotations()
+
+    rotated: Final = [awaited.args[0] for awaited in rotate_key.await_args_list]
+    assert rotated == ([due_key] if reads_from_writer else [])
+
+
+@pytest.mark.asyncio
+async def test_a_rotation_run_with_a_plain_dual_cache_as_the_auth_cache_still_rotates_its_due_keys():
+    """The auth cache can be a plain DualCache, which keeps no last good entries: the run pins nothing, reads its due
+    keys where it always did, and rotates them, rather than stopping on the setting only the cache's subclass
+    carries."""
+    from litellm.caching.dual_cache import DualCache
+    from litellm.proxy.db.prisma_client import PrismaWrapper
+    from litellm.proxy.db.routing_prisma_wrapper import RoutingPrismaWrapper
+
+    due_key: Final = LiteLLM_VerificationToken(
+        token="due-token", auto_rotate=True, rotation_interval="30d", key_rotation_at=None, key_name="due-key"
+    )
+    writer: Final = PrismaWrapper(
+        original_prisma=SimpleNamespace(
+            litellm_verificationtoken=SimpleNamespace(find_many=AsyncMock(return_value=[]), create=AsyncMock()),
+            litellm_deprecatedverificationtoken=SimpleNamespace(delete_many=AsyncMock(return_value=0)),
+        )
+    )
+    reader: Final = PrismaWrapper(
+        original_prisma=SimpleNamespace(
+            litellm_verificationtoken=SimpleNamespace(find_many=AsyncMock(return_value=[due_key]), create=AsyncMock())
+        )
+    )
+    prisma: Final = SimpleNamespace(db=RoutingPrismaWrapper(writer=writer, reader=reader), writer_db=writer)
+    manager: Final = KeyRotationManager(prisma)  # pyright: ignore[reportArgumentType]  # a fake for PrismaClient
+    rotated: Final[list[LiteLLM_VerificationToken]] = []  # mutable-ok: records each key the run rotates
+
+    async def rotate_key(key: LiteLLM_VerificationToken) -> None:
+        rotated.append(key)
+
+    with (
+        patch.object(manager, "_rotate_key", rotate_key),  # test-quality-ok: records the keys the run rotates
+        patch(  # test-quality-ok: the run reads the setting off this proxy_server global; no injection seam
+            "litellm.proxy.proxy_server.user_api_key_cache", DualCache()
+        ),
+    ):
+        await manager.process_rotations()
+
+    assert rotated == [due_key]

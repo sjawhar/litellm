@@ -2920,6 +2920,9 @@ class AdapterCompletionStreamWrapper:
             raise StopAsyncIteration
 
 
+AuthEntriesSource: TypeAlias = Literal["fresh", "last_good"]
+
+
 class StandardLoggingUserAPIKeyMetadata(TypedDict):
     user_api_key_hash: str | None  # hash of the litellm virtual key used
     user_api_key_alias: str | None
@@ -2941,6 +2944,7 @@ class StandardLoggingUserAPIKeyMetadata(TypedDict):
     user_api_key_end_user_id: str | None
     user_api_key_request_route: str | None
     user_api_key_auth_metadata: dict[str, str] | None
+    user_api_key_auth_entries: NotRequired[ReadOnly[AuthEntriesSource | None]]
 
 
 class StandardLoggingMCPToolCall(TypedDict, total=False):
@@ -4666,13 +4670,13 @@ class PriorityReservationSettings(LiteLLMBaseModel):
     """
     Settings for priority-based rate limiting reservation.
 
-    Defines what priority to assign to keys without explicit priority metadata.
+    Defines the share given to teams without a priority in ``metadata.priority``.
     The priority_reservation mapping is configured separately via litellm.priority_reservation.
     """
 
     default_priority: float = Field(
         default=0.25,
-        description="Priority level to assign to API keys without explicit priority metadata. Should match a key in litellm.priority_reservation.",
+        description="Priority weight for teams without a priority in metadata.priority. They share one default pool.",
     )
 
     saturation_threshold: float = Field(

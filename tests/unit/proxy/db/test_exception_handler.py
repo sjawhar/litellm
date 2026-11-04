@@ -22,7 +22,9 @@ from prisma.errors import (
 
 import litellm
 from litellm.proxy._types import ProxyErrorTypes, ProxyException
+from litellm.proxy.db.db_lookup_gate import DBLookupDeadlineExceeded
 from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
+from tests.unit.proxy.db.cancelled_statements import CancelReason, cancelled_statement
 
 
 # Test is_database_connection_error method
@@ -951,3 +953,154 @@ def test_is_lock_timeout_error_recognises_a_statement_cancelled_under_lock_timeo
 )
 def test_is_lock_timeout_error_excludes_other_failures(error: Exception) -> None:
     assert PrismaDBExceptionHandler.is_lock_timeout_error(error) is False
+
+
+def _wrapped(cause: Exception) -> Exception:
+    wrapper: Final = RuntimeError("team lookup failed")
+    wrapper.__cause__ = cause
+    return wrapper
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.ConnectError("All connection attempts failed"),
+        httpx.ReadTimeout("timed out"),
+        ClientNotConnectedError(),
+        EngineConnectionError(),
+        DataError(data={"user_facing_error": {"message": "Can't reach database server at `127.0.0.1`:`5499`"}}),
+        _pool_timeout_error(),
+        _capacity_error("sorry, too many clients already"),
+        ConnectionRefusedError("connection refused"),
+        TimeoutError("timed out"),
+        _wrapped(httpx.ConnectError("conn refused")),
+    ],
+    ids=[
+        "engine_connect",
+        "engine_read_timeout",
+        "client_not_connected",
+        "engine_connection",
+        "P1001_as_dataerror",
+        "pool_timeout_P2024",
+        "capacity_53300",
+        "socket_refused",
+        "socket_timeout",
+        "wrapped_transport",
+    ],
+)
+def test_is_database_unreachable_error_recognises_connection_timeout_and_transport_failures(error: Exception) -> None:
+    assert PrismaDBExceptionHandler.is_database_unreachable_error(error) is True
+
+
+def test_is_database_unreachable_error_recognises_the_lookup_deadline() -> None:
+    assert PrismaDBExceptionHandler.is_database_unreachable_error(DBLookupDeadlineExceeded("team", 0.5)) is True
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        DataError(data={"user_facing_error": {"message": "invalid byte sequence for encoding UTF8: 0x00"}}),
+        UniqueViolationError(data={"user_facing_error": {"meta": {"table": "t"}}}),
+        RecordNotFoundError(data={"user_facing_error": {"meta": {"table": "t"}}}),
+        BinaryNotFoundError("query engine binary not found"),
+        ProxyException(message="not found", type=ProxyErrorTypes.token_not_found_in_db, param="key", code=401),
+        ValueError("Team doesn't exist in db"),
+        _wrapped(ValueError("bad row")),
+    ],
+    ids=[
+        "data_error",
+        "unique_violation",
+        "record_not_found",
+        "missing_engine_binary",
+        "token_not_found",
+        "plain_value_error",
+        "wrapped_value_error",
+    ],
+)
+def test_is_database_unreachable_error_excludes_answers_and_permanent_faults(error: Exception) -> None:
+    """A database that answered, whatever it said, and a query engine that will never come back by itself, are
+    not an outage the last good auth entry may cover."""
+    assert PrismaDBExceptionHandler.is_database_unreachable_error(error) is False
+
+
+def _cancelled_then_reconnect_timed_out(reason: CancelReason) -> Exception:
+    """``call_with_db_reconnect_retry`` re-raises the first error from the reconnect's ``TimeoutError``."""
+    cancelled: Final = cancelled_statement(reason)
+    cancelled.__cause__ = TimeoutError("reconnect timed out")
+    return cancelled
+
+
+def _lookup_deadline_over_a_reconnect_that_timed_out(reason: CancelReason | None) -> DBLookupDeadlineExceeded:
+    """``bounded_db_lookup`` turns a lookup's ``TimeoutError`` into its deadline, here a reconnect that timed out
+    while it handled a cancelled statement, or while the engine answered nothing at all (``reason`` None)."""
+    timeout: Final = TimeoutError("reconnect timed out")
+    timeout.__context__ = None if reason is None else cancelled_statement(reason)
+    deadline: Final = DBLookupDeadlineExceeded("key", 10.0)
+    deadline.__cause__ = timeout
+    return deadline
+
+
+def _engine_unreachable_then_reconnect_timed_out() -> Exception:
+    unreachable: Final = httpx.ConnectError("All connection attempts failed")
+    unreachable.__cause__ = TimeoutError("reconnect timed out")
+    return unreachable
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        cancelled_statement("statement timeout"),
+        cancelled_statement("statement timeout", raw=True),
+        cancelled_statement("user request"),
+        cancelled_statement("user request", raw=True),
+        cancelled_statement("lock timeout"),
+        cancelled_statement("lock timeout", raw=True),
+        _cancelled_then_reconnect_timed_out("statement timeout"),
+        _cancelled_then_reconnect_timed_out("user request"),
+        _lookup_deadline_over_a_reconnect_that_timed_out("statement timeout"),
+        _wrapped(cancelled_statement("lock timeout")),
+    ],
+    ids=[
+        "statement_timeout_57014",
+        "statement_timeout_57014_raw_query",
+        "cancel_request_57014",
+        "cancel_request_57014_raw_query",
+        "lock_timeout_55P03",
+        "lock_timeout_55P03_raw_query",
+        "statement_timeout_then_reconnect_timed_out",
+        "cancel_request_then_reconnect_timed_out",
+        "lookup_deadline_over_a_statement_timeout",
+        "wrapped_lock_timeout",
+    ],
+)
+def test_is_database_unreachable_error_excludes_a_statement_the_database_cancelled(error: Exception) -> None:
+    """A database that cancels a statement, for its statement or lock timeout or a cancel request, is up and
+    answering, so the last good auth entry must not cover it, even when a timeout lands on top of the cancel."""
+    assert PrismaDBExceptionHandler.is_database_unreachable_error(error) is False
+
+
+@pytest.mark.parametrize(
+    "error",
+    [_engine_unreachable_then_reconnect_timed_out(), _lookup_deadline_over_a_reconnect_that_timed_out(None)],
+    ids=["engine_unreachable_then_reconnect_timed_out", "lookup_deadline_over_a_silent_engine"],
+)
+def test_is_database_unreachable_error_still_recognises_timeouts_with_no_cancelled_statement(error: Exception) -> None:
+    assert PrismaDBExceptionHandler.is_database_unreachable_error(error) is True
+
+
+def test_is_database_unreachable_error_recognises_the_engine_crash_of_a_torn_down_connection():
+    """The first request of an outage: prisma's engine returns a malformed P1001 payload and prisma-client-py
+    crashes on it with an AttributeError before it can raise the P1001 error itself."""
+    from prisma.engine import utils as prisma_engine_utils
+
+    malformed_payload: Final = [
+        {
+            "error": "Can't reach database server",
+            "user_facing_error": {"error_code": "P1001", "message": "Can't reach database server", "meta": None},
+        }
+    ]
+    with pytest.raises(AttributeError) as crash:
+        prisma_engine_utils.handle_response_errors(None, malformed_payload)
+
+    assert PrismaDBExceptionHandler.is_database_unreachable_error(crash.value) is True
+    assert PrismaDBExceptionHandler.is_database_unreachable_error(AttributeError("an application bug")) is False
