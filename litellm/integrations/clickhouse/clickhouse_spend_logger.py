@@ -22,6 +22,7 @@ from litellm.integrations.clickhouse.schema import SPEND_LOGS_TABLE
 from litellm.litellm_core_utils.llm_response_utils.get_headers import get_provider_request_id
 from litellm.litellm_core_utils.sensitive_data_masker import redact_credentials_in_payload
 from litellm.tracing.types import SpendLogPayload, SpendLogRecord
+from litellm.types.proxy.auth.client_context import VERIFIED_CLIENT_CONTEXT_KEY
 from litellm.types.utils import StandardLoggingPayload
 
 # litellm_logging.py rewrites cache-hit ids as f"{id}_cache_hit{time.time()}"
@@ -35,7 +36,13 @@ TRACE_INGEST_ROUTE: Final = "/v1/traces"
 _METADATA_MAPPING: Final = TypeAdapter(Mapping[str, object])
 _METADATA_VALUE: Final = TypeAdapter(JsonValue)
 _INTERNAL_METADATA_KEYS: Final = frozenset(
-    ("user_api_key", "user_api_key_auth", "user_api_key_budget_reservation", "proxy_server_request")
+    (
+        "user_api_key",
+        "user_api_key_auth",
+        "user_api_key_budget_reservation",
+        "proxy_server_request",
+        VERIFIED_CLIENT_CONTEXT_KEY,
+    )
 )
 
 
