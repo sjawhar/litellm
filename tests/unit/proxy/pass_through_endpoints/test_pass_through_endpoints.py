@@ -32,6 +32,7 @@ from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.proxy._lazy_features import LazyFeature, attach_lazy_features
 from litellm.proxy._types import ProxyException, UserAPIKeyAuth
+from litellm.proxy.litellm_pre_call_utils import ROUTER_OWNED_REQUEST_FIELDS
 from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import router as llm_passthrough_router
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     DEFAULT_PASS_THROUGH_REQUEST_TIMEOUT_SECONDS,
@@ -1381,6 +1382,39 @@ async def test_pass_through_request_uses_resolved_timeout():
 
             mock_get_client.assert_called_once()
             assert mock_get_client.call_args[1]["params"]["timeout"] == 1500
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("allow_client_pricing_override", [True, False])
+async def test_pass_through_request_strips_client_guardrail_information(allow_client_pricing_override: bool):
+    mock_request = MagicMock(spec=Request)
+    mock_request.method = "POST"
+    mock_request.headers = Headers({})
+    mock_request.query_params = QueryParams({})
+
+    with patch("litellm.proxy.proxy_server.proxy_logging_obj") as mock_proxy_logging:
+        mock_proxy_logging.pre_call_hook = AsyncMock(side_effect=RuntimeError("stop before upstream"))
+        mock_proxy_logging.post_call_failure_hook = AsyncMock()
+        with pytest.raises(ProxyException):
+            await pass_through_request(
+                request=mock_request,
+                target="http://test.com",
+                custom_headers={},
+                user_api_key_dict=UserAPIKeyAuth(
+                    metadata={"allow_client_pricing_override": allow_client_pricing_override}
+                ),
+                custom_body={
+                    "model": "gpt-4o",
+                    "input_cost_per_token": 0.5,
+                    "metadata": {
+                        "trace_id": "keep-me",
+                        "standard_logging_guardrail_information": [{"guardrail_name": "forged", "guardrail_cost": 5.0}],
+                    },
+                },
+            )
+
+    hooked_body: Final = mock_proxy_logging.pre_call_hook.call_args.kwargs["data"]
+    assert hooked_body["metadata"] == {"trace_id": "keep-me"}
 
 
 @pytest.mark.asyncio
@@ -7810,7 +7844,12 @@ PROXY_STAMPED_NAMES: Final = frozenset(
 
 @pytest.mark.parametrize(
     "name",
-    sorted(frozenset(litellm.all_litellm_params) - frozenset(("metadata", "litellm_metadata")) - PROXY_STAMPED_NAMES),
+    sorted(
+        frozenset(litellm.all_litellm_params)
+        - frozenset(("metadata", "litellm_metadata"))
+        - PROXY_STAMPED_NAMES
+        - ROUTER_OWNED_REQUEST_FIELDS
+    ),
 )
 def test_passthrough_keeps_each_registered_litellm_owned_name_out_of_the_forwarded_body(name: str) -> None:
     split: Final = _split_pass_through_body(json.dumps({name: "owned", **json.loads(GEMINI_BODY)}))
@@ -7820,7 +7859,7 @@ def test_passthrough_keeps_each_registered_litellm_owned_name_out_of_the_forward
     assert split.forwarded_body == json.loads(GEMINI_BODY)
 
 
-@pytest.mark.parametrize("name", sorted(PROXY_STAMPED_NAMES))
+@pytest.mark.parametrize("name", sorted(PROXY_STAMPED_NAMES | ROUTER_OWNED_REQUEST_FIELDS))
 def test_passthrough_drops_a_client_supplied_proxy_stamped_name(name: str) -> None:
     split: Final = _split_pass_through_body(json.dumps({name: {"forged": "by-client"}, **json.loads(GEMINI_BODY)}))
 

@@ -27,9 +27,14 @@ from litellm.proxy.auth.auth_utils import (  # noqa: F401  # legacy module expor
     is_invalid_virtual_key_error,
     mark_invalid_virtual_key_error,
     normalize_request_route,
+    request_names_provider_fallback_models,
 )
 from litellm.proxy.auth.model_access_denied import ModelAccessDeniedHTTPException
-from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
+from litellm.proxy.db.exception_handler import LastGoodEntryMissing, PrismaDBExceptionHandler
+from litellm.types.proxy.auth.client_context import (
+    VERIFIED_CLIENT_CONTEXT_KEY,
+    VerifiedClientContext,
+)
 from litellm.types.services import ServiceTypes
 
 # Sentinel user_id for the synthetic UserAPIKeyAuth issued during a DB
@@ -74,6 +79,16 @@ def _as_proxy_exception(e: Exception) -> ProxyException:
         return e
     if PrismaDBExceptionHandler.is_database_service_unavailable_error(e):
         return PrismaDBExceptionHandler.service_unavailable_proxy_exception(e)
+    from litellm.router_utils.fallback_event_handlers import FallbackListShapeError
+
+    if isinstance(e, FallbackListShapeError):
+        # A malformed fallback list is the caller's request, refused with the 400 the Router and saved settings give
+        return ProxyException(
+            message=str(e),
+            type=ProxyErrorTypes.bad_request_error,
+            param=e.param,
+            code=status.HTTP_400_BAD_REQUEST,
+        )
     return ProxyException(
         message="Authentication Error, " + str(e),
         type=ProxyErrorTypes.auth_error,
@@ -89,6 +104,7 @@ def _get_user_agent(request: Request) -> str | None:
 
 
 _CLIENT_CONTEXT_FIELDS: Final = ("requester_ip_address", "user_agent")
+_CALLER_CLIENT_CONTEXT_NAMES: Final = frozenset((*_CLIENT_CONTEXT_FIELDS, VERIFIED_CLIENT_CONTEXT_KEY))
 
 
 _NO_METADATA: Final[Mapping[str, object]] = MappingProxyType({})
@@ -99,7 +115,9 @@ def _is_metadata_bucket(value: object) -> TypeIs[Mapping[str, object]]:  # guard
 
 
 def _without_client_context(metadata: Mapping[str, object]) -> Mapping[str, object]:
-    return MappingProxyType({name: value for name, value in metadata.items() if name not in _CLIENT_CONTEXT_FIELDS})
+    return MappingProxyType(
+        {name: value for name, value in metadata.items() if name not in _CALLER_CLIENT_CONTEXT_NAMES}
+    )
 
 
 def _with_client_context(
@@ -108,12 +126,18 @@ def _with_client_context(
     """Auth gate rejections are raised before `add_litellm_data_to_request` records the
     caller IP and User-Agent, so their failure logs would otherwise carry neither. At this
     point the body is the caller's own, so the request's values replace what it sent under
-    those names, and the bucket the logging layer does not read keeps neither."""
+    those names, and the bucket the logging layer does not read keeps neither.
+
+    The same values also go in as a `VerifiedClientContext`, so a reader that must not take
+    the caller's strings has something only the proxy can have put there."""
     key: Final = "litellm_metadata" if "litellm_metadata" in request_data else "metadata"
     other: Final = "metadata" if key == "litellm_metadata" else "litellm_metadata"
     metadata: Final = request_data.get(key)
     base: Final[Mapping[str, object]] = metadata if _is_metadata_bucket(metadata) else _NO_METADATA
-    stamped: Final = {name: value for name, value in zip(_CLIENT_CONTEXT_FIELDS, (requester_ip, user_agent)) if value}
+    stamped: Final[Mapping[str, object]] = {
+        **{name: value for name, value in zip(_CLIENT_CONTEXT_FIELDS, (requester_ip, user_agent)) if value},
+        VERIFIED_CLIENT_CONTEXT_KEY: VerifiedClientContext(requester_ip_address=requester_ip, user_agent=user_agent),
+    }
     other_metadata: Final = request_data.get(other)
     other_rewritten: Final = (
         {other: {**_without_client_context(other_metadata)}} if _is_metadata_bucket(other_metadata) else {}
@@ -138,6 +162,23 @@ def _identity_log_suffix(resolved_identity: UserAPIKeyAuth | None) -> str:
     )
     known: Final = " ".join(f"{name}={_escape_control_chars(value)}" for name, value in fields if value)
     return f"\nKey Identity: {known}" if known else ""
+
+
+def _outage_identity_would_skip_provider_fallback_checks(
+    e: Exception, request_data: Mapping[str, object], route: str, request: Request
+) -> bool:
+    """
+    Whether the database-outage identity would serve a request whose fallbacks Anthropic gets name a model, an identity
+    that carries none of the checks such a model needs. Read in the order of the handler's own condition: the setting
+    first, the classification of the error, which imports the optional database client, only with the setting on, and
+    the walk of the fallback lists only for an error the setting recovers. That condition reads the setting and the
+    classification again after this, deliberately: its two lines stay as they were, and both are cheap reads.
+    """
+    return (
+        PrismaDBExceptionHandler.should_allow_request_on_db_unavailable()
+        and PrismaDBExceptionHandler.is_database_connection_error(e)
+        and request_names_provider_fallback_models(request_data, route, request)
+    )
 
 
 class UserAPIKeyAuthExceptionHandler:
@@ -170,9 +211,12 @@ class UserAPIKeyAuthExceptionHandler:
             proxy_logging_obj,
         )
 
-        if (
+        # The fallback identity carries none of the checks a model in Anthropic's own fallbacks needs, so such a request
+        # gets the error as with the setting off
+        if not _outage_identity_would_skip_provider_fallback_checks(e, request_data, route, request) and (
             PrismaDBExceptionHandler.should_allow_request_on_db_unavailable()
             and PrismaDBExceptionHandler.is_database_connection_error(e)
+            and not isinstance(e, LastGoodEntryMissing)
         ):
             # log this as a DB failure on prometheus
             proxy_logging_obj.service_logging_obj.service_failure_hook(

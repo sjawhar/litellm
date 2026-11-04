@@ -48,12 +48,18 @@ from typing import (
 )
 
 import httpx
-from typing_extensions import Never, ReadOnly, TypedDict
+from typing_extensions import (
+    Never,
+    ReadOnly,
+    TypedDict,
+    TypeIs,  # noqa: TID251  # TypeIs reaches typing only on 3.13
+)
 
 from litellm import _custom_logger_compatible_callbacks_literal
 from litellm.constants import (
     DEFAULT_MODEL_CREATED_AT_TIME,
     FILE_USAGE_MAX_TRACKED_COUNTERS,
+    INTERNAL_CALL_ORIGIN_METADATA_KEY,
     LITELLM_HTTP_STATUS_CLIENT_DISCONNECTED,
     LITELLM_LOGGING_NO_UPSTREAM_LLM_CALL,
     MAX_TEAM_LIST_LIMIT,
@@ -170,7 +176,7 @@ from litellm.proxy._types import (
 )
 from litellm.proxy.agent_endpoints.auth.agent_access_groups import CeilingResolver, resolve_agent_access_group_ceiling
 from litellm.proxy.auth.route_checks import RouteChecks
-from litellm.proxy.common_utils.callback_utils import add_guardrail_to_applied_guardrails_header
+from litellm.proxy.common_utils.callback_utils import add_guardrail_to_applied_guardrails_header, strip_callback_config
 from litellm.proxy.common_utils.config_sync_pubsub import publish_config_param_change
 from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.proxy.db.create_views import (
@@ -237,7 +243,11 @@ from litellm.proxy.hooks.sensitive_data_routing import (  # noqa: F401, RUF100  
     PROXY_SensitiveDataRoutingHandler,
     _PROXY_SensitiveDataRoutingHandler,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
 )
-from litellm.proxy.litellm_pre_call_utils import LiteLLMProxyRequestSetup, add_guardrails_from_auth_metadata
+from litellm.proxy.litellm_pre_call_utils import (
+    LiteLLMProxyRequestSetup,
+    add_guardrails_from_auth_metadata,
+    strip_client_guardrail_information,
+)
 from litellm.proxy.management_helpers.key_settings_audit import with_settings_updated_at
 from litellm.proxy.policy_engine.pipeline_executor import PipelineExecutor
 from litellm.proxy.policy_engine.policy_registry import get_policy_registry
@@ -1229,6 +1239,36 @@ def _reached_deployment(litellm_logging_obj: Logging) -> bool:
     )
 
 
+# The router's failure callbacks count failures and RPM against the deployment ``model_info.id`` names and cool
+# it for ``cooldown_time``. On a request that reached no deployment the logging object can hold either only
+# because the proxy built it from the caller's body.
+_BODY_DEPLOYMENT_PARAMS: Final = frozenset(("model_info", "cooldown_time"))
+
+
+# What an auth-gate failure's spend row and daily aggregates read to name the provider, deployment, group, agent or
+# origin a request was served by or on behalf of. The proxy and the router write these only for a request the gate
+# authorized, so on a request it refused each one present came from the body.
+_AUTH_GATE_CALLER_ROOT_FIELDS: Final = frozenset(
+    ("model_info", "custom_llm_provider", "agent_id", "response_headers", "proxy_server_request")
+)
+_AUTH_GATE_CALLER_METADATA_FIELDS: Final = frozenset(
+    (
+        "model_info",
+        "model_group",
+        "deployment",
+        "original_model_group",
+        "routing_decision",
+        "agent_id",
+        "actor_agent_id",
+        "target_agent_id",
+        "billing_agent_id",
+        "agent_execution_mode",
+        "verified_human_user_id",
+        INTERNAL_CALL_ORIGIN_METADATA_KEY,
+    )
+)
+
+
 def _stamp_deployment_attribution(
     litellm_params: dict[str, object], model_group: str | None, team_id: str | None, dispatched: bool
 ) -> Mapping[str, object]:
@@ -1237,31 +1277,40 @@ def _stamp_deployment_attribution(
     callbacks key off it and must not count a proxy-side reject against the deployment. A failure
     after the provider handoff keeps the metadata the router stamped; a request that never reached a
     provider is flagged ``PROXY_REJECTED_BEFORE_ROUTING_KEY`` (deployment metrics key off it) whatever
-    its metadata says, since ``metadata.model_info`` can be caller supplied."""
+    its metadata says, since ``metadata.model_info`` can be caller supplied. Its ``deployment`` and
+    ``model_group`` always come from the router config, never from the caller's metadata: the group is the
+    requested name whenever the router routes it, with one deployment or several."""
     attribution: Final = _deployment_attribution_for_model_group(model_group, team_id)
     if "custom_llm_provider" in attribution:
         litellm_params["custom_llm_provider"] = attribution["custom_llm_provider"]
     if dispatched:
         return attribution
     litellm_params[PROXY_REJECTED_BEFORE_ROUTING_KEY] = True
-    if "model_info" not in attribution:
+    routing: Final = MappingProxyType(
+        {key: attribution[key] for key in ("deployment", "model_group") if key in attribution}
+    )
+    if not routing:
         return attribution
     if litellm_params.get("metadata") is None:
         litellm_params["metadata"] = {}
     metadata: Final = litellm_params["metadata"]
     if not isinstance(metadata, dict):
         return attribution
-    metadata.setdefault("model_info", attribution["model_info"])
-    metadata.setdefault("deployment", attribution["deployment"])
-    if isinstance(model_group, str):
-        metadata.setdefault("model_group", model_group)
+    if "model_info" in attribution:
+        metadata.setdefault("model_info", attribution["model_info"])
+    metadata.update(routing)
+    litellm_metadata: Final = litellm_params.get("litellm_metadata")
+    if isinstance(litellm_metadata, dict):
+        litellm_metadata.update(routing)
     return attribution
 
 
 def _deployment_attribution_for_model_group(model_group: object, team_id: str | None) -> Mapping[str, object]:
     """Provider fields the router would have stamped had it reached a deployment:
     ``custom_llm_provider`` when every deployment in the group resolves to the same
-    provider, plus ``model_info`` and ``deployment`` when the group has exactly one.
+    provider, plus ``model_info`` and ``deployment`` when the group has exactly one, and ``model_group``
+    whenever the router routes the name: the requested name itself (a group, an alias, a wildcard match, a team's
+    public name, a deployment id or a deployment's model name), which is what the router files a served call under.
     ``team_id`` picks the key's team deployments over a global group of the same public name."""
     if not isinstance(model_group, str):
         return _EMPTY_LIFT
@@ -1272,7 +1321,12 @@ def _deployment_attribution_for_model_group(model_group: object, team_id: str | 
         return _EMPTY_LIFT
     deployments: Final = llm_router.get_model_list(model_name=model_group, team_id=team_id)
     if not deployments:
-        return _EMPTY_LIFT
+        # A deployment id or a deployment's own model name routes too, outside any group lookup.
+        return (
+            MappingProxyType({"model_group": model_group})
+            if llm_router.has_model_id(model_group) or model_group in llm_router.deployment_names
+            else _EMPTY_LIFT
+        )
 
     def _provider_for_deployment(deployment: Mapping[str, object]) -> str | None:
         litellm_params: Final = cast(  # cast-ok: router deployment parameters are mapping-shaped
@@ -1301,6 +1355,7 @@ def _deployment_attribution_for_model_group(model_group: object, team_id: str | 
     )
     return MappingProxyType(
         {
+            "model_group": model_group,
             **({"custom_llm_provider": shared_provider} if shared_provider is not None else {}),
             **(
                 {
@@ -1326,8 +1381,94 @@ def _call_type_for_route(route: str | None) -> str | None:
     return call_types[0].value if len(operations) == 1 else None
 
 
+_CALLER_TEAM_IDENTITY_FIELDS: Final = frozenset(("team_id", "team_alias"))
+
+
+def _without_caller_identity_fields(metadata: Mapping[str, object]) -> Mapping[str, object]:
+    """Drop every name that says who the caller is. The ``user_api_key`` family is the proxy's own
+    identity stamp. ``team_id`` and ``team_alias`` sit outside it and are read as the team by the
+    ClickHouse spend row, the Datadog loggers, New Relic and the OTel span model whenever the
+    authenticated key has no team of its own."""
+    return {
+        key: value
+        for key, value in metadata.items()
+        if not (key.startswith("user_api_key") or key in _CALLER_TEAM_IDENTITY_FIELDS)
+    }
+
+
+def _is_metadata_bucket(value: object) -> TypeIs[Mapping[str, object]]:  # guard-ok: request metadata keys are str
+    return isinstance(value, dict)
+
+
+def proxy_stamped_metadata_bucket(request_data: Mapping[str, object]) -> Mapping[str, object] | None:
+    """The metadata bucket add_litellm_data_to_request wrote the authenticated identity into, or None when it
+    has not run. A request body can forge the ``user_api_key_*`` names but never the UserAPIKeyAuth instance.
+    Which bucket it is depends on the route, so a reader of a field the proxy owns must take this one rather
+    than ``metadata``, which on a ``litellm_metadata`` route holds the caller's provider metadata."""
+    buckets: Final = (request_data.get("metadata"), request_data.get("litellm_metadata"))
+    stamped: Final = tuple(
+        bucket
+        for bucket in buckets
+        if _is_metadata_bucket(bucket) and isinstance(bucket.get("user_api_key_auth"), UserAPIKeyAuth)
+    )
+    return stamped[0] if stamped else None
+
+
+def _proxy_stamped_request_metadata(request_data: Mapping[str, object]) -> bool:
+    return proxy_stamped_metadata_bucket(request_data) is not None
+
+
 _PROXY_ONLY_LLM_API_ERRORS: Final = (HTTPException, ProxyException, GuardrailRaisedException)
 _LOG_DB_METRICS_CALL_TYPES: Final = frozenset(("get_data", "insert_data", "update_data", "delete_data"))
+_PROXY_ONLY_ERROR_LOGGED_FIELDS: Final = frozenset(
+    {"model", "messages", "input", "prompt", "user", "stream", "litellm_call_id"}
+)
+
+
+def _as_str_mapping(value: object) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        return MappingProxyType({})
+    return cast(  # cast-ok: the runtime Mapping check validates the container shape
+        Mapping[str, object], value
+    )
+
+
+def _proxy_only_error_logged_metadata_keys(*, authenticated: bool, past_pre_call: bool) -> frozenset[str]:
+    return frozenset(
+        key
+        for key, logged in (("tags", authenticated), ("standard_logging_guardrail_information", past_pre_call))
+        if logged
+    )
+
+
+def _is_logged_metadata_value(key: str, value: object) -> bool:
+    return key != "tags" or (isinstance(value, list) and all(isinstance(item, str) for item in value))
+
+
+def _proxy_only_error_log_metadata(value: object, logged_keys: frozenset[str]) -> dict[str, object] | None:
+    if not isinstance(value, Mapping):
+        return None
+    metadata: Final = _as_str_mapping(value)
+    return {
+        key: value for key, value in metadata.items() if key in logged_keys and _is_logged_metadata_value(key, value)
+    }
+
+
+def _proxy_only_error_log_fields(
+    request_data: Mapping[str, object], logged_metadata_keys: frozenset[str]
+) -> Mapping[str, object]:
+    metadata_fields: Final = {
+        key: filtered_metadata
+        for key in ("metadata", "litellm_metadata")
+        if (filtered_metadata := _proxy_only_error_log_metadata(request_data.get(key), logged_metadata_keys))
+        is not None
+    }
+    return MappingProxyType(
+        {
+            **{key: value for key, value in request_data.items() if key in _PROXY_ONLY_ERROR_LOGGED_FIELDS},
+            **metadata_fields,
+        }
+    )
 
 
 _EXCEPTION_CHAIN_MAX_DEPTH: Final = 16
@@ -3607,6 +3748,7 @@ class ProxyLogging:
                 user_api_key_dict=user_api_key_dict,
                 route=route,
                 original_exception=original_exception,
+                error_type=error_type,
             )
 
         request_data.update(
@@ -3695,6 +3837,7 @@ class ProxyLogging:
         user_api_key_dict: UserAPIKeyAuth,
         route: str | None = None,
         original_exception: Exception | None = None,
+        error_type: ProxyErrorTypes | None = None,
     ):
         """
         Handle logging for proxy only errors by calling `litellm_logging_obj.async_failure_handler`
@@ -3702,24 +3845,75 @@ class ProxyLogging:
         Is triggered when self._is_proxy_only_error() returns True
         """
         litellm_logging_obj: Logging | None = request_data.get("litellm_logging_obj", None)
+        logged_metadata_keys: Final = _proxy_only_error_logged_metadata_keys(
+            authenticated=error_type != ProxyErrorTypes.auth_error, past_pre_call=litellm_logging_obj is not None
+        )
+        user_api_key_logged_metadata: Final = LiteLLMProxyRequestSetup.get_sanitized_user_information_from_key(
+            user_api_key_dict=user_api_key_dict
+        )
         if litellm_logging_obj is None:
             from litellm._uuid import uuid
 
             request_data.setdefault("litellm_call_id", str(uuid.uuid4()))
-            user_api_key_logged_metadata: Final = LiteLLMProxyRequestSetup.get_sanitized_user_information_from_key(
-                user_api_key_dict=user_api_key_dict
+            # Without a logging object the request either never reached its route's request setup (the auth gate, a
+            # route's own check) or passed it, and the setup removes a body's root litellm_params. A copy here is the
+            # body's, and the failure callbacks would read it as the parameters of a call that never happened.
+            request_data.pop("litellm_params", None)
+            authenticated_metadata: Final = {
+                **user_api_key_logged_metadata,
+                "user_api_key_team_metadata": strip_callback_config(user_api_key_dict.team_metadata),
+            }
+            proxy_stamped: Final = _proxy_stamped_request_metadata(request_data)
+            if proxy_stamped:
+                request_data["metadata"] = {  # rebind-ok: the proxy already wrote this request's identity
+                    **(request_data.get("metadata") or {}),
+                    **user_api_key_logged_metadata,
+                }
+            else:
+                # An auth-gate rejection never reaches add_litellm_data_to_request, so the body still holds
+                # whatever user_api_key fields the caller sent in either metadata bucket.
+                caller_litellm_metadata: Final = request_data.get("litellm_metadata")
+                if isinstance(caller_litellm_metadata, dict):
+                    request_data["litellm_metadata"] = _without_caller_identity_fields(  # rebind-ok: drops forgeries
+                        caller_litellm_metadata
+                    )
+                request_data["metadata"] = {  # rebind-ok: replaces forged identity with the authenticated one
+                    **_without_caller_identity_fields(request_data.get("metadata") or {}),
+                    **authenticated_metadata,
+                }
+                # No guardrail of the proxy runs before the stamp (they run in pre_call_hook), so a guardrail record
+                # here is the caller's, and the failure spend row would bill its cost.
+                strip_client_guardrail_information(request_data)
+                if error_type == ProxyErrorTypes.auth_error:
+                    # The gate did not authorize this request, so nothing its body claims about the deployment,
+                    # group, provider or agent is taken: the failure record takes its deployment, group and provider
+                    # from the router config and names no agent.
+                    for field in _AUTH_GATE_CALLER_ROOT_FIELDS & request_data.keys():
+                        request_data.pop(field)
+                    request_data.update(
+                        {
+                            bucket: {
+                                k: v for k, v in caller_bucket.items() if k not in _AUTH_GATE_CALLER_METADATA_FIELDS
+                            }
+                            for bucket in ("metadata", "litellm_metadata")
+                            if isinstance(caller_bucket := request_data.get(bucket), dict)
+                        }
+                    )
+            # The logging object starts from what the proxy wrote for this request, as a route's own logging
+            # object does: each bucket it stamped, else the identity written above. The body adds the allowlist.
+            proxy_written_metadata: Final = (
+                {bucket: request_data[bucket] for bucket in ("metadata", "litellm_metadata") if bucket in request_data}
+                if proxy_stamped
+                else {"metadata": authenticated_metadata}
             )
 
             litellm_logging_obj, data = litellm.utils.function_setup(
                 original_function=route or "IGNORE_THIS",
                 rules_obj=litellm.utils.Rules(),
                 start_time=datetime.now(),
-                **request_data,
+                **{**_proxy_only_error_log_fields(request_data, logged_metadata_keys), **proxy_written_metadata},
             )
             request_data["litellm_logging_obj"] = litellm_logging_obj  # rebind-ok: lifted then popped by the caller
-            if "metadata" not in request_data:
-                request_data["metadata"] = {}
-            request_data["metadata"].update(user_api_key_logged_metadata)
 
         if litellm_logging_obj is not None:
             ## UPDATE LOGGING INPUT
@@ -3727,24 +3921,86 @@ class ProxyLogging:
             _litellm_params: Final = {}
 
             litellm_param_keys: Final = LoggedLiteLLMParams.__annotations__.keys()
-            for k, v in request_data.items():
+            # A pass-through route puts the litellm_params and call_type it built into request_data itself, and
+            # returns below before any failure handler runs; on every other route the body adds only the allowlist.
+            logged_fields: Final = (
+                request_data
+                if litellm_logging_obj.call_type == CallTypes.pass_through.value
+                else _proxy_only_error_log_fields(request_data, logged_metadata_keys)
+            )
+            for k, v in logged_fields.items():
                 if k in litellm_param_keys:
                     _litellm_params[k] = v
                 elif k not in ("model", "user", "litellm_logging_obj"):
                     _optional_params[k] = v
 
+            existing: Final = _as_str_mapping(litellm_logging_obj.litellm_params)
+            litellm_params: Final = {
+                **_litellm_params,
+                "metadata": {
+                    **_as_str_mapping(existing.get("metadata")),
+                    **_as_str_mapping(_litellm_params.get("metadata")),
+                    **user_api_key_logged_metadata,
+                },
+                **{
+                    key: {
+                        **_as_str_mapping(existing.get(key)),
+                        **_as_str_mapping(value),
+                        **user_api_key_logged_metadata,
+                    }
+                    for key, value in _litellm_params.items()
+                    if key == "litellm_metadata"
+                },
+            }
+
+            dispatched: Final = _reached_deployment(litellm_logging_obj)
+            if not dispatched:
+                # update_environment_variables keeps what the logging object already holds.
+                litellm_logging_obj.litellm_params = {
+                    key: value for key, value in existing.items() if key not in _BODY_DEPLOYMENT_PARAMS
+                }
+                if litellm_logging_obj.call_type != CallTypes.pass_through.value:
+                    # A group in a metadata bucket that names another model than the one requested came from the body:
+                    # the routes that write their own group before the setup (A2A, the MCP REST tool call, search) write
+                    # the requested model's name. It leaves the request's buckets, which the failure callbacks read, and
+                    # the logging object's; the group the router would file the requested name under is stamped below.
+                    requested: Final = request_data.get("model")
+                    for holder, held_before in ((request_data, _EMPTY_LIFT), (litellm_params, existing)):
+                        holder.update(
+                            {
+                                bucket: {k: v for k, v in held.items() if k != "model_group" or v == requested}
+                                for bucket in ("metadata", "litellm_metadata")
+                                if isinstance(held := holder.get(bucket, held_before.get(bucket)), Mapping)
+                            }
+                        )
             attribution: Final = _stamp_deployment_attribution(
-                _litellm_params,
+                litellm_params,
                 request_data.get("model"),
                 user_api_key_dict.team_id,
-                dispatched=_reached_deployment(litellm_logging_obj),
+                dispatched=dispatched,
             )
+            if (
+                not dispatched
+                and "model_group" in attribution
+                and litellm_logging_obj.call_type != CallTypes.pass_through.value
+            ):
+                # The failure callbacks read the group from the request's own metadata, which on a request that reached
+                # no deployment still holds whatever the body named there. The routes that write their own group before
+                # the setup (A2A, the MCP REST tool call, search) write the requested model's name, so this either
+                # leaves their group alone (a name the router does not route) or writes the same name.
+                request_data.update(
+                    {
+                        bucket: {**held, "model_group": attribution["model_group"]}
+                        for bucket in ("metadata", "litellm_metadata")
+                        if isinstance(held := request_data.get(bucket), dict)
+                    }
+                )
 
             litellm_logging_obj.update_environment_variables(
                 model=request_data.get("model", ""),
                 user=request_data.get("user", ""),
                 optional_params=_optional_params,
-                litellm_params=_litellm_params,
+                litellm_params=litellm_params,
                 **(
                     {"custom_llm_provider": attribution["custom_llm_provider"]}
                     if "custom_llm_provider" in attribution

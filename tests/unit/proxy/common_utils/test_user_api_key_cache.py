@@ -1,21 +1,45 @@
+import asyncio
 import hashlib
 import json
-from typing import Any
+import logging
+import math
+from collections.abc import Awaitable, Callable, Sequence
+from typing import Any, Final, Literal
 
 import pytest
+from fakeredis import FakeServer
 
 from litellm.caching.dual_cache import DualCache
 from litellm.caching.in_memory_cache import InMemoryCache
 from litellm.caching.redis_cache import RedisCache
-from litellm.constants import DEFAULT_MANAGEMENT_OBJECT_IN_MEMORY_CACHE_TTL
+from litellm.constants import (
+    DEFAULT_MANAGEMENT_OBJECT_IN_MEMORY_CACHE_TTL,
+    LAST_GOOD_ENTRY_TTL_SECONDS,
+    LAST_GOOD_TOMBSTONE_TTL_SECONDS,
+)
+from litellm.models.team import LiteLLM_TeamTableCachedObj
 from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy.common_utils.cache_pydantic_utils import CacheCodec
 from litellm.proxy.common_utils.user_api_key_cache import (
+    LAST_GOOD_LATE_STORE_MARGIN_SECONDS,
+    LAST_GOOD_REVOCATION_PASSES,
+    LastGoodMemory,
     UserApiKeyCache,
     end_user_cache_key,
+    forget_last_good,
     get_management_object_ttl,
     is_user_key_cache_key,
+    last_good_auth_entries_scope,
+    last_good_reads_started_at,
+    recall_last_good,
+    remember_last_good,
+    revoke_and_delete_read_rows,
+    revoke_last_good,
+    revoke_last_good_then,
+    start_last_good_reads,
 )
 from litellm.proxy.proxy_server import UserAPIKeyCacheTTLEnum
+from tests.unit.caching.fake_redis_cache import ScriptedPipelines, drive_fake_redis_time, fake_redis_cache
 
 HASHED_TOKEN = hashlib.sha256(b"sk-lit7563-hot-key").hexdigest()
 
@@ -32,6 +56,182 @@ class CapturingInMemoryCache(InMemoryCache):
         super().set_cache(key, value, **kwargs)
 
 
+class _DeleteLandsDuringWrite(RedisCache):
+    """The reading pod's Redis: another pod's delete lands just before this pod's entry write reaches Redis."""
+
+    def __init__(self, redis: RedisCache, deleting_pod: UserApiKeyCache) -> None:
+        self._redis = redis
+        self._deleting_pod = deleting_pod
+
+    async def async_get_cache_or_raise(self, key: str) -> object:
+        return await self._redis.async_get_cache_or_raise(key)
+
+    async def async_set_cache_or_raise(
+        self, key: str, value: object, ttl: int | None = None, *, expire_at: int | None = None
+    ) -> None:
+        if key.startswith("last_good:"):
+            await forget_last_good(self._deleting_pod, key.removeprefix("last_good:"), tombstone=True)
+        await self._redis.async_set_cache_or_raise(key, value, ttl=ttl, expire_at=expire_at)
+
+    async def async_delete_cache(self, key: str) -> None:
+        await self._redis.async_delete_cache(key)
+
+
+class _UndoFailsAfterADeleteLandsDuringWrite(_DeleteLandsDuringWrite):
+    """As ``_DeleteLandsDuringWrite``, and Redis goes away before the reading pod can take its write back."""
+
+    async def async_delete_cache(self, key: str) -> None:
+        raise ConnectionError("Redis went away before the write was taken back")
+
+
+class _FailsAfterTheWrite(RedisCache):
+    """The reading pod's Redis: the entry write lands, then its answer or the tombstone check after it fails, as when
+    Redis goes away in the middle of a store."""
+
+    def __init__(self, redis: RedisCache, failing: Literal["write", "tombstone check"]) -> None:
+        self._redis = redis
+        self._failing = failing
+        self.wrote = False
+
+    async def async_get_cache_or_raise(self, key: str) -> object:
+        if self.wrote and self._failing == "tombstone check":
+            raise ConnectionError("Redis went away after the write")
+        return await self._redis.async_get_cache_or_raise(key)
+
+    async def async_set_cache_or_raise(
+        self, key: str, value: object, ttl: int | None = None, *, expire_at: int | None = None
+    ) -> None:
+        await self._redis.async_set_cache_or_raise(key, value, ttl=ttl, expire_at=expire_at)
+        self.wrote = True  # rebind-ok: records that the write reached Redis
+        if self._failing == "write":
+            raise TimeoutError("the write reached Redis but its answer was lost")
+
+    async def async_delete_cache(self, key: str) -> None:
+        await self._redis.async_delete_cache(key)
+
+
+# How far the wall clock a test drives runs ahead of _Clock: a quarter second into a Unix second, so that a store's
+# rounding of the end down to a whole second shows
+_WALL_CLOCK_AHEAD_SECONDS: Final = 1_700_000_000.25
+
+
+class _Clock:
+    """The last good entries' clock, which a test moves instead of sleeping. ``wall`` is the wall clock that moves with
+    it, for ``last_good_wall_clock`` and for fake Redis (``drive_fake_redis_time``)."""
+
+    def __init__(self, now: float = 1000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def wall(self) -> float:
+        return self.now + _WALL_CLOCK_AHEAD_SECONDS
+
+    def move_to_wall(self, wall: float) -> None:
+        self.now = wall - _WALL_CLOCK_AHEAD_SECONDS
+
+
+class _SlowTombstoneCheck(RedisCache):
+    """The reading pod's Redis: its first read, the tombstone check before the entry write, takes ``seconds``."""
+
+    def __init__(self, redis: RedisCache, clock: _Clock, seconds: float) -> None:
+        self._redis = redis
+        self._clock = clock
+        self._seconds = seconds
+
+    async def async_get_cache_or_raise(self, key: str) -> object:
+        answer: Final = await self._redis.async_get_cache_or_raise(key)
+        self._clock.now += self._seconds
+        self._seconds = 0.0  # rebind-ok: only the first read is slow
+        return answer
+
+    async def async_set_cache_or_raise(
+        self, key: str, value: object, ttl: int | None = None, *, expire_at: int | None = None
+    ) -> None:
+        await self._redis.async_set_cache_or_raise(key, value, ttl=ttl, expire_at=expire_at)
+
+    async def async_delete_cache(self, key: str) -> None:
+        await self._redis.async_delete_cache(key)
+
+
+class _FailsSlowlyBeforeTheWrite(RedisCache):
+    """The reading pod's Redis: the tombstone check before the entry write fails after ``seconds``, as a Redis that
+    times out does."""
+
+    def __init__(self, clock: _Clock, seconds: float) -> None:
+        self._clock = clock
+        self._seconds = seconds
+
+    async def async_get_cache_or_raise(self, key: str) -> object:
+        self._clock.now += self._seconds
+        raise TimeoutError("Redis did not answer the tombstone check")
+
+
+class _SlowWrite(RedisCache):
+    """The pod's Redis: each write takes ``seconds`` before it lands, an entry's SET or a revocation's one batch of
+    tombstone SETs and entry DELs; the keys it SETs are recorded in order, and each batch's SETs on their own."""
+
+    def __init__(self, redis: RedisCache, clock: _Clock, seconds: float) -> None:
+        self._redis = redis
+        self._clock = clock
+        self.seconds = seconds
+        self.set_keys: Final[list[str]] = []  # mutable-ok: records every SET in order
+        self.batches: Final[list[tuple[str, ...]]] = []  # mutable-ok: records each revocation batch's SETs in order
+
+    async def async_get_cache_or_raise(self, key: str) -> object:
+        return await self._redis.async_get_cache_or_raise(key)
+
+    async def async_set_cache_or_raise(
+        self, key: str, value: object, ttl: int | None = None, *, expire_at: int | None = None
+    ) -> None:
+        self._clock.now += self.seconds
+        self.set_keys.append(key)
+        await self._redis.async_set_cache_or_raise(key, value, ttl=ttl, expire_at=expire_at)
+
+    async def async_delete_cache(self, key: str) -> None:
+        await self._redis.async_delete_cache(key)
+
+    async def async_set_then_delete_or_raise(
+        self, set_keys: Sequence[str], value: object, ttl: int, delete_keys: Sequence[str]
+    ) -> None:
+        self._clock.now += self.seconds
+        self.set_keys.extend(set_keys)
+        self.batches.append(tuple(set_keys))
+        await self._redis.async_set_then_delete_or_raise(set_keys, value, ttl, delete_keys)
+
+
+class _LostRightAfterASlowWrite(_SlowWrite):
+    """As ``_SlowWrite``, and the Redis server is lost right after each entry's SET lands, until the test restores it:
+    the tombstone check after the entry's write and the undo both fail."""
+
+    def __init__(self, redis: RedisCache, server: FakeServer, clock: _Clock, seconds: float) -> None:
+        super().__init__(redis, clock, seconds)
+        self._server = server
+
+    async def async_set_cache_or_raise(
+        self, key: str, value: object, ttl: int | None = None, *, expire_at: int | None = None
+    ) -> None:
+        await super().async_set_cache_or_raise(key, value, ttl, expire_at=expire_at)
+        self._server.connected = False
+
+
+async def _held_in(redis: RedisCache, cache: UserApiKeyCache, cache_key: str) -> tuple[bool, bool]:
+    """Whether the Redis server and this pod's memory each hold the last good entry for ``cache_key``."""
+    return (
+        await redis.init_async_client().get(f"last_good:{cache_key}") is not None,
+        cache.last_good_memory.get(cache_key) is not None,
+    )
+
+
+def _cache_on_driven_clocks(monkeypatch: pytest.MonkeyPatch, clock: _Clock, redis: RedisCache) -> UserApiKeyCache:
+    """A cache serving last good entries whose stores, and every fake Redis server, run on ``clock`` and its wall."""
+    drive_fake_redis_time(monkeypatch, clock.wall)
+    return UserApiKeyCache(
+        redis_cache=redis, serve_last_good_entries=True, last_good_clock=clock, last_good_wall_clock=clock.wall
+    )
+
+
 class FakeRedisCache(RedisCache):
     """
     In-memory fake that enforces the UserApiKeyCache Redis payload contract.
@@ -46,7 +246,7 @@ class FakeRedisCache(RedisCache):
     Records the ``ttl`` kwarg DualCache forwards on each Redis write for tests.
     """
 
-    def __init__(self):  # noqa: super().__init__ skipped intentionally
+    def __init__(self):
         self._store: dict[str, str] = {}
         self.last_ttl: Any = None
 
@@ -485,3 +685,1485 @@ class TestManagementObjectTTL:
         )
 
         assert mem.last_ttl == 300
+
+
+class TestLastGoodEntries:
+    """The last good team or key entry: Redis first, this pod's memory when Redis cannot answer, both until the entry
+    expires ``LAST_GOOD_ENTRY_TTL_SECONDS`` after the database read that stored it."""
+
+    @staticmethod
+    def _team(team_id: str, alias: str = "alias") -> LiteLLM_TeamTableCachedObj:
+        return LiteLLM_TeamTableCachedObj(team_id=team_id, team_alias=alias, models=["claude-opus-5-5"])
+
+    @pytest.mark.asyncio
+    async def test_the_redis_entry_ends_with_the_memory_line(self, monkeypatch: pytest.MonkeyPatch):
+        """The end is taken as the store begins, from the moment the read began, rounded down to a whole Unix second:
+        Redis gets it as an absolute expiry, so the 30.5 s the tombstone check before the write takes do not move it,
+        and the memory line ends at that same instant."""
+        clock: Final = _Clock()
+        redis: Final = fake_redis_cache()
+        cache: Final = _cache_on_driven_clocks(
+            monkeypatch, clock, _SlowTombstoneCheck(redis.cache, clock, seconds=30.5)
+        )
+        expire_at: Final = math.floor(clock.wall() + LAST_GOOD_ENTRY_TTL_SECONDS)
+
+        with last_good_reads_started_at(clock()):
+            await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        assert await redis.cache.init_async_client().expiretime("last_good:team_id:t1") == expire_at
+        redis.server.connected = False
+        clock.move_to_wall(expire_at - 0.001)
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) == self._team("t1")
+        clock.move_to_wall(expire_at)
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
+
+    @pytest.mark.asyncio
+    async def test_an_outage_is_served_an_entry_inside_its_expiry_and_not_one_older(self):
+        clock = _Clock()
+        redis = fake_redis_cache()
+        cache = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=clock)
+        with last_good_reads_started_at(clock()):
+            await remember_last_good(cache, "team_id:t1", self._team("t1"))
+        redis.server.connected = False
+
+        clock.now += LAST_GOOD_ENTRY_TTL_SECONDS - 1
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) == self._team("t1")
+        clock.now += 1
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
+
+    @pytest.mark.asyncio
+    async def test_serving_an_entry_does_not_extend_its_expiry(self):
+        """Only a database read sets an entry's time: an entry served from Redis and then from memory during an
+        outage still ends where its read put it."""
+        clock = _Clock()
+        redis = fake_redis_cache()
+        cache = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=clock)
+        stored_at: Final = clock.now
+        with last_good_reads_started_at(clock()):
+            await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        clock.now = stored_at + LAST_GOOD_ENTRY_TTL_SECONDS / 2
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) == self._team("t1")
+        redis.server.connected = False
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) == self._team("t1")
+        clock.now = stored_at + LAST_GOOD_ENTRY_TTL_SECONDS
+
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
+
+    @pytest.mark.asyncio
+    async def test_a_thirty_day_expiry_still_serves_an_entry_far_older_than_the_default(self, monkeypatch):
+        thirty_days: Final = 2592000
+        monkeypatch.setattr(
+            "litellm.proxy.common_utils.user_api_key_cache.LAST_GOOD_ENTRY_TTL_SECONDS", thirty_days
+        )
+        clock = _Clock()
+        redis = fake_redis_cache()
+        cache = _cache_on_driven_clocks(monkeypatch, clock, redis.cache)
+        with last_good_reads_started_at(clock()):
+            await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        assert await redis.cache.init_async_client().expiretime("last_good:team_id:t1") == math.floor(
+            clock.wall() + thirty_days
+        )
+        redis.server.connected = False
+        clock.now += thirty_days - 1
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) == self._team("t1")
+        clock.now += 1
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
+
+    @pytest.mark.asyncio
+    async def test_an_entry_ends_its_expiry_after_its_read_began_not_after_its_store(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The read began at 0 and its store completed at 100: the entry ends at the expiry after 0, in memory and in
+        Redis, not 100 s later."""
+        clock: Final = _Clock(0.0)
+        redis: Final = fake_redis_cache()
+        cache: Final = _cache_on_driven_clocks(monkeypatch, clock, redis.cache)
+        read_began_on_the_wall: Final = clock.wall()
+        with last_good_reads_started_at(0.0):
+            clock.now = 100.0
+            await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        assert await redis.cache.init_async_client().expiretime("last_good:team_id:t1") == math.floor(
+            read_began_on_the_wall + LAST_GOOD_ENTRY_TTL_SECONDS
+        )
+        redis.server.connected = False
+        clock.now = LAST_GOOD_ENTRY_TTL_SECONDS - 1
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) == self._team("t1")
+        clock.now = LAST_GOOD_ENTRY_TTL_SECONDS
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("entry_ttl_seconds", [LAST_GOOD_ENTRY_TTL_SECONDS, 2592000])
+    async def test_a_store_that_completes_after_the_tombstone_of_a_delete_lapsed_keeps_nothing(
+        self, entry_ttl_seconds: int, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ):
+        """A read begins, another pod deletes the team and leaves its tombstone, the tombstone lapses, and only then
+        does the read's store complete: whatever the entry's expiry, the deleted team is kept nowhere."""
+        monkeypatch.setattr(
+            "litellm.proxy.common_utils.user_api_key_cache.LAST_GOOD_ENTRY_TTL_SECONDS", entry_ttl_seconds
+        )
+        clock: Final = _Clock()
+        redis: Final = fake_redis_cache()
+        deleting_pod: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+        reading_pod: Final = UserApiKeyCache(
+            redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=clock
+        )
+        read_started_at: Final = clock()
+        await forget_last_good(deleting_pod, "team_id:t1", tombstone=True)
+        # The tombstone lapses: Redis expires it, and the reading pod's clock passes its whole life
+        await redis.cache.init_async_client().delete("last_good_tombstone:team_id:t1")
+        clock.now += LAST_GOOD_TOMBSTONE_TTL_SECONDS
+
+        with last_good_reads_started_at(read_started_at), caplog.at_level(logging.WARNING, logger="LiteLLM Proxy"):
+            await remember_last_good(reading_pod, "team_id:t1", self._team("t1"))
+
+        assert await redis.cache.init_async_client().get("last_good:team_id:t1") is None
+        assert reading_pod.last_good_memory.get("team_id:t1") is None
+        assert any(r.levelname == "WARNING" and "team_id:t1" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "lateness", ["no start", "an old start", "late after the check before the write", "late while Redis fails"]
+    )
+    async def test_a_store_late_before_its_write_keeps_the_entry_an_earlier_read_kept(
+        self, lateness: str, caplog: pytest.LogCaptureFixture
+    ):
+        """A store with no recorded start, or one already late before its write, says nothing about a revocation: it
+        writes and deletes nothing, so the entry an earlier, timely read kept stays in Redis and in this pod's memory
+        until its own expiry."""
+        clock: Final = _Clock()
+        redis: Final = fake_redis_cache()
+        late_after: Final = LAST_GOOD_TOMBSTONE_TTL_SECONDS - LAST_GOOD_LATE_STORE_MARGIN_SECONDS
+        reading_pod_redis: Final[dict[str, RedisCache]] = {
+            "no start": redis.cache,
+            "an old start": redis.cache,
+            "late after the check before the write": _SlowTombstoneCheck(redis.cache, clock, seconds=late_after),
+            "late while Redis fails": _FailsSlowlyBeforeTheWrite(clock, seconds=late_after),
+        }
+        reading_pod: Final = UserApiKeyCache(
+            redis_cache=reading_pod_redis[lateness], serve_last_good_entries=True, last_good_clock=clock
+        )
+        earlier_pod: Final = UserApiKeyCache(
+            redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=clock
+        )
+        before: Final = self._team("t1", alias="before")
+        with last_good_reads_started_at(clock()):
+            await remember_last_good(earlier_pod, "team_id:t1", before)
+        assert reading_pod.last_good_memory.set(
+            "team_id:t1", CacheCodec.serialize(before), ends_at=clock() + LAST_GOOD_ENTRY_TTL_SECONDS
+        )
+        starts: Final = {"no start": None, "an old start": clock() - late_after}
+
+        with last_good_reads_started_at(starts.get(lateness, clock())):
+            with caplog.at_level(logging.WARNING, logger="LiteLLM Proxy"):
+                await remember_last_good(reading_pod, "team_id:t1", self._team("t1", alias="after"))
+
+        # Redis answers for the earlier pod, so its recall shows what Redis holds
+        assert await recall_last_good(earlier_pod, "team_id:t1", LiteLLM_TeamTableCachedObj) == before
+        assert reading_pod.last_good_memory.get("team_id:t1") == CacheCodec.serialize(before)
+        assert any(r.levelname == "WARNING" and "team_id:t1" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_a_store_that_turns_late_during_its_write_is_undone_and_drops_the_memory_line(self):
+        """The write replaced the entry an earlier read kept, so taking it back leaves no entry in Redis, and this
+        pod's memory copy goes too, as for every undone store."""
+        clock: Final = _Clock()
+        redis: Final = fake_redis_cache()
+        late_after: Final = LAST_GOOD_TOMBSTONE_TTL_SECONDS - LAST_GOOD_LATE_STORE_MARGIN_SECONDS
+        earlier_pod: Final = UserApiKeyCache(
+            redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=clock
+        )
+        reading_pod: Final = UserApiKeyCache(
+            redis_cache=_SlowWrite(redis.cache, clock, seconds=late_after),
+            serve_last_good_entries=True,
+            last_good_clock=clock,
+        )
+        before: Final = self._team("t1", alias="before")
+
+        with last_good_reads_started_at(clock()):
+            await remember_last_good(earlier_pod, "team_id:t1", before)
+            assert reading_pod.last_good_memory.set(
+                "team_id:t1", CacheCodec.serialize(before), ends_at=clock() + LAST_GOOD_ENTRY_TTL_SECONDS
+            )
+            await remember_last_good(reading_pod, "team_id:t1", self._team("t1", alias="after"))
+
+        assert await redis.cache.init_async_client().get("last_good:team_id:t1") is None
+        assert reading_pod.last_good_memory.get("team_id:t1") is None
+
+    @pytest.mark.asyncio
+    async def test_a_set_redis_runs_100_s_late_is_kept_and_both_copies_end_at_the_reads_deadline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The SET carries the end the store took before sending it, as an absolute expiry, so a SET that Redis runs
+        100 s later, far inside the time a tombstone stands, is kept: Redis still drops the entry at the read's
+        deadline, the instant the memory line ends, and not 100 s past it."""
+        clock: Final = _Clock()
+        redis: Final = fake_redis_cache()
+        cache: Final = _cache_on_driven_clocks(monkeypatch, clock, _SlowWrite(redis.cache, clock, seconds=100))
+        expire_at: Final = math.floor(clock.wall() + LAST_GOOD_ENTRY_TTL_SECONDS)
+
+        with last_good_reads_started_at(clock()):
+            await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        assert await redis.cache.init_async_client().expiretime("last_good:team_id:t1") == expire_at
+        clock.move_to_wall(expire_at - 0.01)
+        assert await _held_in(redis.cache, cache, "team_id:t1") == (True, True)
+        clock.move_to_wall(expire_at + 0.01)
+        assert await _held_in(redis.cache, cache, "team_id:t1") == (False, False)
+
+    @pytest.mark.asyncio
+    async def test_a_late_set_whose_check_and_undo_both_fail_leaves_an_entry_that_ends_at_the_reads_deadline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Redis runs the SET 100 s late and is lost right after it, so the tombstone check after the write and the
+        undo both fail, and Redis comes back later: the entry left in Redis ends at the read's deadline, as its
+        absolute expiry says, not 100 s past it, and this pod keeps no memory line."""
+        clock: Final = _Clock()
+        redis: Final = fake_redis_cache()
+        cache: Final = _cache_on_driven_clocks(
+            monkeypatch, clock, _LostRightAfterASlowWrite(redis.cache, redis.server, clock, seconds=100)
+        )
+        expire_at: Final = math.floor(clock.wall() + LAST_GOOD_ENTRY_TTL_SECONDS)
+
+        with last_good_reads_started_at(clock()):
+            await remember_last_good(cache, "team_id:t1", self._team("t1"))
+        redis.server.connected = True
+
+        clock.move_to_wall(expire_at - 0.01)
+        assert await _held_in(redis.cache, cache, "team_id:t1") == (True, False)
+        clock.move_to_wall(expire_at + 0.01)
+        assert await _held_in(redis.cache, cache, "team_id:t1") == (False, False)
+
+    @pytest.mark.asyncio
+    async def test_a_store_whose_end_passed_before_it_began_sends_no_set_and_keeps_the_earlier_entry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A 10 s expiry, and a read that began 9.5 s ago a quarter second into a Unix second: rounded down to a whole
+        second, its end has passed when the store begins. No SET is sent and nothing goes into memory, so the entry an
+        earlier read kept stays in Redis and in memory until its own expiry."""
+        monkeypatch.setattr(  # test-quality-ok: the store reads the entry's expiry from this module's constant
+            "litellm.proxy.common_utils.user_api_key_cache.LAST_GOOD_ENTRY_TTL_SECONDS", 10
+        )
+        clock: Final = _Clock()
+        redis: Final = _SlowWrite(fake_redis_cache().cache, clock, seconds=0.0)
+        cache: Final = _cache_on_driven_clocks(monkeypatch, clock, redis)
+        before: Final = self._team("t1", alias="before")
+        with last_good_reads_started_at(clock()):
+            await remember_last_good(cache, "team_id:t1", before)
+        redis.set_keys.clear()
+
+        with last_good_reads_started_at(clock() - 9.5):
+            await remember_last_good(cache, "team_id:t1", self._team("t1", alias="after"))
+
+        assert redis.set_keys == []
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) == before
+        assert cache.last_good_memory.get("team_id:t1") == CacheCodec.serialize(before)
+
+    @pytest.mark.asyncio
+    async def test_the_memory_line_and_the_redis_entry_end_at_the_same_instant(self, monkeypatch: pytest.MonkeyPatch):
+        """The wall clock is a quarter second into a Unix second, so the end, rounded down to a whole second, comes a
+        quarter second before the read's full expiry: both copies are there just before that instant and both are gone
+        just after it."""
+        clock: Final = _Clock()
+        redis: Final = fake_redis_cache()
+        cache: Final = _cache_on_driven_clocks(monkeypatch, clock, redis.cache)
+        expire_at: Final = math.floor(clock.wall() + LAST_GOOD_ENTRY_TTL_SECONDS)
+
+        with last_good_reads_started_at(clock()):
+            await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        clock.move_to_wall(expire_at - 0.01)
+        assert await _held_in(redis.cache, cache, "team_id:t1") == (True, True)
+        clock.move_to_wall(expire_at + 0.01)
+        assert await _held_in(redis.cache, cache, "team_id:t1") == (False, False)
+
+    @pytest.mark.asyncio
+    async def test_memory_line_answers_while_redis_is_away(self):
+        redis = fake_redis_cache()
+        cache = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+        await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        redis.server.connected = False
+
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) == self._team("t1")
+
+    @pytest.mark.asyncio
+    async def test_a_redis_that_answers_without_the_entry_wins_over_this_pods_memory(self):
+        """Another pod forgot the entry (a delete or a block): Redis answers that it is gone, so the memory copy
+        this pod still holds, because the broadcast has not reached it yet, is not served."""
+        redis = fake_redis_cache()
+        cache = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+        await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        await redis.cache.init_async_client().delete("last_good:team_id:t1")
+
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
+
+    @pytest.mark.asyncio
+    async def test_forget_removes_the_entry_from_redis_and_memory(self):
+        redis = fake_redis_cache()
+        cache = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+        await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        await forget_last_good(cache, "team_id:t1")
+
+        assert await redis.cache.init_async_client().get("last_good:team_id:t1") is None
+        redis.server.connected = False
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
+
+    @pytest.mark.asyncio
+    async def test_forget_with_redis_away_still_clears_memory_and_does_not_raise(self):
+        redis = fake_redis_cache()
+        cache = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+        await remember_last_good(cache, "team_id:t1", self._team("t1"))
+        redis.server.connected = False
+
+        await forget_last_good(cache, "team_id:t1")
+
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
+
+    @pytest.mark.asyncio
+    async def test_remember_with_redis_away_keeps_the_memory_line(self):
+        redis = fake_redis_cache()
+        cache = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+        redis.server.connected = False
+
+        await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) == self._team("t1")
+
+    @pytest.mark.asyncio
+    async def test_without_redis_the_memory_line_is_the_only_line(self):
+        cache = UserApiKeyCache(serve_last_good_entries=True)
+        await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) == self._team("t1")
+        await forget_last_good(cache, "team_id:t1")
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
+
+    @pytest.mark.asyncio
+    async def test_recalled_entry_is_a_fresh_object_each_time(self):
+        cache = UserApiKeyCache(serve_last_good_entries=True)
+        await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        first = await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj)
+        assert first is not None
+        first.models.append("leaked")
+
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) == self._team("t1")
+
+    @pytest.mark.asyncio
+    async def test_a_recalled_entry_is_recorded_in_the_open_scope(self):
+        cache = UserApiKeyCache(serve_last_good_entries=True)
+        await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        with last_good_auth_entries_scope() as scope:
+            await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj)
+
+        assert scope.served == ("LiteLLM_TeamTableCachedObj",)
+
+    @pytest.mark.asyncio
+    async def test_a_recall_that_finds_no_entry_records_nothing(self):
+        cache = UserApiKeyCache(serve_last_good_entries=True)
+
+        with last_good_auth_entries_scope() as scope:
+            assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
+
+        assert scope.served == ()
+
+    @pytest.mark.asyncio
+    async def test_a_recall_in_a_gather_child_is_recorded_in_the_parents_scope(self):
+        cache = UserApiKeyCache(serve_last_good_entries=True)
+        await remember_last_good(cache, "team_id:t1", self._team("t1"))
+        await remember_last_good(cache, HASHED_TOKEN, UserAPIKeyAuth(token=HASHED_TOKEN))
+
+        with last_good_auth_entries_scope() as scope:
+            await asyncio.gather(
+                recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj),
+                recall_last_good(cache, HASHED_TOKEN, UserAPIKeyAuth),
+            )
+
+        assert sorted(scope.served) == ["LiteLLM_TeamTableCachedObj", "UserAPIKeyAuth"]
+
+    @pytest.mark.asyncio
+    async def test_a_recall_with_no_open_scope_records_nowhere(self):
+        cache = UserApiKeyCache(serve_last_good_entries=True)
+        await remember_last_good(cache, "team_id:t1", self._team("t1"))
+        with last_good_auth_entries_scope() as closed:
+            pass
+
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) == self._team("t1")
+        assert closed.served == ()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_requests_record_into_their_own_scopes(self):
+        cache = UserApiKeyCache(serve_last_good_entries=True)
+        await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        async def request(recalls: bool) -> tuple[str, ...]:
+            with last_good_auth_entries_scope() as scope:
+                await asyncio.sleep(0)
+                if recalls:
+                    await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj)
+                await asyncio.sleep(0)
+            return scope.served
+
+        assert await asyncio.gather(request(True), request(False)) == [("LiteLLM_TeamTableCachedObj",), ()]
+
+    @pytest.mark.asyncio
+    async def test_an_auth_object_read_back_from_the_cache_carries_no_mark(self):
+        from litellm.proxy.auth.auth_checks import copy_user_api_key_auth_for_cache
+
+        cache = UserApiKeyCache(redis_cache=fake_redis_cache().cache)
+        marked = UserAPIKeyAuth(token=HASHED_TOKEN)
+        marked.auth_entries = "last_good"
+        await cache.async_set_cache(HASHED_TOKEN, marked, model_type=UserAPIKeyAuth)
+        cache.in_memory_cache_for(HASHED_TOKEN).delete_cache(HASHED_TOKEN)
+
+        from_redis = await cache.async_get_cache(key=HASHED_TOKEN, model_type=UserAPIKeyAuth)
+
+        assert from_redis is not None
+        assert (from_redis.token, from_redis.auth_entries) == (HASHED_TOKEN, None)
+        assert copy_user_api_key_auth_for_cache(marked).auth_entries is None
+
+    def test_memory_line_drops_the_least_recently_written_entry_first(self):
+        memory = LastGoodMemory(max_entries=2, clock=lambda: 0.0)
+        memory.set("a", {"v": 1}, ends_at=600.0)
+        memory.set("b", {"v": 2}, ends_at=600.0)
+        memory.set("a", {"v": 3}, ends_at=600.0)
+        memory.set("c", {"v": 4}, ends_at=600.0)
+
+        assert (memory.get("a"), memory.get("b"), memory.get("c")) == ({"v": 3}, None, {"v": 4})
+
+    @pytest.mark.asyncio
+    async def test_a_tombstone_refuses_to_store_the_entry_again(self):
+        cache = UserApiKeyCache(serve_last_good_entries=True)
+        await forget_last_good(cache, "team_id:t1", tombstone=True)
+
+        await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
+
+    @pytest.mark.asyncio
+    async def test_another_pods_tombstone_refuses_the_entry_in_redis_and_in_this_pods_memory(self):
+        redis = fake_redis_cache()
+        deleting_pod = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+        reading_pod = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+        await forget_last_good(deleting_pod, "team_id:t1", tombstone=True)
+
+        await remember_last_good(reading_pod, "team_id:t1", self._team("t1"))
+
+        assert await redis.cache.init_async_client().get("last_good:team_id:t1") is None
+        redis.server.connected = False
+        assert await recall_last_good(reading_pod, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
+
+    @pytest.mark.asyncio
+    async def test_a_write_that_lands_as_the_tombstone_appears_is_undone(self):
+        """The delete runs between the read's tombstone check and its write: the read checks again after
+        writing and takes its write back."""
+        redis = fake_redis_cache()
+        deleting_pod = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+        reading_pod = UserApiKeyCache(
+            redis_cache=_DeleteLandsDuringWrite(redis.cache, deleting_pod), serve_last_good_entries=True
+        )
+
+        await remember_last_good(reading_pod, "team_id:t1", self._team("t1"))
+
+        assert await redis.cache.init_async_client().get("last_good:team_id:t1") is None
+        assert reading_pod.last_good_memory.get("team_id:t1") is None
+        assert await recall_last_good(reading_pod, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
+
+    @pytest.mark.asyncio
+    async def test_a_write_that_finds_a_tombstone_keeps_no_memory_line_when_it_cannot_be_taken_back(self):
+        """Taking the write back is best effort: the entry left in Redis ends at its expiry, and the memory line
+        does not keep the value the tombstone refused."""
+        redis = fake_redis_cache()
+        deleting_pod = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+        reading_pod = UserApiKeyCache(
+            redis_cache=_UndoFailsAfterADeleteLandsDuringWrite(redis.cache, deleting_pod), serve_last_good_entries=True
+        )
+
+        await remember_last_good(reading_pod, "team_id:t1", self._team("t1"))
+
+        assert reading_pod.last_good_memory.get("team_id:t1") is None
+        assert 0 < await redis.cache.init_async_client().ttl("last_good:team_id:t1") <= LAST_GOOD_ENTRY_TTL_SECONDS
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failing", ["write", "tombstone check"])
+    async def test_a_store_that_fails_once_its_write_began_takes_it_back_and_keeps_no_memory_line(
+        self, failing: Literal["write", "tombstone check"]
+    ):
+        """The write may have landed after a tombstone the store could not see, so neither Redis nor the memory
+        line may keep the value it was writing."""
+        redis = fake_redis_cache()
+        reading_pod_redis: Final = _FailsAfterTheWrite(redis.cache, failing=failing)
+        cache = UserApiKeyCache(redis_cache=reading_pod_redis, serve_last_good_entries=True)
+
+        await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        assert reading_pod_redis.wrote
+        assert await redis.cache.init_async_client().get("last_good:team_id:t1") is None
+        assert cache.last_good_memory.get("team_id:t1") is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "refusal", ["tombstone before the write", "tombstone after the write", "write fails", "tombstone check fails"]
+    )
+    async def test_a_refused_store_drops_the_copy_this_pod_already_kept(self, refusal: str):
+        """This pod kept the team from an earlier read. A store that is then refused, whatever the reason, may be
+        refused because another pod revoked the team, so the earlier copy must not stay to be served by this pod
+        when Redis and the database are both unreachable."""
+        redis = fake_redis_cache()
+        deleting_pod = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+        reading_pod_redis: Final[dict[str, RedisCache]] = {
+            "tombstone before the write": redis.cache,
+            "tombstone after the write": _DeleteLandsDuringWrite(redis.cache, deleting_pod),
+            "write fails": _FailsAfterTheWrite(redis.cache, failing="write"),
+            "tombstone check fails": _FailsAfterTheWrite(redis.cache, failing="tombstone check"),
+        }
+        reading_pod = UserApiKeyCache(redis_cache=reading_pod_redis[refusal], serve_last_good_entries=True)
+        # The copy an earlier store left in this pod's memory, as it does when Redis cannot answer that store
+        earlier_copy: Final = self._team("t1", alias="before")
+        assert reading_pod.last_good_memory.set(
+            "team_id:t1",
+            CacheCodec.serialize(earlier_copy),
+            ends_at=reading_pod.last_good_clock() + LAST_GOOD_ENTRY_TTL_SECONDS,
+        )
+        if refusal == "tombstone before the write":
+            await forget_last_good(deleting_pod, "team_id:t1", tombstone=True)
+
+        await remember_last_good(reading_pod, "team_id:t1", self._team("t1", alias="after"))
+
+        assert reading_pod.last_good_memory.get("team_id:t1") is None
+
+    def test_a_tombstone_lapses(self):
+        now = [100.0]
+        memory = LastGoodMemory(max_entries=10, clock=lambda: now[0])
+        memory.tombstone("a", ttl_seconds=600)
+        assert memory.set("a", {"v": 1}, ends_at=now[0] + 600) is False
+
+        now[0] += 601
+
+        assert memory.set("a", {"v": 1}, ends_at=now[0] + 600) is True
+        assert memory.get("a") == {"v": 1}
+
+    @pytest.mark.asyncio
+    async def test_revoke_tombstones_and_drops_the_entry_so_no_read_can_store_it_again(self):
+        redis = fake_redis_cache()
+        cache = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+        other_pod = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+        await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        await revoke_last_good(cache, ("team_id:t1",))
+        await remember_last_good(other_pod, "team_id:t1", self._team("t1"))
+
+        assert await redis.cache.init_async_client().get("last_good:team_id:t1") is None
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
+
+    @pytest.mark.asyncio
+    async def test_revoke_refuses_with_503_and_logs_an_error_when_redis_cannot_take_it(self, caplog):
+        from fastapi import HTTPException
+
+        redis = fake_redis_cache()
+        cache = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+        await remember_last_good(cache, "hashed-token-1", UserAPIKeyAuth(token="hashed-token-1"))
+        redis.server.connected = False
+
+        with pytest.raises(HTTPException) as refused:
+            await revoke_last_good(cache, ("hashed-token-1",))
+
+        assert refused.value.status_code == 503
+        assert any(r.levelname == "ERROR" and "hashed-token-1" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_revoke_does_nothing_while_the_setting_is_off(self):
+        redis = fake_redis_cache()
+        redis.server.connected = False
+
+        cache = UserApiKeyCache(redis_cache=redis.cache)
+        await revoke_last_good(cache, ("hashed-token-1",))
+
+        assert cache.last_good_memory.tombstoned("hashed-token-1") is False
+
+    @pytest.mark.asyncio
+    async def test_revoke_skips_a_key_this_request_revoked_while_its_tombstone_stands(self):
+        """A request revokes its whole set before its first write, so a revocation nested after that write skips Redis
+        for a key the request revoked less than the tombstone's time minus 5 s ago; any other key, or one revoked
+        longer ago, goes to Redis again and is refused while Redis is away."""
+        from fastapi import HTTPException
+
+        from litellm.constants import LAST_GOOD_TOMBSTONE_TTL_SECONDS
+
+        revoked_token: Final = "hashed-token-revoked-before-the-write"
+        other_token: Final = "hashed-token-never-revoked"
+        clock: Final = _Clock()
+        redis: Final = fake_redis_cache()
+        cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=clock)
+        await revoke_last_good(cache, (revoked_token,))
+        redis.server.connected = False
+
+        clock.now += LAST_GOOD_TOMBSTONE_TTL_SECONDS - 6
+        await revoke_last_good(cache, (revoked_token,))
+        with pytest.raises(HTTPException) as never_revoked:
+            await revoke_last_good(cache, (other_token,))
+        clock.now += 1
+        with pytest.raises(HTTPException) as revoked_long_ago:
+            await revoke_last_good(cache, (revoked_token,))
+
+        assert never_revoked.value.status_code == 503
+        assert revoked_long_ago.value.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_a_later_request_revokes_a_key_an_earlier_request_revoked_again(self):
+        """The record of revoked keys belongs to one request: the next request, in a task of its own, sends the same
+        key to Redis again and is refused while Redis is away."""
+        from fastapi import HTTPException
+
+        token: Final = "hashed-token-revoked-by-the-earlier-request"
+        redis: Final = fake_redis_cache()
+        cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=_Clock())
+        await asyncio.create_task(revoke_last_good(cache, (token,)))
+        redis.server.connected = False
+
+        with pytest.raises(HTTPException) as refused:
+            await asyncio.create_task(revoke_last_good(cache, (token,)))
+
+        assert refused.value.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_a_task_a_request_starts_after_revoking_does_not_skip_by_its_record(self):
+        """A task the request starts copies the request's context, record included, yet only the request's own task
+        skips by it: the started task sends the key to Redis again and is refused while Redis is away."""
+        from fastapi import HTTPException
+
+        token: Final = "hashed-token-revoked-before-the-task-started"
+        redis: Final = fake_redis_cache()
+        cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=_Clock())
+
+        async def request_starting_a_task() -> asyncio.Task[None]:
+            await revoke_last_good(cache, (token,))
+            redis.server.connected = False
+            return asyncio.create_task(revoke_last_good(cache, (token,)))
+
+        started_task: Final = await asyncio.create_task(request_starting_a_task())
+        with pytest.raises(HTTPException) as refused:
+            await started_task
+
+        assert refused.value.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_a_revocation_checks_its_record_again_after_each_pass_not_only_when_the_call_began(self):
+        """K was revoked earlier. A later call that revokes J and K begins 1 s inside the time its record allows for K,
+        so its first pass sends J alone; that pass takes 2 s, so K's tombstone may lapse before the request's write:
+        the next pass sends K to Redis again."""
+        clock: Final = _Clock()
+        redis: Final = _SlowWrite(fake_redis_cache().cache, clock, seconds=0.0)
+        cache: Final = UserApiKeyCache(redis_cache=redis, serve_last_good_entries=True, last_good_clock=clock)
+        await revoke_last_good(cache, ("hashed-k",))
+        clock.now += LAST_GOOD_TOMBSTONE_TTL_SECONDS - LAST_GOOD_LATE_STORE_MARGIN_SECONDS - 1
+        redis.seconds = 2.0
+        redis.set_keys.clear()
+        redis.batches.clear()
+
+        await revoke_last_good(cache, ("hashed-j", "hashed-k"))
+
+        assert redis.set_keys == ["last_good_tombstone:hashed-j", "last_good_tombstone:hashed-k"]
+        assert redis.batches == [("last_good_tombstone:hashed-j",), ("last_good_tombstone:hashed-k",)]
+
+    @pytest.mark.asyncio
+    async def test_a_second_auth_run_in_the_same_task_starts_with_an_empty_record_of_revoked_keys(self):
+        """One task can handle two requests: where the second one's auth begins (``start_last_good_reads``, the first
+        statement of user_api_key_auth and of every MCP request), the first one's record is dropped, so the second
+        sends the same key to Redis again and is refused while Redis is away."""
+        from fastapi import HTTPException
+
+        token: Final = "hashed-token-revoked-by-the-earlier-request"
+        redis: Final = fake_redis_cache()
+        cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=_Clock())
+        await revoke_last_good(cache, (token,))
+        redis.server.connected = False
+
+        start_last_good_reads()
+        with pytest.raises(HTTPException) as refused:
+            await revoke_last_good(cache, (token,))
+
+        assert refused.value.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_a_write_paired_with_its_revocation_runs_only_once_the_revocation_is_recorded(self):
+        """``revoke_last_good_then`` revokes, then writes: with Redis away and the key not revoked by this task, the 503
+        leaves the write unmade; a key this task revoked moments ago needs no Redis, so its write runs; no keys, just
+        the write."""
+        from fastapi import HTTPException
+
+        written: Final[list[str]] = []  # mutable-ok: records each write that ran
+
+        async def write(name: str) -> str:
+            written.append(name)
+            return name
+
+        redis: Final = fake_redis_cache()
+        cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=_Clock())
+        await revoke_last_good(cache, ("hashed-revoked",))
+        redis.server.connected = False
+
+        with pytest.raises(HTTPException) as refused:
+            await revoke_last_good_then(cache, ("hashed-never-revoked",), lambda: write("refused"))
+        kept: Final = await revoke_last_good_then(cache, ("hashed-revoked",), lambda: write("revoked before"))
+        bare: Final = await revoke_last_good_then(cache, (), lambda: write("no keys"))
+
+        assert refused.value.status_code == 503
+        assert (kept, bare, written) == ("revoked before", "no keys", ["revoked before", "no keys"])
+
+    @pytest.mark.asyncio
+    async def test_an_exact_delete_revokes_and_deletes_a_row_added_after_its_read_in_a_next_round(self):
+        """The first read finds a, the second b, the third nothing: a is deleted alone, then b, each right after its own
+        revocation, so b, added after the first read, is never deleted unrevoked."""
+        redis: Final = fake_redis_cache()
+        cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=_Clock())
+        answers: Final = [("a",), ("b",)]  # mutable-ok: each read takes the next answer
+        deletes: Final[list[tuple[tuple[str, ...], bool]]] = []  # mutable-ok: each delete and its tombstones
+
+        async def read() -> tuple[str, ...]:
+            return answers.pop(0) if answers else ()
+
+        async def delete(rows: Sequence[str]) -> None:
+            stood: Final = all([await redis.cache.async_get_cache(f"last_good_tombstone:{row}") for row in rows])
+            deletes.append((tuple(rows), stood))
+
+        deleted: Final = await revoke_and_delete_read_rows(cache, read, tuple, delete)
+
+        assert deleted == ("a", "b")
+        assert deletes == [(("a",), True), (("b",), True)]
+
+    @pytest.mark.asyncio
+    async def test_an_exact_delete_whose_late_row_cannot_be_revoked_answers_503_and_leaves_it(self):
+        """The first round's row is deleted; Redis is lost before the row added since can be revoked, so the 503
+        leaves it undeleted."""
+        from fastapi import HTTPException
+
+        redis: Final = fake_redis_cache()
+        cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=_Clock())
+        answers: Final = [("read first",), ("late",)]  # mutable-ok: each read takes the next answer
+        deletes: Final[list[tuple[str, ...]]] = []  # mutable-ok: records each delete in order
+
+        async def read() -> tuple[str, ...]:
+            return answers.pop(0)
+
+        async def delete(rows: Sequence[str]) -> None:
+            deletes.append(tuple(rows))
+            redis.server.connected = False
+
+        with pytest.raises(HTTPException) as refused:
+            await revoke_and_delete_read_rows(cache, read, tuple, delete)
+
+        assert refused.value.status_code == 503
+        assert deletes == [("read first",)]
+
+    @pytest.mark.asyncio
+    async def test_an_exact_delete_prepares_each_round_before_its_revocation_and_deletes_right_after_it(self):
+        """``prepare`` gets each round's rows before their revocation, so their tombstone is not in Redis yet, and the
+        delete runs right after it, with the tombstone standing; Redis lost while the late round is prepared refuses its
+        revocation with 503, and its delete never runs."""
+        from fastapi import HTTPException
+
+        redis: Final = fake_redis_cache()
+        cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=_Clock())
+        answers: Final = [("a",), ("late",)]  # mutable-ok: each read takes the next answer
+        steps: Final[list[tuple[str, tuple[str, ...], bool]]] = []  # mutable-ok: each step, its rows, their tombstones
+
+        async def tombstoned(rows: Sequence[str]) -> bool:
+            return all([await redis.cache.async_get_cache(f"last_good_tombstone:{row}") for row in rows])
+
+        async def read() -> tuple[str, ...]:
+            return answers.pop(0)
+
+        async def prepare(rows: Sequence[str]) -> None:
+            steps.append(("prepare", tuple(rows), await tombstoned(rows)))
+            if tuple(rows) == ("late",):
+                redis.server.connected = False
+
+        async def delete(rows: Sequence[str]) -> None:
+            steps.append(("delete", tuple(rows), await tombstoned(rows)))
+
+        with pytest.raises(HTTPException) as refused:
+            await revoke_and_delete_read_rows(cache, read, tuple, delete, prepare=prepare)
+
+        assert refused.value.status_code == 503
+        assert steps == [("prepare", ("a",), False), ("delete", ("a",), True), ("prepare", ("late",), False)]
+
+    @pytest.mark.asyncio
+    async def test_an_exact_delete_goes_in_chunks_each_prepared_revoked_and_deleted_on_its_own(self):
+        """A round of more rows than ``chunk_size`` goes in chunks: each chunk is prepared, then revoked, then deleted
+        before the next chunk is prepared, so no callback gets more than ``chunk_size`` rows for an ``in`` filter, and
+        each delete runs with its own chunk's tombstones standing and the next chunk's not yet written."""
+        redis: Final = fake_redis_cache()
+        cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=_Clock())
+        answers: Final = [("a", "b", "c")]  # mutable-ok: each read takes the next answer
+        steps: Final[list[tuple[str, tuple[str, ...], tuple[bool, ...]]]] = []  # mutable-ok: each call in order
+
+        async def tombstones() -> tuple[bool, ...]:
+            return tuple([await redis.cache.async_get_cache(f"last_good_tombstone:{row}") is not None for row in "abc"])
+
+        async def read() -> tuple[str, ...]:
+            return answers.pop(0) if answers else ()
+
+        async def prepare(rows: Sequence[str]) -> None:
+            steps.append(("prepare", tuple(rows), await tombstones()))
+
+        async def delete(rows: Sequence[str]) -> None:
+            steps.append(("delete", tuple(rows), await tombstones()))
+
+        deleted: Final = await revoke_and_delete_read_rows(cache, read, tuple, delete, prepare=prepare, chunk_size=2)
+
+        assert deleted == ("a", "b", "c")
+        assert steps == [
+            ("prepare", ("a", "b"), (False, False, False)),
+            ("delete", ("a", "b"), (True, True, False)),
+            ("prepare", ("c",), (True, True, False)),
+            ("delete", ("c",), (True, True, True)),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_rows_that_keep_appearing_refuse_with_409_after_the_last_round_and_stay(self):
+        """Every read finds a new row: after LAST_GOOD_EXACT_DELETE_ROUNDS deletes the request answers 409 and the row
+        of the last read is neither revoked nor deleted."""
+        from fastapi import HTTPException
+
+        from litellm.proxy.common_utils.user_api_key_cache import LAST_GOOD_EXACT_DELETE_ROUNDS
+
+        cache: Final = UserApiKeyCache(serve_last_good_entries=True, last_good_clock=_Clock())
+        reads: Final = [0]  # mutable-ok: counts the reads
+        deletes: Final[list[tuple[str, ...]]] = []  # mutable-ok: records each delete in order
+
+        async def read() -> tuple[str, ...]:
+            reads[0] += 1
+            return (f"row-{reads[0]}",)
+
+        async def delete(rows: Sequence[str]) -> None:
+            deletes.append(tuple(rows))
+
+        with pytest.raises(HTTPException) as refused:
+            await revoke_and_delete_read_rows(cache, read, tuple, delete)
+
+        last_read: Final = f"row-{LAST_GOOD_EXACT_DELETE_ROUNDS + 1}"
+        assert refused.value.status_code == 409
+        assert deletes == [(f"row-{n}",) for n in range(1, LAST_GOOD_EXACT_DELETE_ROUNDS + 1)]
+        assert cache.last_good_memory.tombstoned(last_read) is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("seconds", "keys", "executions"),
+        [
+            ((100.0,), 1000, 4),
+            ((LAST_GOOD_TOMBSTONE_TTL_SECONDS - LAST_GOOD_LATE_STORE_MARGIN_SECONDS + 1.0, 0.0), 4, 6),
+        ],
+        ids=["a_pass_of_1000_keys_at_100_s_an_execution", "a_first_set_pipeline_that_stalls"],
+    )
+    async def test_a_revocation_returns_only_with_every_tombstone_standing_for_the_margin(
+        self, monkeypatch: pytest.MonkeyPatch, seconds: tuple[float, ...], keys: int, executions: int
+    ) -> None:
+        """Each pipeline execution of the revoking pod takes time on the driven clock (``_SlowPipelines``). A pass sends
+        every key in two executions, its tombstones' SETs and then its entries' DELs, so 1,000 keys at 100 s an
+        execution take one pass of 200 s. When the first SET pipeline is answered 596 s after its SETs landed, a 600 s
+        tombstone may lapse within the margin of the write, so the pass is sent again. Either way the write after the
+        revocation runs with every tombstone standing for more than the margin, and two more executions record the
+        tombstones again after it."""
+        clock: Final = _Clock()
+        redis: Final = fake_redis_cache()
+        cache: Final = _cache_on_driven_clocks(monkeypatch, clock, redis.cache)
+        slow: Final = _SlowPipelines(monkeypatch, redis.cache, clock, seconds)
+        cache_keys: Final = tuple(f"hashed-key-{n}" for n in range(keys))
+        left_at_write: Final[list[tuple[int, ...]]] = []  # mutable-ok: each tombstone's seconds left at the write
+
+        async def write() -> str:
+            client: Final = redis.cache.init_async_client()
+            left_at_write.append(tuple([await client.ttl(f"last_good_tombstone:{key}") for key in cache_keys]))
+            return "written"
+
+        assert await revoke_last_good_then(cache, cache_keys, write) == "written"
+        assert slow.pipelines.executions == executions
+        assert len(left_at_write) == 1
+        assert all(left > LAST_GOOD_LATE_STORE_MARGIN_SECONDS for left in left_at_write[0]), left_at_write
+
+    @pytest.mark.asyncio
+    async def test_a_revocation_whose_every_pass_outlasts_its_tombstones_answers_503_and_leaves_the_write_unmade(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Every pipeline execution takes longer than a tombstone lasts, so no pass can leave the tombstones standing
+        for the write: after LAST_GOOD_REVOCATION_PASSES passes the revocation refuses with 503, saying it took longer
+        than its tombstones last, and the write is not made."""
+        from fastapi import HTTPException
+
+        clock: Final = _Clock()
+        redis: Final = fake_redis_cache()
+        cache: Final = _cache_on_driven_clocks(monkeypatch, clock, redis.cache)
+        slow: Final = _SlowPipelines(monkeypatch, redis.cache, clock, (LAST_GOOD_TOMBSTONE_TTL_SECONDS + 100.0,))
+        written: Final[list[str]] = []  # mutable-ok: records the write if it runs
+
+        async def write() -> None:
+            written.append("written")
+
+        with pytest.raises(HTTPException) as refused:
+            await revoke_last_good_then(cache, ("hashed-key-0", "hashed-key-1"), write)
+
+        assert refused.value.status_code == 503
+        assert "took longer than its tombstones last" in refused.value.detail["error"]
+        assert written == []
+        # Each pass is two executions, the tombstones' SET pipeline and then the entries' DEL pipeline
+        assert slow.pipelines.executions == 2 * LAST_GOOD_REVOCATION_PASSES
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("seconds", "stored_after", "present_after"),
+        [((11.0, 0.0), 1, (True, False, False, False)), ((0.0, 11.0, 0.0), 2, (False, True, True, False))],
+        ids=["between_the_set_and_the_del_pipeline", "after_a_first_pass_that_outlasts_the_tombstone"],
+    )
+    async def test_an_entry_another_pod_stores_while_a_revocation_runs_is_not_served_in_a_later_outage(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        seconds: tuple[float, ...],
+        stored_after: int,
+        present_after: tuple[bool, ...],
+    ) -> None:
+        """With a 10 s tombstone, another pod stores the first key's entry, read from its still-existing row, 11 s into
+        the revocation, once that tombstone has lapsed: right after the first pass's SET pipeline is answered, before
+        its DEL pipeline, or right after the first pass. Redis is lost right after the revocation, so the eviction after
+        the write is lost too, and comes back for a database outage. An entry stored between the pipelines goes with
+        the first pass's DEL pipeline; a first pass that took 11 s is sent again, and an entry stored after it goes
+        with the second pass's DEL pipeline. Either way it is gone when the write runs, and the outage serves nothing.
+        ``present_after`` is whether the entry is in Redis after each execution: the first pass's SETs and DELs, then
+        the second pass's."""
+        monkeypatch.setattr(  # test-quality-ok: the reviewer's sequence takes a 10 s tombstone; no setting seam
+            "litellm.proxy.common_utils.user_api_key_cache.LAST_GOOD_TOMBSTONE_TTL_SECONDS", 10
+        )
+        clock: Final = _Clock()
+        redis: Final = fake_redis_cache()
+        cache: Final = _cache_on_driven_clocks(monkeypatch, clock, redis.cache)
+        other_pod: Final = _cache_on_driven_clocks(monkeypatch, clock, redis.cache)
+        client: Final = redis.cache.init_async_client()
+        first_key: Final = "hashed-key-0"
+        present: Final[list[bool]] = []  # mutable-ok: whether the first key's entry is in Redis after each execution
+        present_at_write: Final[list[bool]] = []  # mutable-ok: whether it is in Redis when the write runs
+
+        async def another_pod_stores_the_first_key_then_look(execution: int) -> None:
+            if execution == stored_after:
+                with last_good_reads_started_at(clock()):
+                    await remember_last_good(other_pod, first_key, UserAPIKeyAuth(token=first_key))
+            present.append(await client.exists(f"last_good:{first_key}") == 1)
+
+        slow: Final = _SlowPipelines(
+            monkeypatch, redis.cache, clock, seconds, after=another_pod_stores_the_first_key_then_look
+        )
+
+        async def delete_after_which_redis_is_lost() -> None:
+            present_at_write.append(await client.exists(f"last_good:{first_key}") == 1)
+            redis.server.connected = False
+
+        await revoke_last_good_then(cache, (first_key, "hashed-key-1"), delete_after_which_redis_is_lost)
+        redis.server.connected = True
+        outage_pod: Final = _cache_on_driven_clocks(monkeypatch, clock, redis.cache)
+
+        assert slow.pipelines.executions == 4
+        assert tuple(present) == present_after
+        assert present_at_write == [False]
+        assert await recall_last_good(outage_pod, first_key, UserAPIKeyAuth) is None
+
+    @pytest.mark.asyncio
+    async def test_a_revocation_whose_set_pipeline_has_a_refused_set_answers_503_and_a_retry_completes_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Redis refuses one tombstone SET of the pass's pipeline after running the others, so no DEL is sent: the
+        request is refused with 503 and its write is not made, and no key of the failed pass counts as revoked, in this
+        task's record or in this pod's memory. A retry in the same task, with Redis taking every command, sends every
+        key again rather than skipping one: every tombstone is recorded and every entry is gone."""
+        from fastapi import HTTPException
+
+        redis: Final = fake_redis_cache()
+        client: Final = redis.cache.init_async_client()
+        cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=_Clock())
+        cache_keys: Final = ("hashed-key-0", "hashed-key-1", "hashed-key-2")
+        for key in cache_keys:
+            await client.set(f"last_good:{key}", "entry")
+        pipelines: Final = ScriptedPipelines(
+            monkeypatch, redis.cache, refused_sets=frozenset({"last_good_tombstone:hashed-key-1"})
+        )
+        written: Final[list[str]] = []  # mutable-ok: records each write that ran
+
+        async def write() -> str:
+            written.append("written")
+            return "written"
+
+        with pytest.raises(HTTPException) as refused:
+            await revoke_last_good_then(cache, cache_keys, write)
+
+        assert refused.value.status_code == 503
+        assert written == []
+        assert await _in_redis(redis.cache, "last_good_tombstone", cache_keys) == (True, False, True)
+        assert await _in_redis(redis.cache, "last_good", cache_keys) == (True, True, True)
+        assert [cache.last_good_memory.tombstoned(key) for key in cache_keys] == [False, False, False]
+
+        pipelines.refused_sets = frozenset()
+        assert await revoke_last_good_then(cache, cache_keys, write) == "written"
+
+        assert written == ["written"]
+        assert await _in_redis(redis.cache, "last_good_tombstone", cache_keys) == (True, True, True)
+        assert await _in_redis(redis.cache, "last_good", cache_keys) == (False, False, False)
+        assert [cache.last_good_memory.tombstoned(key) for key in cache_keys] == [True, True, True]
+
+    @pytest.mark.asyncio
+    async def test_a_revocation_whose_del_pipeline_fails_after_its_sets_answers_503_and_a_retry_completes_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Redis is lost once the pass's SET pipeline is answered, so its DEL pipeline fails with every tombstone
+        recorded and every entry still there: the request is refused with 503 and its write is not made, and no key of
+        the failed pass counts as revoked, in this task's record or in this pod's memory. A retry in the same task,
+        with Redis back, sends every key again rather than skipping one (two executions), records the tombstones again
+        after the write (two more), and every entry is gone."""
+        from fastapi import HTTPException
+
+        redis: Final = fake_redis_cache()
+        client: Final = redis.cache.init_async_client()
+        cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=_Clock())
+        cache_keys: Final = ("hashed-key-0", "hashed-key-1")
+        for key in cache_keys:
+            await client.set(f"last_good:{key}", "entry")
+
+        async def lose_redis_after_the_first_sets(execution: int) -> None:
+            if execution == 1:
+                redis.server.connected = False
+
+        pipelines: Final = ScriptedPipelines(monkeypatch, redis.cache, after_execution=lose_redis_after_the_first_sets)
+        written: Final[list[str]] = []  # mutable-ok: records each write that ran
+
+        async def write() -> str:
+            written.append("written")
+            return "written"
+
+        with pytest.raises(HTTPException) as refused:
+            await revoke_last_good_then(cache, cache_keys, write)
+        redis.server.connected = True
+
+        assert refused.value.status_code == 503
+        assert written == []
+        assert pipelines.executions == 1
+        assert await _in_redis(redis.cache, "last_good_tombstone", cache_keys) == (True, True)
+        assert await _in_redis(redis.cache, "last_good", cache_keys) == (True, True)
+        assert [cache.last_good_memory.tombstoned(key) for key in cache_keys] == [False, False]
+
+        assert await revoke_last_good_then(cache, cache_keys, write) == "written"
+
+        assert written == ["written"]
+        assert pipelines.executions == 5
+        assert await _in_redis(redis.cache, "last_good_tombstone", cache_keys) == (True, True)
+        assert await _in_redis(redis.cache, "last_good", cache_keys) == (False, False)
+        assert [cache.last_good_memory.tombstoned(key) for key in cache_keys] == [True, True]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "stored", ["after_the_write", "during_a_write_that_outlasts_the_tombstone"], ids=lambda stored: stored
+    )
+    async def test_an_old_row_a_read_from_before_the_write_stores_once_the_first_tombstone_lapses_is_not_served(
+        self, monkeypatch: pytest.MonkeyPatch, stored: str
+    ) -> None:
+        """With a 30 s tombstone the request revokes the key at t=0, and its paired write at t=19 needs no Redis, the
+        record showing the tombstone standing for 11 s more. Another pod's read began at t=19, before the write
+        committed, and got the old row. Stored at t=31, after the write, once the first tombstone lapsed at t=30, the
+        tombstone recorded again after the write refuses it. Stored at t=32 while a write that ends at t=35 is still
+        running, it is kept, and the delete of that second record drops it. Either way an outage serves nothing."""
+        monkeypatch.setattr(  # test-quality-ok: the reviewer's trace takes a 30 s tombstone; no setting seam
+            "litellm.proxy.common_utils.user_api_key_cache.LAST_GOOD_TOMBSTONE_TTL_SECONDS", 30
+        )
+        clock: Final = _Clock(now=0.0)
+        redis: Final = fake_redis_cache()
+        cache: Final = _cache_on_driven_clocks(monkeypatch, clock, redis.cache)
+        other_pod: Final = _cache_on_driven_clocks(monkeypatch, clock, redis.cache)
+        key: Final = "hashed-key-revoked"
+        pipelines: Final = ScriptedPipelines(monkeypatch, redis.cache)
+
+        async def another_pod_stores_the_old_row_at(seconds: float) -> None:
+            clock.now = seconds
+            with last_good_reads_started_at(19.0):
+                await remember_last_good(other_pod, key, UserAPIKeyAuth(token=key))
+
+        async def write() -> str:
+            if stored == "during_a_write_that_outlasts_the_tombstone":
+                await another_pod_stores_the_old_row_at(32.0)
+                assert await _in_redis(redis.cache, "last_good", (key,)) == (True,)
+            clock.now = 35.0 if stored == "during_a_write_that_outlasts_the_tombstone" else 20.0
+            return "written"
+
+        await revoke_last_good(cache, (key,))
+        clock.now = 19.0
+        executions_before_the_write: Final = pipelines.executions
+
+        assert await revoke_last_good_then(cache, (key,), write) == "written"
+        if stored == "after_the_write":
+            await another_pod_stores_the_old_row_at(31.0)
+        outage_pod: Final = _cache_on_driven_clocks(monkeypatch, clock, redis.cache)
+
+        assert executions_before_the_write == 2
+        assert await recall_last_good(outage_pod, key, UserAPIKeyAuth) is None
+        assert await _in_redis(redis.cache, "last_good", (key,)) == (False,)
+        assert pipelines.executions == 4
+
+    @pytest.mark.asyncio
+    async def test_a_paired_write_with_the_setting_off_sends_no_redis_command_after_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With last good entries not served, the pair is just the write: no pipeline before or after it, and no
+        tombstone in Redis or in this pod's memory."""
+        redis: Final = fake_redis_cache()
+        cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=False, last_good_clock=_Clock())
+        pipelines: Final = ScriptedPipelines(monkeypatch, redis.cache)
+
+        async def write() -> str:
+            return "written"
+
+        assert await revoke_last_good_then(cache, ("hashed-key",), write) == "written"
+        assert pipelines.executions == 0
+        assert await _in_redis(redis.cache, "last_good_tombstone", ("hashed-key",)) == (False,)
+        assert cache.last_good_memory.tombstoned("hashed-key") is False
+
+    @staticmethod
+    def _on_a_30_s_tombstone(
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> tuple[_Clock, RedisCache, UserApiKeyCache, ScriptedPipelines]:
+        """A 30 s tombstone, the driven clock at t=0, a ``RedisCache`` over fake Redis on it, a cache serving last good
+        entries over that, and the count of its pipeline executions."""
+        monkeypatch.setattr(  # test-quality-ok: these races take a 30 s tombstone; no setting seam
+            "litellm.proxy.common_utils.user_api_key_cache.LAST_GOOD_TOMBSTONE_TTL_SECONDS", 30
+        )
+        clock: Final = _Clock(now=0.0)
+        redis: Final = fake_redis_cache()
+        cache: Final = _cache_on_driven_clocks(monkeypatch, clock, redis.cache)
+        return clock, redis.cache, cache, ScriptedPipelines(monkeypatch, redis.cache)
+
+    @pytest.mark.asyncio
+    async def test_a_paired_write_that_raises_still_gets_its_tombstones_recorded_again_and_its_own_error_goes_on(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The request revoked the key at t=0, two executions. Its paired write at t=19 needs no Redis before it and
+        raises, as a write can after it committed in part or once its commit reached the database: the key's
+        tombstone is still recorded again after it, two more executions, standing 30 s from t=19, and the caller gets
+        the write's own error."""
+        clock, redis, cache, pipelines = self._on_a_30_s_tombstone(monkeypatch)
+        key: Final = "hashed-key-whose-delete-fails"
+        await revoke_last_good(cache, (key,))
+        clock.now = 19.0
+
+        async def write() -> None:
+            raise ConnectionResetError("the database dropped the delete")
+
+        with pytest.raises(ConnectionResetError, match="dropped the delete"):
+            await revoke_last_good_then(cache, (key,), write)
+
+        assert pipelines.executions == 4
+        assert await redis.init_async_client().ttl(f"last_good_tombstone:{key}") == 30
+
+    @pytest.mark.asyncio
+    async def test_a_paired_write_that_is_cancelled_still_gets_its_tombstones_recorded_again(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The pair revokes the key at t=0, two executions, and its write is cancelled at t=19 while it runs: the
+        cancellation goes on to the caller, and the key's tombstone is recorded again on the way, two more
+        executions, standing 30 s from t=19."""
+        clock, redis, cache, pipelines = self._on_a_30_s_tombstone(monkeypatch)
+        key: Final = "hashed-key-whose-delete-is-cancelled"
+        started: Final = asyncio.Event()
+        never: Final = asyncio.Event()
+
+        async def write() -> None:
+            started.set()
+            await never.wait()
+
+        pair: Final = asyncio.create_task(revoke_last_good_then(cache, (key,), write))
+        await started.wait()
+        clock.now = 19.0
+        _ = pair.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await pair
+
+        assert pipelines.executions == 4
+        assert await redis.init_async_client().ttl(f"last_good_tombstone:{key}") == 30
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("ends", ["raised", "returned"])
+    async def test_a_transaction_records_again_the_tombstones_of_what_it_revoked_once_it_ends(
+        self, monkeypatch: pytest.MonkeyPatch, ends: str
+    ) -> None:
+        """The request revoked the key at t=0. Inside a transaction at t=19 its revocation of the key needs no Redis,
+        and the transaction then returns, or raises as one can once its commit reached the database: once it ends the
+        key's tombstone is recorded again, after the commit, standing 30 s from t=19, and the transaction's own error,
+        if it raised, goes on. A revocation made outside the transaction is not recorded again by it."""
+        from litellm.proxy.common_utils.user_api_key_cache import last_good_recorded_after_transaction
+
+        clock, redis, cache, pipelines = self._on_a_30_s_tombstone(monkeypatch)
+        key: Final = "hashed-key-revoked-in-the-transaction"
+        outside: Final = "hashed-key-revoked-before-the-transaction"
+        await revoke_last_good(cache, (key, outside))
+        clock.now = 19.0
+
+        async def transaction() -> str:
+            async with last_good_recorded_after_transaction(cache):
+                await revoke_last_good(cache, (key,))
+                if ends == "raised":
+                    raise RuntimeError("the commit's answer was lost")
+            return "committed"
+
+        if ends == "raised":
+            with pytest.raises(RuntimeError, match="answer was lost"):
+                await transaction()
+        else:
+            assert await transaction() == "committed"
+
+        client: Final = redis.init_async_client()
+        assert pipelines.executions == 4
+        assert (await client.ttl(f"last_good_tombstone:{key}"), await client.ttl(f"last_good_tombstone:{outside}")) == (
+            30,
+            11,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("write_ends", ["returned", "raised"])
+    async def test_a_pair_inside_a_transaction_leaves_its_record_to_the_transaction_whose_record_refuses_a_late_store(
+        self, monkeypatch: pytest.MonkeyPatch, write_ends: str
+    ) -> None:
+        """The request revoked the key at t=0, before its transaction opened. Inside the transaction at t=19 a pair's
+        write ends the key's entry, and returns or raises: the pair's revocation needs no Redis, the tombstone standing
+        11 s more, and nothing is sent to Redis after the write while the transaction is open, where a record would
+        precede the commit. Once the transaction ends, its record sends the key's tombstone SET and then its entry's
+        DEL, two executions, and the tombstone stands 30 s from t=19. Another pod's read began at t=19, before the
+        commit, and got the old row; its store at t=31, once the first tombstone lapsed, is refused, so an outage
+        serves nothing."""
+        from litellm.proxy.common_utils.user_api_key_cache import last_good_recorded_after_transaction
+
+        clock, redis, cache, pipelines = self._on_a_30_s_tombstone(monkeypatch)
+        key: Final = "hashed-key-paired-in-the-transaction"
+        events: Final[list[str]] = []  # mutable-ok: each send to Redis, the write and the transaction's end, in order
+        sends: Final = redis.async_set_then_delete_or_raise
+
+        async def sent_in_order(set_keys: Sequence[str], value: object, ttl: int, delete_keys: Sequence[str]) -> None:
+            events.append(f"SET {' '.join(set_keys)}, then DEL {' '.join(delete_keys)}")
+            await sends(set_keys, value, ttl, delete_keys)
+
+        monkeypatch.setattr(  # test-quality-ok: notes each Redis send among the write and the transaction's end
+            redis, "async_set_then_delete_or_raise", sent_in_order
+        )
+
+        async def write() -> str:
+            events.append("write")
+            if write_ends == "raised":
+                raise ConnectionResetError("the commit's answer was lost")
+            return "written"
+
+        async def transaction() -> str:
+            async with last_good_recorded_after_transaction(cache):
+                try:
+                    return await revoke_last_good_then(cache, (key,), write)
+                finally:
+                    events.append("the transaction ends")
+
+        await revoke_last_good(cache, (key,))
+        clock.now = 19.0
+        if write_ends == "raised":
+            with pytest.raises(ConnectionResetError, match="answer was lost"):
+                await transaction()
+        else:
+            assert await transaction() == "written"
+
+        tombstone_then_drop: Final = f"SET last_good_tombstone:{key}, then DEL last_good:{key}"
+        assert events == [tombstone_then_drop, "write", "the transaction ends", tombstone_then_drop]
+        assert pipelines.executions == 4
+        assert await redis.init_async_client().ttl(f"last_good_tombstone:{key}") == 30
+        other_pod: Final = _cache_on_driven_clocks(monkeypatch, clock, redis)
+        clock.now = 31.0
+        with last_good_reads_started_at(19.0):
+            await remember_last_good(other_pod, key, UserAPIKeyAuth(token=key))
+        outage_pod: Final = _cache_on_driven_clocks(monkeypatch, clock, redis)
+        assert await recall_last_good(outage_pod, key, UserAPIKeyAuth) is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("write_raises", "cancellations"),
+        [(False, 1), (True, 1), (False, 2)],
+        ids=["after_a_write_that_returned", "after_a_write_that_raised", "twice"],
+    )
+    async def test_a_record_after_the_write_runs_to_its_end_when_the_request_is_cancelled_while_it_waits(
+        self, monkeypatch: pytest.MonkeyPatch, write_raises: bool, cancellations: int
+    ) -> None:
+        """The pair revokes the key at t=0, two executions, and its write at t=19 returns or raises. The record after
+        it waits before sending its first pipeline, and the request is cancelled meanwhile, once or twice. The record
+        still runs to its end, two more executions, the key's tombstone standing 30 s from t=19. Then the caller gets
+        the write's own error if it raised, else the cancellation, raised again once the record is done."""
+        clock, redis, cache, pipelines = self._on_a_30_s_tombstone(monkeypatch)
+        key: Final = "hashed-key-whose-record-is-cancelled"
+        record_waits: Final = asyncio.Event()
+        release_record: Final = asyncio.Event()
+        sends: Final = redis.async_set_then_delete_or_raise
+        calls: Final = [0]  # mutable-ok: counts the pipelines' calls, the revocation's then the record's
+
+        async def record_waits_before_sending(
+            set_keys: Sequence[str], value: object, ttl: int, delete_keys: Sequence[str]
+        ) -> None:
+            calls[0] += 1
+            if calls[0] == 2:
+                record_waits.set()
+                await release_record.wait()
+            await sends(set_keys, value, ttl, delete_keys)
+
+        monkeypatch.setattr(  # test-quality-ok: the record's first pipeline waits until the test releases it
+            redis, "async_set_then_delete_or_raise", record_waits_before_sending
+        )
+
+        async def write() -> str:
+            clock.now = 19.0
+            if write_raises:
+                raise ConnectionResetError("the commit's answer was lost")
+            return "written"
+
+        pair: Final = asyncio.create_task(revoke_last_good_then(cache, (key,), write))
+        await record_waits.wait()
+        for _ in range(cancellations):
+            _ = pair.cancel()
+            # Lets the pair take the cancellation and go back to waiting for the record
+            await asyncio.sleep(0)
+        release_record.set()
+
+        with pytest.raises(ConnectionResetError if write_raises else asyncio.CancelledError):
+            await pair
+
+        assert pipelines.executions == 4
+        assert await redis.init_async_client().ttl(f"last_good_tombstone:{key}") == 30
+        assert pair.cancelled() is not write_raises
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cancelled", [False, True], ids=["left_alone", "cancelled_while_it_waits"])
+    async def test_a_record_after_the_write_that_redis_never_answers_ends_at_its_own_deadline(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, cancelled: bool
+    ) -> None:
+        """The pair revokes the key at t=0 and its write at t=19 returns. The record after it renews the key's tombstone
+        in this pod's memory, until t=49, and then its pipeline never gets an answer from Redis, as a client with no
+        socket timeout can wait. At the record's own deadline (here 0.05 s) the record gives up with a warning naming
+        it, and the request ends: with the write's result, or cancelled when it was cancelled while it waited. The
+        test's own one-second wait stands for a request that would otherwise never end."""
+        monkeypatch.setattr(  # test-quality-ok: the deadline is shortened so the test waits for it in real time
+            "litellm.proxy.common_utils.user_api_key_cache.LAST_GOOD_RECORD_TIMEOUT_SECONDS", 0.05, raising=False
+        )
+        clock, redis, cache, _pipelines = self._on_a_30_s_tombstone(monkeypatch)
+        key: Final = "hashed-key-whose-record-redis-never-answers"
+        record_sent: Final = asyncio.Event()
+        never_answered: Final = asyncio.Event()
+        sends: Final = redis.async_set_then_delete_or_raise
+        calls: Final = [0]  # mutable-ok: counts the pipelines' calls, the revocation's then the record's
+
+        async def redis_stops_answering_the_record(
+            set_keys: Sequence[str], value: object, ttl: int, delete_keys: Sequence[str]
+        ) -> None:
+            calls[0] += 1
+            if calls[0] == 2:
+                record_sent.set()
+                await never_answered.wait()
+            await sends(set_keys, value, ttl, delete_keys)
+
+        monkeypatch.setattr(  # test-quality-ok: Redis stops answering once the record sends its pipeline
+            redis, "async_set_then_delete_or_raise", redis_stops_answering_the_record
+        )
+
+        async def write() -> str:
+            clock.now = 19.0
+            return "written"
+
+        with caplog.at_level(logging.WARNING, logger="LiteLLM Proxy"):
+            pair: Final = asyncio.create_task(revoke_last_good_then(cache, (key,), write))
+            await record_sent.wait()
+            if cancelled:
+                _ = pair.cancel()
+            try:
+                done, _pending = await asyncio.wait({pair}, timeout=1.0)
+            finally:
+                never_answered.set()
+
+        assert pair in done
+        assert pair.cancelled() is cancelled
+        if not cancelled:
+            assert pair.result() == "written"
+        assert any("within 0.05 s" in record.getMessage() for record in caplog.records)
+        clock.now = 40.0
+        assert cache.last_good_memory.tombstoned(key) is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "write_raises", [False, True], ids=["after_a_write_that_returned", "after_one_that_raised"]
+    )
+    async def test_a_record_after_the_write_that_raises_itself_does_not_replace_the_writes_outcome(
+        self, monkeypatch: pytest.MonkeyPatch, write_raises: bool
+    ) -> None:
+        """The pair revokes the key, and the record after its write fails in its own memory part with an error of its
+        own. That error is logged inside the record, and the caller gets the write's own error if it raised, else its
+        result."""
+        from litellm.proxy.common_utils.user_api_key_cache import LastGoodMemory
+
+        _clock, _redis, cache, _pipelines = self._on_a_30_s_tombstone(monkeypatch)
+        key: Final = "hashed-key-whose-record-fails-in-memory"
+        tombstones: Final = LastGoodMemory.tombstone
+        record_fails: Final = [False]  # mutable-ok: set by the write, so only the record's memory tombstone fails
+
+        def tombstone(memory: LastGoodMemory, cache_key: str, ttl_seconds: float) -> None:
+            if record_fails[0]:
+                raise RuntimeError("the memory tombstone failed")
+            tombstones(memory, cache_key, ttl_seconds)
+
+        monkeypatch.setattr(  # test-quality-ok: the record's memory tombstone fails once the write has run
+            LastGoodMemory, "tombstone", tombstone
+        )
+
+        async def write() -> str:
+            record_fails[0] = True
+            if write_raises:
+                raise ConnectionResetError("the commit's answer was lost")
+            return "written"
+
+        if write_raises:
+            with pytest.raises(ConnectionResetError, match="answer was lost"):
+                await revoke_last_good_then(cache, (key,), write)
+        else:
+            assert await revoke_last_good_then(cache, (key,), write) == "written"
+
+
+async def _in_redis(redis: RedisCache, prefix: str, cache_keys: Sequence[str]) -> tuple[bool, ...]:
+    """Whether the Redis server holds ``<prefix>:<cache key>``, for each of ``cache_keys``."""
+    client: Final = redis.init_async_client()
+    return tuple([await client.exists(f"{prefix}:{key}") == 1 for key in cache_keys])
+
+
+class _SlowPipelines:
+    """The revoking pod's Redis, timed one pipeline execution at a time (``ScriptedPipelines``): once the server has
+    answered the n-th execution, counted from 1, the driven clock moves by the n-th of ``seconds`` (the last one for
+    every execution after), then ``after`` runs with n: what another pod does meanwhile, or a look at Redis then. The
+    server runs a pipeline's commands when it gets them, so the time passes between their landing and the answer. A
+    revocation pass is two executions, the SET pipeline of its tombstones and then the DEL pipeline of its entries
+    (``RedisCache.async_set_then_delete_or_raise``): execution 1 is the first pass's SETs, 2 its DELs, 3 the second
+    pass's SETs. Plain commands, and pipelines executed inside ``after``, take no time."""
+
+    def __init__(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        redis: RedisCache,
+        clock: _Clock,
+        seconds: Sequence[float],
+        *,
+        after: Callable[[int], Awaitable[None]] | None = None,
+    ) -> None:
+        self._clock: Final = clock
+        self._seconds: Final = tuple(seconds)
+        self._after: Final = after
+        self.pipelines: Final = ScriptedPipelines(monkeypatch, redis, after_execution=self._answered)
+
+    async def _answered(self, execution: int) -> None:
+        self._clock.now += self._seconds[min(execution, len(self._seconds)) - 1]
+        if self._after is not None:
+            await self._after(execution)

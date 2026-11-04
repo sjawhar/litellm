@@ -4,7 +4,15 @@ from typing import Final
 
 import pytest
 
+from litellm.constants import LAST_GOOD_ENTRY_TTL_SECONDS
+from litellm.models.team import LiteLLM_TeamTableCachedObj
+from litellm.proxy.common_utils.user_api_key_cache import (
+    UserApiKeyCache,
+    last_good_reads_started_at,
+    remember_last_good,
+)
 from litellm.proxy.db.db_lookup_gate import DBLookupDeadlineExceeded, DBLookupStallTracker, bounded_db_lookup
+from tests.unit.caching.fake_redis_cache import fake_redis_cache
 
 
 async def _never_answers() -> None:
@@ -109,3 +117,27 @@ def test_stall_tracker_reports_a_stall_only_inside_the_window():
     tracker.record_hit()
     tracker.clear()
     assert tracker.stalled_within(30) is False
+
+
+@pytest.mark.asyncio
+async def test_a_bounded_read_records_when_the_auth_reads_began_only_when_no_start_is_recorded():
+    """Outside a request the bounded read records the start, so the entry it returned is kept; inside one the start the
+    request recorded stays, so the entry still ends its expiry after the request's auth began."""
+    redis: Final = fake_redis_cache()
+    cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+    request_auth_began: Final = time.monotonic() - (LAST_GOOD_ENTRY_TTL_SECONDS - 100)
+
+    with last_good_reads_started_at(None):
+        team_read_alone: Final = await bounded_db_lookup(
+            asyncio.sleep(0, result=LiteLLM_TeamTableCachedObj(team_id="t1")), name="team"
+        )
+        await remember_last_good(cache, "team_id:t1", team_read_alone)
+    with last_good_reads_started_at(request_auth_began):
+        team_read_in_request: Final = await bounded_db_lookup(
+            asyncio.sleep(0, result=LiteLLM_TeamTableCachedObj(team_id="t2")), name="team"
+        )
+        await remember_last_good(cache, "team_id:t2", team_read_in_request)
+
+    redis_client: Final = redis.cache.init_async_client()
+    assert 0 < await redis_client.ttl("last_good:team_id:t1") <= LAST_GOOD_ENTRY_TTL_SECONDS
+    assert 0 < await redis_client.ttl("last_good:team_id:t2") <= 100

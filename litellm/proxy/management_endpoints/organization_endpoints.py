@@ -13,7 +13,9 @@ Endpoints for /organization operations
 
 #### ORGANIZATION MANAGEMENT ####
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from functools import partial
+from itertools import chain
 from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
@@ -21,6 +23,7 @@ from typing import (
     Final,
     NamedTuple,
     Protocol,
+    TypeVar,
     cast,  # noqa: TID251  # prisma types Json columns as fields.Json but reads back plain python values
     overload,
 )
@@ -36,14 +39,24 @@ from litellm.proxy._types import *
 from litellm.proxy.auth.auth_checks import (
     can_user_call_model,
     delete_cache_key_objects,
+    delete_cache_team_object,
     get_jwt_key_mapping_cache_keys_for_tokens,
     get_user_object,
+    organization_cache_keys,
+    team_cache_keys,
 )
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_broadcast
 from litellm.proxy.common_utils.timezone_utils import get_budget_reset_time
-from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+from litellm.proxy.common_utils.user_api_key_cache import (
+    UserApiKeyCache,
+    revoke_and_delete_read_rows,
+    revoke_last_good,
+    revoke_last_good_then,
+    serves_last_good_entries,
+)
 from litellm.proxy.management_endpoints.budget_management_endpoints import (
+    evict_budget_holders,
     new_budget,
     update_budget,
 )
@@ -91,6 +104,7 @@ if TYPE_CHECKING:
         LiteLLM_OrganizationMembership as PrismaOrganizationMembership,
     )
     from prisma.models import LiteLLM_OrganizationTable as PrismaOrganizationTable
+    from prisma.models import LiteLLM_TeamTable as PrismaTeamTable
     from prisma.models import LiteLLM_UserTable as PrismaUserTable
     from prisma.models import LiteLLM_VerificationToken as PrismaVerificationToken
 
@@ -111,6 +125,8 @@ async def _enterprise_license_required(
 
 
 router: Final = APIRouter(dependencies=[Depends(_enterprise_license_required)])
+
+_Row: Final = TypeVar("_Row")
 
 
 class _ObjectPermissionRow(Protocol):
@@ -178,6 +194,8 @@ class _OrganizationMembershipTableClient(Protocol):
 
 
 class _TeamTableClient(Protocol):
+    async def find_many(self, where: Mapping[str, object] | None = None) -> "Sequence[PrismaTeamTable]": ...
+
     async def delete_many(self, where: Mapping[str, object]) -> int: ...
 
 
@@ -708,7 +726,7 @@ async def update_organization(
     """
     Update an organization
     """
-    from litellm.proxy.proxy_server import prisma_client
+    from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
 
     if prisma_client is None:
         raise HTTPException(
@@ -815,6 +833,9 @@ async def update_organization(
         data=updated_organization_row,
         include={"members": True, "teams": True, "litellm_budget_table": True},
     )
+    await evict_and_broadcast(
+        cache_keys=organization_cache_keys(data.organization_id), user_api_key_cache=user_api_key_cache
+    )
 
     return response
 
@@ -867,7 +888,7 @@ async def update_organization_v2(
     Validation failures return 422; the object-permission upsert, budget-row write, and
     org-row write are one transaction.
     """
-    from litellm.proxy.proxy_server import prisma_client
+    from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
 
     if prisma_client is None:
         raise HTTPException(
@@ -1005,7 +1026,25 @@ async def update_organization_v2(
             include={"members": True, "teams": True, "litellm_budget_table": True},
         )
 
+    await _evict_updated_organization(
+        organization_id=organization_id,
+        budget_id=existing_organization_row.budget_id,
+        budget_changed=bool(budget_updates),
+        user_api_key_cache=user_api_key_cache,
+    )
+
     return response
+
+
+async def _evict_updated_organization(
+    organization_id: str, budget_id: str, budget_changed: bool, user_api_key_cache: UserApiKeyCache
+) -> None:
+    """The organization's cached copies always go, and a budget change also evicts everything else on that budget."""
+    await evict_and_broadcast(
+        cache_keys=organization_cache_keys(organization_id), user_api_key_cache=user_api_key_cache
+    )
+    if budget_changed:
+        await evict_budget_holders(budget_id)
 
 
 @router.delete(
@@ -1039,13 +1078,39 @@ async def delete_organization(
             detail={"error": "Only proxy admins can delete organizations"},
         )
 
+    # While last good entries are served, the organizations' entries, their teams', their keys' and their members' (a
+    # member's entry carries its organization memberships) are revoked before the first delete, so a Redis that cannot
+    # record the revocation refuses the request with nothing deleted. With the setting off nothing is revoked, so none
+    # of these reads runs
+    if serves_last_good_entries(user_api_key_cache):
+        org_ids: Final = data.organization_ids
+        teams: Final = await find_many_in(_table(TeamRepository(prisma_client)), "organization_id", org_ids)
+        keys: Final = await find_many_in(_table(VerificationTokenRepository(prisma_client)), "organization_id", org_ids)
+        members: Final = await find_many_in(
+            _table(OrganizationMembershipRepository(prisma_client)), "organization_id", org_ids
+        )
+        await revoke_last_good(
+            user_api_key_cache,
+            (
+                *chain.from_iterable(
+                    organization_cache_keys(organization_id) for organization_id in data.organization_ids
+                ),
+                *chain.from_iterable(team_cache_keys(team.team_id, team.team_alias) for team in teams),
+                *(key.token for key in keys),
+                *(member.user_id for member in members),
+            ),
+        )
+
     deleted_orgs: Final = []
     for organization_id in data.organization_ids:
-        # delete all teams in the organization
-        await _table(TeamRepository(prisma_client)).delete_many(where={"organization_id": organization_id})
-        # delete all members in the organization
-        await _table(OrganizationMembershipRepository(prisma_client)).delete_many(
-            where={"organization_id": organization_id}
+        await _delete_organization_teams(
+            organization_id=organization_id,
+            prisma_client=prisma_client,
+            user_api_key_cache=user_api_key_cache,
+            proxy_logging_obj=proxy_logging_obj,
+        )
+        await _delete_organization_members(
+            organization_id=organization_id, prisma_client=prisma_client, user_api_key_cache=user_api_key_cache
         )
         await _delete_organization_keys(
             organization_id=organization_id,
@@ -1053,10 +1118,16 @@ async def delete_organization(
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
         )
-        # delete the organization
-        deleted_org = await _table(OrganizationRepository(prisma_client)).delete(
-            where={"organization_id": organization_id},
-            include={"members": True, "teams": True, "litellm_budget_table": True},
+        # The child deletes above, and the earlier organizations', can outlast the first revocation's tombstones, so the
+        # organization's entries are revoked again right before its delete: no Redis while those tombstones stand
+        deleted_org = await revoke_last_good_then(
+            user_api_key_cache,
+            organization_cache_keys(organization_id),
+            partial(
+                _table(OrganizationRepository(prisma_client)).delete,
+                where={"organization_id": organization_id},
+                include={"members": True, "teams": True, "litellm_budget_table": True},
+            ),
         )
         if deleted_org is None:
             raise HTTPException(
@@ -1064,8 +1135,85 @@ async def delete_organization(
                 detail={"error": f"Organization={organization_id} not found"},
             )
         deleted_orgs.append(deleted_org)
+        await evict_and_broadcast(
+            cache_keys=organization_cache_keys(organization_id), user_api_key_cache=user_api_key_cache
+        )
 
     return deleted_orgs
+
+
+async def _delete_organization_rows(
+    user_api_key_cache: UserApiKeyCache,
+    read: Callable[[], Awaitable[Sequence[_Row]]],
+    cache_keys_of: Callable[[Sequence[_Row]], Sequence[str]],
+    delete_read: Callable[[Sequence[_Row]], Awaitable[object]],
+    delete_all: Callable[[], Awaitable[object]],
+    prepare: Callable[[Sequence[_Row]], Awaitable[object]] | None = None,
+) -> Sequence[_Row]:
+    """Delete one table's rows of an organization and return the rows deleted. While last good entries are served, only
+    the rows a read found are deleted, each round right after the revocation of their entries, until a read finds none
+    (``revoke_and_delete_read_rows``), so a row added to the organization after the request's first read, or between a
+    read and its delete, is revoked before its delete too; ``prepare`` gets each chunk of a round before its
+    revocation. Otherwise nothing is revoked, ``prepare`` gets every row read, and one delete takes every row of the
+    organization."""
+    if serves_last_good_entries(user_api_key_cache):
+        return await revoke_and_delete_read_rows(user_api_key_cache, read, cache_keys_of, delete_read, prepare=prepare)
+    rows: Final = await read()
+    if prepare is not None:
+        await prepare(rows)
+    await delete_all()
+    return rows
+
+
+async def _delete_organization_teams(
+    organization_id: str,
+    prisma_client: PrismaClient,
+    user_api_key_cache: UserApiKeyCache,
+    proxy_logging_obj: ProxyLogging | None,
+) -> None:
+    """Delete the organization's teams and tombstone them again now that the rows are gone. While last good entries are
+    served, each round deletes right after the revocation of its teams' entries, with no Redis while the request's first
+    revocation of them stands (``_delete_organization_rows``)."""
+    org_filter: Final[_OrganizationIdFilter] = {"organization_id": organization_id}
+    team_table: Final = _table(TeamRepository(prisma_client))
+    teams: Final = await _delete_organization_rows(
+        user_api_key_cache,
+        partial(team_table.find_many, where=org_filter),
+        lambda rows: tuple(chain.from_iterable(team_cache_keys(team.team_id, team.team_alias) for team in rows)),
+        # bounded-ok: revoke_and_delete_read_rows hands each call at most IN_LIST_CHUNK_SIZE rows
+        lambda rows: team_table.delete_many(where={**org_filter, "team_id": {"in": [team.team_id for team in rows]}}),
+        partial(team_table.delete_many, where=org_filter),
+    )
+    for team in teams:
+        await delete_cache_team_object(
+            team_id=team.team_id,
+            team_alias=team.team_alias,
+            user_api_key_cache=user_api_key_cache,
+            proxy_logging_obj=proxy_logging_obj,
+            revoked=True,
+        )
+
+
+async def _delete_organization_members(
+    organization_id: str, prisma_client: PrismaClient, user_api_key_cache: UserApiKeyCache
+) -> None:
+    """Delete the organization's memberships. A member's entry carries its organization memberships, which the org
+    admin route checks read, so it is revoked before its membership's delete and evicted once the row is gone."""
+    org_filter: Final[_OrganizationIdFilter] = {"organization_id": organization_id}
+    membership_table: Final = _table(OrganizationMembershipRepository(prisma_client))
+    members: Final = await _delete_organization_rows(
+        user_api_key_cache,
+        partial(membership_table.find_many, where=org_filter),
+        lambda rows: tuple(member.user_id for member in rows),
+        lambda rows: membership_table.delete_many(
+            # bounded-ok: revoke_and_delete_read_rows hands each call at most IN_LIST_CHUNK_SIZE rows
+            where={**org_filter, "user_id": {"in": [member.user_id for member in rows]}}
+        ),
+        partial(membership_table.delete_many, where=org_filter),
+    )
+    await evict_and_broadcast(
+        cache_keys=tuple(member.user_id for member in members), user_api_key_cache=user_api_key_cache
+    )
 
 
 async def _delete_organization_keys(
@@ -1074,18 +1222,36 @@ async def _delete_organization_keys(
     user_api_key_cache: UserApiKeyCache,
     proxy_logging_obj: ProxyLogging | None,
 ) -> None:
+    """Delete the organization's keys and tombstone them again now that the rows are gone. While last good entries are
+    served, each round deletes right after the revocation of its keys' entries, with no Redis while the request's first
+    revocation of them stands (``_delete_organization_rows``). A key's JWT mappings go with it by cascade, so the cache
+    keys of its mappings are read before its delete: chunk by chunk while last good entries are served, each read
+    covering one chunk's keys right before their revocation, otherwise all of them right after the keys' read."""
     key_filter: Final[_OrganizationIdFilter] = {"organization_id": organization_id}
-    keys_to_delete: Final = await _table(VerificationTokenRepository(prisma_client)).find_many(where=key_filter)
-    hashed_tokens_to_delete: Final = tuple(key.token for key in keys_to_delete)
-    jwt_mapping_cache_keys: Final = await get_jwt_key_mapping_cache_keys_for_tokens(
-        hashed_tokens=hashed_tokens_to_delete,
-        prisma_client=prisma_client,
+    key_table: Final = _table(VerificationTokenRepository(prisma_client))
+    jwt_mapping_cache_keys: Final[list[str]] = []  # mutable-ok: grows by what each read of the keys' mappings finds
+
+    async def read_jwt_mappings(keys: "Sequence[PrismaVerificationToken]") -> None:
+        jwt_mapping_cache_keys.extend(
+            await get_jwt_key_mapping_cache_keys_for_tokens(
+                hashed_tokens=tuple(key.token for key in keys), prisma_client=prisma_client
+            )
+        )
+
+    deleted_keys: Final = await _delete_organization_rows(
+        user_api_key_cache,
+        partial(key_table.find_many, where=key_filter),
+        lambda rows: tuple(key.token for key in rows),
+        # bounded-ok: revoke_and_delete_read_rows hands each call at most IN_LIST_CHUNK_SIZE rows
+        lambda rows: key_table.delete_many(where={**key_filter, "token": {"in": [key.token for key in rows]}}),
+        partial(key_table.delete_many, where=key_filter),
+        prepare=read_jwt_mappings,
     )
-    await _table(VerificationTokenRepository(prisma_client)).delete_many(where=key_filter)
     await delete_cache_key_objects(
-        hashed_tokens=hashed_tokens_to_delete,
+        hashed_tokens=tuple(key.token for key in deleted_keys),
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
+        revoked=True,
     )
     await evict_and_broadcast(cache_keys=jwt_mapping_cache_keys, user_api_key_cache=user_api_key_cache)
 
@@ -1446,7 +1612,7 @@ async def organization_member_update(
     Update a member's role in an organization
     """
     try:
-        from litellm.proxy.proxy_server import prisma_client
+        from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
 
         if prisma_client is None:
             raise HTTPException(
@@ -1535,6 +1701,10 @@ async def organization_member_update(
                 },
                 data={"user_role": data.role},
             )
+            # The user's entry carries its organization memberships, which the org admin route checks read
+            await evict_and_broadcast(
+                cache_keys=(data.user_id,) if data.user_id is not None else (), user_api_key_cache=user_api_key_cache
+            )
         if data.max_budget_in_organization is not None:
             # if budget_id is None, create a new budget
             budget_id: Final = existing_organization_membership.budget_id or str(uuid.uuid4())
@@ -1596,7 +1766,7 @@ async def organization_member_delete(
     Delete a member from an organization
     """
     try:
-        from litellm.proxy.proxy_server import prisma_client
+        from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
 
         if prisma_client is None:
             raise HTTPException(
@@ -1617,14 +1787,22 @@ async def organization_member_delete(
             existing_user_email_row: Final = await find_member_if_email(data.user_email, prisma_client)
             data.user_id = existing_user_email_row.user_id
 
-        member_to_delete: Final = await _table(OrganizationMembershipRepository(prisma_client)).delete(
-            where={
-                "user_id_organization_id": {
-                    "user_id": data.user_id,
-                    "organization_id": data.organization_id,
-                }
-            }
+        # The user's entry carries its organization memberships, which the org admin route checks read
+        member_user_ids: Final = (data.user_id,) if data.user_id is not None else ()
+        member_to_delete: Final = await revoke_last_good_then(
+            user_api_key_cache,
+            member_user_ids,
+            partial(
+                _table(OrganizationMembershipRepository(prisma_client)).delete,
+                where={
+                    "user_id_organization_id": {
+                        "user_id": data.user_id,
+                        "organization_id": data.organization_id,
+                    }
+                },
+            ),
         )
+        await evict_and_broadcast(cache_keys=member_user_ids, user_api_key_cache=user_api_key_cache)
         return member_to_delete
 
     except Exception as e:

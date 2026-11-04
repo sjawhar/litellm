@@ -1474,6 +1474,7 @@ class TeamMemberEntry(BaseModel):
 
 class TeamMetadata(BaseModel):
     disable_global_guardrails: bool | None = None
+    priority: str | None = None
 
 
 class TeamNewBody(BaseModel):
@@ -1505,6 +1506,7 @@ class TeamData(BaseModel):
     team_alias: str | None = None
     models: list[str] = []
     members_with_roles: list[TeamMemberEntry] = []
+    metadata: TeamMetadata | None = None
 
 
 class TeamInfoResponse(BaseModel):

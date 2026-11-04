@@ -12,6 +12,7 @@ Endpoints for /project operations
 
 import json
 from collections.abc import Mapping, Sequence
+from functools import partial
 from typing import TYPE_CHECKING, Final
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -22,6 +23,7 @@ from litellm._uuid import uuid
 from litellm.proxy._types import *
 from litellm.proxy.auth.auth_checks import delete_cached_project_object
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+from litellm.proxy.common_utils.user_api_key_cache import project_cache_key, revoke_last_good, revoke_last_good_then
 from litellm.proxy.management.teams.authz import TEAM_OR_ORG_ADMIN, TeamAccess, is_team_admin, is_team_member
 from litellm.proxy.management.teams.dependencies import get_team_access
 from litellm.proxy.management.users.service import org_admin_org_ids
@@ -646,6 +648,11 @@ async def new_project(
         raise handle_exception_on_proxy(e)
 
 
+def _cache_keys_a_project_update_revokes(data: UpdateProjectRequest) -> tuple[str, ...]:
+    """A block ends the project's access, so its entry is revoked strictly; any other update evicts after its write."""
+    return (project_cache_key(data.project_id),) if data.blocked is True else ()
+
+
 @router.post(
     "/project/update",
     tags=["project management"],
@@ -813,6 +820,10 @@ async def update_project(
                 data, existing_project, _router_access_group_names(llm_router)
             )
 
+        # A block revokes the project before the first write, so a Redis that cannot record it refuses with nothing
+        # written
+        await revoke_last_good(user_api_key_cache, _cache_keys_a_project_update_revokes(data))
+
         # Prepare update data
         update_data = _jsonified(prisma_client, data.model_dump(exclude_none=True, exclude={"project_id"}))
         update_data["updated_by"] = user_api_key_dict.user_id or litellm_proxy_admin_name
@@ -866,11 +877,16 @@ async def update_project(
         # Remove budget fields (following organization_endpoints.py pattern)
         update_data = _remove_budget_fields_from_project_data(update_data)
 
-        # Update project
-        updated_project: Final = await _project_table(prisma_client).update(
-            where={"project_id": data.project_id},
-            data=update_data,
-            include={"litellm_budget_table": True, "object_permission": True},
+        # Update project; a block revokes the project again first, since the writes above may outlast its tombstone
+        updated_project: Final = await revoke_last_good_then(
+            user_api_key_cache,
+            _cache_keys_a_project_update_revokes(data),
+            partial(
+                _project_table(prisma_client).update,
+                where={"project_id": data.project_id},
+                data=update_data,
+                include={"litellm_budget_table": True, "object_permission": True},
+            ),
         )
 
         await delete_cached_project_object(
@@ -948,6 +964,12 @@ async def delete_project(
                 detail={"error": "Only admins can delete projects"},
             )
 
+        # Every project's entry is revoked before the first read and delete, so a Redis that cannot record the
+        # revocation refuses the request with nothing deleted
+        await revoke_last_good(
+            user_api_key_cache, tuple(project_cache_key(project_id) for project_id in data.project_ids)
+        )
+
         deleted_projects: list[prisma_models.LiteLLM_ProjectTable | None] = []
 
         for project_id in data.project_ids:
@@ -975,10 +997,13 @@ async def delete_project(
                     param="project_ids",
                 )
 
-            # Delete the project
-            deleted_project: (
-                prisma_models.LiteLLM_ProjectTable | None
-            ) = await _project_table(prisma_client).delete(where={"project_id": project_id})
+            # Delete the project; its entry is revoked again first, since the reads and writes before it may outlast
+            # the tombstone recorded above
+            deleted_project: prisma_models.LiteLLM_ProjectTable | None = await revoke_last_good_then(
+                user_api_key_cache,
+                (project_cache_key(project_id),),
+                partial(_project_table(prisma_client).delete, where={"project_id": project_id}),
+            )
 
             await delete_cached_project_object(
                 project_id=project_id,

@@ -177,6 +177,29 @@ def get_input_sequence_length_bucket(prompt_tokens: object) -> str:
     return next(label for upper, label in INPUT_SEQUENCE_LENGTH_BUCKETS if prompt_tokens < upper)
 
 
+def team_priority_label(litellm_params: object) -> str:
+    """The calling team's ``metadata.priority``, read only from the team metadata the proxy stores.
+
+    ``/v1/messages`` keeps it in ``litellm_metadata``, every other route in ``metadata``; a caller's own
+    request metadata and a key's metadata never set it. ``""`` when the team has no class.
+    """
+    match litellm_params:
+        case {"litellm_metadata": {"user_api_key_team_metadata": team_metadata}}:
+            return priority_of_team_metadata(team_metadata)
+        case {"metadata": {"user_api_key_team_metadata": team_metadata}}:
+            return priority_of_team_metadata(team_metadata)
+        case _:
+            return ""
+
+
+def priority_of_team_metadata(team_metadata: object) -> str:
+    match team_metadata:
+        case {"priority": str() as priority}:
+            return priority
+        case _:
+            return ""
+
+
 # Batch jobs can run for minutes to hours; buckets span 1 min → 24 h.
 BATCH_DURATION_BUCKETS: Final = (
     60.0,
@@ -230,6 +253,7 @@ class UserAPIKeyLabelNames(Enum):
     MCP_TOOL_NAME = "mcp_tool_name"
     MCP_SERVER_NAME = "mcp_server_name"
     SERVICE_TIER = "service_tier"
+    PRIORITY = "priority"
     INPUT_SEQUENCE_LENGTH = "input_sequence_length"
 
 
@@ -299,6 +323,7 @@ DEFINED_PROMETHEUS_METRICS = Literal[
     "litellm_provider_cache_creation_input_tokens_metric",
     "litellm_deployment_tpm_limit",
     "litellm_deployment_rpm_limit",
+    "litellm_model_group_saturation_ratio",
     "litellm_remaining_api_key_requests_for_model",
     "litellm_remaining_api_key_tokens_for_model",
     "litellm_api_key_rate_limit_allowed_metric",
@@ -690,6 +715,11 @@ class PrometheusMetricLabels:
 
     litellm_deployment_rpm_limit = litellm_deployment_tpm_limit
 
+    litellm_model_group_saturation_ratio: ClassVar[tuple[str, ...]] = (
+        UserAPIKeyLabelNames.MODEL_GROUP.value,
+        UserAPIKeyLabelNames.PRIORITY.value,
+    )
+
     litellm_deployment_cooled_down = [
         UserAPIKeyLabelNames.v2_LITELLM_MODEL_NAME.value,
         UserAPIKeyLabelNames.MODEL_ID.value,
@@ -982,6 +1012,8 @@ class PrometheusMetricLabels:
             metric_name=label_name,
             labels=getattr(PrometheusMetricLabels, label_name),
         )
+        if label_name == "litellm_model_group_saturation_ratio":
+            return default_labels
         custom_labels: Final = []
 
         # Add custom metadata labels
@@ -1101,6 +1133,7 @@ class UserAPIKeyLabelValues:
     mcp_server_name: str | None = None
     service_tier: str | None = None
     input_sequence_length: str | None = None
+    priority: str = ""
 
     # Added for test compatibility.
     def __init__(self, **kwargs: Any) -> None:
@@ -1173,17 +1206,17 @@ class PrometheusSettings:
 class NoOpMetric:
     """A no-op metric that has the same interface as prometheus metrics but does nothing"""
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args: object, **kwargs: object) -> None:
         pass
 
-    def labels(self, *args, **kwargs):
+    def labels(self, *args: object, **kwargs: object) -> "NoOpMetric":
         return self
 
-    def inc(self, *args, **kwargs) -> None:
+    def inc(self, *args: object, **kwargs: object) -> None:
         pass
 
-    def set(self, *args, **kwargs) -> None:
+    def set(self, *args: object, **kwargs: object) -> None:
         pass
 
-    def observe(self, *args, **kwargs) -> None:
+    def observe(self, *args: object, **kwargs: object) -> None:
         pass

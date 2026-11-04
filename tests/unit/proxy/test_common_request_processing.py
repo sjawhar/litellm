@@ -49,6 +49,7 @@ from litellm.proxy.common_request_processing import (
     resolve_litellm_call_id,
     ttft_keepalive_interval,
     _override_openai_response_model,
+    _server_side_fallback_routed_model,
     _parse_event_data_for_error,
     _resolve_per_request_model_group_alias,
     should_return_raw_model_name,
@@ -469,6 +470,50 @@ class TestProxyBaseLLMRequestProcessing:
         except ValueError:
             pytest.fail("litellm_call_id is not a valid UUID")
         assert data_passed["litellm_call_id"] == returned_data["litellm_call_id"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("caller_timeouts", "marked"),
+        [
+            pytest.param({"request_timeout": 1, "stream_timeout": 5}, ("stream_timeout",), id="caller-stream-timeout"),
+            pytest.param({"request_timeout": 1}, None, id="only-the-pinned-one"),
+        ],
+    )
+    async def test_the_command_line_request_timeout_is_not_named_in_the_callers_timeout_mark(
+        self, monkeypatch, caller_timeouts: dict[str, int], marked: tuple[str, ...] | None
+    ):
+        """
+        The request setup names the caller's own timeouts in client_side_timeout; the command line's request_timeout
+        then replaces the caller's, so the mark no longer names it, and a mark left with no name is dropped
+        """
+        processing_obj: Final = ProxyBaseLLMRequestProcessing(data=dict(caller_timeouts))
+        mock_request: Final = MagicMock(spec=Request)
+        mock_request.headers = {}
+
+        async def setup_naming_the_callers_timeouts(*args, data: dict, **kwargs) -> dict:
+            return {**data, "client_side_timeout": tuple(caller_timeouts)}
+
+        async def pre_call_hook(user_api_key_dict, data, call_type, skip_guardrails=False):
+            return copy.deepcopy(data)
+
+        proxy_logging_obj: Final = MagicMock(spec=ProxyLogging)
+        proxy_logging_obj.pre_call_hook = AsyncMock(side_effect=pre_call_hook)
+        monkeypatch.setattr(
+            litellm.proxy.common_request_processing, "add_litellm_data_to_request", setup_naming_the_callers_timeouts
+        )
+
+        returned_data, _ = await processing_obj.common_processing_pre_call_logic(
+            request=mock_request,
+            general_settings={},
+            user_api_key_dict=MagicMock(spec=UserAPIKeyAuth),
+            proxy_logging_obj=proxy_logging_obj,
+            proxy_config=MagicMock(spec=ProxyConfig),
+            route_type="acompletion",
+            user_request_timeout=30,
+        )
+
+        assert returned_data["request_timeout"] == 30
+        assert returned_data.get("client_side_timeout") == marked
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("requested_model", [{"bad": "value"}, ["gpt-5.2"], 1])
@@ -1922,6 +1967,28 @@ class TestProxyBaseLLMRequestProcessing:
         assert "x-litellm-key-spend" in headers_7
         assert float(headers_7["x-litellm-key-spend"]) == 0.001  # Should use original spend on error
 
+    def test_get_custom_headers_carries_the_auth_entries_mark_and_leaves_it_out_when_unset(self):
+        """One test over the three values, so the unset case is checked beside the two that send the header: on its
+        own it would also pass where the header is never sent."""
+
+        def sent_mark(auth_entries: str | None) -> dict[str, str]:
+            mock_user_api_key_dict = MagicMock(spec=UserAPIKeyAuth)
+            mock_user_api_key_dict.tpm_limit = None
+            mock_user_api_key_dict.rpm_limit = None
+            mock_user_api_key_dict.max_budget = None
+            mock_user_api_key_dict.spend = 0
+            mock_user_api_key_dict.auth_entries = auth_entries
+            headers = ProxyBaseLLMRequestProcessing.get_custom_headers(
+                user_api_key_dict=mock_user_api_key_dict, call_id="call-1"
+            )
+            return {name: value for name, value in headers.items() if name == "x-litellm-auth-entries"}
+
+        assert [sent_mark(value) for value in ("fresh", "last_good", None)] == [
+            {"x-litellm-auth-entries": "fresh"},
+            {"x-litellm-auth-entries": "last_good"},
+            {},
+        ]
+
     @pytest.mark.parametrize(
         ("hidden_params", "request_data", "expected_call_id"),
         [
@@ -2994,6 +3061,62 @@ class TestExtractErrorFromSSEChunk:
         # Other fields should be obtained from the original error object (if exists)
 
 
+_SERVER_SIDE_FALLBACK_HEADER = {
+    "custom_llm_provider": "anthropic,bedrock",
+    "extra_headers": {"anthropic-beta": "server-side-fallback-2026-07-01"},
+}
+
+
+def _fallback_request(provider: str, deployment: str, **extra: object) -> dict:
+    return {
+        "litellm_logging_obj": SimpleNamespace(model_call_details={"custom_llm_provider": provider}),
+        "litellm_metadata": {"deployment": deployment},
+        "provider_specific_header": _SERVER_SIDE_FALLBACK_HEADER,
+        **extra,
+    }
+
+
+@pytest.mark.parametrize(
+    ("request_data", "expected"),
+    [
+        pytest.param(
+            _fallback_request("anthropic", "anthropic/claude-fable-5", fallbacks="default"),
+            "anthropic/claude-fable-5",
+            id="fallbacks-direct-anthropic",
+        ),
+        pytest.param(
+            _fallback_request("anthropic", "claude-fable-5", fallbacks="default"),
+            "claude-fable-5",
+            id="fallbacks-direct-anthropic-without-prefix",
+        ),
+        pytest.param(_fallback_request("anthropic", "anthropic/claude-fable-5"), None, id="no-fallbacks"),
+        pytest.param(
+            _fallback_request(
+                "anthropic", "anthropic/claude-fable-5", fallbacks=[{"group": ["other"]}], provider_specific_header=None
+            ),
+            None,
+            id="fallbacks-without-the-beta-are-litellm-fallbacks",
+        ),
+        pytest.param(_fallback_request("openai", "openai/gpt-4o", fallbacks="default"), None, id="not-anthropic"),
+        pytest.param(
+            _fallback_request("bedrock", "bedrock/us.anthropic.claude-sonnet-4-5", fallbacks="default"),
+            None,
+            id="anthropic-on-bedrock",
+        ),
+        pytest.param(
+            {
+                **_fallback_request("bedrock", "bedrock/us.anthropic.claude-sonnet-4-5", fallbacks="default"),
+                "metadata": {"deployment": "anthropic/x"},
+            },
+            None,
+            id="client-metadata-ignored",
+        ),
+    ],
+)
+def test_server_side_fallback_routed_model_only_for_fallbacks_to_direct_anthropic(request_data, expected):
+    assert _server_side_fallback_routed_model(request_data) == expected
+
+
 class TestOverrideOpenAIResponseModel:
     """Tests for _override_openai_response_model function"""
 
@@ -3103,6 +3226,26 @@ class TestOverrideOpenAIResponseModel:
 
         # Verify the model WAS overridden to requested model
         assert response_obj["model"] == requested_model
+
+    @pytest.mark.parametrize(
+        ("provider_model", "client_model"),
+        [
+            pytest.param("claude-opus-4-8", "claude-opus-4-8", id="anthropic-fallback-model-kept"),
+            pytest.param("claude-fable-5", "fable-alias", id="routed-model-restamped"),
+            pytest.param("claude-fable-5-20260607", "fable-alias", id="routed-snapshot-restamped"),
+        ],
+    )
+    def test_override_keeps_a_model_the_provider_fell_back_to(self, provider_model: str, client_model: str):
+        response_obj = {"model": provider_model}
+
+        _override_openai_response_model(
+            response_obj=response_obj,
+            requested_model="fable-alias",
+            log_context="test_context",
+            routed_model="anthropic/claude-fable-5",
+        )
+
+        assert response_obj["model"] == client_model
 
     def test_override_model_overrides_when_no_fallback_object(self):
         """
@@ -7099,6 +7242,7 @@ class TestPreCallWithFallbacksOnLocalRateLimit:
         rpm_limit: int | None = None,
         model_rpm_limit: dict[str, int] | None = None,
         disable_fallbacks: bool | None = None,
+        models: tuple[str, ...] = (),
     ) -> ProxyUserAPIKeyAuth:
         from opentelemetry.sdk.trace import TracerProvider
 
@@ -7107,6 +7251,7 @@ class TestPreCallWithFallbacksOnLocalRateLimit:
             api_key="hashed-key",
             parent_otel_span=span,
             rpm_limit=rpm_limit,
+            models=list(models),
             metadata={
                 **({"model_rpm_limit": model_rpm_limit} if model_rpm_limit else {}),
                 **({"disable_fallbacks": disable_fallbacks} if disable_fallbacks is not None else {}),
@@ -7230,6 +7375,71 @@ class TestPreCallWithFallbacksOnLocalRateLimit:
 
         assert data["model"] == fallback_model
         assert rig[3] == [primary_model, primary_model, fallback_model]
+
+    @pytest.mark.asyncio
+    async def test_fallback_the_key_may_not_call_is_skipped_when_fallback_access_is_enforced(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """With ``enforce_fallback_model_access`` the failover runs the check a router fallback hop runs on its target,
+        so a key that may call only the rate-limited model gets its rate limit, not the configured fallback."""
+        from litellm.proxy import proxy_server
+        from litellm.proxy.common_utils.proxy_rate_limit_error import ProxyRateLimitError
+
+        primary_model = "gpt-4.1"
+        fallback_model = "gpt-4.1-mini"
+        monkeypatch.setattr(proxy_server, "general_settings", {"enforce_fallback_model_access": True})
+        key = self._otel_key(model_rpm_limit={primary_model: 1}, models=(primary_model,))
+        rig = self._v3_limiter_rig(monkeypatch, key, [{primary_model: [fallback_model]}])
+        # The request's own empty list leaves the configured one to this failover
+        request = {"model": primary_model, "messages": [{"role": "user", "content": "hi"}], "fallbacks": []}
+
+        await self._pre_call(dict(request), key, rig)
+        with pytest.raises(ProxyRateLimitError) as exc_info:
+            await self._pre_call(dict(request), key, rig)
+
+        assert exc_info.value.status_code == 429
+        assert rig[3] == [primary_model, primary_model]
+
+    @pytest.mark.asyncio
+    async def test_fallback_the_key_may_call_is_served_when_fallback_access_is_enforced(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        from litellm.proxy import proxy_server
+
+        primary_model = "gpt-4.1"
+        fallback_model = "gpt-4.1-mini"
+        monkeypatch.setattr(proxy_server, "general_settings", {"enforce_fallback_model_access": True})
+        key = self._otel_key(model_rpm_limit={primary_model: 1}, models=(primary_model, fallback_model))
+        rig = self._v3_limiter_rig(monkeypatch, key, [{primary_model: [fallback_model]}])
+        request = {"model": primary_model, "messages": [{"role": "user", "content": "hi"}], "fallbacks": []}
+
+        await self._pre_call(dict(request), key, rig)
+        _, (data, _) = await self._pre_call(dict(request), key, rig)
+
+        assert data["model"] == fallback_model
+        assert rig[3] == [primary_model, primary_model, fallback_model]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("source", ["router", "key"])
+    async def test_a_configured_group_mapped_to_a_string_is_refused_not_called_by_character(
+        self, monkeypatch: pytest.MonkeyPatch, source: str
+    ):
+        """The failover reads the configured list, which the request's own list keeps from the Router's refusal"""
+        primary_model = "gpt-4.1"
+        malformed: Final = [{primary_model: "f"}]
+        key = self._otel_key(model_rpm_limit={primary_model: 1})
+        rig = self._v3_limiter_rig(monkeypatch, key, [{primary_model: ["f"]}])
+        if source == "router":
+            rig[1].fallbacks = malformed
+        else:
+            key.router_settings = {"fallbacks": malformed}
+        request = {"model": primary_model, "messages": [{"role": "user", "content": "hi"}], "fallbacks": []}
+
+        await self._pre_call(dict(request), key, rig)
+        with pytest.raises(litellm.BadRequestError, match=f"must map model group '{primary_model}' to a list"):
+            await self._pre_call(dict(request), key, rig)
+
+        assert rig[3] == [primary_model, primary_model]
 
     @pytest.mark.asyncio
     async def test_key_metadata_disable_fallbacks_returns_429_instead_of_retrying(

@@ -142,6 +142,7 @@ from litellm.types.llms.openai import (
 )
 from litellm.types.mcp import MCPPostCallResponseObject
 from litellm.types.prompts.init_prompts import PromptSpec
+from litellm.types.proxy.auth.client_context import VERIFIED_CLIENT_CONTEXT_KEY
 from litellm.types.rerank import RerankResponse
 from litellm.types.utils import (
     DEPLOYMENT_SCOPED_PRICING_FIELDS,
@@ -327,7 +328,7 @@ def _get_provider_request_id(original_exception: Exception) -> str | None:
 _CUSTOM_PRICING_KEYS: Final[frozenset[str]] = frozenset(CustomPricingLiteLLMParams.model_fields.keys())
 _MODEL_INFO_CUSTOM_PRICING_KEYS: Final[frozenset[str]] = _CUSTOM_PRICING_KEYS | DEPLOYMENT_SCOPED_PRICING_FIELDS
 _UNSERIALIZABLE_METADATA_KEYS: Final[frozenset[str]] = frozenset(
-    ("user_api_key_auth", "user_api_key_budget_reservation")
+    ("user_api_key_auth", "user_api_key_budget_reservation", VERIFIED_CLIENT_CONTEXT_KEY)
 )
 
 sentry_sdk_instance = None
@@ -5032,8 +5033,6 @@ def _init_custom_logger_compatible_class(
                 internal_usage_cache=internal_usage_cache
             )
 
-            if llm_router is not None and isinstance(llm_router, litellm.Router):
-                dynamic_rate_limiter_obj_v3.update_variables(llm_router=llm_router)
             _in_memory_loggers.append(dynamic_rate_limiter_obj_v3)
             return dynamic_rate_limiter_obj_v3
         elif logging_integration == "langtrace":
@@ -5939,6 +5938,7 @@ class StandardLoggingPayloadSetup:
             requester_custom_headers=None,
             cold_storage_object_key=None,
             user_api_key_auth_metadata=None,
+            user_api_key_auth_entries=None,
             team_alias=None,
             team_id=None,
             used_client_oauth_token=resolve_used_client_oauth_token(
@@ -6478,19 +6478,17 @@ class StandardLoggingPayloadSetup:
         litellm_metadata: Final = cast(  # cast-ok: request metadata is caller-provided
             Mapping[str, object], litellm_params.get("litellm_metadata") or {}
         )
-        if metadata.get("tags", []):
-            request_tags = cast(list[str], metadata.get("tags", [])).copy()  # cast-ok: tags are caller-provided
-        elif litellm_metadata.get("tags", []):
-            request_tags = cast(list[str], litellm_metadata.get("tags", [])).copy()  # cast-ok: tags are caller-provided
-        else:
-            request_tags = []
+        request_tags: Final = next(
+            (
+                cast(list[str], tags)  # cast-ok: tags are caller-provided
+                for tags in (metadata.get("tags"), litellm_metadata.get("tags"))
+                if isinstance(tags, list) and tags
+            ),
+            [],
+        )
         user_agent_tags: Final = StandardLoggingPayloadSetup._get_user_agent_tags(proxy_server_request)
         additional_header_tags: Final = StandardLoggingPayloadSetup._get_extra_header_tags(proxy_server_request)
-        if user_agent_tags is not None:
-            request_tags.extend(user_agent_tags)
-        if additional_header_tags is not None:
-            request_tags.extend(additional_header_tags)
-        return request_tags
+        return [*request_tags, *(user_agent_tags or ()), *(additional_header_tags or ())]
 
     _get_request_tags = get_request_tags
 
@@ -6986,6 +6984,7 @@ def get_standard_logging_metadata(
         user_api_key_request_route=None,
         cold_storage_object_key=None,
         user_api_key_auth_metadata=None,
+        user_api_key_auth_entries=None,
         team_alias=None,
         team_id=None,
         used_client_oauth_token=None,
