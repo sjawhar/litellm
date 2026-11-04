@@ -53,6 +53,7 @@ from litellm.proxy.hooks.cache_control_check import PROXY_CacheControlCheck
 from litellm.proxy.hooks.max_iterations_limiter import PROXY_MaxIterationsHandler
 from litellm.proxy.hooks.parallel_request_limiter_v3 import PROXY_MaxParallelRequestsHandler_v3
 from litellm.proxy.utils import InternalUsageCache
+from litellm.types.proxy.auth.client_context import VERIFIED_CLIENT_CONTEXT_KEY, VerifiedClientContext
 from litellm.types.llms.openai import ResponseAPIUsage, ResponseCompletedEvent, ResponsesAPIResponse
 from litellm.types.utils import (
     CallTypes,
@@ -11075,6 +11076,7 @@ def test_merge_litellm_metadata_skip_non_serializable():
         "metadata": {
             "user_api_key": "test-key-123",
             "user_api_key_auth": user_api_key_auth,  # This should be skipped
+            VERIFIED_CLIENT_CONTEXT_KEY: VerifiedClientContext(requester_ip_address="10.0.0.1", user_agent="ua"),
             "safe_field": "safe_value",
         },
         "litellm_metadata": {
@@ -11086,6 +11088,8 @@ def test_merge_litellm_metadata_skip_non_serializable():
 
     # user_api_key_auth should be skipped
     assert "user_api_key_auth" not in result
+    assert VERIFIED_CLIENT_CONTEXT_KEY not in result
+    json.dumps(result)
 
     # Other fields should be present
     assert result["user_api_key"] == "test-key-123"
