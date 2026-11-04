@@ -48,7 +48,12 @@ from typing import (
 )
 
 import httpx
-from typing_extensions import Never, ReadOnly, TypedDict
+from typing_extensions import (
+    Never,
+    ReadOnly,
+    TypedDict,
+    TypeIs,  # noqa: TID251  # TypeIs reaches typing only on 3.13
+)
 
 from litellm import _custom_logger_compatible_callbacks_literal
 from litellm.constants import (
@@ -1345,13 +1350,26 @@ def _without_caller_identity_fields(metadata: Mapping[str, object]) -> Mapping[s
     }
 
 
-def _proxy_stamped_request_metadata(request_data: Mapping[str, object]) -> bool:
-    """True when add_litellm_data_to_request already wrote the authenticated identity into a metadata
-    bucket. A request body can forge the ``user_api_key_*`` names but never the UserAPIKeyAuth instance."""
+def _is_metadata_bucket(value: object) -> TypeIs[Mapping[str, object]]:  # guard-ok: request metadata keys are str
+    return isinstance(value, dict)
+
+
+def proxy_stamped_metadata_bucket(request_data: Mapping[str, object]) -> Mapping[str, object] | None:
+    """The metadata bucket add_litellm_data_to_request wrote the authenticated identity into, or None when it
+    has not run. A request body can forge the ``user_api_key_*`` names but never the UserAPIKeyAuth instance.
+    Which bucket it is depends on the route, so a reader of a field the proxy owns must take this one rather
+    than ``metadata``, which on a ``litellm_metadata`` route holds the caller's provider metadata."""
     buckets: Final = (request_data.get("metadata"), request_data.get("litellm_metadata"))
-    return any(
-        isinstance(bucket, dict) and isinstance(bucket.get("user_api_key_auth"), UserAPIKeyAuth) for bucket in buckets
+    stamped: Final = tuple(
+        bucket
+        for bucket in buckets
+        if _is_metadata_bucket(bucket) and isinstance(bucket.get("user_api_key_auth"), UserAPIKeyAuth)
     )
+    return stamped[0] if stamped else None
+
+
+def _proxy_stamped_request_metadata(request_data: Mapping[str, object]) -> bool:
+    return proxy_stamped_metadata_bucket(request_data) is not None
 
 
 _PROXY_ONLY_LLM_API_ERRORS: Final = (HTTPException, ProxyException, GuardrailRaisedException)
