@@ -404,6 +404,48 @@ async def test_client_failure_ip_and_agent_labels_come_from_the_bucket_the_proxy
     }
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verified", (None, "10.1.2.3"))
+async def test_client_failure_ip_and_agent_labels_ignore_a_body_the_proxy_never_vouched_for(verified: str | None):
+    """A request can fail with no identity stamp at all, for instance inside add_litellm_data_to_request before
+    it writes one. The caller's metadata is then the only thing in the body, and taking it would let an
+    authenticated caller mint a series per string. The auth gate's own VerifiedClientContext is the one source
+    that a JSON body cannot produce."""
+    from litellm.types.proxy.auth.client_context import (
+        VERIFIED_CLIENT_CONTEXT_KEY,
+        VerifiedClientContext,
+    )
+
+    _clear_prometheus_registry()
+    prometheus_logger: Final = PrometheusLogger()
+    forged: Final = {
+        "requester_ip_address": "9.9.9.9",
+        "user_agent": "forged-agent",
+        VERIFIED_CLIENT_CONTEXT_KEY: {"requester_ip_address": "9.9.9.9", "user_agent": "forged-agent"},
+    }
+    vouched: Final = (
+        {VERIFIED_CLIENT_CONTEXT_KEY: VerifiedClientContext(requester_ip_address=verified, user_agent="real/1.0")}
+        if verified
+        else {}
+    )
+
+    await prometheus_logger.async_post_call_failure_hook(
+        request_data={"model": "gpt-4o-mini", "metadata": {**forged, **vouched}},
+        original_exception=litellm.BudgetExceededError(current_cost=2.0, max_budget=1.0),
+        user_api_key_dict=UserAPIKeyAuth(token="hashed-key"),
+    )
+
+    observed: Final = _client_labels_by_metric()
+    assert set(observed) == {
+        "litellm_proxy_failed_requests_metric_total",
+        "litellm_proxy_total_requests_metric_total",
+    }
+    for pair in chain.from_iterable(observed.values()):
+        assert "9.9.9.9" not in pair and "forged-agent" not in pair, pair
+    if verified:
+        assert all(pairs == {(verified, "real/1.0")} for pairs in observed.values()), observed
+
+
 def test_virtual_key_rate_limit_metrics_accept_custom_metadata_labels(
     monkeypatch: pytest.MonkeyPatch,
 ):

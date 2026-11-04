@@ -37,6 +37,10 @@ from litellm.proxy._types import (
 )
 from litellm.proxy.auth.auth_exception_handler import UserAPIKeyAuthExceptionHandler, _as_proxy_exception
 from litellm.proxy.auth.model_access_denied import ModelAccessDeniedHTTPException
+from litellm.types.proxy.auth.client_context import (
+    VERIFIED_CLIENT_CONTEXT_KEY,
+    VerifiedClientContext,
+)
 
 
 class _EngineHttp500:
@@ -854,6 +858,9 @@ async def test_auth_failure_replaces_a_requester_ip_address_the_caller_sent():
     assert logged_request_data["metadata"] == {
         "requester_ip_address": "10.1.2.3",
         "user_agent": "real-client/1.0",
+        VERIFIED_CLIENT_CONTEXT_KEY: VerifiedClientContext(
+            requester_ip_address="10.1.2.3", user_agent="real-client/1.0"
+        ),
     }
 
 
@@ -900,6 +907,9 @@ async def test_auth_failure_drops_client_context_the_caller_sent_in_the_other_bu
     assert logged_request_data["litellm_metadata"] == {
         "requester_ip_address": "10.1.2.3",
         "user_agent": "real-client/1.0",
+        VERIFIED_CLIENT_CONTEXT_KEY: VerifiedClientContext(
+            requester_ip_address="10.1.2.3", user_agent="real-client/1.0"
+        ),
     }
     assert logged_request_data["metadata"] == {"user_supplied": "keep-me"}
 

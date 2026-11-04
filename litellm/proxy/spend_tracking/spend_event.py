@@ -27,6 +27,7 @@ from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.db.spend_log_tool_index import response_tool_call_names
 from litellm.types.interactions import InteractionsAPIResponse
 from litellm.types.llms.base import LiteLLMBaseModel
+from litellm.types.proxy.auth.client_context import VERIFIED_CLIENT_CONTEXT_KEY
 from litellm.types.utils import LiteLLMBatch, Usage
 
 SPEND_EVENT_VERSION: Final = 1
@@ -34,7 +35,9 @@ CACHE_OFF_KEY: Final = "Cache OFF"
 
 ObjectMapping: TypeAlias = Mapping[str, object]
 
-_UNSERIALIZABLE_METADATA_KEYS: Final = frozenset({"user_api_key_auth", "litellm_parent_otel_span"})
+_UNSERIALIZABLE_METADATA_KEYS: Final = frozenset(
+    {"user_api_key_auth", "litellm_parent_otel_span", VERIFIED_CLIENT_CONTEXT_KEY}
+)
 _STANDARD_LOGGING_BODY_KEYS: Final = frozenset({"messages", "response"})
 _STANDARD_LOGGING_DROPPED_KEYS: Final = frozenset({"model_parameters"})
 _NOT_OFFLOADED_RESPONSE_TYPES: Final = (LiteLLMBatch, InteractionsAPIResponse)
