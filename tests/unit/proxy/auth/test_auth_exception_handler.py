@@ -905,6 +905,41 @@ async def test_auth_failure_drops_client_context_the_caller_sent_in_the_other_bu
 
 
 @pytest.mark.asyncio
+async def test_auth_failure_keeps_the_other_bucket_strippable_of_router_stamps():
+    with (
+        patch("litellm.proxy.auth.auth_exception_handler.seed_request_identity"),
+        patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj.post_call_failure_hook",
+            new_callable=AsyncMock,
+            return_value=None,
+        ) as mock_hook,
+        patch(
+            "litellm.proxy.proxy_server.general_settings",
+            {"allow_requests_on_db_unavailable": False},
+        ),
+    ):
+        with pytest.raises(ProxyException):
+            await UserAPIKeyAuthExceptionHandler._handle_authentication_error(
+                ProxyException(
+                    message="Invalid API key",
+                    type=ProxyErrorTypes.auth_error,
+                    param=None,
+                    code=status.HTTP_401_UNAUTHORIZED,
+                ),
+                _http_request(headers={"user-agent": "real-client/1.0"}),
+                {"litellm_metadata": {}, "metadata": {"user_supplied": "keep-me", "model_group": "forged"}},
+                "/v1/responses",
+                None,
+                "sk-bad-key",
+            )
+
+    from litellm.proxy.litellm_pre_call_utils import without_router_reserved_fields
+
+    stripped = without_router_reserved_fields(mock_hook.call_args[1]["request_data"])
+    assert stripped["metadata"] == {"user_supplied": "keep-me"}
+
+
+@pytest.mark.asyncio
 async def test_auth_failure_ip_uses_litellm_metadata_when_present():
     """Routes that keep proxy metadata under `litellm_metadata` (e.g. /responses) must
     get the IP there, since that is the dict the logging layer reads for them."""
