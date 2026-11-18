@@ -1,2 +1,7 @@
 /model_prices_and_context_window.json @mateo-berri @ryan-crabbe-berri @kerrylu-berri
 /litellm/model_prices_and_context_window_backup.json @mateo-berri @ryan-crabbe-berri @kerrylu-berri
+# Agent instruction files and skills: a pull request that changes one requests the owner's review.
+**/AGENTS.md @sjawhar
+**/CLAUDE.md @sjawhar
+**/SKILL.md @sjawhar
+**/.agents/skills/ @sjawhar
