@@ -21,3 +21,4 @@ __all__ = [
     "get_skill",
     "list_skills",
 ]
+# Control line: the narrowed pattern leaves Skills API code unowned.
