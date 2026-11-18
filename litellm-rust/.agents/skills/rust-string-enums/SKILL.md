@@ -64,3 +64,5 @@ Test structured parsers with valid and invalid payloads, including their existin
 ## Upstream references
 
 The workspace used Strum 0.28.0 and serde_with 3.16.1 when this guidance was written. Consult the matching version of the [EnumString docs](https://docs.rs/strum/0.28.0/strum/derive.EnumString.html), [Display docs](https://docs.rs/strum_macros/0.28.0/strum_macros/derive.Display.html), [DeserializeFromStr docs](https://docs.rs/serde_with/3.16.1/serde_with/derive.DeserializeFromStr.html), and [SerializeDisplay docs](https://docs.rs/serde_with/3.16.1/serde_with/derive.SerializeDisplay.html). Schemars documents [schema overrides and Serde conversion attributes](https://docs.rs/schemars/1.2.2/schemars/derive.JsonSchema.html)
+
+Probe line: a pull request that changes this file requests the code owner's review.
