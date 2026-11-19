@@ -9770,6 +9770,84 @@ async def test_mapping_row_is_refused_while_the_database_is_stopped_with_the_set
 
 
 @pytest.mark.asyncio
+async def test_issuer_without_a_row_is_served_the_last_good_global_row_while_the_database_is_stopped():
+    cache: Final = await _cache_holding_keys("hashed-global-key")
+    table: Final = await _stopped_after_one_read(cache, _svc_mapping("hashed-global-key", jwt_issuer=""))
+
+    served: Final = await _resolve_svc(table, cache)
+
+    assert isinstance(served, UserAPIKeyAuth)
+    assert served.token == "hashed-global-key"
+
+
+@pytest.mark.asyncio
+async def test_issuer_never_read_is_refused_while_another_issuer_kept_the_global_row():
+    from litellm.proxy.auth.user_api_key_auth import _resolve_jwt_to_virtual_key
+
+    cache: Final = await _cache_holding_keys("hashed-global-key")
+    table: Final = _JWTKeyMappingTable(_svc_mapping("hashed-global-key", jwt_issuer=""))
+    warmed: Final = await _resolve_jwt_to_virtual_key(
+        jwt_claims={JWTHandler.LITELLM_JWT_ISSUER_CLAIM: ISSUER_ONE, "sub": "svc-7"},
+        jwt_handler=_per_issuer_virtual_key_jwt_handler(global_claim_field="sub"),
+        prisma_client=SimpleNamespace(db=SimpleNamespace(litellm_jwtkeymapping=table)),
+        user_api_key_cache=cache,
+        parent_otel_span=None,
+        proxy_logging_obj=MagicMock(),
+    )
+    await _outlive_the_mapping_cache(cache)
+    table.stopped = True
+
+    assert isinstance(warmed, UserAPIKeyAuth)
+    assert warmed.token == "hashed-global-key"
+    with pytest.raises(httpx.ConnectError):
+        await _resolve_svc(table, cache)
+
+
+@pytest.mark.asyncio
+async def test_issuer_scopes_whose_parts_join_to_the_same_text_keep_separate_entries():
+    """Issuer ``.../a`` with sub ``sub:v`` and issuer ``.../a:sub`` with sub ``v`` join to the same text when the parts
+    are only separated by ``:``. Warming the second must not answer the first during an outage."""
+    from litellm.proxy.auth.user_api_key_auth import _resolve_jwt_to_virtual_key
+
+    first_issuer: Final = "https://idp.example/a"
+    second_issuer: Final = "https://idp.example/a:sub"
+    jwt_handler: Final = MagicMock()
+    jwt_handler.litellm_jwtauth = LiteLLM_JWTAuth(
+        virtual_key_claim_field="sub", unregistered_jwt_client_behavior="reject"
+    )
+    cache: Final = await _cache_holding_keys("hashed-second-key")
+    table: Final = _JWTKeyMappingTable(
+        {
+            "jwt_issuer": second_issuer,
+            "jwt_claim_name": "sub",
+            "jwt_claim_value": "v",
+            "token": "hashed-second-key",
+            "is_active": True,
+        }
+    )
+
+    async def resolve(issuer: str, sub: str) -> object:
+        return await _resolve_jwt_to_virtual_key(
+            jwt_claims={JWTHandler.LITELLM_JWT_ISSUER_CLAIM: issuer, "sub": sub},
+            jwt_handler=jwt_handler,
+            prisma_client=SimpleNamespace(db=SimpleNamespace(litellm_jwtkeymapping=table)),
+            user_api_key_cache=cache,
+            parent_otel_span=None,
+            proxy_logging_obj=MagicMock(),
+        )
+
+    warmed: Final = await resolve(second_issuer, "v")
+    for issuer, sub in ((first_issuer, "sub:v"), (second_issuer, "v"), (None, "sub:v"), (None, "v")):
+        await cache.async_delete_cache(jwt_key_mapping_cache_key("sub", sub, issuer))
+    table.stopped = True
+
+    assert isinstance(warmed, UserAPIKeyAuth)
+    assert warmed.token == "hashed-second-key"
+    with pytest.raises(httpx.ConnectError):
+        await resolve(first_issuer, "sub:v")
+
+
+@pytest.mark.asyncio
 async def test_auth_flow_enters_virtual_key_mapping_when_only_an_issuer_configures_the_claim_field():
     jwt_token = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJzdmMtYWNjb3VudC03In0.signature"
     jwt_handler = _per_issuer_virtual_key_jwt_handler(global_claim_field=None)

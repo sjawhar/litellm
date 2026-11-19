@@ -27,6 +27,8 @@ from litellm.repositories.table_repositories import JWTKeyMappingRepository
 router: Final = APIRouter()
 
 _TOKEN_HASH_PATTERN: Final = re.compile(r"[0-9a-f]{64}")
+# The fields an update can change that change what a mapping resolves to; an update of any of them is a revocation.
+_RESOLVING_FIELDS: Final = frozenset(("token", "jwt_issuer", "is_active"))
 
 
 def _validated_token_hash(token: str) -> str:
@@ -173,9 +175,10 @@ async def create_jwt_key_mapping(
         if data.description is not None:
             create_data["description"] = data.description
 
+        cache_key: Final = jwt_key_mapping_cache_key(data.jwt_claim_name, data.jwt_claim_value, data.jwt_issuer)
+        await revoke_last_good(user_api_key_cache, (cache_key,))
         new_mapping: Final = await _mapping_table(prisma_client).create(data=create_data)
 
-        cache_key: Final = jwt_key_mapping_cache_key(data.jwt_claim_name, data.jwt_claim_value, data.jwt_issuer)
         await evict_and_broadcast(cache_keys=(cache_key,), user_api_key_cache=user_api_key_cache)
 
         return _to_response(new_mapping)
@@ -235,8 +238,13 @@ async def update_jwt_key_mapping(
         old_cache_key: Final = jwt_key_mapping_cache_key(
             old_mapping.jwt_claim_name, old_mapping.jwt_claim_value, old_mapping.jwt_issuer
         )
-        if data.is_active is False:
-            await revoke_last_good(user_api_key_cache, (old_cache_key,))
+        scope_cache_key: Final = jwt_key_mapping_cache_key(
+            old_mapping.jwt_claim_name,
+            old_mapping.jwt_claim_value,
+            update_data.get("jwt_issuer", old_mapping.jwt_issuer),
+        )
+        if update_data.keys() & _RESOLVING_FIELDS:
+            await revoke_last_good(user_api_key_cache, tuple(dict.fromkeys((old_cache_key, scope_cache_key))))
 
         updated_mapping: Final = await _mapping_table(prisma_client).update(where={"id": data.id}, data=update_data)
 
