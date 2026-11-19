@@ -32,6 +32,7 @@ from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.proxy._lazy_features import LazyFeature, attach_lazy_features
 from litellm.proxy._types import ProxyException, UserAPIKeyAuth
+from litellm.proxy.litellm_pre_call_utils import ROUTER_OWNED_REQUEST_FIELDS
 from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import router as llm_passthrough_router
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     DEFAULT_PASS_THROUGH_REQUEST_TIMEOUT_SECONDS,
@@ -7843,7 +7844,12 @@ PROXY_STAMPED_NAMES: Final = frozenset(
 
 @pytest.mark.parametrize(
     "name",
-    sorted(frozenset(litellm.all_litellm_params) - frozenset(("metadata", "litellm_metadata")) - PROXY_STAMPED_NAMES),
+    sorted(
+        frozenset(litellm.all_litellm_params)
+        - frozenset(("metadata", "litellm_metadata"))
+        - PROXY_STAMPED_NAMES
+        - ROUTER_OWNED_REQUEST_FIELDS
+    ),
 )
 def test_passthrough_keeps_each_registered_litellm_owned_name_out_of_the_forwarded_body(name: str) -> None:
     split: Final = _split_pass_through_body(json.dumps({name: "owned", **json.loads(GEMINI_BODY)}))
@@ -7853,7 +7859,7 @@ def test_passthrough_keeps_each_registered_litellm_owned_name_out_of_the_forward
     assert split.forwarded_body == json.loads(GEMINI_BODY)
 
 
-@pytest.mark.parametrize("name", sorted(PROXY_STAMPED_NAMES))
+@pytest.mark.parametrize("name", sorted(PROXY_STAMPED_NAMES | ROUTER_OWNED_REQUEST_FIELDS))
 def test_passthrough_drops_a_client_supplied_proxy_stamped_name(name: str) -> None:
     split: Final = _split_pass_through_body(json.dumps({name: {"forged": "by-client"}, **json.loads(GEMINI_BODY)}))
 

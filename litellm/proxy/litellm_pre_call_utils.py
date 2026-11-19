@@ -416,6 +416,11 @@ _ROUTER_RESERVED_METADATA_FIELDS: Final = frozenset(
         ROUTER_USAGE_COUNTED_TOKENS_METADATA_KEY,
     }
 )
+# The router writes a dispatched call's ``model_info`` and takes ``cooldown_time`` from the deployment it picked;
+# its failure and usage callbacks count against the deployment ``model_info.id`` names and cool it for that time.
+# A client value only points them at a deployment the request never reached, or lengthens a real one's cooldown,
+# so the strip is never gated.
+ROUTER_OWNED_REQUEST_FIELDS: Final = frozenset({"model_info", "cooldown_time"})
 _ALLOW_CLIENT_PRICING_OVERRIDE_METADATA_KEY: Final = "allow_client_pricing_override"
 
 # Request fields whose value, when URL-valued, becomes the outbound destination
@@ -683,6 +688,15 @@ def _strip_router_reserved_metadata(
             verbose_proxy_logger.debug(
                 "Stripped router-reserved metadata field from request body: %s.%s", metadata_key, field
             )
+
+
+def _strip_router_owned_request_fields(
+    data: dict[str, object],  # mutable-ok: strips in place on the request body the pre-call pipeline threads through
+) -> None:
+    """Drop the router-owned deployment fields from the root of the client's request body."""
+    for field in ROUTER_OWNED_REQUEST_FIELDS & data.keys():
+        data.pop(field)
+        verbose_proxy_logger.debug("Stripped router-owned field from request body: %s", field)
 
 
 def get_metadata_variable_name(request: Request) -> str:
@@ -2376,6 +2390,7 @@ async def add_litellm_data_to_request(
         _strip_client_pricing_overrides(data)
     strip_client_guardrail_information(data)
     _strip_router_reserved_metadata(data)
+    _strip_router_owned_request_fields(data)
 
     # Same reason as the strips above: runs after the metadata string-to-dict parse
     # so JSON-string metadata cannot smuggle callback credentials past the dict guard.

@@ -343,6 +343,38 @@ async def test_add_litellm_data_to_request_strips_guardrail_information_despite_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("allow_client_pricing_override", [False, True])
+async def test_add_litellm_data_to_request_strips_root_model_info_and_cooldown_time(allow_client_pricing_override):
+    """The router writes a dispatched call's ``model_info`` and takes ``cooldown_time`` from the deployment, and its
+    failure callbacks count against and cool the deployment a logged ``model_info.id`` names. A body's root value of
+    either never reaches a logging object, whatever the pricing opt-in, which still decides ``metadata.model_info``."""
+    data = {
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "hi"}],
+        "model_info": {"id": "victim-deployment"},
+        "cooldown_time": 3600,
+        "metadata": {"model_info": {"output_cost_per_token": 0.0002}},
+    }
+
+    updated = await add_litellm_data_to_request(
+        data=data,
+        request=_make_request_mock(),
+        user_api_key_dict=_user_api_key_auth(metadata={"allow_client_pricing_override": allow_client_pricing_override}),
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    assert {
+        "root": {field: updated.get(field) for field in ("model_info", "cooldown_time")},
+        "metadata_model_info": updated["metadata"].get("model_info"),
+    } == {
+        "root": {"model_info": None, "cooldown_time": None},
+        "metadata_model_info": {"output_cost_per_token": 0.0002} if allow_client_pricing_override else None,
+    }
+
+
+@pytest.mark.asyncio
 async def test_add_litellm_data_to_request_strips_json_string_litellm_metadata():
     """``litellm_metadata`` may arrive as a JSON-encoded string (multipart/
     form-data or ``extra_body``). The strip has to run after the proxy parses
