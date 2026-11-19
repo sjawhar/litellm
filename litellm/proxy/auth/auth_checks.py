@@ -885,10 +885,10 @@ def _deployment_sends_name_to_anthropic(deployment: object, name: str) -> bool:
 
 def _deployments_under_name(model: str, llm_router: Router) -> Iterator[object]:
     """
-    Every deployment the router can serve ``model`` from, whichever team asks: the deployments of that name and the
-    members of the routing group of that name, each team's deployments published under that name, the deployment of
-    every wildcard route that matches it, the proxy's and each team's, with the model the route fills in, the deployment
-    whose id it is, and the deployments whose provider model it is.
+    Every deployment the router can serve ``model`` from, whichever team asks: the deployments of that name, each
+    team's deployments published under that name, the deployment of every wildcard route that matches it, the proxy's
+    and each team's, with the model the route fills in, the deployment whose id it is, and the deployments whose
+    provider model it is. A routing group's name is refused before this scan, so none of its members is read here.
     """
     yield from llm_router.get_model_list(model_name=model) or ()
     for team_id, public_name in llm_router.team_model_to_deployment_indices:
@@ -906,33 +906,39 @@ def _deployments_under_name(model: str, llm_router: Router) -> Iterator[object]:
 
 def _reject_provider_fallback_served_as_another_model(*, model: str, llm_router: Router | None) -> None:
     """
-    A name in Anthropic's own ``fallbacks`` is refused when the router can serve that name, for any team, from a
-    deployment that does not send the same name to Anthropic: a model check could grant the name through that
-    deployment, while Anthropic serves the name itself.
+    A name in Anthropic's own ``fallbacks`` is refused when it is a routing group, or when the router can serve that
+    name, for any team, from a deployment that does not send the same name to Anthropic: a model check could grant the
+    name through that deployment, while Anthropic serves the name itself.
     """
     if llm_router is None:
         return
-    if all(_deployment_sends_name_to_anthropic(row, model) for row in _deployments_under_name(model, llm_router)):
+    # A routing group is an indirection, as an alias is: the router resolves each member for the caller's team, so the
+    # name is refused as such, whatever its members send
+    is_routing_group: Final = llm_router.get_routing_group(model) is not None
+    if not is_routing_group and all(
+        _deployment_sends_name_to_anthropic(row, model) for row in _deployments_under_name(model, llm_router)
+    ):
         return
+    reason: Final = (
+        "is a routing group" if is_routing_group else "is served by a deployment that does not send it to Anthropic"
+    )
     raise ModelAccessDeniedProxyException(
         message=model_access_denied_client_message(model=model),
-        internal_message=(
-            f"Fallback model {model} is served by a deployment that does not send it to Anthropic, "
-            "while Anthropic serves it as named."
-        ),
+        internal_message=f"Fallback model {model} {reason}, while Anthropic serves it as named.",
         type=ProxyErrorTypes.key_model_access_denied,
         param="fallbacks",
         code=status.HTTP_403_FORBIDDEN,
     )
 
 
-def reject_ambiguous_provider_fallbacks(
+def deny_ambiguous_provider_fallbacks(
     *, provider_fallback_models: Sequence[str], valid_token: UserAPIKeyAuth | None, llm_router: Router | None
 ) -> None:
     """
-    A name in Anthropic's own ``fallbacks`` must mean the model Anthropic serves, so a name that is an alias, or that
-    the router can serve from another model, is refused. Both the key's check and common_checks() run this before any
-    other check on those names, so no error a request can be recovered from comes first.
+    A name in Anthropic's own ``fallbacks`` must mean the model Anthropic serves, so a name that is an alias or a
+    routing group, or that the router can serve from another model, is refused. Both the key's check and
+    common_checks() run this before any other check on those names, so no error a request can be recovered from comes
+    first.
     """
     for model in provider_fallback_models:
         _reject_aliased_provider_fallback(model=model, valid_token=valid_token, llm_router=llm_router)
@@ -960,7 +966,7 @@ async def _run_fallback_model_checks(
     """
     from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
 
-    reject_ambiguous_provider_fallbacks(
+    deny_ambiguous_provider_fallbacks(
         provider_fallback_models=provider_fallback_models, valid_token=valid_token, llm_router=llm_router
     )
 

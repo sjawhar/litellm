@@ -588,6 +588,7 @@ class _Gateway:
         token_team_models: tuple[str, ...] | None = None,
         allow_requests_on_db_unavailable: bool = False,
         user_id: str | None = None,
+        team_models: tuple[str, ...] = ("requested", "other"),
     ) -> "_GatewayResult":
         import httpx
         import respx
@@ -632,7 +633,7 @@ class _Gateway:
             team_id=team_id,
             user_id=user_id,
             team_models=(
-                list(token_team_models) if token_team_models is not None else ["requested", "other"] if team_id else []
+                list(token_team_models) if token_team_models is not None else list(team_models) if team_id else []
             ),
             router_settings=key_router_settings,
             aliases=dict(key_aliases or {}),
@@ -645,7 +646,7 @@ class _Gateway:
             await cache.async_set_cache(
                 key=f"team_id:{team_id}",
                 value=LiteLLM_TeamTableCachedObj(
-                    team_id=team_id, models=["requested", "other"], router_settings=team_router_settings
+                    team_id=team_id, models=list(team_models), router_settings=team_router_settings
                 ),
             )
         for name, value in {
@@ -1230,6 +1231,14 @@ _KEY_WITH_THE_NAME: Final = ("requested", _OPUS)
             id="routing-group-of-another-model",
         ),
         pytest.param(
+            (_opus_deployment(f"anthropic/{_OPUS}", "expensive", model_name="opus-member"),),
+            _KEY_WITH_THE_NAME,
+            {},
+            ({"group_name": _OPUS, "models": ["opus-member"], "routing_strategy": "simple-shuffle"},),
+            # A routing group is refused as such, as an alias is, even when its members all send the name
+            id="routing-group-whose-member-sends-the-name",
+        ),
+        pytest.param(
             (
                 _opus_deployment(
                     "anthropic/claude-haiku-4-5", "cheap", model_name="haiku-deployment", deployment_id=_OPUS
@@ -1273,6 +1282,33 @@ async def test_a_name_in_anthropics_fallbacks_the_router_can_serve_as_another_mo
     assert "key_model_access_denied" in result.response.text
     assert '"param":"fallbacks"' in result.response.text.replace(" ", "")
     assert f"The requested model '{_OPUS}' is not available" in result.response.text
+    assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+
+
+@pytest.mark.asyncio
+async def test_a_routing_group_in_anthropics_fallbacks_is_refused_where_a_team_resolves_its_member_to_another_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The proxy-wide member sends the name, but the caller's team publishes a deployment of another model under the
+    member's name, which the router serves the group from for that team
+    """
+    result: Final = await _Gateway(monkeypatch, requested_answers=True).send(
+        {"fallbacks": [{"model": _OPUS}]},
+        beta=True,
+        team_router_settings={},
+        key_models=_KEY_WITH_THE_NAME,
+        team_models=_KEY_WITH_THE_NAME,
+        extra_deployments=(
+            _opus_deployment(f"anthropic/{_OPUS}", "expensive", model_name="member"),
+            _opus_deployment("anthropic/claude-haiku-4-5", "cheap", model_name="member", team_id="fallback-team"),
+        ),
+        routing_groups=({"group_name": _OPUS, "models": ["member"], "routing_strategy": "simple-shuffle"},),
+    )
+
+    assert result.response.status_code == 403, result.response.text
+    assert "key_model_access_denied" in result.response.text
+    assert '"param":"fallbacks"' in result.response.text.replace(" ", "")
     assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
 
 

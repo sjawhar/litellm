@@ -61,6 +61,7 @@ from litellm.proxy.auth.auth_checks import (  # noqa: F401  # legacy module expo
     check_end_user_budget,
     common_checks,
     delete_cache_key_object,
+    deny_ambiguous_provider_fallbacks,
     get_end_user_object,
     get_jwt_key_mapping_object,
     get_key_end_user_budget_id,
@@ -76,7 +77,6 @@ from litellm.proxy.auth.auth_checks import (  # noqa: F401  # legacy module expo
     is_valid_fallback_model,
     jwt_key_mapping_cache_key,
     key_model_aliases_for_auth_check,
-    reject_ambiguous_provider_fallbacks,
     resolve_and_validate_end_user_id,
     resolve_default_end_user_budget,
     team_member_max_budget_alert_check,
@@ -3841,7 +3841,7 @@ async def enforce_key_and_fallback_model_access(
         request_data, anthropic_owns_body_fallbacks=body_fallbacks_go_to_anthropic(route, request)
     )
     # Refused before any check on them, as in common_checks, so no error a request can be recovered from comes first
-    reject_ambiguous_provider_fallbacks(
+    deny_ambiguous_provider_fallbacks(
         provider_fallback_models=anthropic_fallback_names, valid_token=valid_token, llm_router=llm_router
     )
 
