@@ -34,6 +34,7 @@ from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.user_api_key_cache import (
     end_user_cache_key,
     end_user_restricted_registry_cache_key,
+    revoke_last_good,
 )
 from litellm.proxy.management_endpoints.common_daily_activity import get_daily_activity
 from litellm.proxy.management_endpoints.common_utils import validate_budget_duration
@@ -177,8 +178,10 @@ async def block_user(data: BlockUsers):
         }'
         ```
     """
-    from litellm.proxy.proxy_server import prisma_client
+    from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
 
+    if prisma_client is not None:
+        await revoke_last_good(user_api_key_cache, _end_user_cache_keys(data.user_ids))
     try:
         records: Final = []
         if prisma_client is not None:
@@ -663,7 +666,7 @@ async def update_end_user(
     ```
     """
 
-    from litellm.proxy.proxy_server import litellm_proxy_admin_name, prisma_client
+    from litellm.proxy.proxy_server import litellm_proxy_admin_name, prisma_client, user_api_key_cache
 
     try:
         data_json: Final = _STR_OBJECT_DICT.validate_python(data.json())
@@ -690,6 +693,8 @@ async def update_end_user(
             )
 
         end_user_table_data_typed: Final = LiteLLM_EndUserTable.model_validate(end_user_table_data.model_dump())
+        if non_default_values.get("blocked") is True:
+            await revoke_last_good(user_api_key_cache, _end_user_cache_keys((data.user_id,)))
 
         ## Get budget table data ##
         end_user_budget_table: Final = end_user_table_data_typed.litellm_budget_table

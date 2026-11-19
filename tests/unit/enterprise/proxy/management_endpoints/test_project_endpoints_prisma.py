@@ -1,5 +1,7 @@
+import asyncio
 import os
 import traceback
+import httpx
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -1023,6 +1025,101 @@ async def test_update_project_succeeds_when_cache_eviction_fails(monkeypatch):
 
     assert response is updated_row
     failing_cache.async_delete_cache.assert_awaited_once()
+
+
+class _ProjectRows:
+    """One project row the update endpoint writes and auth reads. While ``stopped`` every read fails the way an
+    unreachable Postgres does; ``pause_next_read`` holds the next read once it has the row."""
+
+    def __init__(self, project_id: str) -> None:
+        self.project_id = project_id
+        self.blocked = False
+        self.stopped = False
+        self.read_held = asyncio.Event()
+        self._release: asyncio.Event | None = None
+
+    def pause_next_read(self) -> asyncio.Event:
+        self._release = asyncio.Event()
+        return self._release
+
+    def _row(self) -> mock.MagicMock:
+        row = mock.MagicMock(team_id=None, budget_id=None, object_permission_id=None)
+        columns = {"project_id": self.project_id, "team_id": None, "models": [], "blocked": self.blocked}
+        row.model_dump = lambda: columns
+        return row
+
+    async def find_unique(self, where: Mapping[str, object], include: object = None) -> mock.MagicMock:
+        if self.stopped:
+            raise httpx.ConnectError("All connection attempts failed")
+        row = self._row()
+        release = self._release
+        if release is not None:
+            self._release = None
+            self.read_held.set()
+            await release.wait()
+        return row
+
+    async def update(self, where: Mapping[str, object], data: Mapping[str, object], include: object = None):
+        self.blocked = bool(data.get("blocked", self.blocked))
+        return self._row()
+
+
+def _serve_project_rows(monkeypatch, rows: _ProjectRows, cache: UserApiKeyCache) -> mock.MagicMock:
+    prisma = mock.MagicMock()
+    prisma.jsonify_object = lambda data: data
+    prisma.db.litellm_projecttable = rows
+    monkeypatch.setattr(litellm.proxy.proxy_server, "premium_user", True)
+    monkeypatch.setattr(litellm.proxy.proxy_server, "prisma_client", prisma)
+    monkeypatch.setattr(litellm.proxy.proxy_server, "user_api_key_cache", cache)
+    return prisma
+
+
+async def _block_project(project_id: str) -> None:
+    await update_project(
+        data=UpdateProjectRequest(project_id=project_id, blocked=True),
+        http_request=Request(scope={"type": "http"}),
+        user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN, api_key=MASTER_KEY, user_id="1234"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_project_block_answers_503_and_writes_nothing_when_redis_cannot_record_it(monkeypatch):
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis = fake_redis_cache()
+    redis.server.connected = False
+    rows = _ProjectRows(f"project-{uuid.uuid4()}")
+    _serve_project_rows(monkeypatch, rows, UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True))
+
+    with pytest.raises(ProxyException) as refused:
+        await _block_project(rows.project_id)
+
+    assert (str(refused.value.code), rows.blocked) == ("503", False)
+
+
+@pytest.mark.asyncio
+async def test_after_a_project_block_a_read_in_flight_cannot_bring_the_unblocked_project_back_in_an_outage(monkeypatch):
+    from litellm.proxy.auth.auth_checks import get_project_object
+    from litellm.proxy.db.exception_handler import LastGoodEntryMissing
+
+    rows = _ProjectRows(f"project-{uuid.uuid4()}")
+    cache = UserApiKeyCache(serve_last_good_entries=True)
+    prisma = _serve_project_rows(monkeypatch, rows, cache)
+
+    async def project():
+        return await get_project_object(project_id=rows.project_id, prisma_client=prisma, user_api_key_cache=cache)
+
+    release = rows.pause_next_read()
+    in_flight = asyncio.create_task(project())
+    await rows.read_held.wait()
+    await _block_project(rows.project_id)
+    release.set()
+    assert (await in_flight).blocked is False
+    await cache.async_delete_cache(f"project_id:{rows.project_id}")
+    rows.stopped = True
+
+    with pytest.raises(LastGoodEntryMissing):
+        await project()
 
 
 @pytest.mark.asyncio

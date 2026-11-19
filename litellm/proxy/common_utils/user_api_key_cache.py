@@ -545,18 +545,23 @@ _active_auth_entries_scope: Final[ContextVar[last_good_auth_entries_scope | None
 
 class last_good_auth_entries_scope:
     """Records the type of each last good entry ``recall_last_good`` serves inside the scope, from ``asyncio.gather``
-    children too, since they share the scope object the parent opened."""
+    children too, since they share the scope object the parent opened. A scope opened inside another one also records
+    into it, so a lookup can tell whether it served a last good entry without hiding that from the request."""
 
-    __slots__ = ("_token", "served")
+    __slots__ = ("_outer", "_token", "served")
 
     def __init__(self) -> None:
         self.served: tuple[str, ...] = ()
+        self._outer: last_good_auth_entries_scope | None = None
         self._token: Token[last_good_auth_entries_scope | None] | None = None
 
     def record(self, entry_type: str) -> None:
         self.served = (*self.served, entry_type)
+        if self._outer is not None:
+            self._outer.record(entry_type)
 
     def __enter__(self) -> last_good_auth_entries_scope:
+        self._outer = _active_auth_entries_scope.get()
         self._token = _active_auth_entries_scope.set(self)
         return self
 
@@ -567,15 +572,22 @@ class last_good_auth_entries_scope:
             _active_auth_entries_scope.reset(self._token)
 
 
+def record_last_good_served(entry_type: str) -> None:
+    """Record ``entry_type`` in the open scope for a value an ordinary cache hands back that was first served from a
+    last good entry, so a request that rests on it reads last_good like the request that recalled it."""
+    scope: Final = _active_auth_entries_scope.get()
+    if scope is not None:
+        scope.record(entry_type)
+
+
 async def recall_last_good(cache: DualCache, cache_key: str, model_type: type[T]) -> T | None:
     """The last good entry for ``cache_key``, recorded in the open ``last_good_auth_entries_scope`` when found."""
     store: Final = _last_good_store(cache)
     if store is None or not store.serve_last_good_entries:
         return None
     entry: Final = await _read_last_good(store, cache_key, model_type)
-    scope: Final = _active_auth_entries_scope.get()
-    if entry is not None and scope is not None:
-        scope.record(model_type.__name__)
+    if entry is not None:
+        record_last_good_served(model_type.__name__)
     return entry
 
 

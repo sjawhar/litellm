@@ -22,6 +22,7 @@ from litellm._uuid import uuid
 from litellm.proxy._types import *
 from litellm.proxy.auth.auth_checks import delete_cached_project_object
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+from litellm.proxy.common_utils.user_api_key_cache import project_cache_key, revoke_last_good
 from litellm.proxy.management.teams.authz import TEAM_OR_ORG_ADMIN, TeamAccess, is_team_admin, is_team_member
 from litellm.proxy.management.teams.dependencies import get_team_access
 from litellm.proxy.management.users.service import org_admin_org_ids
@@ -812,6 +813,9 @@ async def update_project(
             _raise_on_missing_project_model_quota_on_update(
                 data, existing_project, _router_access_group_names(llm_router)
             )
+
+        if data.blocked is True:
+            await revoke_last_good(user_api_key_cache, (project_cache_key(data.project_id),))
 
         # Prepare update data
         update_data = _jsonified(prisma_client, data.model_dump(exclude_none=True, exclude={"project_id"}))

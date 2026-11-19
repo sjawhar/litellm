@@ -1,6 +1,9 @@
+import asyncio
 from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
@@ -8,12 +11,16 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 from litellm.proxy._types import (
+    BlockUsers,
     LiteLLM_EndUserTable,
     LitellmUserRoles,
     ProxyException,
+    UpdateCustomerRequest,
 )
 from litellm.proxy.auth.user_api_key_auth import UserAPIKeyAuth, user_api_key_auth
+from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.proxy.management_endpoints.customer_endpoints import _should_update_field, router
+from tests.unit.caching.fake_redis_cache import fake_redis_cache
 from litellm.types.proxy.management_endpoints.common_daily_activity import (
     SpendAnalyticsPaginatedResponse,
 )
@@ -1150,3 +1157,123 @@ def test_customer_delete_invalidates_end_user_and_registry_caches(mock_prisma_cl
         "end_user_id:c2",
         "end_user_restricted_registry",
     ]
+
+
+class _EndUserRows:
+    """The end-user table a block writes and auth reads. While ``stopped`` every read fails the way an unreachable
+    Postgres does; ``pause_next_registry_read`` holds the next restricted-registry read once it has its rows."""
+
+    def __init__(self, *rows: LiteLLM_EndUserTable) -> None:
+        self.rows = {row.user_id: row for row in rows}
+        self.stopped = False
+        self.registry_read_held = asyncio.Event()
+        self._release: asyncio.Event | None = None
+
+    def _answer(self) -> None:
+        if self.stopped:
+            raise httpx.ConnectError("All connection attempts failed")
+
+    def pause_next_registry_read(self) -> asyncio.Event:
+        self._release = asyncio.Event()
+        return self._release
+
+    async def upsert(self, where: dict[str, str], data: dict[str, dict[str, object]]) -> LiteLLM_EndUserTable:
+        self._answer()
+        row = LiteLLM_EndUserTable(user_id=where["user_id"], blocked=True)
+        self.rows[row.user_id] = row
+        return row
+
+    async def find_first(self, where: dict[str, str], include: object = None) -> LiteLLM_EndUserTable | None:
+        self._answer()
+        return self.rows.get(where["user_id"])
+
+    async def find_unique(self, where: dict[str, str], include: object = None) -> LiteLLM_EndUserTable | None:
+        return await self.find_first(where)
+
+    async def find_many(self, where: object = None, take: int | None = None) -> list[LiteLLM_EndUserTable]:
+        self._answer()
+        restricted = [row for row in self.rows.values() if row.blocked]
+        release = self._release
+        if release is not None:
+            self._release = None
+            self.registry_read_held.set()
+            await release.wait()
+        return restricted
+
+
+def _serve_end_user_rows(monkeypatch: pytest.MonkeyPatch, rows: _EndUserRows, cache: UserApiKeyCache) -> None:
+    monkeypatch.setattr(
+        "litellm.proxy.proxy_server.prisma_client", SimpleNamespace(db=SimpleNamespace(litellm_endusertable=rows))
+    )
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
+
+
+@pytest.mark.asyncio
+async def test_customer_block_answers_503_and_writes_nothing_when_redis_cannot_record_it(monkeypatch):
+    from litellm.proxy.management_endpoints.customer_endpoints import block_user
+
+    redis = fake_redis_cache()
+    redis.server.connected = False
+    rows = _EndUserRows(LiteLLM_EndUserTable(user_id="c1", blocked=False))
+    _serve_end_user_rows(monkeypatch, rows, UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True))
+
+    with pytest.raises(HTTPException) as refused:
+        await block_user(data=BlockUsers(user_ids=["c1"]))
+
+    assert (refused.value.status_code, rows.rows["c1"].blocked) == (503, False)
+
+
+@pytest.mark.asyncio
+async def test_customer_update_that_blocks_answers_503_and_writes_nothing_when_redis_cannot_record_it(monkeypatch):
+    from litellm.proxy.management_endpoints.customer_endpoints import update_end_user
+
+    redis = fake_redis_cache()
+    redis.server.connected = False
+    rows = _EndUserRows(LiteLLM_EndUserTable(user_id="c1", blocked=False))
+    _serve_end_user_rows(monkeypatch, rows, UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True))
+
+    with pytest.raises(ProxyException) as refused:
+        await update_end_user(
+            data=UpdateCustomerRequest(user_id="c1", blocked=True),
+            user_api_key_dict=UserAPIKeyAuth(user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+        )
+
+    assert (str(refused.value.code), rows.rows["c1"].blocked) == ("503", False)
+
+
+@pytest.mark.asyncio
+async def test_after_a_customer_block_a_registry_read_in_flight_cannot_vouch_for_the_customer_in_an_outage(monkeypatch):
+    """The restricted registry the database last returned left the customer out, which lets an outage serve it
+    unchecked. A registry read that took its rows before the block and finishes after it must not keep that answer:
+    the outage refuses the customer instead."""
+    from litellm.proxy.auth.auth_checks import get_end_user_object
+    from litellm.proxy.db.exception_handler import LastGoodEntryMissing
+    from litellm.proxy.management_endpoints.customer_endpoints import block_user
+
+    rows = _EndUserRows(LiteLLM_EndUserTable(user_id="c1", blocked=False))
+    cache = UserApiKeyCache(serve_last_good_entries=True)
+    _serve_end_user_rows(monkeypatch, rows, cache)
+
+    database = SimpleNamespace(db=SimpleNamespace(litellm_endusertable=rows))
+
+    async def customer() -> LiteLLM_EndUserTable | None:
+        return await get_end_user_object(
+            end_user_id="c1",
+            prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+            user_api_key_cache=cache,
+        )
+
+    assert await customer() is None
+    await cache.async_delete_cache("end_user_restricted_registry")
+    release = rows.pause_next_registry_read()
+    in_flight = asyncio.create_task(customer())
+    await rows.registry_read_held.wait()
+    await block_user(data=BlockUsers(user_ids=["c1"]))
+    release.set()
+    assert await in_flight is None
+    for key in ("end_user_id:c1", "end_user_restricted_registry"):
+        await cache.async_delete_cache(key)
+    rows.stopped = True
+
+    with pytest.raises(LastGoodEntryMissing):
+        await customer()
