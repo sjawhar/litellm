@@ -263,6 +263,38 @@ async def test_async_post_call_failure_hook_carries_used_client_oauth_token_from
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("auth_entries", ["fresh", "last_good"])
+async def test_async_post_call_failure_hook_writes_the_auth_entries_mark_into_the_spend_row(auth_entries: str):
+    logger = ProxyDBLogger()
+    user_api_key_dict = UserAPIKeyAuth(token="hashed-token")
+    user_api_key_dict.auth_entries = auth_entries
+    request_data = {
+        "model": "claude-sonnet-5",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "metadata": {},
+        "proxy_server_request": {"request_id": "test_request_id"},
+    }
+
+    with patch(
+        "litellm.proxy.db.db_spend_update_writer.DBSpendUpdateWriter.update_database",
+        new_callable=AsyncMock,
+    ) as mock_update_database:
+        await logger.async_post_call_failure_hook(
+            request_data=request_data,
+            original_exception=Exception("rate limited"),
+            user_api_key_dict=user_api_key_dict,
+        )
+
+    payload = get_logging_payload(
+        kwargs=mock_update_database.call_args[1]["kwargs"],
+        response_obj={},
+        start_time=datetime.now(),
+        end_time=datetime.now(),
+    )
+    assert json.loads(payload["metadata"])["user_api_key_auth_entries"] == auth_entries
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "metadata_buckets, expected",
     [

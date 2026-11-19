@@ -1924,12 +1924,19 @@ class TestProxyBaseLLMRequestProcessing:
 
     @pytest.mark.parametrize("auth_entries", ["fresh", "last_good", None])
     def test_get_custom_headers_carries_the_auth_entries_mark(self, auth_entries):
-        user_api_key_dict = UserAPIKeyAuth(token="hashed-token")
-        user_api_key_dict.auth_entries = auth_entries
+        mock_user_api_key_dict = MagicMock(spec=UserAPIKeyAuth)
+        mock_user_api_key_dict.tpm_limit = None
+        mock_user_api_key_dict.rpm_limit = None
+        mock_user_api_key_dict.max_budget = None
+        mock_user_api_key_dict.spend = 0
+        mock_user_api_key_dict.auth_entries = auth_entries
 
-        headers = ProxyBaseLLMRequestProcessing.get_custom_headers(user_api_key_dict=user_api_key_dict, call_id="call-1")
+        headers = ProxyBaseLLMRequestProcessing.get_custom_headers(
+            user_api_key_dict=mock_user_api_key_dict, call_id="call-1"
+        )
 
-        assert headers.get("x-litellm-auth-entries") == auth_entries
+        sent = {name: value for name, value in headers.items() if name == "x-litellm-auth-entries"}
+        assert sent == ({} if auth_entries is None else {"x-litellm-auth-entries": auth_entries})
 
     @pytest.mark.parametrize(
         ("hidden_params", "request_data", "expected_call_id"),

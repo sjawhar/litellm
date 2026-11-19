@@ -651,6 +651,37 @@ class TestLastGoodEntries:
         assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) == self._team("t1")
         assert closed.served == ()
 
+    @pytest.mark.asyncio
+    async def test_concurrent_requests_record_into_their_own_scopes(self):
+        cache = UserApiKeyCache(serve_last_good_entries=True)
+        await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        async def request(recalls: bool) -> tuple[str, ...]:
+            with last_good_auth_entries_scope() as scope:
+                await asyncio.sleep(0)
+                if recalls:
+                    await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj)
+                await asyncio.sleep(0)
+            return scope.served
+
+        assert await asyncio.gather(request(True), request(False)) == [("LiteLLM_TeamTableCachedObj",), ()]
+
+    @pytest.mark.asyncio
+    async def test_an_auth_object_read_back_from_the_cache_carries_no_mark(self):
+        from litellm.proxy.auth.auth_checks import copy_user_api_key_auth_for_cache
+
+        cache = UserApiKeyCache(redis_cache=fake_redis_cache().cache)
+        marked = UserAPIKeyAuth(token=HASHED_TOKEN)
+        marked.auth_entries = "last_good"
+        await cache.async_set_cache(HASHED_TOKEN, marked, model_type=UserAPIKeyAuth)
+        cache.in_memory_cache_for(HASHED_TOKEN).delete_cache(HASHED_TOKEN)
+
+        from_redis = await cache.async_get_cache(key=HASHED_TOKEN, model_type=UserAPIKeyAuth)
+
+        assert from_redis is not None
+        assert (from_redis.token, from_redis.auth_entries) == (HASHED_TOKEN, None)
+        assert copy_user_api_key_auth_for_cache(marked).auth_entries is None
+
     def test_memory_line_drops_the_least_recently_written_entry_first(self):
         memory = LastGoodMemory(max_entries=2)
         memory.set("a", {"v": 1})
