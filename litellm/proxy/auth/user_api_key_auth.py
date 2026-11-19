@@ -3834,8 +3834,8 @@ async def enforce_key_and_fallback_model_access(
                 llm_router=llm_router,
             )
 
-    # Fallback targets are checked for an all-team-models key too: can_key_call_model reads the team's models, and
-    # nothing else checks a fallback target against them.
+    # Fallback targets are checked for an all-team-models key too: can_key_call_model reads the team's models. The
+    # team, member, user and project checks of every fallback target run in common_checks.
     anthropic_owns_body_fallbacks: Final = (
         route.endswith("/v1/messages")
         and request is not None
@@ -3858,7 +3858,7 @@ async def enforce_key_and_fallback_model_access(
             user_model=None,
         )
 
-    # Anthropic serves its own fallback models, so they need only the key's model access, not a Router group
+    # Anthropic serves its own fallback models, so they need the key's model access but no Router group
     for _name in anthropic_fallback_names:
         await can_key_call_model(
             model=_name,
