@@ -7217,7 +7217,7 @@ async def test_add_litellm_data_to_request_strips_caller_supplied_callback_crede
     assert "litellm_metadata" not in updated
     assert "dd_site" not in updated["metadata"]
     assert "dd_agent_host" not in updated["metadata"]
-    assert "dd_site" not in updated["litellm_params"]["metadata"]
+    assert "litellm_params" not in updated
     assert updated["metadata"]["safe_user_metadata"] == "kept"
 
 

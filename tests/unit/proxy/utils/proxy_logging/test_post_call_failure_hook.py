@@ -12,7 +12,7 @@ from typing import Final
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 
 import litellm
 from litellm.constants import PROXY_REJECTED_BEFORE_ROUTING_KEY
@@ -1420,7 +1420,7 @@ _AUTH_GATE_BODY_CLAIMS: Final = (
 async def test_auth_gate_failure_spend_row_takes_its_deployment_from_the_router_not_the_body(
     proxy_logging, monkeypatch, place: str, field: str, claim: object
 ):
-    """Nobody is authenticated at the auth gate, so nothing the body says about the provider, deployment, group,
+    """The gate did not authorize this request, so nothing the body says about the provider, deployment, group,
     agent or origin, at the top level or in either metadata bucket, may reach the failure row it is filed under."""
     from litellm.proxy import proxy_server
     from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
@@ -1479,6 +1479,36 @@ async def test_auth_gate_failure_spend_row_takes_its_deployment_from_the_router_
     }
 
 
+async def _preprocessed_request_with_its_logging_object(
+    body: dict[str, object], user_api_key_dict: UserAPIKeyAuth
+) -> dict[str, object]:
+    """The request data a route holds when its pre-call hooks run: the body after add_litellm_data_to_request,
+    and the logging object the proxy builds from it."""
+    from litellm.proxy.litellm_pre_call_utils import add_litellm_data_to_request
+
+    request: Final = MagicMock(spec=Request)
+    request.url = MagicMock()
+    request.url.path = "/chat/completions"
+    request.url.__str__.return_value = "http://localhost/chat/completions"
+    request.method = "POST"
+    request.query_params = {}
+    request.headers = {"content-type": "application/json"}
+    request.client = MagicMock()
+    request.client.host = "127.0.0.1"
+    data: Final = await add_litellm_data_to_request(
+        data=dict(body),
+        request=request,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+    logging_obj, _ = litellm.utils.function_setup(
+        original_function="acompletion", rules_obj=litellm.utils.Rules(), start_time=datetime.now(), **data
+    )
+    return {**data, "litellm_logging_obj": logging_obj}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "original_exception",
@@ -1492,7 +1522,8 @@ async def test_pre_call_refusal_spend_row_takes_no_deployment_from_a_body_litell
     proxy_logging, make_user_api_key_auth, monkeypatch, original_exception: Exception
 ):
     """A key refused in the pre-call hooks reached no deployment, so a root litellm_params in its body must not
-    name the API base, deployment or group of its failure row; the spend logger prefers it over the logged payload."""
+    name the API base, deployment or group of its failure row; the request setup removes it before anything reads
+    it."""
     from litellm.proxy import proxy_server
     from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
 
@@ -1512,22 +1543,21 @@ async def test_pre_call_refusal_spend_row_takes_no_deployment_from_a_body_litell
     update_database: Final = _record_failure_spend_rows(monkeypatch)
     proxy_logging.alert_types = []
     authenticated: Final = make_user_api_key_auth(request_route="/chat/completions")
-    request_data: Final[dict[str, object]] = {
-        "model": "internal-model",
-        "messages": [{"role": "user", "content": "hi"}],
-        "litellm_call_id": "pre-call-refusal",
-        "metadata": {"user_api_key_auth": authenticated},
-        "litellm_params": {
-            "api_base": "https://victim.invalid",
-            "litellm_metadata": {"model_info": {"id": "victim-deployment"}, "model_group": "victim-group"},
+    request_data: Final = await _preprocessed_request_with_its_logging_object(
+        {
+            "model": "internal-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "litellm_call_id": "pre-call-refusal",
+            "litellm_params": {
+                "api_base": "https://victim.invalid",
+                "litellm_metadata": {"model_info": {"id": "victim-deployment"}, "model_group": "victim-group"},
+            },
         },
-    }
-    logging_obj, _ = litellm.utils.function_setup(
-        original_function="acompletion", rules_obj=litellm.utils.Rules(), start_time=datetime.now(), **request_data
+        authenticated,
     )
 
     await proxy_logging.post_call_failure_hook(
-        request_data={**request_data, "litellm_logging_obj": logging_obj},
+        request_data=request_data,
         original_exception=original_exception,
         user_api_key_dict=authenticated,
         route="/chat/completions",
@@ -1546,6 +1576,89 @@ async def test_pre_call_refusal_spend_row_takes_no_deployment_from_a_body_litell
         "attribution": {"model_id": "configured-deployment", "model_group": "internal-model", "api_base": ""},
         "names_the_claim": False,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("allow_client_pricing_override", (False, True), ids=("no-opt-in", "pricing-opt-in"))
+@pytest.mark.parametrize("bucket", ("metadata", "litellm_metadata"))
+@pytest.mark.parametrize(
+    "original_exception",
+    (
+        GuardrailRaisedException(guardrail_name="local-block", message="blocked"),
+        ProxyRateLimitError(detail="key over its rate limit"),
+    ),
+    ids=("guardrail", "rate-limited-key"),
+)
+async def test_pre_call_refusal_spend_row_is_filed_under_the_requested_models_group(
+    proxy_logging,
+    make_user_api_key_auth,
+    monkeypatch,
+    original_exception: Exception,
+    bucket: str,
+    allow_client_pricing_override: bool,
+):
+    """The router writes a served call's model_group from the model it was asked for. A request refused in the
+    pre-call hooks reached no router, so a model_group its body put in either metadata bucket must not name the
+    group its failure row is filed under, with several deployments in the requested group and whatever the
+    client-pricing opt-in, which keeps only the body's model_info."""
+    from litellm.proxy import proxy_server
+    from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+
+    monkeypatch.setattr(
+        proxy_server,
+        "llm_router",
+        litellm.Router(
+            model_list=[
+                {
+                    "model_name": "internal-model",
+                    "litellm_params": {"model": "openai/gpt-4.1", "api_key": "sk-test"},
+                    "model_info": {"id": "configured-a"},
+                },
+                {
+                    "model_name": "internal-model",
+                    "litellm_params": {"model": "openai/gpt-4.1-mini", "api_key": "sk-test"},
+                    "model_info": {"id": "configured-b"},
+                },
+                {
+                    "model_name": "victim-group",
+                    "litellm_params": {"model": "openai/gpt-4o", "api_key": "sk-test"},
+                    "model_info": {"id": "victim-deployment"},
+                },
+            ]
+        ),
+    )
+    update_database: Final = _record_failure_spend_rows(monkeypatch)
+    proxy_logging.alert_types = []
+    authenticated: Final = make_user_api_key_auth(
+        request_route="/chat/completions",
+        metadata={"allow_client_pricing_override": allow_client_pricing_override},
+    )
+    request_data: Final = await _preprocessed_request_with_its_logging_object(
+        {
+            "model": "internal-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "litellm_call_id": "pre-call-refusal-group",
+            bucket: {"model_group": "victim-group", "model_info": {"id": "victim-deployment"}},
+        },
+        authenticated,
+    )
+
+    await proxy_logging.post_call_failure_hook(
+        request_data=request_data,
+        original_exception=original_exception,
+        user_api_key_dict=authenticated,
+        route="/chat/completions",
+    )
+
+    update_database.assert_awaited_once()
+    now: Final = datetime.now()
+    payload: Final = get_logging_payload(
+        kwargs={**update_database.call_args.kwargs["kwargs"], "completion_start_time": now},
+        response_obj=None,
+        start_time=now,
+        end_time=now,
+    )
+    assert payload["model_group"] == "internal-model"
 
 
 _LOGGING_OBJECT_FIELDS: Final = (

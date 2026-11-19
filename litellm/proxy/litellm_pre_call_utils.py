@@ -403,13 +403,14 @@ _CLIENT_PRICING_CONTROL_FIELDS: Final = frozenset(CustomPricingLiteLLMParams.mod
 # ``model_info`` carries the same pricing fields when read by
 # ``use_custom_pricing_for_model``; strip from metadata for the same reason.
 _CLIENT_PRICING_METADATA_FIELDS: Final = frozenset({"model_info"})
-# ``attempted_fallbacks`` and ``original_model_group`` are written by the router
+# ``attempted_fallbacks``, ``original_model_group`` and ``deployment`` are written by the router
 # and read by spend logs as fact; a client value has no legitimate meaning and no
 # key or team setting keeps it, so the strip is never gated.
 _ROUTER_RESERVED_METADATA_FIELDS: Final = frozenset(
     {
         "attempted_fallbacks",
         "original_model_group",
+        "deployment",
         "previous_models",
         "request_retry_count",
         CLIENT_OUTPUT_CEILING_METADATA_KEY,
@@ -421,6 +422,11 @@ _ROUTER_RESERVED_METADATA_FIELDS: Final = frozenset(
 # A client value only points them at a deployment the request never reached, or lengthens a real one's cooldown,
 # so the strip is never gated.
 ROUTER_OWNED_REQUEST_FIELDS: Final = frozenset({"model_info", "cooldown_time"})
+# The SDK spreads the request parameters it does not know over the ``litellm_params`` its failure and usage
+# callbacks read, so a body's root ``litellm_params`` replaces them: a provider error then counts against, and
+# cools, the deployment its ``model_info`` names. Nothing on the proxy reads a caller's copy, so the strip is never
+# gated.
+_CLIENT_LITELLM_PARAMS_FIELD: Final = "litellm_params"
 _ALLOW_CLIENT_PRICING_OVERRIDE_METADATA_KEY: Final = "allow_client_pricing_override"
 
 # Request fields whose value, when URL-valued, becomes the outbound destination
@@ -697,6 +703,15 @@ def _strip_router_owned_request_fields(
     for field in ROUTER_OWNED_REQUEST_FIELDS & data.keys():
         data.pop(field)
         verbose_proxy_logger.debug("Stripped router-owned field from request body: %s", field)
+
+
+def _strip_client_litellm_params(
+    data: dict[str, object],  # mutable-ok: strips in place on the request body the pre-call pipeline threads through
+) -> None:
+    """Drop a root ``litellm_params`` from the client's request body."""
+    if _CLIENT_LITELLM_PARAMS_FIELD in data:
+        data.pop(_CLIENT_LITELLM_PARAMS_FIELD)
+        verbose_proxy_logger.debug("Stripped client-supplied field from request body: %s", _CLIENT_LITELLM_PARAMS_FIELD)
 
 
 def get_metadata_variable_name(request: Request) -> str:
@@ -2391,6 +2406,7 @@ async def add_litellm_data_to_request(
     strip_client_guardrail_information(data)
     _strip_router_reserved_metadata(data)
     _strip_router_owned_request_fields(data)
+    _strip_client_litellm_params(data)
 
     # Same reason as the strips above: runs after the metadata string-to-dict parse
     # so JSON-string metadata cannot smuggle callback credentials past the dict guard.
