@@ -4354,6 +4354,39 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             return 0
         return total_tokens
 
+    def _settled_total_tokens(
+        self,
+        kwargs: Mapping[str, object],
+        response_obj: object,
+        rate_limit_type: Literal["output", "input", "total"],
+    ) -> int:
+        """
+        Tokens a successful response settles on the token windows under ``rate_limit_type``.
+
+        Responses LiteLLM does not model (e.g. pass-through, whose usage is
+        reported by the upstream rather than parsed out of the body) carry
+        their usage in ``combined_usage_object`` instead, and would otherwise
+        never charge a token window. Usage that reports only a total charges
+        that total under every ``token_rate_limit_type``.
+        """
+        usage: Usage | dict | None = None
+        if isinstance(
+            response_obj,
+            (
+                ModelResponse,
+                EmbeddingResponse,
+                TextCompletionResponse,
+                BaseLiteLLMOpenAIResponseObject,
+            ),
+        ):
+            usage = getattr(response_obj, "usage", None)
+        else:
+            combined_usage: Final = kwargs.get("combined_usage_object")
+            if isinstance(combined_usage, Usage):
+                usage = combined_usage
+        total_tokens: Final = self._get_total_tokens_from_usage(usage=usage, rate_limit_type=rate_limit_type)
+        return total_tokens if total_tokens != 0 else self._aggregate_only_total_tokens(usage=usage)
+
     @staticmethod
     def _response_usage(
         response_obj: object,
@@ -4979,29 +5012,9 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
 
         model_group: Final = get_model_group_from_litellm_kwargs(kwargs)
 
-        # Get total tokens from response. Responses LiteLLM does not model
-        # (e.g. pass-through, whose usage is reported by the upstream rather
-        # than parsed out of the body) carry their usage in
-        # ``combined_usage_object`` instead, and would otherwise never charge
-        # the TPM window.
-        _usage: Usage | dict | None = None
-        if isinstance(
-            response_obj,
-            (
-                ModelResponse,
-                EmbeddingResponse,
-                TextCompletionResponse,
-                BaseLiteLLMOpenAIResponseObject,
-            ),
-        ):
-            _usage = getattr(response_obj, "usage", None)
-        else:
-            _combined_usage: Final = kwargs.get("combined_usage_object")
-            if isinstance(_combined_usage, Usage):
-                _usage = _combined_usage
-        total_tokens = self._get_total_tokens_from_usage(usage=_usage, rate_limit_type=rate_limit_type)
-        if total_tokens == 0:
-            total_tokens = self._aggregate_only_total_tokens(usage=_usage)
+        total_tokens: Final = self._settled_total_tokens(
+            kwargs=kwargs, response_obj=response_obj, rate_limit_type=rate_limit_type
+        )
 
         stash: Final = get_request_stash_for_call(_call_id_from_callback_kwargs(kwargs))
         reserved_tokens: Final = stash.reserved_tokens if stash is not None else 0

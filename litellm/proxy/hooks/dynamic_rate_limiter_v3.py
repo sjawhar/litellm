@@ -727,14 +727,14 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
             user_api_key_auth_metadata: Final = standard_logging_metadata.get("user_api_key_auth_metadata") or {}
             key_priority: Final[str | None] = user_api_key_auth_metadata.get("priority")
 
-            # Count tokens as the v3 limiter counts them for the same token_rate_limit_type,
-            # so the saturation this hook reads and the priority counters it charges agree
-            # with the TPM windows: they read the same responses (a Responses API response
-            # as well as a ModelResponse) and leave cache reads out of input and total.
+            # Settle the tokens the TPM windows settle for the same response, through the
+            # v3 limiter's own helper, so the saturation this hook reads and the priority
+            # counters it charges cannot drift from them: the response's usage, or the
+            # combined usage of a response LiteLLM does not model, with cache reads left out
+            # of input and total, and a total-only usage charged under every limit type.
             rate_limit_type: Final = self.v3_limiter.get_rate_limit_type()
-            total_tokens: Final = self.v3_limiter._get_total_tokens_from_usage(
-                usage=self.v3_limiter._response_usage(response_obj),
-                rate_limit_type=rate_limit_type,
+            total_tokens: Final = self.v3_limiter._settled_total_tokens(
+                kwargs=kwargs, response_obj=response_obj, rate_limit_type=rate_limit_type
             )
 
             if total_tokens == 0:

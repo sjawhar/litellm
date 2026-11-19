@@ -1942,10 +1942,11 @@ async def test_post_call_success_hook_priority_header_is_always_http_encodable(t
 
 
 async def _settled_increments(
-    monkeypatch: pytest.MonkeyPatch, rate_limit_type: str, response_obj: object
+    monkeypatch: pytest.MonkeyPatch, rate_limit_type: str, response_obj: object, **callback_kwargs: object
 ) -> list[int]:
     """The model_saturation_check and priority_model token increments that the success hook
-    makes for ``response_obj`` under ``token_rate_limit_type: rate_limit_type``."""
+    makes for ``response_obj`` under ``token_rate_limit_type: rate_limit_type``, with
+    ``callback_kwargs`` added to the logging kwargs it receives."""
     from litellm.proxy import proxy_server
 
     monkeypatch.setitem(proxy_server.general_settings, "token_rate_limit_type", rate_limit_type)
@@ -1976,6 +1977,7 @@ async def _settled_increments(
         kwargs={
             "standard_logging_object": {"metadata": {"user_api_key_auth_metadata": {}}},
             "litellm_params": {"metadata": {"model_group": model}},
+            **callback_kwargs,
         },
         response_obj=response_obj,
         start_time=None,
@@ -2165,3 +2167,132 @@ async def test_a_streamed_responses_api_response_settles_the_providers_uncached_
     )
 
     assert await _settled_increments(monkeypatch, rate_limit_type, assembled) == [counted, counted]
+
+
+def _tpm_window_increments(rate_limit_type: str, response_obj: object, **callback_kwargs: object) -> list[int]:
+    """The token increments that the TPM window of the v3 limiter the priority hook sits on makes
+    for the same response under the same token_rate_limit_type, for a key with no reservation."""
+    from litellm.proxy.hooks.parallel_request_limiter_v3 import _request_stash
+
+    limiter = DynamicRateLimitHandler(internal_usage_cache=DualCache()).v3_limiter
+    token = _request_stash.set(None)
+    try:
+        operations = limiter._build_success_event_pipeline_operations(
+            kwargs={
+                "standard_logging_object": {"metadata": {"user_api_key_hash": "test-key-hash"}},
+                **callback_kwargs,
+            },
+            response_obj=response_obj,
+            rate_limit_type=rate_limit_type,
+        )
+    finally:
+        _request_stash.reset(token)
+    return [op["increment_value"] for op in operations if op["key"].endswith(":tokens")]
+
+
+@pytest.mark.parametrize("rate_limit_type", ["input", "output", "total"])
+@pytest.mark.asyncio
+async def test_a_pass_through_response_settles_the_total_its_upstream_reported(
+    monkeypatch: pytest.MonkeyPatch, rate_limit_type: str
+):
+    """A pass-through response whose body LiteLLM never parses reaches the hook with no usage of
+    its own; logging stores the total that the upstream reported in its x-litellm-total-tokens
+    header as combined_usage_object. That total-only usage counts 1874 under every limit type,
+    as the TPM window charges it."""
+    import httpx
+
+    from litellm.proxy.pass_through_endpoints.upstream_usage_headers import (
+        UPSTREAM_TOTAL_TOKENS_HEADER,
+        apply_upstream_reported_usage,
+    )
+    from litellm.types.utils import StandardPassThroughResponseObject
+
+    logging_obj = _logging_obj(model="pass-through-target", call_type="pass_through_endpoint", stream=False)
+    apply_upstream_reported_usage(logging_obj, httpx.Headers({UPSTREAM_TOTAL_TOKENS_HEADER: "1874"}))
+    reported = {"combined_usage_object": logging_obj.model_call_details["combined_usage_object"]}
+    response = StandardPassThroughResponseObject(response="upstream body was never parsed")
+
+    assert await _settled_increments(monkeypatch, rate_limit_type, response, **reported) == [1874, 1874]
+    assert _tpm_window_increments(rate_limit_type, response, **reported) == [1874]
+
+
+@pytest.mark.parametrize("rate_limit_type", ["input", "output", "total"])
+@pytest.mark.asyncio
+async def test_a_response_with_no_usage_settles_nothing(monkeypatch: pytest.MonkeyPatch, rate_limit_type: str):
+    """A pass-through response for which the upstream reported no usage counts 0 and leaves the
+    saturation and priority counters alone, as it leaves the TPM window alone."""
+    from litellm.types.utils import StandardPassThroughResponseObject
+
+    response = StandardPassThroughResponseObject(response="upstream body was never parsed")
+
+    assert await _settled_increments(monkeypatch, rate_limit_type, response) == []
+    assert _tpm_window_increments(rate_limit_type, response) == []
+
+
+def _embedding_response():
+    from litellm.types.utils import EmbeddingResponse, Usage
+
+    return EmbeddingResponse(
+        model="text-embedding-3-small",
+        data=[],
+        usage=Usage(prompt_tokens=12, completion_tokens=0, total_tokens=12),
+    )
+
+
+def _text_completion_response():
+    from litellm.types.utils import PromptTokensDetailsWrapper, TextCompletionResponse, Usage
+
+    return TextCompletionResponse(
+        model="gpt-3.5-turbo-instruct",
+        usage=Usage(
+            prompt_tokens=1000,
+            completion_tokens=10,
+            total_tokens=1010,
+            prompt_tokens_details=PromptTokensDetailsWrapper(cached_tokens=900),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("make_response", "rate_limit_type", "counted"),
+    [
+        pytest.param(_embedding_response, "input", 12, id="embedding-input-12"),
+        pytest.param(_embedding_response, "output", 0, id="embedding-output-0"),
+        pytest.param(_embedding_response, "total", 12, id="embedding-total-12"),
+        pytest.param(_text_completion_response, "input", 100, id="text_completion-input-100"),
+        pytest.param(_text_completion_response, "output", 10, id="text_completion-output-10"),
+        pytest.param(_text_completion_response, "total", 110, id="text_completion-total-110"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_an_embedding_or_text_completion_settles_what_the_tpm_window_charges(
+    monkeypatch: pytest.MonkeyPatch, make_response, rate_limit_type: str, counted: int
+):
+    """An embedding and a text completion are not a ModelResponse; they count on the saturation
+    and priority counters what they count on the TPM window, cache reads left out."""
+    response = make_response()
+
+    assert await _settled_increments(monkeypatch, rate_limit_type, response) == ([counted] * 2 if counted else [])
+    assert _tpm_window_increments(rate_limit_type, response) == ([counted] if counted else [])
+
+
+@pytest.mark.parametrize(("rate_limit_type", "counted"), [("input", 0), ("output", 5), ("total", 0)])
+@pytest.mark.asyncio
+async def test_cache_reads_beyond_the_prompt_count_settle_no_negative_tokens(
+    monkeypatch: pytest.MonkeyPatch, rate_limit_type: str, counted: int
+):
+    """Input and total stop at 0 when the cache reads a response reports exceed its prompt count,
+    as they do on the TPM window."""
+    from litellm.types.utils import ModelResponse, PromptTokensDetailsWrapper, Usage
+
+    response = ModelResponse(
+        usage=Usage(
+            prompt_tokens=10,
+            completion_tokens=5,
+            total_tokens=15,
+            prompt_tokens_details=PromptTokensDetailsWrapper(cached_tokens=30),
+        )
+    )
+
+    assert await _settled_increments(monkeypatch, rate_limit_type, response) == ([counted] * 2 if counted else [])
+    assert _tpm_window_increments(rate_limit_type, response) == ([counted] if counted else [])
