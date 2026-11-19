@@ -375,6 +375,222 @@ async def test_add_litellm_data_to_request_strips_root_model_info_and_cooldown_t
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("allow_client_pricing_override", [False, True])
+@pytest.mark.parametrize("bucket", ["metadata", "litellm_metadata"])
+async def test_add_litellm_data_to_request_strips_a_body_litellm_params_and_metadata_deployment(
+    bucket, allow_client_pricing_override
+):
+    """The SDK spreads a body's root ``litellm_params`` over the parameters its callbacks read, and the router writes
+    ``deployment`` on dispatch, so the request setup removes both whatever the pricing opt-in. ``model_group`` stays:
+    A2A, the MCP REST tool call and search write their own before the setup. ``model_info`` still follows the opt-in."""
+    updated = await add_litellm_data_to_request(
+        data={
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "litellm_params": {"model_info": {"id": "victim-deployment"}, "cooldown_time": 86400},
+            bucket: {
+                "deployment": "openai/victim-model",
+                "model_group": "a2a_agent/route-written",
+                "model_info": {"output_cost_per_token": 0.0002},
+            },
+        },
+        request=_make_request_mock(),
+        user_api_key_dict=_user_api_key_auth(metadata={"allow_client_pricing_override": allow_client_pricing_override}),
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    assert {
+        "litellm_params": updated.get("litellm_params"),
+        "metadata": {field: updated["metadata"].get(field) for field in ("deployment", "model_group", "model_info")},
+    } == {
+        "litellm_params": None,
+        "metadata": {
+            "deployment": None,
+            "model_group": "a2a_agent/route-written",
+            "model_info": {"output_cost_per_token": 0.0002} if allow_client_pricing_override else None,
+        },
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("slot", "sampling_rate"), [("metadata", 0.25), ("litellm_params", None)])
+async def test_a_callback_param_is_read_from_metadata_and_no_longer_from_a_body_litellm_params(slot, sampling_rate):
+    """The SDK reads the callback parameters a caller may set (``langsmith_sampling_rate`` among them) from
+    ``metadata``, ``litellm_metadata`` and ``litellm_params.metadata``. The request setup removes a body's root
+    ``litellm_params``, so on a proxy request only the first two still take effect."""
+    from litellm.litellm_core_utils.initialize_dynamic_callback_params import (
+        initialize_standard_callback_dynamic_params,
+    )
+
+    claim = {"langsmith_sampling_rate": 0.25}
+    updated = await add_litellm_data_to_request(
+        data={
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            **({"metadata": claim} if slot == "metadata" else {"litellm_params": {"metadata": claim}}),
+        },
+        request=_make_request_mock(),
+        user_api_key_dict=_user_api_key_auth(),
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    assert initialize_standard_callback_dynamic_params(updated).get("langsmith_sampling_rate") == sampling_rate
+
+
+@pytest.mark.asyncio
+async def test_a_failure_after_dispatch_counts_and_cools_the_deployment_the_router_chose_not_the_one_the_body_names():
+    """The positive control for the strip above: a provider failure after dispatch still counts against, and cools
+    for the router's own ``cooldown_time``, the deployment the router chose, while the deployment and the time the
+    body names get nothing."""
+    from litellm.router_utils.router_callbacks.track_deployment_metrics import (
+        get_deployment_failures_for_current_minute,
+    )
+
+    deployment_ids = ("chosen-a", "chosen-b", "body-named")
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "gpt-4",
+                "litellm_params": {"model": "openai/gpt-4", "api_key": "sk-test"},
+                "model_info": {"id": "chosen-a"},
+            },
+            {
+                "model_name": "gpt-4",
+                "litellm_params": {"model": "openai/gpt-4o", "api_key": "sk-test"},
+                "model_info": {"id": "chosen-b"},
+            },
+            {
+                "model_name": "other-model",
+                "litellm_params": {"model": "openai/gpt-4.1", "api_key": "sk-test"},
+                "model_info": {"id": "body-named"},
+            },
+        ],
+        cooldown_time=13,
+        num_retries=0,
+    )
+    data = await add_litellm_data_to_request(
+        data={
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "model_info": {"id": "body-named"},
+            "cooldown_time": 86400,
+        },
+        request=_make_request_mock(),
+        user_api_key_dict=_user_api_key_auth(),
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    with pytest.raises(litellm.RateLimitError):
+        router.completion(**data, mock_response="litellm.RateLimitError")
+
+    failures = {
+        deployment_id: get_deployment_failures_for_current_minute(
+            litellm_router_instance=router, deployment_id=deployment_id
+        )
+        for deployment_id in deployment_ids
+    }
+    cooldowns = {
+        deployment_id: cooldown["cooldown_time"]
+        for deployment_id, cooldown in router.cooldown_cache.get_active_cooldowns(
+            model_ids=list(deployment_ids), parent_otel_span=None
+        )
+    }
+    chosen = [deployment_id for deployment_id, count in failures.items() if count]
+    assert chosen in (["chosen-a"], ["chosen-b"])
+    assert {"failures": failures, "cooldowns": cooldowns} == {
+        "failures": {deployment_id: int(deployment_id in chosen) for deployment_id in deployment_ids},
+        "cooldowns": {chosen[0]: 13},
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_provider_error_counts_against_the_deployment_the_router_chose_not_one_a_body_litellm_params_names():
+    """On a provider that is not OpenAI the SDK copies the request parameters it does not know into the parameters
+    its failure callbacks read, so a body's root ``litellm_params`` replaced the ``litellm_params`` the router's
+    callbacks take the deployment and the cooldown from. The request setup removes it: a provider error counts
+    against, cools for the router's own ``cooldown_time`` and adds usage to the deployment the router chose, and the
+    deployment the body named gets no failure, no cooldown and no usage."""
+    import asyncio
+
+    from litellm.router_utils.router_callbacks.track_deployment_metrics import (
+        get_deployment_failures_for_current_minute,
+    )
+
+    deployment_ids = ("chosen-a", "chosen-b", "body-named")
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "claude",
+                "litellm_params": {"model": "anthropic/claude-sonnet-4-5", "api_key": "sk-test"},
+                "model_info": {"id": "chosen-a"},
+            },
+            {
+                "model_name": "claude",
+                "litellm_params": {"model": "anthropic/claude-3-5-haiku-20241022", "api_key": "sk-test"},
+                "model_info": {"id": "chosen-b"},
+            },
+            {
+                "model_name": "other-model",
+                "litellm_params": {"model": "anthropic/claude-3-opus-20240229", "api_key": "sk-test"},
+                "model_info": {"id": "body-named"},
+            },
+        ],
+        cooldown_time=13,
+        num_retries=0,
+    )
+    data = await add_litellm_data_to_request(
+        data={
+            "model": "claude",
+            "messages": [{"role": "user", "content": "hi"}],
+            "litellm_params": {
+                "model_info": {"id": "body-named"},
+                "cooldown_time": 86400,
+                "metadata": {"model_group": "other-model", "deployment": "anthropic/claude-3-opus-20240229"},
+            },
+        },
+        request=_make_request_mock(),
+        user_api_key_dict=_user_api_key_auth(),
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    with pytest.raises(litellm.RateLimitError):
+        await router.acompletion(**data, mock_response="litellm.RateLimitError")
+    pending = asyncio.all_tasks() - {asyncio.current_task()}
+    await asyncio.gather(*pending, return_exceptions=True)
+
+    failures = {
+        deployment_id: get_deployment_failures_for_current_minute(
+            litellm_router_instance=router, deployment_id=deployment_id
+        )
+        for deployment_id in deployment_ids
+    }
+    cooldowns = {
+        deployment_id: cooldown["cooldown_time"]
+        for deployment_id, cooldown in router.cooldown_cache.get_active_cooldowns(
+            model_ids=list(deployment_ids), parent_otel_span=None
+        )
+    }
+    chosen = next((deployment_id for deployment_id in ("chosen-a", "chosen-b") if failures[deployment_id]), None)
+    assert {
+        "failures": failures,
+        "cooldowns": cooldowns,
+        "body_named_usage": [key for key in router.cache.in_memory_cache.cache_dict if "body-named" in key],
+    } == {
+        "failures": {deployment_id: int(deployment_id == chosen) for deployment_id in deployment_ids},
+        "cooldowns": {chosen: 13},
+        "body_named_usage": [],
+    }
+
+
+@pytest.mark.asyncio
 async def test_add_litellm_data_to_request_strips_json_string_litellm_metadata():
     """``litellm_metadata`` may arrive as a JSON-encoded string (multipart/
     form-data or ``extra_body``). The strip has to run after the proxy parses
