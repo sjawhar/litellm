@@ -3853,8 +3853,8 @@ async def enforce_key_and_fallback_model_access(
             user_model=None,
         )
 
-    # Anthropic serves its own fallback models, so they need the key's model access but no Router group. A name there
-    # that has an alias is refused in common_checks, so this check reads each name as Anthropic gets it.
+    # Anthropic serves its own fallback models, so they need the key's model access but no Router group. common_checks
+    # refuses a name there that the proxy grants as another model: an alias, or another deployment's access group.
     for _name in anthropic_fallback_names:
         await can_key_call_model(
             model=_name,
