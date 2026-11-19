@@ -2690,6 +2690,56 @@ async def test_messages_tokens_reach_the_bucket_of_the_organization_admitted_thr
     assert "Model capacity reached" in full.value.detail["error"]
 
 
+@pytest.mark.asyncio
+async def test_chat_fallback_on_one_logging_object_charges_the_serving_deployment_not_the_failed_organization(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(litellm, "priority_reservation", None)
+    handler = DynamicRateLimitHandler(internal_usage_cache=DualCache())
+    spy = _AttemptSpy()
+    success = _SuccessLogged()
+    monkeypatch.setattr(litellm, "callbacks", [spy, handler, success])
+    without_organization: Final = "no-organization-claude"
+    router = Router(
+        model_list=[
+            {
+                "model_name": "claude",
+                "litellm_params": {
+                    "model": "anthropic/claude-opus-4-7",
+                    "anthropic_organization_id": ORG_A,
+                    "mock_response": "litellm.InternalServerError",
+                },
+                "model_info": {"id": f"{ORG_A}-claude", "bucket_class": OPUS_4_CLASSES},
+            },
+            {
+                "model_name": "claude-fallback",
+                "litellm_params": {"model": "anthropic/claude-opus-4-7", "mock_response": "served"},
+                "model_info": {"id": without_organization, "bucket_class": OPUS_4_CLASSES},
+            },
+        ],
+        num_retries=0,
+        fallbacks=[{"claude": ["claude-fallback"]}],
+    )
+    logging_obj, data = litellm.utils.function_setup(
+        original_function="acompletion",
+        rules_obj=litellm.utils.Rules(),
+        start_time=datetime.now(),
+        model="claude",
+        messages=[{"role": "user", "content": "hi"}],
+        litellm_call_id=uuid4().hex,
+        metadata={},
+    )
+
+    served = await router.acompletion(**data, litellm_logging_obj=logging_obj)
+    await asyncio.wait_for(success.logged.wait(), timeout=20)
+
+    assert spy.attempts == (f"{ORG_A}-claude", without_organization)
+    assert (
+        await _pool_counter(handler, f"{without_organization}:opus-4", "default_pool", "tokens"),
+        await _pool_counter(handler, f"{ORG_A}:opus-4", "default_pool", "tokens"),
+    ) == (served.usage.total_tokens, 0)
+
+
 def _messages_upstream_reply() -> dict[str, object]:
     return {
         "id": "msg_1",
