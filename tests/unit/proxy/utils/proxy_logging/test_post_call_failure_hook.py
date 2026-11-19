@@ -493,12 +493,13 @@ async def test_post_call_failure_hook_attribution_does_not_count_against_the_dep
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("original_exception", "error_type", "authenticated"),
+    ("original_exception", "error_type", "authenticated", "past_pre_call"),
     (
-        (ProxyRateLimitError(detail="key over its rate limit"), None, True),
-        (HTTPException(status_code=401, detail="Invalid virtual key"), ProxyErrorTypes.auth_error, False),
+        (ProxyRateLimitError(detail="key over its rate limit"), None, True, False),
+        (HTTPException(status_code=401, detail="Invalid virtual key"), ProxyErrorTypes.auth_error, False, False),
+        (ProxyRateLimitError(detail="key over its rate limit"), None, True, True),
     ),
-    ids=("rate-limited-key", "invalid-key"),
+    ids=("rate-limited-key", "invalid-key", "rate-limited-key-with-logging-object"),
 )
 async def test_proxy_only_failure_does_not_count_or_cool_the_deployment_the_body_names(
     proxy_logging,
@@ -507,10 +508,12 @@ async def test_proxy_only_failure_does_not_count_or_cool_the_deployment_the_body
     original_exception: Exception,
     error_type: ProxyErrorTypes | None,
     authenticated: bool,
+    past_pre_call: bool,
 ):
     """``model_info`` and ``cooldown_time`` are logged litellm_params names, and the router's failure callbacks
     take the deployment and the cooldown from them. A body naming a real deployment must not make a key's own
-    429, or the 401 of a caller with no valid key, count against that deployment or cool it down."""
+    429, or the 401 of a caller with no valid key, count against that deployment or cool it down. A key refused
+    in the pre-call hooks already has the logging object the proxy built from that body, and it holds both."""
     from litellm.proxy import proxy_server
     from litellm.router_utils.router_callbacks.track_deployment_metrics import (
         get_deployment_failures_for_current_minute,
@@ -542,14 +545,27 @@ async def test_proxy_only_failure_does_not_count_or_cool_the_deployment_the_body
 
     monkeypatch.setattr("litellm.proxy.utils.threading", SimpleNamespace(Thread=_JoinableThread))
 
+    body: Final[dict[str, object]] = {
+        "model": "internal-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "litellm_call_id": "body-named-deployment-call",
+        "metadata": {"model_group": "internal-model"},
+        "model_info": {"id": named_deployment},
+        "cooldown_time": 86400,
+    }
+    request_data: Final[dict[str, object]] = (
+        {
+            **body,
+            "litellm_logging_obj": litellm.utils.function_setup(
+                original_function="acompletion", rules_obj=litellm.utils.Rules(), start_time=datetime.now(), **body
+            )[0],
+        }
+        if past_pre_call
+        else dict(body)
+    )
+
     await proxy_logging.post_call_failure_hook(
-        request_data={
-            "model": "internal-model",
-            "messages": [{"role": "user", "content": "hi"}],
-            "metadata": {"model_group": "internal-model"},
-            "model_info": {"id": named_deployment},
-            "cooldown_time": 86400,
-        },
+        request_data=request_data,
         original_exception=original_exception,
         user_api_key_dict=(
             make_user_api_key_auth(request_route="/chat/completions")
