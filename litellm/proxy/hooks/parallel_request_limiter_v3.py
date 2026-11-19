@@ -4688,6 +4688,18 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             mapped_prompt_tokens: Final = raw_prompt_tokens if isinstance(raw_prompt_tokens, int) else 0
             mapped_completion_tokens: Final = raw_completion_tokens if isinstance(raw_completion_tokens, int) else 0
             prompt_details: Final = usage.get("prompt_tokens_details") or usage.get("input_tokens_details")
+            raw_cache_reads: Final = usage.get("cache_read_input_tokens")
+            raw_cache_writes: Final = usage.get("cache_creation_input_tokens")
+            cache_reads: Final = raw_cache_reads if isinstance(raw_cache_reads, int) else 0
+            cache_writes: Final = raw_cache_writes if isinstance(raw_cache_writes, int) else 0
+            # A dict in Anthropic's own shape reports input_tokens without its cache reads and
+            # cache writes, so its billable input is the uncached input plus the cache writes.
+            if (
+                not usage.get("prompt_tokens")
+                and not (isinstance(prompt_details, dict) and "cached_tokens" in prompt_details)
+                and (cache_reads != 0 or cache_writes != 0)
+            ):
+                return max(0, mapped_prompt_tokens + cache_writes), mapped_completion_tokens, True
             raw_cached_tokens: Final = (
                 (prompt_details.get("cached_tokens", 0) if isinstance(prompt_details, dict) else 0)
                 or usage.get("cache_read_input_tokens")

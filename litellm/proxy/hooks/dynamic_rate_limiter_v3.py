@@ -42,7 +42,7 @@ from litellm.types.router import ModelGroupInfo
 from litellm.types.utils import CallTypesLiteral, LLMResponseTypes
 
 if TYPE_CHECKING:
-    from litellm.types.utils import PriorityReservationSettings
+    from litellm.types.utils import PriorityReservationSettings, Usage
 
 
 def _get_priority_settings() -> "PriorityReservationSettings":
@@ -59,6 +59,11 @@ def _get_priority_settings() -> "PriorityReservationSettings":
 
         return PriorityReservationSettings()
     return settings
+
+
+def _cache_read_tokens(usage: "Usage") -> int:
+    details: Final = usage.prompt_tokens_details
+    return (details.cached_tokens or 0) if details is not None else 0
 
 
 def _is_latin1_encodable(value: object) -> bool:
@@ -738,9 +743,9 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
                     if rate_limit_type == "output":
                         total_tokens = _usage.completion_tokens
                     elif rate_limit_type == "input":
-                        total_tokens = _usage.prompt_tokens
+                        total_tokens = max(0, _usage.prompt_tokens - _cache_read_tokens(_usage))
                     elif rate_limit_type == "total":
-                        total_tokens = _usage.total_tokens
+                        total_tokens = max(0, _usage.total_tokens - _cache_read_tokens(_usage))
 
             if total_tokens == 0:
                 return

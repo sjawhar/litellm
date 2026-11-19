@@ -1430,10 +1430,7 @@ async def test_async_log_success_event_increments_by_actual_tokens(monkeypatch):
 
     # Create mock response with 50 completion tokens
     mock_response = MagicMock(spec=ModelResponse)
-    mock_response.usage = MagicMock(spec=Usage)
-    mock_response.usage.prompt_tokens = 10
-    mock_response.usage.completion_tokens = 50
-    mock_response.usage.total_tokens = 60
+    mock_response.usage = Usage(prompt_tokens=10, completion_tokens=50, total_tokens=60)
 
     # Create kwargs with priority in user_api_key_auth_metadata
     kwargs = {
@@ -1629,10 +1626,7 @@ async def test_async_log_success_event_uses_team_priority_from_auth_metadata(mon
 
     # Create mock response
     mock_response = MagicMock(spec=ModelResponse)
-    mock_response.usage = MagicMock(spec=Usage)
-    mock_response.usage.prompt_tokens = 10
-    mock_response.usage.completion_tokens = 20
-    mock_response.usage.total_tokens = 30
+    mock_response.usage = Usage(prompt_tokens=10, completion_tokens=20, total_tokens=30)
 
     # Simulate team metadata inheritance: priority is in user_api_key_auth_metadata
     # This is how the proxy passes team metadata to the callback
@@ -1945,3 +1939,173 @@ async def test_post_call_success_hook_priority_header_is_always_http_encodable(t
     http_response = Response(headers={key: str(value) for key, value in additional_headers.items()})
     assert http_response.headers.get("x-litellm-priority") == expected_priority_header
     assert http_response.headers["x-litellm-rate-limiter-version"] == "v3"
+
+
+async def _settled_increments(
+    monkeypatch: pytest.MonkeyPatch, rate_limit_type: str, response_obj: object
+) -> list[int]:
+    """The model_saturation_check and priority_model token increments that the success hook
+    makes for ``response_obj`` under ``token_rate_limit_type: rate_limit_type``."""
+    from litellm.proxy import proxy_server
+
+    monkeypatch.setitem(proxy_server.general_settings, "token_rate_limit_type", rate_limit_type)
+    model = "test-settled-tokens"
+    handler = DynamicRateLimitHandler(internal_usage_cache=DualCache())
+    handler.update_variables(
+        llm_router=Router(
+            model_list=[
+                {
+                    "model_name": model,
+                    "litellm_params": {
+                        "model": "gpt-3.5-turbo",
+                        "api_key": "test-key",
+                        "api_base": "test-base",
+                        "tpm": 1000,
+                    },
+                }
+            ]
+        )
+    )
+    increments: list[int] = []
+
+    async def record(pipeline_operations, parent_otel_span=None):
+        increments.extend(op["increment_value"] for op in pipeline_operations)
+
+    handler.v3_limiter.async_increment_tokens_with_ttl_preservation = record
+    await handler.async_log_success_event(
+        kwargs={
+            "standard_logging_object": {"metadata": {"user_api_key_auth_metadata": {}}},
+            "litellm_params": {"metadata": {"model_group": model}},
+        },
+        response_obj=response_obj,
+        start_time=None,
+        end_time=None,
+    )
+    return increments
+
+
+@pytest.mark.parametrize(("rate_limit_type", "counted"), [("input", 20), ("total", 25), ("output", 5)])
+@pytest.mark.asyncio
+async def test_cache_read_tokens_are_left_out_of_the_tokens_a_response_settles(
+    monkeypatch: pytest.MonkeyPatch, rate_limit_type: str, counted: int
+):
+    from litellm.types.utils import ModelResponse, PromptTokensDetailsWrapper, Usage
+
+    usage = Usage(
+        prompt_tokens=50,
+        completion_tokens=5,
+        total_tokens=55,
+        prompt_tokens_details=PromptTokensDetailsWrapper(cached_tokens=30),
+    )
+
+    increments = await _settled_increments(monkeypatch, rate_limit_type, ModelResponse(usage=usage))
+
+    assert increments == [counted, counted]
+
+
+# 40 new input tokens, 60 cache writes, 900 cache reads and 10 output tokens: a provider whose
+# input-token limit leaves cache reads out counts 100 input, 10 output and 110 in total.
+_ANTHROPIC_CACHED_USAGE = {
+    "input_tokens": 40,
+    "cache_creation_input_tokens": 60,
+    "cache_read_input_tokens": 900,
+    "output_tokens": 10,
+}
+_UNCACHED_COUNTS = [("input", 100), ("output", 10), ("total", 110)]
+
+
+def _logging_obj(*, model: str, call_type: str, stream: bool):
+    from litellm.litellm_core_utils.litellm_logging import Logging
+
+    logging_obj = Logging(
+        model=model,
+        messages=[{"role": "user", "content": "hi"}],
+        stream=stream,
+        call_type=call_type,
+        start_time=datetime.now(),
+        litellm_call_id="test-settled-tokens-call",
+        function_id="test-settled-tokens",
+    )
+    logging_obj.optional_params = {}
+    return logging_obj
+
+
+@pytest.mark.parametrize(("rate_limit_type", "counted"), _UNCACHED_COUNTS)
+@pytest.mark.asyncio
+async def test_a_v1_messages_response_settles_the_providers_uncached_count(
+    monkeypatch: pytest.MonkeyPatch, rate_limit_type: str, counted: int
+):
+    """A non-streamed /v1/messages call reaches the hook as the ModelResponse that logging builds
+    from Anthropic's response body, whose prompt_tokens holds the cache reads and writes."""
+    logging_obj = _logging_obj(model="claude-haiku-4-5", call_type="anthropic_messages", stream=False)
+    logging_obj.model_call_details["custom_llm_provider"] = "anthropic"
+    logged = logging_obj._anthropic_messages_logged_response(
+        result={
+            "id": "msg_cached",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-haiku-4-5",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": _ANTHROPIC_CACHED_USAGE,
+        }
+    )
+
+    assert await _settled_increments(monkeypatch, rate_limit_type, logged) == [counted, counted]
+
+
+@pytest.mark.parametrize(("rate_limit_type", "counted"), _UNCACHED_COUNTS)
+@pytest.mark.asyncio
+async def test_a_streamed_v1_messages_response_settles_the_providers_uncached_count(
+    monkeypatch: pytest.MonkeyPatch, rate_limit_type: str, counted: int
+):
+    """A streamed /v1/messages call reaches the hook as the ModelResponse that logging assembles
+    from the collected SSE events: message_start reports the cache reads and writes, and
+    message_delta the final output count."""
+    import json
+    from unittest.mock import MagicMock
+
+    from litellm.proxy.pass_through_endpoints.llm_provider_handlers.anthropic_passthrough_logging_handler import (
+        AnthropicPassthroughLoggingHandler,
+    )
+    from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointType
+
+    events = [
+        {
+            "type": "message_start",
+            "message": {
+                "id": "msg_cached_stream",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-haiku-4-5",
+                "content": [],
+                "usage": {**_ANTHROPIC_CACHED_USAGE, "output_tokens": 1},
+            },
+        },
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hi"}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 10}},
+        {"type": "message_stop"},
+    ]
+    logging_obj = _logging_obj(model="claude-haiku-4-5", call_type="anthropic_messages", stream=True)
+    logging_obj.model_call_details["custom_llm_provider"] = "anthropic"
+    logging_obj.model_call_details["stream"] = True
+    now = datetime.now()
+    collected = AnthropicPassthroughLoggingHandler.handle_logging_anthropic_collected_chunks(
+        litellm_logging_obj=logging_obj,
+        passthrough_success_handler_obj=MagicMock(),
+        url_route="/v1/messages",
+        request_body={"model": "claude-haiku-4-5"},
+        endpoint_type=EndpointType.ANTHROPIC,
+        start_time=now,
+        all_chunks=[f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events],
+        end_time=now,
+    )
+    logged = logging_obj._anthropic_messages_logged_response(result=collected["result"])
+    assembled = logging_obj._get_assembled_streaming_response(
+        result=logged, start_time=now, end_time=now, is_async=True, streaming_chunks=[]
+    )
+
+    assert await _settled_increments(monkeypatch, rate_limit_type, assembled) == [counted, counted]

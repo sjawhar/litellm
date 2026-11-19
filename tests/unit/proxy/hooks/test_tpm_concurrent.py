@@ -3227,16 +3227,71 @@ def test_anthropic_messages_usage_reconciles_split_project_quota(rate_limiter):
     billable_input, output_tokens, resolved = handler._resolve_io_token_reconcile_usage(
         {
             "usage": {
-                "input_tokens": 100,
+                "input_tokens": 40,
                 "output_tokens": 25,
-                "cache_read_input_tokens": 30,
+                "cache_creation_input_tokens": 60,
+                "cache_read_input_tokens": 900,
             }
         }
     )
 
     assert resolved is True
-    assert billable_input == 70
-    assert output_tokens == 25
+    assert (billable_input, output_tokens) == (100, 25), "uncached input plus cache writes, with cache reads left out"
+
+
+def test_usage_dict_with_prompt_tokens_keeps_cache_reads_inside_the_prompt_count(rate_limiter):
+    handler, _cache = rate_limiter
+
+    billable_input, output_tokens, resolved = handler._resolve_io_token_reconcile_usage(
+        {"usage": {"prompt_tokens": 100, "completion_tokens": 25, "cache_read_input_tokens": 30}}
+    )
+
+    assert resolved is True
+    assert (billable_input, output_tokens) == (70, 25)
+
+
+@pytest.mark.parametrize(
+    ("usage", "expected"),
+    [
+        pytest.param(
+            {
+                "input_tokens": 40,
+                "output_tokens": 25,
+                "cache_creation_input_tokens": 60,
+                "cache_read_input_tokens": 900,
+            },
+            (100, 25),
+            id="anthropic_shape_adds_cache_writes_and_reads_to_the_prompt",
+        ),
+        pytest.param(
+            {"input_tokens": 40, "output_tokens": 25, "cache_creation_input_tokens": 60},
+            (100, 25),
+            id="anthropic_shape_with_cache_writes_only",
+        ),
+        pytest.param(
+            {"prompt_tokens": 100, "completion_tokens": 25, "cache_read_input_tokens": 30},
+            (70, 25),
+            id="prompt_tokens_already_hold_the_cache_reads",
+        ),
+        pytest.param(
+            {
+                "input_tokens": 100,
+                "output_tokens": 25,
+                "input_tokens_details": {"cached_tokens": 30},
+                "cache_creation_input_tokens": 60,
+            },
+            (70, 25),
+            id="input_tokens_details_already_hold_the_cache_reads",
+        ),
+    ],
+)
+def test_a_plain_usage_dict_reconciles_its_billable_input(rate_limiter, usage, expected):
+    handler, _cache = rate_limiter
+
+    billable_input, output_tokens, resolved = handler._resolve_io_token_reconcile_usage(usage)
+
+    assert resolved is True
+    assert (billable_input, output_tokens) == expected
 
 
 @pytest.mark.asyncio
