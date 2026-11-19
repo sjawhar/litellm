@@ -1229,6 +1229,12 @@ def _reached_deployment(litellm_logging_obj: Logging) -> bool:
     )
 
 
+# The router's failure callbacks count failures and RPM against the deployment ``model_info.id`` names and cool
+# it for ``cooldown_time``. On a request that reached no deployment the logging object can hold either only
+# because the proxy built it from the caller's body.
+_BODY_DEPLOYMENT_PARAMS: Final = frozenset(("model_info", "cooldown_time"))
+
+
 def _stamp_deployment_attribution(
     litellm_params: dict[str, object], model_group: str | None, team_id: str | None, dispatched: bool
 ) -> Mapping[str, object]:
@@ -3868,11 +3874,17 @@ class ProxyLogging:
                 },
             }
 
+            dispatched: Final = _reached_deployment(litellm_logging_obj)
+            if not dispatched:
+                # update_environment_variables keeps what the logging object already holds.
+                litellm_logging_obj.litellm_params = {
+                    key: value for key, value in existing.items() if key not in _BODY_DEPLOYMENT_PARAMS
+                }
             attribution: Final = _stamp_deployment_attribution(
                 litellm_params,
                 request_data.get("model"),
                 user_api_key_dict.team_id,
-                dispatched=_reached_deployment(litellm_logging_obj),
+                dispatched=dispatched,
             )
 
             litellm_logging_obj.update_environment_variables(
