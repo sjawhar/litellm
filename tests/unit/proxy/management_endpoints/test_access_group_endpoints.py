@@ -1346,6 +1346,43 @@ def test_update_access_group_syncs_removed_keys(client_and_mocks):
     assert "ag-update" not in call_kwargs["data"]["access_group_ids"]
 
 
+@pytest.mark.asyncio
+async def test_update_access_group_drops_the_last_good_entries_of_the_teams_and_keys_it_changes(
+    client_and_mocks, monkeypatch
+):
+    """Adding or removing a group patches the cached team and key in place. Their last good entries never expire, so
+    they must go too, or a database outage serves the grants as they were before the change."""
+    from litellm.proxy._types import LiteLLM_TeamTableCachedObj
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, recall_last_good, remember_last_good
+
+    client, mock_prisma, mock_access_group_table, *_ = client_and_mocks
+    mock_access_group_table.find_unique = AsyncMock(
+        return_value=_make_access_group_record(
+            access_group_id="ag-update", assigned_team_ids=["team-remove"], assigned_key_ids=["key-remove"]
+        )
+    )
+    teams = {"team-remove": _make_team_record("team-remove", ["ag-update"]), "team-add": _make_team_record("team-add")}
+    mock_prisma.db.litellm_teamtable.find_many = AsyncMock(return_value=list(teams.values()))
+    mock_prisma.db.litellm_teamtable.find_unique = AsyncMock(side_effect=lambda *, where: teams[where["team_id"]])
+    keys = {
+        "key-remove": types.SimpleNamespace(token="key-remove", access_group_ids=["ag-update"]),
+        "key-add": types.SimpleNamespace(token="key-add", access_group_ids=[]),
+    }
+    mock_prisma.db.litellm_verificationtoken.find_unique = AsyncMock(side_effect=lambda *, where: keys[where["token"]])
+    cache = UserApiKeyCache(serve_last_good_entries=True)
+    held = ("team_id:team-add", "team_id:team-remove", "key-add", "key-remove")
+    for cache_key in held:
+        await remember_last_good(cache, cache_key, LiteLLM_TeamTableCachedObj(team_id="before-the-change"))
+    monkeypatch.setattr(ps, "user_api_key_cache", cache)
+
+    resp = client.put(
+        "/v1/access_group/ag-update", json={"assigned_team_ids": ["team-add"], "assigned_key_ids": ["key-add"]}
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert {key: await recall_last_good(cache, key, LiteLLM_TeamTableCachedObj) for key in held} == dict.fromkeys(held)
+
+
 # ---------------------------------------------------------------------------
 # Sync tests: DELETE (out-of-sync data handling)
 # ---------------------------------------------------------------------------

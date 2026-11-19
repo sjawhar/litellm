@@ -57,6 +57,7 @@ from litellm.proxy.auth.auth_checks import (  # noqa: F401  # legacy module expo
     _delete_cache_key_object,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
     can_team_access_model,
     delete_cache_key_object,
+    delete_cache_key_objects,
     get_jwt_key_mapping_cache_keys_for_token,
     get_key_end_user_budget_id,
     get_org_object,
@@ -84,7 +85,7 @@ from litellm.proxy.common_utils.config_sync_pubsub import (
 )
 from litellm.proxy.common_utils.rbac_utils import check_org_admin_can_generate_keys
 from litellm.proxy.common_utils.timezone_utils import get_budget_reset_time
-from litellm.proxy.common_utils.user_api_key_cache import AUTH_OBJECTS_TARGET, UserApiKeyCache
+from litellm.proxy.common_utils.user_api_key_cache import AUTH_OBJECTS_TARGET, UserApiKeyCache, revoke_last_good
 from litellm.proxy.hooks.key_management_event_hooks import KeyManagementEventHooks
 from litellm.proxy.hooks.model_max_budget_limiter import build_model_max_budget_usage
 from litellm.proxy.management.teams.authz import TEAM_ADMIN_ONLY, TEAM_OR_ORG_ADMIN, is_team_admin
@@ -2726,6 +2727,16 @@ def _resolve_token_to_update(data: UpdateKeyRequest, existing_key_row: LiteLLM_V
     return existing_key_row.token
 
 
+async def _revoke_key_if_blocking(
+    data: UpdateKeyRequest, existing_key_row: LiteLLM_VerificationToken, user_api_key_cache: UserApiKeyCache
+) -> None:
+    if data.blocked is True:
+        await revoke_last_good(
+            user_api_key_cache,
+            (hash_token_if_needed(_resolve_token_to_update(data=data, existing_key_row=existing_key_row)),),
+        )
+
+
 async def _process_single_key_update(
     update_key_request: UpdateKeyRequest,
     user_api_key_dict: UserAPIKeyAuth,
@@ -2887,6 +2898,7 @@ async def _process_single_key_update(
             detail={"error": "Database not connected"},
         )
 
+    await _revoke_key_if_blocking(key_request, existing_key_row, user_api_key_cache)
     update_values: Final = await _handle_update_object_permission(
         data_json=non_default_values,
         existing_key_row=existing_key_row,
@@ -2910,6 +2922,7 @@ async def _process_single_key_update(
         hashed_token=hash_token_if_needed(key_request.key),
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
+        revoked=key_request.blocked is True,
     )
 
     # After the key's own cache entry is dropped, so a failure here cannot leave the key
@@ -3563,6 +3576,8 @@ async def update_key_fn(
         if prisma_client is None:
             raise Exception("Not connected to DB!")
 
+        if data.blocked is True:
+            await revoke_last_good(user_api_key_cache, (hash_token_if_needed(key),))
         update_values: Final = await _handle_update_object_permission(
             data_json=non_default_values,
             existing_key_row=existing_key_row,
@@ -3595,6 +3610,7 @@ async def update_key_fn(
             hashed_token=hash_token_if_needed(key),
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
+            revoked=data.blocked is True,
         )
 
         # After the key's own cache entry is dropped, so a failure here cannot leave the key
@@ -5028,7 +5044,7 @@ async def delete_verification_tokens(
                 - List of keys being deleted, this contains information about the key_alias, token, and user_id being deleted,
                 this is passed down to the KeyManagementEventHooks to delete the keys from the secret manager and handle audit logs
     """
-    from litellm.proxy.proxy_server import prisma_client
+    from litellm.proxy.proxy_server import prisma_client, proxy_logging_obj
 
     failed_tokens: list = []
     try:
@@ -5065,6 +5081,9 @@ async def delete_verification_tokens(
                             status_code=status.HTTP_403_FORBIDDEN,
                             detail={"error": "You are not authorized to delete this key"},
                         )
+            await revoke_last_good(
+                user_api_key_cache, tuple(key.token for key in authorized_keys if key.token is not None)
+            )
             await persist_deleted_verification_tokens(
                 keys=authorized_keys,
                 prisma_client=prisma_client,
@@ -5112,11 +5131,12 @@ async def delete_verification_tokens(
         verbose_proxy_logger.debug(traceback.format_exc())
         raise e
 
-    for key in tokens:
-        user_api_key_cache.delete_cache(key)
-        # remove hash token from cache
-        hashed_token = hash_token(cast(str, key))
-        user_api_key_cache.delete_cache(hashed_token)
+    await delete_cache_key_objects(
+        hashed_tokens=hashed_tokens,
+        user_api_key_cache=user_api_key_cache,
+        proxy_logging_obj=proxy_logging_obj,
+        revoked=True,
+    )
 
     # After credential invalidation, so a failure here can never keep a deleted key alive.
     for deleted_key in authorized_keys:
@@ -5681,6 +5701,7 @@ async def _execute_virtual_key_regeneration(
             request=data if data is not None else RegenerateKeyRequest(),
         ),
     )
+    await revoke_last_good(user_api_key_cache, (hashed_api_key,))
     update_values: Final = await _handle_update_object_permission(
         data_json=non_default_values,
         existing_key_row=key_in_db,
@@ -5733,6 +5754,7 @@ async def _execute_virtual_key_regeneration(
             hashed_token=hash_token_if_needed(key),
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
+            revoked=True,
         )
 
     await evict_and_broadcast(cache_keys=jwt_mapping_cache_keys, user_api_key_cache=user_api_key_cache)
@@ -7430,6 +7452,8 @@ async def block_key(
             code=status.HTTP_404_NOT_FOUND,
         )
 
+    await revoke_last_good(user_api_key_cache, (hashed_token,))
+
     if is_audit_logging_enabled():
         asyncio.create_task(
             create_audit_log_for_update(
@@ -7461,6 +7485,7 @@ async def block_key(
         hashed_token=hashed_token,
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
+        revoked=True,
     )
 
     return record

@@ -4,13 +4,14 @@ Handles Authentication Errors
 
 import logging
 from collections.abc import Mapping
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final
 
 from fastapi import HTTPException, Request, status
+from typing_extensions import TypeIs  # noqa: TID251  # TypeIs reaches typing only on 3.13
 
 import litellm
 from litellm._logging import verbose_proxy_logger, verbose_proxy_stdout_logger
-from litellm.constants import EMPTY_MAPPING
 from litellm.integrations.otel.runtime import seed_request_identity
 from litellm.litellm_core_utils.core_helpers import is_expected_client_error
 from litellm.proxy._types import (
@@ -28,7 +29,11 @@ from litellm.proxy.auth.auth_utils import (  # noqa: F401  # legacy module expor
     normalize_request_route,
 )
 from litellm.proxy.auth.model_access_denied import ModelAccessDeniedHTTPException
-from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
+from litellm.proxy.db.exception_handler import LastGoodEntryMissing, PrismaDBExceptionHandler
+from litellm.types.proxy.auth.client_context import (
+    VERIFIED_CLIENT_CONTEXT_KEY,
+    VerifiedClientContext,
+)
 from litellm.types.services import ServiceTypes
 
 # Sentinel user_id for the synthetic UserAPIKeyAuth issued during a DB
@@ -87,22 +92,46 @@ def _get_user_agent(request: Request) -> str | None:
     return request.headers.get("user-agent")
 
 
+_CLIENT_CONTEXT_FIELDS: Final = ("requester_ip_address", "user_agent")
+_CALLER_CLIENT_CONTEXT_NAMES: Final = frozenset((*_CLIENT_CONTEXT_FIELDS, VERIFIED_CLIENT_CONTEXT_KEY))
+
+
+_NO_METADATA: Final[Mapping[str, object]] = MappingProxyType({})
+
+
+def _is_metadata_bucket(value: object) -> TypeIs[Mapping[str, object]]:  # guard-ok: request metadata keys are str
+    return isinstance(value, Mapping)
+
+
+def _without_client_context(metadata: Mapping[str, object]) -> Mapping[str, object]:
+    return MappingProxyType(
+        {name: value for name, value in metadata.items() if name not in _CALLER_CLIENT_CONTEXT_NAMES}
+    )
+
+
 def _with_client_context(
     request_data: dict[str, object], requester_ip: str | None, user_agent: str | None
 ) -> dict[str, object]:
     """Auth gate rejections are raised before `add_litellm_data_to_request` records the
-    caller IP and User-Agent, so their failure logs would otherwise carry neither."""
+    caller IP and User-Agent, so their failure logs would otherwise carry neither. At this
+    point the body is the caller's own, so the request's values replace what it sent under
+    those names, and the bucket the logging layer does not read keeps neither.
+
+    The same values also go in as a `VerifiedClientContext`, so a reader that must not take
+    the caller's strings has something only the proxy can have put there."""
     key: Final = "litellm_metadata" if "litellm_metadata" in request_data else "metadata"
+    other: Final = "metadata" if key == "litellm_metadata" else "litellm_metadata"
     metadata: Final = request_data.get(key)
-    base: Final[Mapping[str, object]] = metadata if isinstance(metadata, Mapping) else EMPTY_MAPPING
-    stamped: Final = {
-        name: value
-        for name, value in (("requester_ip_address", requester_ip), ("user_agent", user_agent))
-        if value and not base.get(name)
+    base: Final[Mapping[str, object]] = metadata if _is_metadata_bucket(metadata) else _NO_METADATA
+    stamped: Final[Mapping[str, object]] = {
+        **{name: value for name, value in zip(_CLIENT_CONTEXT_FIELDS, (requester_ip, user_agent)) if value},
+        VERIFIED_CLIENT_CONTEXT_KEY: VerifiedClientContext(requester_ip_address=requester_ip, user_agent=user_agent),
     }
-    if not stamped:
-        return request_data
-    return {**request_data, key: {**base, **stamped}}
+    other_metadata: Final = request_data.get(other)
+    other_rewritten: Final = (
+        {other: {**_without_client_context(other_metadata)}} if _is_metadata_bucket(other_metadata) else {}
+    )
+    return {**request_data, key: {**_without_client_context(base), **stamped}, **other_rewritten}
 
 
 def _escape_control_chars(value: str) -> str:
@@ -157,6 +186,7 @@ class UserAPIKeyAuthExceptionHandler:
         if (
             PrismaDBExceptionHandler.should_allow_request_on_db_unavailable()
             and PrismaDBExceptionHandler.is_database_connection_error(e)
+            and not isinstance(e, LastGoodEntryMissing)
         ):
             # log this as a DB failure on prometheus
             proxy_logging_obj.service_logging_obj.service_failure_hook(

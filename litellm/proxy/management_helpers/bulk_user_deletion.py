@@ -30,7 +30,7 @@ from litellm.proxy._types import (
 )
 from litellm.proxy.auth.auth_checks import delete_cache_key_objects, get_jwt_key_mapping_cache_keys_for_tokens
 from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_broadcast
-from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, revoke_last_good
 from litellm.proxy.hooks.key_management_event_hooks import KeyManagementEventHooks
 from litellm.proxy.hooks.user_management_event_hooks import UserManagementEventHooks
 from litellm.proxy.list_api.common import PROBLEM_TYPE_BASE, ManagementProblem
@@ -223,6 +223,7 @@ async def _remove_members_from_team(
     team_id: str,
     members: Sequence[MemberDeleteRequest],
     user_api_key_dict: UserAPIKeyAuth,
+    user_api_key_cache: UserApiKeyCache,
 ) -> _TeamRemoval:
     await tx.query_raw(TEAM_ADVISORY_LOCK_SQL, team_id)
     roster: Final = await TeamRepository(prisma_client).get_members_with_roles_locked(tx, team_id)
@@ -257,6 +258,7 @@ async def _remove_members_from_team(
         hashed_tokens=tuple(k.token for k in keys),
         prisma_client=prisma_client,
     )
+    await revoke_last_good(user_api_key_cache, tuple(k.token for k in keys))
 
     if removed_members:
         roster_data: Final[_RosterData] = {
@@ -333,7 +335,9 @@ async def bulk_remove_team_members(
     kept_indexes: Final = tuple(i for i in range(len(data.members)) if i not in duplicates)
     members: Final = tuple(data.members[i] for i in kept_indexes)
     async with prisma_client.tx(timeout=_BATCH_TX_TIMEOUT) as tx:
-        removal: Final = await _remove_members_from_team(prisma_client, tx, team_id, members, user_api_key_dict)
+        removal: Final = await _remove_members_from_team(
+            prisma_client, tx, team_id, members, user_api_key_dict, user_api_key_cache
+        )
     if removal.deleted_keys:
         KeyManagementEventHooks.create_key_deleted_audit_logs(
             keys_being_deleted=removal.deleted_keys,
@@ -344,6 +348,7 @@ async def bulk_remove_team_members(
         hashed_tokens=removal.deleted_key_tokens,
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
+        revoked=True,
     )
     await evict_and_broadcast(cache_keys=removal.jwt_mapping_cache_keys, user_api_key_cache=user_api_key_cache)
     _emit_team_members_metric(removal.team)
@@ -392,12 +397,14 @@ async def _delete_user_rows(
     user_ids: frozenset[str],
     user_api_key_dict: UserAPIKeyAuth,
     litellm_changed_by: str | None,
+    user_api_key_cache: UserApiKeyCache,
 ) -> _DeletedKeys:
     keys: Final = await _token_tx_db(tx).find_many(where=_in_filter("user_id", user_ids))
     jwt_mapping_cache_keys: Final = await get_jwt_key_mapping_cache_keys_for_tokens(
         hashed_tokens=tuple(k.token for k in keys),
         prisma_client=prisma_client,
     )
+    await revoke_last_good(user_api_key_cache, tuple(k.token for k in keys))
     if keys:
         await persist_deleted_verification_tokens(
             keys=keys,  # pyright: ignore[reportArgumentType]  # generated row model carries the same columns as LiteLLM_VerificationToken
@@ -426,6 +433,7 @@ async def _delete_users_tx(
     teams_of: Mapping[str, frozenset[str]],
     user_api_key_dict: UserAPIKeyAuth,
     litellm_changed_by: str | None,
+    user_api_key_cache: UserApiKeyCache,
 ) -> _UserBatchDeletion:
     """Rewrites every team the users belong to and deletes their rows in one transaction, so a
     failure anywhere rolls back the whole batch. Teams a user still names but which no longer exist
@@ -447,12 +455,18 @@ async def _delete_users_tx(
                         if tid in teams_of[u.user_id]
                     ),
                     user_api_key_dict,
+                    user_api_key_cache,
                 )
                 for tid in team_ids
             }
         )
         deleted_keys: Final = await _delete_user_rows(
-            prisma_client, tx, frozenset(u.user_id for u in users), user_api_key_dict, litellm_changed_by
+            prisma_client,
+            tx,
+            frozenset(u.user_id for u in users),
+            user_api_key_dict,
+            litellm_changed_by,
+            user_api_key_cache,
         )
     return _UserBatchDeletion(
         removals=removals,
@@ -475,7 +489,9 @@ async def _delete_users(
     """Returns the error message when the transaction rolled back, in which case no row was touched."""
     user_ids: Final = frozenset(u.user_id for u in users)
     try:
-        deletion: Final = await _delete_users_tx(prisma_client, users, teams_of, user_api_key_dict, litellm_changed_by)
+        deletion: Final = await _delete_users_tx(
+            prisma_client, users, teams_of, user_api_key_dict, litellm_changed_by, user_api_key_cache
+        )
     except Exception as e:  # noqa: BLE001  # the rolled-back batch is reported per row, not as a request failure
         verbose_proxy_logger.error("users/bulk_delete: failed to delete users %s: %s", sorted(user_ids), e)
         return _error_message(e)
@@ -489,6 +505,7 @@ async def _delete_users(
         hashed_tokens=deletion.deleted_key_tokens,
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
+        revoked=True,
     )
     await evict_and_broadcast(cache_keys=deletion.jwt_mapping_cache_keys, user_api_key_cache=user_api_key_cache)
     await evict_and_broadcast(cache_keys=sorted(user_ids), user_api_key_cache=user_api_key_cache)
