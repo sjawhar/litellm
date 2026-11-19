@@ -18,7 +18,7 @@ from litellm.exceptions import GuardrailRaisedException
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.proxy._types import ProxyErrorTypes, UserAPIKeyAuth
 from litellm.proxy.utils import ProxyLogging
-from litellm.types.utils import CachingDetails
+from litellm.types.utils import CachingDetails, CallTypes
 
 
 @pytest.fixture(autouse=True)
@@ -994,6 +994,136 @@ async def test_auth_gate_failure_drops_the_team_the_caller_named(
         "litellm_metadata": {"trace_id": "trace-1", **dict.fromkeys(forged)},
         "payload": dict.fromkeys(forged),
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket", ("metadata", "litellm_metadata"))
+async def test_auth_gate_failure_ignores_the_identity_a_caller_nests_in_litellm_params(
+    proxy_logging, make_user_api_key_auth, monkeypatch, bucket: str
+):
+    """A body key named litellm_params replaced the litellm_params the logging object built, and the
+    standard logging payload reads identity from both of its metadata buckets, so a rejected caller
+    could name the key, team and user of its own failure there."""
+    recorder = _FailureEventRecorder()
+    monkeypatch.setattr(litellm, "callbacks", [recorder])
+    forged = {
+        "user_api_key_hash": "f" * 64,
+        "user_api_key_team_id": "victim-team",
+        "user_api_key_user_id": "victim-user",
+        "team_id": "victim-team",
+    }
+    authenticated = make_user_api_key_auth()
+
+    await proxy_logging._handle_logging_proxy_only_error(
+        request_data={
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "litellm_params": {bucket: dict(forged)},
+        },
+        user_api_key_dict=authenticated,
+        route="/chat/completions",
+        original_exception=litellm.BudgetExceededError(current_cost=2.0, max_budget=1.0),
+    )
+
+    assert len(recorder.logged_litellm_params) == 1
+    logged_litellm_params = recorder.logged_litellm_params[0]
+    authenticated_identity = {
+        "user_api_key_hash": authenticated.api_key,
+        "user_api_key_team_id": authenticated.team_id,
+        "user_api_key_user_id": authenticated.user_id,
+        "team_id": None,
+    }
+    assert {
+        "metadata": {key: (logged_litellm_params.get("metadata") or {}).get(key) for key in forged},
+        "litellm_metadata": {key: (logged_litellm_params.get("litellm_metadata") or {}).get(key) for key in forged},
+        "payload": {key: recorder.logged_payload_metadata[0].get(key) for key in forged},
+    } == {
+        "metadata": authenticated_identity,
+        "litellm_metadata": dict.fromkeys(forged),
+        "payload": authenticated_identity,
+    }
+
+
+@pytest.mark.asyncio
+async def test_failure_after_add_litellm_data_to_request_keeps_the_stamp_over_a_caller_litellm_params(
+    proxy_logging, make_user_api_key_auth, monkeypatch
+):
+    recorder = _FailureEventRecorder()
+    monkeypatch.setattr(litellm, "callbacks", [recorder])
+    authenticated = make_user_api_key_auth()
+    stamped = {
+        "user_api_key_auth": authenticated,
+        "user_api_key_metadata": {"owner": "platform"},
+    }
+
+    await proxy_logging._handle_logging_proxy_only_error(
+        request_data={
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": dict(stamped),
+            "litellm_params": {
+                "metadata": {"user_api_key_team_id": "victim-team", "user_api_key_metadata": {"owner": "victim"}}
+            },
+        },
+        user_api_key_dict=authenticated,
+        route="/chat/completions",
+        original_exception=litellm.BudgetExceededError(current_cost=2.0, max_budget=1.0),
+    )
+
+    assert len(recorder.logged_litellm_params) == 1
+    logged_metadata = recorder.logged_litellm_params[0]["metadata"]
+    assert {
+        "metadata": {key: logged_metadata.get(key) for key in (*stamped, "user_api_key_team_id")},
+        "payload_team_id": recorder.logged_payload_metadata[0].get("user_api_key_team_id"),
+    } == {
+        "metadata": {**stamped, "user_api_key_team_id": authenticated.team_id},
+        "payload_team_id": authenticated.team_id,
+    }
+
+
+_LOGGING_OBJECT_FIELDS: Final = (
+    "litellm_params",
+    "optional_params",
+    "start_time",
+    "call_type",
+    "completion_start_time",
+    "standard_callback_dynamic_params",
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "call_type, passed_as_optional_params",
+    (("acompletion", False), (CallTypes.pass_through.value, True)),
+    ids=("body", "pass-through"),
+)
+async def test_handle_logging_proxy_only_path_keeps_body_keys_off_the_logging_object_fields(
+    proxy_logging, make_user_api_key_auth, call_type: str, passed_as_optional_params: bool
+):
+    """update_environment_variables spreads optional_params over the fields it writes from the logging
+    object, so a body key of one of those names must not get there. A pass-through route's request_data
+    carries the litellm_params and call_type the route built itself, and keeps them."""
+    logging_obj = MagicMock()
+    logging_obj.call_type = call_type
+    logging_obj.model_call_details = {}
+    logging_obj.async_failure_handler = AsyncMock()
+
+    await proxy_logging._handle_logging_proxy_only_error(
+        request_data={
+            "litellm_logging_obj": logging_obj,
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            **{name: {"from": "request_data"} for name in _LOGGING_OBJECT_FIELDS},
+        },
+        user_api_key_dict=make_user_api_key_auth(),
+        route="/chat/completions",
+        original_exception=HTTPException(status_code=429, detail="rate"),
+    )
+
+    optional_params = logging_obj.update_environment_variables.call_args.kwargs["optional_params"]
+    assert {name: name in optional_params for name in _LOGGING_OBJECT_FIELDS} == dict.fromkeys(
+        _LOGGING_OBJECT_FIELDS, passed_as_optional_params
+    )
 
 
 @pytest.mark.asyncio
