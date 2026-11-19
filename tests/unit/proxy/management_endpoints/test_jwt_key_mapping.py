@@ -8,8 +8,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 
 from litellm.proxy.auth.user_api_key_auth import (
+    _JWTKeyMappingTarget,
     _resolve_jwt_to_virtual_key,
 )
+from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, recall_last_good, remember_last_good
 from litellm.proxy.auth.handle_jwt import JWTHandler
 from litellm.proxy._types import (
     JWTKeyMappingResponse,
@@ -1724,3 +1726,89 @@ async def test_update_evicts_old_and_new_cache_keys_after_write():
     assert result.jwt_claim_value == "renamed@example.com"
     assert await user_api_key_cache.async_get_cache(old_cache_key) is None
     assert await user_api_key_cache.async_get_cache(new_cache_key) is None
+
+
+# ──────────────────────────────────────────────
+# Tests: the last good mapping entry on the write paths
+# ──────────────────────────────────────────────
+
+
+async def _cache_holding_the_last_good_mapping(cache_key: str) -> UserApiKeyCache:
+    user_api_key_cache = UserApiKeyCache(serve_last_good_entries=True)
+    await remember_last_good(user_api_key_cache, cache_key, _JWTKeyMappingTarget(token="hashed_token"))
+    return user_api_key_cache
+
+
+@pytest.mark.asyncio
+async def test_delete_drops_the_last_good_mapping_and_a_read_in_flight_cannot_keep_it_again():
+    from litellm.proxy._types import DeleteJWTKeyMappingRequest
+    from litellm.proxy.auth.auth_checks import jwt_key_mapping_cache_key
+
+    cache_key = jwt_key_mapping_cache_key("email", "user@example.com")
+    user_api_key_cache = await _cache_holding_the_last_good_mapping(cache_key)
+    mock_prisma = _mock_prisma()
+    mock_prisma.db.litellm_jwtkeymapping.find_unique.return_value = _mock_mapping()
+
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", mock_prisma),
+        patch("litellm.proxy.proxy_server.user_api_key_cache", user_api_key_cache),
+    ):
+        await delete_jwt_key_mapping(
+            data=DeleteJWTKeyMappingRequest(id="mapping-1"),
+            user_api_key_dict=_make_admin_auth(),
+        )
+    await remember_last_good(user_api_key_cache, cache_key, _JWTKeyMappingTarget(token="hashed_token"))
+
+    assert await recall_last_good(user_api_key_cache, cache_key, _JWTKeyMappingTarget) is None
+
+
+@pytest.mark.asyncio
+async def test_update_that_deactivates_a_mapping_drops_its_last_good_entry_and_a_read_in_flight_cannot_keep_it_again():
+    from litellm.proxy._types import UpdateJWTKeyMappingRequest
+    from litellm.proxy.auth.auth_checks import jwt_key_mapping_cache_key
+
+    cache_key = jwt_key_mapping_cache_key("email", "user@example.com")
+    user_api_key_cache = await _cache_holding_the_last_good_mapping(cache_key)
+    mock_prisma = _mock_prisma()
+    mock_prisma.db.litellm_jwtkeymapping.find_unique.return_value = _mock_mapping()
+    mock_prisma.db.litellm_jwtkeymapping.update.return_value = _mock_mapping()
+
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", mock_prisma),
+        patch("litellm.proxy.proxy_server.user_api_key_cache", user_api_key_cache),
+    ):
+        await update_jwt_key_mapping(
+            data=UpdateJWTKeyMappingRequest(id="mapping-1", is_active=False),
+            user_api_key_dict=_make_admin_auth(),
+        )
+    await remember_last_good(user_api_key_cache, cache_key, _JWTKeyMappingTarget(token="hashed_token"))
+
+    assert await recall_last_good(user_api_key_cache, cache_key, _JWTKeyMappingTarget) is None
+
+
+@pytest.mark.asyncio
+async def test_update_that_repoints_a_mapping_drops_its_last_good_entry_and_the_next_read_keeps_the_new_one():
+    from litellm.proxy._types import UpdateJWTKeyMappingRequest
+    from litellm.proxy.auth.auth_checks import jwt_key_mapping_cache_key
+
+    cache_key = jwt_key_mapping_cache_key("email", "user@example.com")
+    user_api_key_cache = await _cache_holding_the_last_good_mapping(cache_key)
+    mock_prisma = _mock_prisma()
+    mock_prisma.db.litellm_jwtkeymapping.find_unique.return_value = _mock_mapping()
+    mock_prisma.db.litellm_jwtkeymapping.update.return_value = _mock_mapping()
+
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", mock_prisma),
+        patch("litellm.proxy.proxy_server.user_api_key_cache", user_api_key_cache),
+    ):
+        await update_jwt_key_mapping(
+            data=UpdateJWTKeyMappingRequest(id="mapping-1", token="a" * 64),
+            user_api_key_dict=_make_admin_auth(),
+        )
+    dropped = await recall_last_good(user_api_key_cache, cache_key, _JWTKeyMappingTarget)
+    await remember_last_good(user_api_key_cache, cache_key, _JWTKeyMappingTarget(token="a" * 64))
+
+    assert dropped is None
+    assert await recall_last_good(user_api_key_cache, cache_key, _JWTKeyMappingTarget) == _JWTKeyMappingTarget(
+        token="a" * 64
+    )

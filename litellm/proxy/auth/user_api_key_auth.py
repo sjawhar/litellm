@@ -1155,6 +1155,7 @@ async def _auto_register_jwt_mapping(
         value=token_hash,
         ttl=jwt_handler.litellm_jwtauth.virtual_key_mapping_cache_ttl,
     )
+    await remember_last_good(user_api_key_cache, cache_key, _JWTKeyMappingTarget(token=token_hash))
 
     verbose_proxy_logger.info(
         "JWT Key Mapping (auto_register): %s virtual key for %s='%s'.",
@@ -1179,23 +1180,66 @@ async def _auto_register_jwt_mapping(
     return auto_registered_key
 
 
+class _JWTKeyMappingTarget(BaseModel):
+    """The virtual key a JWT claim mapped to in one issuer scope when the database last answered for that scope.
+    ``token`` is None when an issuer's own scope had no mapping, which sends the lookup on to the global scope."""
+
+    model_config = ConfigDict(frozen=True)
+
+    token: str | None
+
+
+async def _read_jwt_mapping_scope(
+    prisma_client: PrismaClient,
+    user_api_key_cache: UserApiKeyCache,
+    virtual_key_claim_field: str,
+    claim_value: str,
+    jwt_issuer: str | None,
+    ttl: float,
+) -> str | None:
+    """The token the mapping row of one issuer scope points to. The database's answer is cached and kept as the
+    scope's last good entry, which answers while the database is unreachable. A global row the database reports
+    missing is forgotten, so no later outage serves it."""
+    cache_key: Final = jwt_key_mapping_cache_key(virtual_key_claim_field, claim_value, jwt_issuer)
+    try:
+        token: Final = await get_jwt_key_mapping_object(
+            jwt_claim_name=virtual_key_claim_field,
+            jwt_claim_value=claim_value,
+            prisma_client=prisma_client,
+            jwt_issuer=jwt_issuer,
+        )
+    except Exception as e:
+        served: Final = await recall_last_good_after(e, user_api_key_cache, cache_key, _JWTKeyMappingTarget)
+        if served is None:
+            raise
+        return served.token
+    if token is not None:
+        await user_api_key_cache.async_set_cache(key=cache_key, value=token, ttl=ttl)
+        await remember_last_good(user_api_key_cache, cache_key, _JWTKeyMappingTarget(token=token))
+    elif jwt_issuer:
+        await remember_last_good(user_api_key_cache, cache_key, _JWTKeyMappingTarget(token=None))
+    else:
+        await forget_missing_last_good(user_api_key_cache, cache_key)
+    return token
+
+
 async def _lookup_jwt_mapping_token_hash(
     prisma_client: PrismaClient,
     user_api_key_cache: UserApiKeyCache,
     virtual_key_claim_field: str,
     claim_value: str,
     normalized_issuer: str | None,
-    cache_key: str,
     ttl: float,
 ) -> str | None:
-    issuer_scoped: Final = await get_jwt_key_mapping_object(
-        jwt_claim_name=virtual_key_claim_field,
-        jwt_claim_value=claim_value,
+    issuer_scoped: Final = await _read_jwt_mapping_scope(
         prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+        virtual_key_claim_field=virtual_key_claim_field,
+        claim_value=claim_value,
         jwt_issuer=normalized_issuer,
+        ttl=ttl,
     )
     if issuer_scoped is not None:
-        await user_api_key_cache.async_set_cache(key=cache_key, value=issuer_scoped, ttl=ttl)
         return issuer_scoped
     if normalized_issuer is None:
         return None
@@ -1205,15 +1249,14 @@ async def _lookup_jwt_mapping_token_hash(
     cached_global: Final = await _raw_cache(user_api_key_cache).async_get_cache(key=global_cache_key)
     if isinstance(cached_global, str) and cached_global != "__NO_MAPPING__":
         return cached_global
-    global_row: Final = await get_jwt_key_mapping_object(
-        jwt_claim_name=virtual_key_claim_field,
-        jwt_claim_value=claim_value,
+    return await _read_jwt_mapping_scope(
         prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+        virtual_key_claim_field=virtual_key_claim_field,
+        claim_value=claim_value,
         jwt_issuer=None,
+        ttl=ttl,
     )
-    if global_row is not None:
-        await user_api_key_cache.async_set_cache(key=global_cache_key, value=global_row, ttl=ttl)
-    return global_row
 
 
 async def _resolve_jwt_to_virtual_key(
@@ -1344,7 +1387,6 @@ async def _resolve_jwt_to_virtual_key(
             virtual_key_claim_field=virtual_key_claim_field,
             claim_value=str(claim_value),
             normalized_issuer=normalized_issuer,
-            cache_key=cache_key,
             ttl=jwt_handler.litellm_jwtauth.virtual_key_mapping_cache_ttl,
         )
         if prisma_client is not None

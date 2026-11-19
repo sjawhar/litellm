@@ -29,8 +29,8 @@ pytestmark = pytest.mark.timeout(600)
 MODEL: Final = "last-good-model"
 KEY_ID: Final = "integration-last-good"
 CACHE_TTL_SECONDS: Final = 2
-# JWT sign-in is an Enterprise feature: the team-by-id and team-by-alias JWT callers run only with a license.
-# Without one, the team path is still exercised through the team key, whose auth reads its team by id.
+# JWT sign-in is an Enterprise feature: the team-by-id, team-by-alias and key-mapping JWT callers run only with a
+# license. Without one, the team path is still exercised through the team key, whose auth reads its team by id.
 JWT_LICENSED: Final = bool(os.environ.get("LITELLM_LICENSE"))
 
 
@@ -92,7 +92,12 @@ def _config(directory: Path, upstream_url: str, redis_port: int) -> Path:
             "serve_last_good_auth_entries": True,
             "coordination_redis": {"host": "127.0.0.1", "port": redis_port},
             "enable_jwt_auth": True,
-            "litellm_jwtauth": {"team_id_jwt_field": "team_id", "team_alias_jwt_field": "team_alias"},
+            "litellm_jwtauth": {
+                "team_id_jwt_field": "team_id",
+                "team_alias_jwt_field": "team_alias",
+                "virtual_key_claim_field": "client_id",
+                "virtual_key_mapping_cache_ttl": CACHE_TTL_SECONDS,
+            },
         },
     }
     path: Final = directory / "last_good_auth_entry.yaml"
@@ -137,6 +142,14 @@ def _user_key(proxy: Gateway, *, max_budget: float | None) -> str:
     return string_value(proxy.post("/key/generate", {"user_id": user_id, "models": [MODEL]})["key"])
 
 
+def _mapped_client(proxy: Gateway) -> str:
+    """A client_id claim that a JWT key-mapping row maps to a new key."""
+    client_id: Final = f"last-good-client-{uuid.uuid4().hex}"
+    key: Final = string_value(proxy.post("/key/generate", {"models": [MODEL]})["key"])
+    proxy.post("/jwt/key/mapping/new", {"jwt_claim_name": "client_id", "jwt_claim_value": client_id, "key": key})
+    return client_id
+
+
 def _over_budget(response: httpx.Response) -> bool:
     return response.status_code != 200 and "ExceededBudget" in response.text
 
@@ -176,6 +189,7 @@ def test_callers_the_gateway_last_read_are_served_while_the_database_is_stopped(
                 {
                     "team_by_id": _token(private_key, team_id=by_id),
                     "team_by_alias": _token(private_key, team_alias=by_alias),
+                    "key_mapping": _token(private_key, client_id=_mapped_client(proxy)),
                 }
                 if JWT_LICENSED
                 else {}

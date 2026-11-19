@@ -16,13 +16,14 @@ from typing import Final
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 
+import httpx
 import pytest
 from fastapi import HTTPException, status
 
 import litellm
 import litellm.proxy.proxy_server
 from litellm.caching.dual_cache import DualCache
-from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, last_good_auth_entries_scope
 from litellm.proxy._types import (
     LiteLLMRoutes,
     LiteLLM_JWTAuth,
@@ -9625,6 +9626,147 @@ async def test_issuer_agnostic_mapping_matches_every_issuer():
         )
         assert isinstance(resolved, UserAPIKeyAuth)
         assert resolved.token == "hashed-legacy-key"
+
+
+class _JWTKeyMappingTable:
+    """A ``LiteLLM_JWTKeyMapping`` table; while ``stopped``, every read fails the way an unreachable Postgres does."""
+
+    def __init__(self, *rows: dict[str, object]) -> None:
+        self.rows = list(rows)
+        self.stopped = False
+
+    async def find_first(self, where: dict[str, object]) -> SimpleNamespace | None:
+        if self.stopped:
+            raise httpx.ConnectError("All connection attempts failed")
+        matches: Final = (SimpleNamespace(**row) for row in self.rows if all(row.get(k) == v for k, v in where.items()))
+        return next(matches, None)
+
+
+def _svc_mapping(token: str, jwt_issuer: str = ISSUER_TWO) -> dict[str, object]:
+    return {
+        "jwt_issuer": jwt_issuer,
+        "jwt_claim_name": "sub",
+        "jwt_claim_value": "svc-7",
+        "token": token,
+        "is_active": True,
+    }
+
+
+async def _cache_holding_keys(*tokens: str, serve_last_good_entries: bool = True) -> UserApiKeyCache:
+    """The auth cache already holds each mapped key, so the mapping row is the only entry a lookup can serve from
+    last good."""
+    cache: Final = UserApiKeyCache(serve_last_good_entries=serve_last_good_entries)
+    for token in tokens:
+        await cache.async_set_cache(key=token, value=UserAPIKeyAuth(token=token, api_key=token))
+    return cache
+
+
+async def _resolve_svc(table: _JWTKeyMappingTable, cache: UserApiKeyCache) -> object:
+    from litellm.proxy.auth.user_api_key_auth import _resolve_jwt_to_virtual_key
+
+    return await _resolve_jwt_to_virtual_key(
+        jwt_claims={JWTHandler.LITELLM_JWT_ISSUER_CLAIM: ISSUER_TWO, "sub": "svc-7"},
+        jwt_handler=_per_issuer_virtual_key_jwt_handler(global_claim_field=None),
+        prisma_client=SimpleNamespace(db=SimpleNamespace(litellm_jwtkeymapping=table)),
+        user_api_key_cache=cache,
+        parent_otel_span=None,
+        proxy_logging_obj=MagicMock(),
+    )
+
+
+async def _outlive_the_mapping_cache(cache: UserApiKeyCache) -> None:
+    for jwt_issuer in (ISSUER_TWO, None):
+        await cache.async_delete_cache(jwt_key_mapping_cache_key("sub", "svc-7", jwt_issuer))
+
+
+async def _stopped_after_one_read(cache: UserApiKeyCache, row: dict[str, object]) -> _JWTKeyMappingTable:
+    """The database answers one lookup, the mapping's cache entry expires, then the database stops."""
+    table: Final = _JWTKeyMappingTable(row)
+    await _resolve_svc(table, cache)
+    await _outlive_the_mapping_cache(cache)
+    table.stopped = True
+    return table
+
+
+@pytest.mark.asyncio
+async def test_mapping_row_is_served_from_its_last_good_entry_once_its_cache_entry_has_expired():
+    """The served token is not cached again, so every call during the outage is served from the entry."""
+    cache: Final = await _cache_holding_keys("hashed-mapped-key")
+    table: Final = await _stopped_after_one_read(cache, _svc_mapping("hashed-mapped-key"))
+
+    served: Final = await _resolve_svc(table, cache)
+
+    assert isinstance(served, UserAPIKeyAuth)
+    assert served.token == "hashed-mapped-key"
+    assert await cache.async_get_cache(jwt_key_mapping_cache_key("sub", "svc-7", ISSUER_TWO)) is None
+
+
+@pytest.mark.asyncio
+async def test_a_call_served_through_a_last_good_mapping_row_reads_last_good(monkeypatch):
+    from litellm.proxy.auth.user_api_key_auth import _auth_entries_source
+
+    cache: Final = await _cache_holding_keys("hashed-mapped-key")
+    table: Final = await _stopped_after_one_read(cache, _svc_mapping("hashed-mapped-key"))
+    monkeypatch.setattr(litellm.proxy.proxy_server, "user_api_key_cache", cache)
+
+    with last_good_auth_entries_scope() as scope:
+        await _resolve_svc(table, cache)
+
+    assert (scope.served, _auth_entries_source(scope)) == (("_JWTKeyMappingTarget",), "last_good")
+
+
+@pytest.mark.asyncio
+async def test_mapping_row_never_read_is_refused_while_the_database_is_stopped():
+    cache: Final = await _cache_holding_keys("hashed-mapped-key")
+    table: Final = _JWTKeyMappingTable(_svc_mapping("hashed-mapped-key"))
+    table.stopped = True
+
+    with pytest.raises(httpx.ConnectError):
+        await _resolve_svc(table, cache)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("row_issuer", [ISSUER_TWO, ""], ids=["issuer_row", "global_row"])
+async def test_mapping_row_the_database_reported_missing_is_refused_in_a_later_outage(row_issuer: str):
+    cache: Final = await _cache_holding_keys("hashed-mapped-key")
+    table: Final = _JWTKeyMappingTable(_svc_mapping("hashed-mapped-key", jwt_issuer=row_issuer))
+    await _resolve_svc(table, cache)
+    table.rows.clear()
+    await _outlive_the_mapping_cache(cache)
+    with pytest.raises(HTTPException):
+        await _resolve_svc(table, cache)
+    await _outlive_the_mapping_cache(cache)
+    table.stopped = True
+
+    with pytest.raises(httpx.ConnectError):
+        await _resolve_svc(table, cache)
+
+
+@pytest.mark.asyncio
+async def test_mapping_row_is_refreshed_when_the_database_answers_again():
+    cache: Final = await _cache_holding_keys("hashed-old-key", "hashed-new-key")
+    table: Final = await _stopped_after_one_read(cache, _svc_mapping("hashed-old-key"))
+    during_the_first_outage: Final = await _resolve_svc(table, cache)
+    table.stopped = False
+    table.rows[0] = _svc_mapping("hashed-new-key")
+    await _resolve_svc(table, cache)
+    await _outlive_the_mapping_cache(cache)
+    table.stopped = True
+
+    during_the_second_outage: Final = await _resolve_svc(table, cache)
+
+    assert isinstance(during_the_first_outage, UserAPIKeyAuth)
+    assert isinstance(during_the_second_outage, UserAPIKeyAuth)
+    assert (during_the_first_outage.token, during_the_second_outage.token) == ("hashed-old-key", "hashed-new-key")
+
+
+@pytest.mark.asyncio
+async def test_mapping_row_is_refused_while_the_database_is_stopped_with_the_setting_off():
+    cache: Final = await _cache_holding_keys("hashed-mapped-key", serve_last_good_entries=False)
+    table: Final = await _stopped_after_one_read(cache, _svc_mapping("hashed-mapped-key"))
+
+    with pytest.raises(httpx.ConnectError):
+        await _resolve_svc(table, cache)
 
 
 @pytest.mark.asyncio

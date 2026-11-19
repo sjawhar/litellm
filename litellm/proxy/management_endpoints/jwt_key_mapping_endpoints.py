@@ -17,6 +17,7 @@ from litellm.proxy._types import (
 from litellm.proxy.auth.auth_checks import jwt_key_mapping_cache_key
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_broadcast
+from litellm.proxy.common_utils.user_api_key_cache import revoke_last_good
 from litellm.proxy.management_endpoints.common_utils import (  # noqa: F401  # legacy module exports
     _user_has_admin_view,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
     user_api_key_has_admin_view,
@@ -231,6 +232,12 @@ async def update_jwt_key_mapping(
         if old_mapping is None:
             raise HTTPException(status_code=404, detail="Mapping not found")
 
+        old_cache_key: Final = jwt_key_mapping_cache_key(
+            old_mapping.jwt_claim_name, old_mapping.jwt_claim_value, old_mapping.jwt_issuer
+        )
+        if data.is_active is False:
+            await revoke_last_good(user_api_key_cache, (old_cache_key,))
+
         updated_mapping: Final = await _mapping_table(prisma_client).update(where={"id": data.id}, data=update_data)
 
         if updated_mapping is None:
@@ -239,9 +246,6 @@ async def update_jwt_key_mapping(
         # Evict only after the write commits: a concurrent request between an
         # early eviction and the commit would re-cache the old mapping and keep
         # it authorized until TTL.
-        old_cache_key: Final = jwt_key_mapping_cache_key(
-            old_mapping.jwt_claim_name, old_mapping.jwt_claim_value, old_mapping.jwt_issuer
-        )
         new_cache_key: Final = jwt_key_mapping_cache_key(
             updated_mapping.jwt_claim_name, updated_mapping.jwt_claim_value, updated_mapping.jwt_issuer
         )
@@ -286,13 +290,14 @@ async def delete_jwt_key_mapping(
         if old_mapping is None:
             raise HTTPException(status_code=404, detail="Mapping not found")
 
+        cache_key: Final = jwt_key_mapping_cache_key(
+            old_mapping.jwt_claim_name, old_mapping.jwt_claim_value, old_mapping.jwt_issuer
+        )
+        await revoke_last_good(user_api_key_cache, (cache_key,))
         await _mapping_table(prisma_client).delete(where={"id": data.id})
 
         # Evict only after the row is gone, else a concurrent request can
         # re-cache the deleted mapping and keep it authorized until TTL.
-        cache_key: Final = jwt_key_mapping_cache_key(
-            old_mapping.jwt_claim_name, old_mapping.jwt_claim_value, old_mapping.jwt_issuer
-        )
         await evict_and_broadcast(cache_keys=(cache_key,), user_api_key_cache=user_api_key_cache)
         return {"status": "success"}
     except HTTPException:
