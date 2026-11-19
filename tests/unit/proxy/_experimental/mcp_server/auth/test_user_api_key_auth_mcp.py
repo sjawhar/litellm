@@ -10496,6 +10496,30 @@ class TestEntitlementFaultSemantics:
                     allowed = await MCPRequestHandler.get_allowed_mcp_servers(auth)
             assert set(allowed) == {"srv1"}, f"{shape}: no ceiling we can point at, so key auth stays open"
 
+    @staticmethod
+    def _org_with_no_last_good_entry() -> AsyncMock:
+        """The org lookup in an outage while last good entries are served and the org has none: the store holds every
+        org the database returned, so this one may carry a ceiling nobody can read."""
+        import httpx
+
+        from litellm.proxy.db.exception_handler import LastGoodEntryMissing
+
+        return AsyncMock(side_effect=LastGoodEntryMissing(httpx.ConnectError("All connection attempts failed")))
+
+    async def test_org_with_no_last_good_entry_denies_a_keys_servers(self):
+        auth = _key_auth_reaching("srv1", org_id="org-a")
+        with _entitlement_fault_globals():
+            with patch("litellm.proxy.auth.auth_checks.get_org_object", self._org_with_no_last_good_entry()):
+                allowed = await MCPRequestHandler.get_allowed_mcp_servers(auth)
+        assert allowed == [], "an org ceiling no last good entry can answer for must deny, key auth included"
+
+    async def test_org_with_no_last_good_entry_denies_a_keys_tools(self):
+        auth = _key_auth_reaching("srv1", tools=["tool_a"], org_id="org-a")
+        with _entitlement_fault_globals():
+            with patch("litellm.proxy.auth.auth_checks.get_org_object", self._org_with_no_last_good_entry()):
+                tools = await MCPRequestHandler.get_allowed_tools_for_server("srv1", auth)
+        assert tools == [], "an org tool ceiling no last good entry can answer for must deny its tools"
+
     async def test_keyless_org_ceiling_denies_on_either_fault_class(self):
         """The keyless gateway-admitted path is untouched: it already denied on ANY org-ceiling
         fault, and still denies on both classes, because a per-source org ceiling is the only org

@@ -731,6 +731,10 @@ async def update_end_user(
         }
         if not END_USER_RESTRICTION_COLUMNS.isdisjoint(written_columns):
             await revoke_last_good(user_api_key_cache, _end_user_cache_keys((data.user_id,)))
+        elif budget_table_data:
+            # A change to the customer's existing budget row moves it into or out of no registry, but the customer's
+            # entry carries that budget: a lowered limit must not stay there for the next outage
+            await revoke_last_good(user_api_key_cache, (end_user_cache_key(data.user_id),))
 
         ## Handle object permission updates (MCP servers, vector stores, etc.)
         await _handle_customer_object_permission_update(
