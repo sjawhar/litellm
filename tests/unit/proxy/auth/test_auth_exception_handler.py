@@ -906,6 +906,9 @@ async def test_auth_failure_drops_client_context_the_caller_sent_in_the_other_bu
 
 @pytest.mark.asyncio
 async def test_auth_failure_keeps_the_other_bucket_strippable_of_router_stamps():
+    """The bucket that does not get the stamp is rebuilt without the caller's client context.
+    It must stay a plain dict: the router-stamp strip passes over any other mapping, so a strip
+    of this failure payload would leave the caller's router stamps in it."""
     with (
         patch("litellm.proxy.auth.auth_exception_handler.seed_request_identity"),
         patch(
@@ -927,16 +930,18 @@ async def test_auth_failure_keeps_the_other_bucket_strippable_of_router_stamps()
                     code=status.HTTP_401_UNAUTHORIZED,
                 ),
                 _http_request(headers={"user-agent": "real-client/1.0"}),
-                {"litellm_metadata": {}, "metadata": {"user_supplied": "keep-me", "model_group": "forged"}},
+                {"litellm_metadata": {}, "metadata": {"user_supplied": "keep-me", "attempted_fallbacks": 99}},
                 "/v1/responses",
                 None,
                 "sk-bad-key",
             )
 
-    from litellm.proxy.litellm_pre_call_utils import without_router_reserved_fields
+    from litellm.proxy.litellm_pre_call_utils import _strip_router_reserved_metadata
 
-    stripped = without_router_reserved_fields(mock_hook.call_args[1]["request_data"])
-    assert stripped["metadata"] == {"user_supplied": "keep-me"}
+    logged_request_data = mock_hook.call_args[1]["request_data"]
+    assert type(logged_request_data["metadata"]) is dict
+    _strip_router_reserved_metadata(logged_request_data)
+    assert logged_request_data["metadata"] == {"user_supplied": "keep-me"}
 
 
 @pytest.mark.asyncio
