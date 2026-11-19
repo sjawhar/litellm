@@ -2255,7 +2255,8 @@ class TestLastGoodEntryWhileTheDatabaseIsUnreachable:
 
 class _LimitRows:
     """One table of ``_LimitsDatabase``, answering by its key column. ``find_many`` answers a batch read by that column,
-    a registry read with no filter with every row, and the restricted-customer registry filter with the blocked rows."""
+    a registry read with no filter with every row, and the restricted-customer registry filter with the blocked rows.
+    ``update`` writes columns of one row."""
 
     def __init__(self, database: "_LimitsDatabase", key: str) -> None:
         self._database = database
@@ -2276,6 +2277,12 @@ class _LimitRows:
         if isinstance(batch, dict):
             return [row for name, row in self.rows.items() if name in batch["in"]]
         return [row for row in self.rows.values() if getattr(row, "blocked", False)]
+
+    async def update(self, where: dict[str, str], data: dict[str, object]) -> BaseModel:
+        self._database.answer()
+        updated: Final = self.rows[where[self._key]].model_copy(update=data)
+        self.rows[where[self._key]] = updated
+        return updated
 
 
 class _LimitsDatabase:
@@ -2988,6 +2995,54 @@ class TestLastGoodLimitsWhileTheDatabaseIsUnreachable:
             return end_user_id, bool(scope.served)
 
         assert (await request(), await request()) == (("c-known", True), ("c-known", True))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("claims", [{"roles": ["ADMIN"]}, {"teams": ["t-claimed"]}], ids=["role", "teams"])
+    async def test_a_request_after_the_jwt_sync_updated_a_user_served_from_its_last_good_entry_reads_the_users_row(
+        self, claims: dict[str, list[str]]
+    ):
+        """The JWT sync writes the role or teams of a user its last good entry served, once the database answers again.
+        A request after it reads the user's row, not the last good entry's other fields from an ordinary cache as
+        fresh."""
+        from litellm.proxy._types import JWTLiteLLMRoleMap, LiteLLM_JWTAuth, LitellmUserRoles
+        from litellm.proxy.auth.handle_jwt import JWTAuthManager, JWTHandler
+        from litellm.proxy.common_utils.user_api_key_cache import last_good_auth_entries_scope
+
+        database = _LimitsDatabase()
+        database.users.rows["u-sync"] = LiteLLM_UserTable(user_id="u-sync", user_role="internal_user", spend=1.0)
+        cache = _serving_cache()
+        await self._user(database, cache, "u-sync")
+        await self._expire(cache, "u-sync")
+        # Spend the other workers recorded while this one could not read the row
+        database.users.rows["u-sync"] = LiteLLM_UserTable(user_id="u-sync", user_role="internal_user", spend=5.0)
+        database.stopped_with = _STOPPED
+        jwt_handler: Final = JWTHandler()
+        jwt_handler.update_environment(
+            prisma_client=None,
+            user_api_key_cache=cache,
+            litellm_jwtauth=LiteLLM_JWTAuth(
+                jwt_litellm_role_map=[JWTLiteLLMRoleMap(jwt_role="ADMIN", litellm_role=LitellmUserRoles.PROXY_ADMIN)],
+                roles_jwt_field="roles",
+                team_ids_jwt_field="teams",
+                sync_user_role_and_teams=True,
+            ),
+        )
+
+        async def request() -> tuple[float, tuple[str, ...]]:
+            with last_good_auth_entries_scope() as scope:
+                user: Final = await self._user(database, cache, "u-sync")
+                database.stopped_with = None  # the database answers again before the sync writes
+                await JWTAuthManager.sync_user_role_and_teams(
+                    jwt_handler,
+                    claims,
+                    user,
+                    database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+                    user_api_key_cache=cache,
+                )
+            return user.spend, scope.served
+
+        with patch("litellm.proxy.management_endpoints.scim.scim_v2.patch_team_membership", new_callable=AsyncMock):
+            assert (await request(), await request()) == ((1.0, ("LiteLLM_UserTable",)), (5.0, ()))
 
     @pytest.mark.asyncio
     async def test_user_the_database_reported_missing_refuses_the_request(self, monkeypatch):

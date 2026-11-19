@@ -65,10 +65,10 @@ from litellm.proxy.auth.model_access_denied import (
 from litellm.proxy.auth.resolvers.grants import GrantResolver, UserLookup, canonical_user_id
 from litellm.proxy.auth.route_checks import RouteChecks
 from litellm.proxy.auth.team_grants import team_grants, team_model_aliases
+from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_broadcast
 from litellm.proxy.common_utils.user_api_key_cache import (
     AUTH_OBJECTS_TARGET,
     UserApiKeyCache,
-    get_management_object_ttl,
 )
 from litellm.proxy.utils import PrismaClient, ProxyLogging
 from litellm.repositories.user_repository import UserRepository
@@ -2104,12 +2104,8 @@ class JWTAuthManager:
             )
             user_object.user_role = new_role.value
             if user_api_key_cache is not None:
-                await user_api_key_cache.async_set_cache(
-                    key=user_object.user_id,
-                    value=user_object,
-                    model_type=LiteLLM_UserTable,
-                    ttl=get_management_object_ttl(user_api_key_cache),
-                )
+                # Evicted like any other user update, not cached: the object in hand may be the user's last good entry
+                await evict_and_broadcast(cache_keys=(user_object.user_id,), user_api_key_cache=user_api_key_cache)
 
         # Sync team memberships. With fallback_to_db_teams on, read both plural and
         # singular claim shapes so a singular-only IdP token (e.g. Okta/Auth0) is
@@ -2135,14 +2131,9 @@ class JWTAuthManager:
                 teams_ids_to_add_user_to=list(teams_to_add),
                 teams_ids_to_remove_user_from=list(teams_to_remove),
             )
+            # Not cached: each membership write that landed evicted the user already, and the object in hand may be
+            # the user's last good entry
             user_object.teams = list(jwt_team_ids)
-            if user_api_key_cache is not None:
-                await user_api_key_cache.async_set_cache(
-                    key=user_object.user_id,
-                    value=user_object,
-                    model_type=LiteLLM_UserTable,
-                    ttl=get_management_object_ttl(user_api_key_cache),
-                )
         return
 
     @staticmethod

@@ -7704,8 +7704,9 @@ class TestSyncUserRoleFromJwtRoleMap:
         assert sso_values["user_role"] == LitellmUserRoles.PROXY_ADMIN.value
 
     @pytest.mark.asyncio
-    async def test_existing_user_role_updated_in_db_and_cache(self):
-        """Existing user with stale role gets updated in DB and cache."""
+    async def test_existing_user_role_updated_in_db_and_evicted_from_cache(self):
+        """Existing user with stale role gets updated in DB and evicted from the cache,
+        not cached as the object in hand, which may be the user's last good entry."""
         from litellm.caching.caching import DualCache
         from litellm.proxy._types import LitellmUserRoles
 
@@ -7742,6 +7743,7 @@ class TestSyncUserRoleFromJwtRoleMap:
         )
         assert existing_user.user_role == LitellmUserRoles.PROXY_ADMIN.value
         assert sso_values["user_role"] == LitellmUserRoles.PROXY_ADMIN.value
+        assert await cache.async_get_cache(key=user_id) is None
 
     @pytest.mark.asyncio
     async def test_same_role_no_db_write(self):
