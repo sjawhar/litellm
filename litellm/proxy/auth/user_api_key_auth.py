@@ -3835,7 +3835,7 @@ async def enforce_key_and_fallback_model_access(
             )
 
     # Fallback targets are checked for an all-team-models key too: can_key_call_model reads the team's models. The
-    # team, member, user and project checks of every fallback target run in common_checks.
+    # team, member, user, project and agent checks of every fallback target run in common_checks.
     anthropic_owns_body_fallbacks: Final = (
         route.endswith("/v1/messages")
         and request is not None
