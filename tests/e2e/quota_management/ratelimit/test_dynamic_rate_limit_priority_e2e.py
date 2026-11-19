@@ -180,8 +180,10 @@ class TestDynamicRateLimitPriority:
         fixture = _dynamic_limited_model(client, resources, "generous")
 
         info = client.proxy.key_info(fixture.dev_key)
-        assert info.metadata is not None and info.metadata.priority == DEV_PRIORITY, (
-            f"/key/info must echo the key's priority metadata, got {info.metadata}"
+        assert info.team_id is not None, f"/key/info must report the dev key's team, got {info}"
+        team_metadata = client.team_metadata(info.team_id)
+        assert team_metadata is not None and team_metadata.priority == DEV_PRIORITY, (
+            f"/team/info must echo the dev team's priority metadata, got {team_metadata}"
         )
 
         first = _first_ok(client, fixture.dev_key, fixture.model)

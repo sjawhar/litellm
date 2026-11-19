@@ -2,13 +2,15 @@ import datetime
 import logging
 import sys
 from itertools import chain
+from pathlib import Path
 
 import pytest
-from prometheus_client import REGISTRY
+from prometheus_client import REGISTRY, CollectorRegistry, multiprocess, values
 
 import litellm
 from litellm.integrations.prometheus import PrometheusLogger
 from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy.prometheus_cleanup import mark_worker_exit
 
 
 def _clear_prometheus_registry() -> None:
@@ -189,6 +191,36 @@ async def test_priority_label_uses_team_metadata_for_failure_counters_and_satura
     assert len(saturation_samples) == 1
     assert saturation_samples[0].labels == {"model_group": "gpt-4o-mini", "priority": expected_priority}
     assert saturation_samples[0].value == 0.75
+
+
+def test_saturation_gauge_drops_an_exited_workers_reading_in_multiprocess_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
+    worker_pid = [1001]
+    monkeypatch.setattr(values, "ValueClass", values.MultiProcessValue(process_identifier=lambda: worker_pid[0]))
+    _clear_prometheus_registry()
+    prometheus_logger = PrometheusLogger()
+    litellm_params = {"metadata": {"user_api_key_team_metadata": {"priority": "high"}}}
+
+    prometheus_logger.set_model_group_saturation_ratio(
+        model_group="gpt-4o-mini", saturation=1.0, litellm_params=litellm_params
+    )
+    mark_worker_exit(1001)
+    worker_pid[0] = 1002
+    prometheus_logger.set_model_group_saturation_ratio(
+        model_group="gpt-4o-mini", saturation=0.1, litellm_params=litellm_params
+    )
+
+    scrape_registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(scrape_registry, path=str(tmp_path))
+    saturation_samples = [
+        (sample.labels, sample.value)
+        for metric in scrape_registry.collect()
+        for sample in metric.samples
+        if sample.name == "litellm_model_group_saturation_ratio"
+    ]
+    assert saturation_samples == [({"model_group": "gpt-4o-mini", "priority": "high"}, 0.1)]
 
 
 @pytest.mark.asyncio
