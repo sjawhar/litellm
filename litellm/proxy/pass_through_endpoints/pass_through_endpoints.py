@@ -1244,9 +1244,6 @@ async def pass_through_request(
 
         # Store passthrough guardrails config on logging_obj for field targeting
         logging_obj.passthrough_guardrails_config = guardrails_config
-        # The provider this route forwards to is the route's own, so a refusal in the pre-call hooks still names it.
-        if custom_llm_provider:
-            logging_obj.model_call_details["custom_llm_provider"] = custom_llm_provider
 
         # Store logging_obj in data so guardrails can access it
         if _parsed_body is None:
@@ -1302,8 +1299,9 @@ async def pass_through_request(
             logging_obj=logging_obj,
         )
 
-        # Store the litellm_params the route built on the logging object if a provider is set
+        # Store custom_llm_provider in kwargs and logging object if provided
         if custom_llm_provider:
+            logging_obj.model_call_details["custom_llm_provider"] = custom_llm_provider
             logging_obj.model_call_details["litellm_params"] = kwargs.get("litellm_params", {})
 
         # done for supporting 'parallel_request_limiter.py' with pass-through endpoints
