@@ -29,6 +29,7 @@ from litellm.litellm_core_utils.url_utils import (
     provider_url_destination_candidates,
     validate_url,
 )
+from litellm.llms.anthropic.common_utils import anthropic_beta_opts_into_server_side_fallback
 from litellm.llms.azure.passthrough.transformation import azure_router_model_in_endpoint
 from litellm.llms.nvidia_nim.passthrough.transformation import nvidia_nim_model_group_in_path
 from litellm.proxy._types import *
@@ -609,6 +610,18 @@ def _target_model_names(targets: Iterable[object]) -> tuple[str, ...]:
 
 def request_fallback_model_names(request_body: Mapping[str, object]) -> tuple[str, ...]:
     return _target_model_names(iter_request_fallback_targets(request_body))
+
+
+def body_fallbacks_go_to_anthropic(route: str, request: Request | None) -> bool:
+    """
+    Whether the body's ``fallbacks`` is Anthropic's server-side fallback list, sent to Anthropic as is: a /v1/messages
+    request whose anthropic-beta header opts into server-side fallback
+    """
+    return (
+        route.endswith("/v1/messages")
+        and request is not None
+        and anthropic_beta_opts_into_server_side_fallback(request.headers)
+    )
 
 
 def key_fallback_model_names(

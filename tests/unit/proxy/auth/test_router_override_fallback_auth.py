@@ -578,6 +578,9 @@ class _Gateway:
         team_router_settings: dict[str, object] | None = None,
         key_models: tuple[str, ...] = ("requested", "other"),
         credentials_allowed: bool = False,
+        key_aliases: Mapping[str, str] | None = None,
+        team_aliases: Mapping[str, str] | None = None,
+        router_aliases: Mapping[str, str] | None = None,
     ) -> "_GatewayResult":
         import httpx
         import respx
@@ -606,6 +609,7 @@ class _Gateway:
                 )
             ],
             num_retries=0,
+            model_group_alias=dict(router_aliases or {}),
         )
         router.fallback_target_credentials_allowed = (lambda: True) if credentials_allowed else None
         cache = DualCache()
@@ -618,6 +622,8 @@ class _Gateway:
             team_id=team_id,
             team_models=["requested", "other"] if team_id else [],
             router_settings=key_router_settings,
+            aliases=dict(key_aliases or {}),
+            team_model_aliases=dict(team_aliases) if team_aliases is not None else None,
         )
         await cache.async_set_cache(key=hash_token(_CALLER_KEY), value=token)
         if team_id is not None:
@@ -1055,6 +1061,48 @@ async def test_a_fallback_target_in_the_team_still_serves_a_key_without_a_model_
 
     assert result.response.status_code == 200, result.response.text
     assert result.calls == calls
+
+
+# A name Anthropic would serve as itself, aliased to `other`, a model the key and the team may call
+_ALIASED_PROVIDER_FALLBACK: Final = "claude-opus-aliased"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("alias_kind", ["key", "team", "router", "global"])
+async def test_a_name_in_anthropics_fallbacks_that_has_an_alias_is_refused(
+    monkeypatch: pytest.MonkeyPatch, alias_kind: str
+) -> None:
+    """Every model check would pass the name as its alias target, while Anthropic gets it as named"""
+    import litellm
+
+    aliases: Final = {_ALIASED_PROVIDER_FALLBACK: "other"}
+    if alias_kind == "global":
+        monkeypatch.setattr(litellm, "model_alias_map", aliases)
+    result: Final = await _Gateway(monkeypatch, requested_answers=True).send(
+        {"fallbacks": [{"model": _ALIASED_PROVIDER_FALLBACK}]},
+        beta=True,
+        team_router_settings={} if alias_kind == "team" else None,
+        key_aliases=aliases if alias_kind == "key" else None,
+        team_aliases=aliases if alias_kind == "team" else None,
+        router_aliases=aliases if alias_kind == "router" else None,
+    )
+
+    assert result.response.status_code == 403, result.response.text
+    assert "key_model_access_denied" in result.response.text
+    assert f"The requested model '{_ALIASED_PROVIDER_FALLBACK}' is not available" in result.response.text
+    assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+
+
+@pytest.mark.asyncio
+async def test_a_name_in_anthropics_fallbacks_the_key_may_call_as_named_still_serves_the_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result: Final = await _Gateway(monkeypatch, requested_answers=True).send(
+        {"fallbacks": [{"model": "other"}]}, beta=True
+    )
+
+    assert result.response.status_code == 200, result.response.text
+    assert result.calls == {"requested": 1, "other": 0, "forbidden": 0, "attacker": 0}
 
 
 async def _common_checks_with_fallbacks(
