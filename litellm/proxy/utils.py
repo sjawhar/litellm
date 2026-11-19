@@ -1350,6 +1350,21 @@ def _proxy_stamped_request_metadata(request_data: Mapping[str, object]) -> bool:
     )
 
 
+# What ``Logging.update_environment_variables`` writes into ``model_call_details`` from the logging object
+# itself. It spreads ``optional_params`` after these, so a request_data key of one of these names would
+# replace the value the logging object built, ``litellm_params`` and the identity in it included.
+_LOGGING_OBJECT_FIELDS: Final = frozenset(
+    (
+        "litellm_params",
+        "optional_params",
+        "start_time",
+        "call_type",
+        "completion_start_time",
+        "standard_callback_dynamic_params",
+    )
+)
+
+
 _PROXY_ONLY_LLM_API_ERRORS: Final = (HTTPException, ProxyException, GuardrailRaisedException)
 _LOG_DB_METRICS_CALL_TYPES: Final = frozenset(("get_data", "insert_data", "update_data", "delete_data"))
 
@@ -3766,10 +3781,15 @@ class ProxyLogging:
             _litellm_params: Final = {}
 
             litellm_param_keys: Final = LoggedLiteLLMParams.__annotations__.keys()
+            # A pass-through route puts the litellm_params and call_type it built into request_data itself;
+            # on every other route a key of one of those names came in the caller's body.
+            body_cannot_set: Final = (
+                frozenset() if litellm_logging_obj.call_type == CallTypes.pass_through.value else _LOGGING_OBJECT_FIELDS
+            )
             for k, v in request_data.items():
                 if k in litellm_param_keys:
                     _litellm_params[k] = v
-                elif k not in ("model", "user", "litellm_logging_obj"):
+                elif k not in ("model", "user", "litellm_logging_obj") and k not in body_cannot_set:
                     _optional_params[k] = v
 
             attribution: Final = _stamp_deployment_attribution(
