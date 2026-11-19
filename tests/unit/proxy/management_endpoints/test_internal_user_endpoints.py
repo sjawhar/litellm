@@ -2666,6 +2666,172 @@ async def test_user_rate_limit_update_reaches_cached_user_on_every_worker(
     )
 
 
+class _UserRows:
+    """The user table behind /user/update and /user/bulk_update: rows by id, changed only by a write."""
+
+    def __init__(self, *rows: LiteLLM_UserTable) -> None:
+        # mutable-ok: the table a write changes
+        self.rows: dict[str, LiteLLM_UserTable] = {row.user_id: row for row in rows}
+
+    def _matching(self, where: Mapping[str, object]) -> list[LiteLLM_UserTable]:
+        return [row for row in self.rows.values() if all(getattr(row, k) == v for k, v in where.items())]
+
+    def _write(self, user_id: str, data: Mapping[str, object]) -> LiteLLM_UserTable:
+        written: Final = self.rows[user_id].model_copy(
+            update={column: value for column, value in data.items() if column in LiteLLM_UserTable.model_fields}
+        )
+        self.rows[user_id] = written
+        return written
+
+    async def find_first(self, where: Mapping[str, object]) -> LiteLLM_UserTable | None:
+        return next(iter(self._matching(where)), None)
+
+    async def find_many(self, order: Mapping[str, str]) -> list[LiteLLM_UserTable]:
+        return list(self.rows.values())
+
+    async def get_data(
+        self, key_val: Mapping[str, object], table_name: str, query_type: str
+    ) -> list[LiteLLM_UserTable]:
+        return self._matching(key_val)
+
+    async def update_data(self, user_id: str, data: Mapping[str, object], table_name: str) -> dict[str, object]:
+        # A copy, since the endpoint strips the password from the row it returns
+        return {"user_id": user_id, "data": self._write(user_id, data).model_copy()}
+
+    async def update_many(self, where: Mapping[str, Mapping[str, Sequence[str]]], data: Mapping[str, object]) -> int:
+        # An unfiltered write changes every row
+        user_ids: Final = where["user_id"]["in"] if where else tuple(self.rows)
+        for user_id in user_ids:
+            self._write(user_id, data)
+        return len(user_ids)
+
+
+_BUDGETED_USER: Final = LiteLLM_UserTable(user_id="user-birch", user_email="birch@example.test", max_budget=50.0)
+_USER_ADMIN: Final = UserAPIKeyAuth(user_id="admin-birch", user_role=LitellmUserRoles.PROXY_ADMIN)
+
+
+def _serve_user_rows(mocker: MockerFixture, cache: UserApiKeyCache) -> _UserRows:
+    rows: Final = _UserRows(_BUDGETED_USER)
+    prisma_client: Final = mocker.MagicMock()
+    prisma_client.db.litellm_usertable = rows
+    prisma_client.get_data = rows.get_data
+    prisma_client.update_data = rows.update_data
+    mocker.patch(  # test-quality-ok: substitute the database dependency
+        "litellm.proxy.proxy_server.prisma_client", prisma_client
+    )
+    mocker.patch(  # test-quality-ok: exercise a real isolated cache
+        "litellm.proxy.proxy_server.user_api_key_cache", cache
+    )
+    return rows
+
+
+def _redis_down_cache(serve_last_good_entries: bool) -> UserApiKeyCache:
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis: Final = fake_redis_cache()
+    redis.server.connected = False
+    return UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=serve_last_good_entries)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("by_email", [False, True], ids=["by-user-id", "by-email"])
+async def test_user_budget_update_answers_503_and_writes_nothing_when_redis_cannot_record_it(
+    mocker: MockerFixture, by_email: bool
+) -> None:
+    """The user's last good entry carries its budget. Changing the budget revokes the entry first, so a Redis that
+    cannot record the revocation refuses the update rather than leave the old budget for the next outage."""
+    from litellm.proxy.management_endpoints.internal_user_endpoints import user_update
+
+    rows: Final = _serve_user_rows(mocker, _redis_down_cache(serve_last_good_entries=True))
+
+    with pytest.raises(ProxyException) as refused:
+        await user_update(
+            data=UpdateUserRequest(
+                user_id=None if by_email else _BUDGETED_USER.user_id,
+                user_email=_BUDGETED_USER.user_email if by_email else None,
+                max_budget=5.0,
+            ),
+            user_api_key_dict=_USER_ADMIN,
+        )
+
+    assert (str(refused.value.code), rows.rows[_BUDGETED_USER.user_id].max_budget) == ("503", 50.0)
+
+
+@pytest.mark.asyncio
+async def test_bulk_budget_update_of_all_users_answers_503_and_writes_nothing_when_redis_cannot_record_it(
+    mocker: MockerFixture,
+) -> None:
+    from litellm.proxy.management_endpoints.internal_user_endpoints import bulk_user_update
+    from litellm.types.proxy.management_endpoints.internal_user_endpoints import BulkUpdateUserRequest
+
+    rows: Final = _serve_user_rows(mocker, _redis_down_cache(serve_last_good_entries=True))
+
+    with pytest.raises(HTTPException) as refused:
+        await bulk_user_update(
+            data=BulkUpdateUserRequest(all_users=True, user_updates={"max_budget": 5.0}),
+            user_api_key_dict=_USER_ADMIN,
+            litellm_changed_by=None,
+        )
+
+    assert (refused.value.status_code, rows.rows[_BUDGETED_USER.user_id].max_budget) == (503, 50.0)
+
+
+@pytest.mark.asyncio
+async def test_user_update_without_a_budget_field_writes_while_redis_is_down(mocker: MockerFixture) -> None:
+    """Only a change to what the user's last good entry carries as a budget needs Redis to record a revocation."""
+    from litellm.proxy.management_endpoints.internal_user_endpoints import user_update
+
+    rows: Final = _serve_user_rows(mocker, _redis_down_cache(serve_last_good_entries=True))
+
+    await user_update(
+        data=UpdateUserRequest(user_id=_BUDGETED_USER.user_id, user_alias="Birch"), user_api_key_dict=_USER_ADMIN
+    )
+
+    assert rows.rows[_BUDGETED_USER.user_id].user_alias == "Birch"
+
+
+@pytest.mark.asyncio
+async def test_user_budget_update_writes_while_redis_is_down_when_last_good_entries_are_off(
+    mocker: MockerFixture,
+) -> None:
+    """With last good entries off nothing is revoked, so a budget update does not depend on Redis."""
+    from litellm.proxy.management_endpoints.internal_user_endpoints import user_update
+
+    rows: Final = _serve_user_rows(mocker, _redis_down_cache(serve_last_good_entries=False))
+
+    await user_update(
+        data=UpdateUserRequest(user_id=_BUDGETED_USER.user_id, max_budget=5.0), user_api_key_dict=_USER_ADMIN
+    )
+
+    assert rows.rows[_BUDGETED_USER.user_id].max_budget == 5.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change",
+    [{"model_rpm_limit": {"model-birch": 1}}, {"max_parallel_requests": 1}, {"budget_duration": "1d"}],
+    ids=["model_rpm_limit", "max_parallel_requests", "budget_duration"],
+)
+async def test_user_update_of_a_limit_its_last_good_entry_carries_drops_that_entry(
+    mocker: MockerFixture, change: dict[str, object]
+) -> None:
+    """The user's last good entry carries each of these, the per-model limits inside its metadata; the entry must not
+    outlive the change."""
+    from litellm.proxy.common_utils.user_api_key_cache import recall_last_good, remember_last_good
+    from litellm.proxy.management_endpoints.internal_user_endpoints import user_update
+
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    _serve_user_rows(mocker, cache)
+    await remember_last_good(cache, _BUDGETED_USER.user_id, _BUDGETED_USER)
+
+    await user_update(
+        data=UpdateUserRequest.model_validate({"user_id": _BUDGETED_USER.user_id, **change}),
+        user_api_key_dict=_USER_ADMIN,
+    )
+
+    assert await recall_last_good(cache, _BUDGETED_USER.user_id, LiteLLM_UserTable) is None
+
+
 def test_generate_request_base_validator():
     """
     Test that GenerateRequestBase validator converts empty string to None for max_budget

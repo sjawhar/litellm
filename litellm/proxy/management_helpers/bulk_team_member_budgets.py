@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
+from fastapi import HTTPException
 from pydantic import ConfigDict
 
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
@@ -21,8 +22,9 @@ from litellm.proxy._types import (
     UserAPIKeyAuth,
 )
 from litellm.proxy.auth.auth_checks import invalidate_team_member_spend_state
-from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, revoke_last_good
 from litellm.proxy.db.routing_prisma_wrapper import WriterPinnedClient
+from litellm.proxy.list_api.common import PROBLEM_TYPE_BASE, ManagementProblem
 from litellm.proxy.management.teams.authz import TEAM_OR_ORG_ADMIN
 from litellm.proxy.management.teams.dependencies import get_team_access
 from litellm.proxy.management_endpoints.common_utils import (  # noqa: F401  # legacy module exports
@@ -34,6 +36,7 @@ from litellm.proxy.management_helpers.audit_logs import create_object_audit_log
 from litellm.proxy.management_helpers.bulk_user_deletion import (
     _duplicate_member_indexes,  # pyright: ignore[reportPrivateUsage]  # same duplicate rule as members/bulk_delete
     _eq_filter,  # pyright: ignore[reportPrivateUsage]  # same prisma filter shape as members/bulk_delete
+    _error_message,  # pyright: ignore[reportPrivateUsage]  # same problem detail as members/bulk_delete
     _forbidden,  # pyright: ignore[reportPrivateUsage]  # same problem shape as members/bulk_delete
     _in_filter,  # pyright: ignore[reportPrivateUsage]  # same prisma filter shape as members/bulk_delete
     _team_not_found,  # pyright: ignore[reportPrivateUsage]  # same problem shape as members/bulk_delete
@@ -42,6 +45,7 @@ from litellm.proxy.management_helpers.bulk_user_deletion import (
 from litellm.proxy.utils import PrismaClient
 from litellm.repositories.team_repository import TeamRepository
 from litellm.types.llms.base import LiteLLMBaseModel
+from litellm.types.proxy.management_endpoints.management_v1 import ProblemDetail
 from litellm.types.proxy.management_endpoints.team_endpoints import (
     BulkTeamMemberBudgetUpdateRequest,
     TeamMemberBudgetPatch,
@@ -167,6 +171,18 @@ def _result(
     )
 
 
+def _revocation_refused(refused: HTTPException) -> ManagementProblem:
+    """The route answers any other exception with a generic 500; a refused revocation must stay a 503."""
+    return ManagementProblem(
+        ProblemDetail(
+            type=f"{PROBLEM_TYPE_BASE}service-unavailable",
+            title="Service unavailable",
+            status=503,
+            detail=_error_message(refused),
+        )
+    )
+
+
 async def bulk_update_team_member_budgets(
     team_id: str,
     data: BulkTeamMemberBudgetUpdateRequest,
@@ -177,6 +193,8 @@ async def bulk_update_team_member_budgets(
     litellm_changed_by: str | None = None,
 ) -> tuple[TeamMemberBudgetUpdateResult, ...]:
     """Apply one merge patch of per-member limits per requested member, in one transaction."""
+    from litellm.proxy.management_endpoints.budget_management_endpoints import read_team_member_holders
+
     team: Final = await TeamRepository(WriterPinnedClient(prisma_client.db)).find_by_id(team_id)
     if team is None:
         raise _team_not_found(team_id)
@@ -207,6 +225,12 @@ async def bulk_update_team_member_budgets(
     default_budget_id: Final = _team_default_budget_id(team)
     team_members_filter: Final = _team_users_filter(team_id, user_ids)
 
+    # Each member's entries carry the limits this batch rewrites, so they go before the transaction writes any
+    try:
+        holders: Final = await read_team_member_holders(team_id, user_ids)
+        await revoke_last_good(user_api_key_cache, holders.last_good_keys)
+    except HTTPException as refused:
+        raise _revocation_refused(refused) from refused
     async with prisma_client.tx(timeout=_BATCH_TX_TIMEOUT) as tx:
         memberships: Final = await _membership_tx_db(tx).find_many(where=team_members_filter, include=_WITH_BUDGET)
         budget_id_of: Final = MappingProxyType({m.user_id: m.budget_id for m in memberships})

@@ -524,6 +524,35 @@ async def test_every_written_member_is_evicted_from_both_team_membership_cache_k
 
 
 @pytest.mark.asyncio
+async def test_a_batch_whose_revocation_redis_cannot_record_answers_503_and_writes_nothing(monkeypatch):
+    """Each member's last good entries carry the limits the batch rewrites and never expire, so a batch whose
+    revocation Redis cannot record is refused with 503 before the transaction writes any member's budget."""
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis: Final = fake_redis_cache()
+    redis.server.connected = False
+    cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+    # This fake has no key table, so the members' keys are left unread; their memberships alone must refuse
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", None)
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
+    prisma: Final = _FakePrisma(
+        teams=[_team("m1", "m2")],
+        memberships=[_membership("m1", "priv-m1"), _membership("m2")],
+        budgets=[_budget("priv-m1", max_budget=1.0)],
+    )
+
+    with pytest.raises(ManagementProblem) as refused:
+        await _bulk_update(
+            prisma, [{"user_id": "m1", "max_budget_in_team": 10}, {"user_id": "m2", "tpm_limit": 9}], cache=cache
+        )
+
+    assert refused.value.problem.status == 503
+    assert _budget_of(prisma, "m1").max_budget == 1.0
+    assert _budget_id_of(prisma, "m2") is None
+    assert set(prisma.db.litellm_budgettable.rows) == {"priv-m1"}
+
+
+@pytest.mark.asyncio
 async def test_a_member_with_no_cap_of_their_own_reports_the_team_default_cap_but_only_their_own_rate_limits():
     prisma = _FakePrisma(
         teams=[_team("m1", default_budget_id="team-default")],

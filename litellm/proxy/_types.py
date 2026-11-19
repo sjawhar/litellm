@@ -2961,7 +2961,10 @@ class ConfigGeneralSettings(LiteLLMPydanticObjectBase):
             "the same value as metadata.user_api_key_auth_entries. Creating a customer that is blocked or has a "
             "budget, models, a region, a default model or an object permission, or an update that sets any of them, "
             "also answers 503 and changes nothing when Redis cannot record the revocation of the customer's entry "
-            "and of the registry of restricted customers"
+            "and of the registry of restricted customers. A change to a budget or limit an entry carries, through "
+            "/budget/update or the key, team, team member, user, customer, project, organization, tag or access group "
+            "update endpoints, first revokes the entries of everything that carries it, and changes nothing when "
+            "Redis cannot record that or the database cannot list those holders"
         ),
     )
     max_request_size_mb: int | None = Field(

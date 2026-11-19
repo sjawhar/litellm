@@ -23,6 +23,7 @@ from litellm._logging import verbose_proxy_logger
 from litellm.proxy._types import UserAPIKeyAuth, user_api_key_has_admin_view
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.user_api_key_cache import (
+    revoke_last_good,
     tag_cache_key,
     tag_registry_cache_key,
 )
@@ -421,7 +422,7 @@ async def update_tag(
     - model_max_budget: Optional[dict] - Max budget for a specific model
     - budget_duration: Optional[str] - Frequency of resetting tag budget
     """
-    from litellm.proxy.proxy_server import prisma_client
+    from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
 
     if prisma_client is None:
         raise HTTPException(status_code=500, detail="Database not connected")
@@ -442,6 +443,7 @@ async def update_tag(
             prisma_client=prisma_client,
             litellm_proxy_admin_name=litellm_proxy_admin_name,
             cleared_budget_fields=frozenset(field for field in tag.model_fields_set if getattr(tag, field) is None),
+            before_relink=lambda: revoke_last_good(user_api_key_cache, (tag_cache_key(tag.name),)),
         )
 
         # Get model names for model_info
