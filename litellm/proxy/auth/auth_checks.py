@@ -162,7 +162,13 @@ from .auth_checks_organization import (
     add_team_org_context_to_request_body,
     organization_role_based_access_check,
 )
-from .auth_utils import get_model_from_request, get_request_route_template, request_fallback_model_names
+from .auth_utils import (
+    body_fallbacks_go_to_anthropic,
+    get_model_from_request,
+    get_request_route_template,
+    key_fallback_model_names,
+    request_fallback_model_names,
+)
 
 if TYPE_CHECKING:
     from opentelemetry.trace import Span as _Span
@@ -822,9 +828,37 @@ def _check_fallback_against_unread_team(*, model: str, valid_token: UserAPIKeyAu
     )
 
 
+def _reject_aliased_provider_fallback(
+    *, model: str, valid_token: UserAPIKeyAuth | None, llm_router: Router | None
+) -> None:
+    """
+    A name in Anthropic's own ``fallbacks`` reaches Anthropic as sent, while every model check also allows a name as
+    its key, team, global or router alias target. Such a name could pass as its target and be served as itself, so it
+    is refused; a name without an alias is checked as Anthropic gets it.
+    """
+    # The alias maps the model checks consult: the key's, the team's as the token carries it, the global, the router's
+    alias_sources: Final[tuple[object, ...]] = (
+        key_model_aliases_for_auth_check(valid_token),
+        valid_token.team_model_aliases if valid_token is not None else None,
+        litellm.model_alias_map,
+        llm_router.model_group_alias if llm_router is not None else None,
+    )
+    if any(isinstance(aliases, Mapping) and model in aliases for aliases in alias_sources):
+        raise ModelAccessDeniedProxyException(
+            message=model_access_denied_client_message(model=model),
+            internal_message=(
+                f"Fallback model {model} has a key, team, global or router alias, while Anthropic serves it as named."
+            ),
+            type=ProxyErrorTypes.key_model_access_denied,
+            param="fallbacks",
+            code=status.HTTP_403_FORBIDDEN,
+        )
+
+
 async def _run_fallback_model_checks(
     *,
     fallback_models: Sequence[str],
+    provider_fallback_models: Sequence[str],
     team_object: LiteLLM_TeamTable | None,
     user_object: LiteLLM_UserTable | None,
     project_object: LiteLLM_ProjectTableCachedObj | None,
@@ -837,9 +871,13 @@ async def _run_fallback_model_checks(
     """
     The team, team member, user, project and agent model checks common_checks() runs on the requested model, run on
     each fallback target: a target can serve the request in the requested model's place. A team key whose team could
-    not be read is held to the team models its token records.
+    not be read is held to the team models its token records. ``provider_fallback_models`` are the names Anthropic
+    gets as sent; each must have no alias.
     """
     from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
+
+    for model in provider_fallback_models:
+        _reject_aliased_provider_fallback(model=model, valid_token=valid_token, llm_router=llm_router)
 
     key_model_aliases: Final = key_model_aliases_for_auth_check(valid_token)
     for model in fallback_models:
@@ -1287,10 +1325,15 @@ async def common_checks(
         )
 
     # 2.4 A fallback target can serve the request in the requested model's place, so it passes the same team, team
-    # member, user, project and agent model checks
+    # member, user, project and agent model checks. LiteLLM dispatches its own fallback lists through aliases, but
+    # Anthropic gets the names in its own list as sent.
+    router_fallback_models, provider_fallback_models = key_fallback_model_names(
+        _typed_request_body(request_body), anthropic_owns_body_fallbacks=body_fallbacks_go_to_anthropic(route, request)
+    )
     with tracer.trace("litellm.proxy.auth.common_checks.run_fallback_model_checks"):
         await _run_fallback_model_checks(
-            fallback_models=request_fallback_model_names(_typed_request_body(request_body)),
+            fallback_models=tuple(dict.fromkeys((*router_fallback_models, *provider_fallback_models))),
+            provider_fallback_models=provider_fallback_models,
             team_object=team_object,
             user_object=user_object,
             project_object=project_object,

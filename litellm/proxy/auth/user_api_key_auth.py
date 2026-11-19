@@ -39,7 +39,6 @@ from litellm.integrations.otel.model.config import is_otel_v2_enabled
 from litellm.integrations.otel.runtime import phase_event, phase_span, seed_request_identity
 from litellm.litellm_core_utils.dd_tracing import tracer
 from litellm.litellm_core_utils.dot_notation_indexing import get_nested_value
-from litellm.llms.anthropic.common_utils import anthropic_beta_opts_into_server_side_fallback
 from litellm.proxy._types import *
 from litellm.proxy.agent_endpoints.auth.agent_caller import agent_caller_from_headers
 from litellm.proxy.auth.auth_checks import (  # noqa: F401  # legacy module exports
@@ -94,6 +93,7 @@ from litellm.proxy.auth.auth_object_prefetch import (
 )
 from litellm.proxy.auth.auth_utils import (
     abbreviate_api_key,
+    body_fallbacks_go_to_anthropic,
     get_end_user_id_from_request_body,
     get_model_from_request,
     get_request_route,
@@ -3836,13 +3836,8 @@ async def enforce_key_and_fallback_model_access(
 
     # Fallback targets are checked for an all-team-models key too: can_key_call_model reads the team's models. The
     # team, member, user, project and agent checks of every fallback target run in common_checks.
-    anthropic_owns_body_fallbacks: Final = (
-        route.endswith("/v1/messages")
-        and request is not None
-        and anthropic_beta_opts_into_server_side_fallback(request.headers)
-    )
     fallback_names, anthropic_fallback_names = key_fallback_model_names(
-        request_data, anthropic_owns_body_fallbacks=anthropic_owns_body_fallbacks
+        request_data, anthropic_owns_body_fallbacks=body_fallbacks_go_to_anthropic(route, request)
     )
 
     for _name in fallback_names:
@@ -3858,7 +3853,8 @@ async def enforce_key_and_fallback_model_access(
             user_model=None,
         )
 
-    # Anthropic serves its own fallback models, so they need the key's model access but no Router group
+    # Anthropic serves its own fallback models, so they need the key's model access but no Router group. A name there
+    # that has an alias is refused in common_checks, so this check reads each name as Anthropic gets it.
     for _name in anthropic_fallback_names:
         await can_key_call_model(
             model=_name,
