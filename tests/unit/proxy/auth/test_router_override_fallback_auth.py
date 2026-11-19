@@ -30,6 +30,7 @@ from litellm.proxy._types import (
     LitellmUserRoles,
     ModelAccessDeniedProxyException,
     ProxyErrorTypes,
+    ProxyException,
     UserAPIKeyAuth,
 )
 from litellm.proxy.agent_endpoints.auth.agent_access_groups import AgentAccessGroupCeiling, CeilingResolver
@@ -1056,8 +1057,8 @@ async def test_a_fallback_target_in_the_team_still_serves_a_key_without_a_model_
     assert result.calls == calls
 
 
-async def _common_checks_with_fallback(
-    fallback: str,
+async def _common_checks_with_fallbacks(
+    fallbacks: Sequence[str],
     valid_token: UserAPIKeyAuth,
     *,
     team_object: LiteLLM_TeamTable | None = None,
@@ -1065,7 +1066,7 @@ async def _common_checks_with_fallback(
     user_object: LiteLLM_UserTable | None = None,
     project_object: LiteLLM_ProjectTableCachedObj | None = None,
 ) -> bool:
-    """common_checks on a /v1/messages request for `requested` that names `fallback` in its fallbacks"""
+    """common_checks on a /v1/messages request for `requested` that names `fallbacks`, or none when it is empty"""
     from litellm.proxy.auth.auth_checks import common_checks
 
     with patch("litellm.proxy.auth.auth_checks.get_team_membership", new=AsyncMock(return_value=membership)):
@@ -1074,7 +1075,7 @@ async def _common_checks_with_fallback(
                 "model": "requested",
                 "max_tokens": 5,
                 "messages": [{"role": "user", "content": "hi"}],
-                "fallbacks": [{"model": fallback}],
+                **({"fallbacks": [{"model": name} for name in fallbacks]} if fallbacks else {}),
             },
             team_object=team_object,
             user_object=user_object,
@@ -1091,6 +1092,13 @@ async def _common_checks_with_fallback(
         )
 
 
+# A forbidden target alone and after an allowed one, so a check that reads only the first target fails the second
+_FORBIDDEN_FALLBACKS: Final = (
+    pytest.param(["other"], id="forbidden-only"),
+    pytest.param(["requested", "other"], id="allowed-then-forbidden"),
+)
+
+
 @pytest.mark.asyncio
 async def test_a_fallback_target_outside_the_team_members_own_models_is_refused() -> None:
     member: Final = UserAPIKeyAuth(user_id="caller", team_id="fallback-team")
@@ -1101,9 +1109,9 @@ async def test_a_fallback_target_outside_the_team_members_own_models_is_refused(
         litellm_budget_table=LiteLLM_BudgetTable(allowed_models=["requested"]),
     )
 
-    assert await _common_checks_with_fallback("requested", member, team_object=team, membership=membership) is True
+    assert await _common_checks_with_fallbacks(["requested"], member, team_object=team, membership=membership) is True
     with pytest.raises(ModelAccessDeniedProxyException, match="'other'") as exc_info:
-        await _common_checks_with_fallback("other", member, team_object=team, membership=membership)
+        await _common_checks_with_fallbacks(["other"], member, team_object=team, membership=membership)
 
     assert exc_info.value.type == ProxyErrorTypes.team_model_access_denied
     assert exc_info.value.code == "403"
@@ -1114,9 +1122,9 @@ async def test_a_fallback_target_outside_a_personal_keys_user_models_is_refused(
     personal_key: Final = UserAPIKeyAuth(user_id="caller")
     user: Final = LiteLLM_UserTable(user_id="caller", models=["requested"])
 
-    assert await _common_checks_with_fallback("requested", personal_key, user_object=user) is True
+    assert await _common_checks_with_fallbacks(["requested"], personal_key, user_object=user) is True
     with pytest.raises(ModelAccessDeniedProxyException, match="'other'") as exc_info:
-        await _common_checks_with_fallback("other", personal_key, user_object=user)
+        await _common_checks_with_fallbacks(["other"], personal_key, user_object=user)
 
     assert exc_info.value.type == ProxyErrorTypes.user_model_access_denied
     assert exc_info.value.code == "403"
@@ -1127,12 +1135,40 @@ async def test_a_fallback_target_outside_the_projects_models_is_refused() -> Non
     project_key: Final = UserAPIKeyAuth(project_id="fallback-project")
     project: Final = LiteLLM_ProjectTableCachedObj(project_id="fallback-project", models=["requested"])
 
-    assert await _common_checks_with_fallback("requested", project_key, project_object=project) is True
+    assert await _common_checks_with_fallbacks(["requested"], project_key, project_object=project) is True
     with pytest.raises(ModelAccessDeniedProxyException, match="'other'") as exc_info:
-        await _common_checks_with_fallback("other", project_key, project_object=project)
+        await _common_checks_with_fallbacks(["other"], project_key, project_object=project)
 
     assert exc_info.value.type == ProxyErrorTypes.project_model_access_denied
     assert exc_info.value.code == "403"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("forbidden", _FORBIDDEN_FALLBACKS)
+async def test_a_team_key_whose_team_cannot_be_read_is_held_to_the_team_models_its_token_records(
+    forbidden: Sequence[str],
+) -> None:
+    """The team lookup failed, so the team object is absent; the team models on the token still bind every target"""
+    team_key: Final = UserAPIKeyAuth(team_id="fallback-team", team_models=["requested"])
+
+    assert await _common_checks_with_fallbacks(["requested"], team_key) is True
+    with pytest.raises(ModelAccessDeniedProxyException, match="'other'") as exc_info:
+        await _common_checks_with_fallbacks(forbidden, team_key)
+
+    assert exc_info.value.type == ProxyErrorTypes.team_model_access_denied
+    assert exc_info.value.code == "403"
+
+
+@pytest.mark.asyncio
+async def test_fallback_targets_are_refused_while_a_team_without_a_recorded_grant_cannot_be_read() -> None:
+    team_key: Final = UserAPIKeyAuth(team_id="fallback-team")
+
+    assert await _common_checks_with_fallbacks([], team_key) is True
+    with pytest.raises(ProxyException, match="cannot be checked while Team=fallback-team cannot be read") as exc_info:
+        await _common_checks_with_fallbacks(["requested"], team_key)
+
+    assert exc_info.value.type == ProxyErrorTypes.no_db_connection
+    assert exc_info.value.code == "503"
 
 
 def _agent_access_group_ceiling(models: frozenset[str] | None) -> CeilingResolver:
@@ -1149,22 +1185,24 @@ def _agent_access_group_ceiling(models: frozenset[str] | None) -> CeilingResolve
 
 
 @pytest.mark.asyncio
-async def test_a_fallback_target_outside_a_managed_agents_model_grants_is_refused() -> None:
+@pytest.mark.parametrize("forbidden", _FORBIDDEN_FALLBACKS)
+async def test_a_fallback_target_outside_a_managed_agents_model_grants_is_refused(forbidden: Sequence[str]) -> None:
     managed: Final = UserAPIKeyAuth(token="managed-token")
     managed.managed_agent_policy = AgentResponse(
         agent_id="managed", agent_name="Managed", agent_card_params={}, object_permission={"models": ["requested"]}
     )
 
-    assert await _common_checks_with_fallback("requested", managed) is True
+    assert await _common_checks_with_fallbacks(["requested"], managed) is True
     with pytest.raises(ModelAccessDeniedProxyException, match="'other'") as exc_info:
-        await _common_checks_with_fallback("other", managed)
+        await _common_checks_with_fallbacks(forbidden, managed)
 
     assert exc_info.value.type == ProxyErrorTypes.agent_model_access_denied
     assert exc_info.value.code == "403"
 
 
 @pytest.mark.asyncio
-async def test_a_fallback_target_outside_an_agents_access_groups_is_refused() -> None:
+@pytest.mark.parametrize("forbidden", _FORBIDDEN_FALLBACKS)
+async def test_a_fallback_target_outside_an_agents_access_groups_is_refused(forbidden: Sequence[str]) -> None:
     from litellm.proxy.auth import auth_checks
 
     agent_key: Final = UserAPIKeyAuth(token="agent-token", agent_id="agent-1")
@@ -1174,16 +1212,17 @@ async def test_a_fallback_target_outside_an_agents_access_groups_is_refused() ->
         "litellm.proxy.auth.auth_checks._check_agent_access_group_model_access",
         new=partial(auth_checks._check_agent_access_group_model_access, resolve_ceiling=ceiling),
     ):
-        assert await _common_checks_with_fallback("requested", agent_key) is True
+        assert await _common_checks_with_fallbacks(["requested"], agent_key) is True
         with pytest.raises(ModelAccessDeniedProxyException, match="'other'") as exc_info:
-            await _common_checks_with_fallback("other", agent_key)
+            await _common_checks_with_fallbacks(forbidden, agent_key)
 
     assert exc_info.value.type == ProxyErrorTypes.agent_model_access_denied
     assert exc_info.value.code == "403"
 
 
 @pytest.mark.asyncio
-async def test_a_fallback_target_outside_the_invoking_teams_models_is_refused() -> None:
+@pytest.mark.parametrize("forbidden", _FORBIDDEN_FALLBACKS)
+async def test_a_fallback_target_outside_the_invoking_teams_models_is_refused(forbidden: Sequence[str]) -> None:
     """An agent key acting for a caller is held to the caller's team, so a target outside that team is refused"""
     from litellm.proxy.auth import auth_checks
 
@@ -1209,9 +1248,9 @@ async def test_a_fallback_target_outside_the_invoking_teams_models_is_refused() 
             new=partial(auth_checks._check_agent_caller_model_access, load_team=load_team, load_user=load_user),
         ),
     ):
-        assert await _common_checks_with_fallback("requested", agent_key) is True
+        assert await _common_checks_with_fallbacks(["requested"], agent_key) is True
         with pytest.raises(ModelAccessDeniedProxyException, match="'other'") as exc_info:
-            await _common_checks_with_fallback("other", agent_key)
+            await _common_checks_with_fallbacks(forbidden, agent_key)
 
     assert exc_info.value.type == ProxyErrorTypes.team_model_access_denied
     assert exc_info.value.code == "403"
