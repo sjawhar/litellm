@@ -12,7 +12,7 @@ from typing_extensions import TypeIs  # noqa: TID251  # TypeIs reaches typing on
 import litellm
 from litellm._logging import verbose_proxy_logger
 from litellm.batches.batch_utils import batch_cost_is_final
-from litellm.constants import BACKGROUND_INTERACTION_COST_POLLING_ENABLED
+from litellm.constants import BACKGROUND_INTERACTION_COST_POLLING_ENABLED, INTERNAL_CALL_ORIGIN_METADATA_KEY
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.core_helpers import (
     budget_reservation_from_metadata,
@@ -160,6 +160,31 @@ def _billed_failed_attempts(request_data: Mapping[str, object]) -> tuple[BilledF
         return ()
     lifted: Final = cast("tuple[object, ...]", attempts)  # cast-ok: lifted by _failure_fields_to_lift, checked below
     return tuple(attempt for attempt in lifted if isinstance(attempt, BilledFailedAttempt))
+
+
+# The metadata names a failure row reads to name the deployment, group, routing, agent or origin it is filed
+# under. When the request has a logging object the row takes them from it (the litellm_params
+# post_call_failure_hook lifts), never from the request's own metadata, which on a refused request still holds
+# whatever the body sent.
+_ROW_ATTRIBUTION_METADATA_FIELDS: Final = frozenset(
+    (
+        "model_info",
+        "model_group",
+        "deployment",
+        "original_model_group",
+        "routing_decision",
+        "agent_id",
+        "actor_agent_id",
+        "target_agent_id",
+        "billing_agent_id",
+        "agent_execution_mode",
+        "verified_human_user_id",
+        INTERNAL_CALL_ORIGIN_METADATA_KEY,
+    )
+)
+# Top-level request fields the row would read as its agent and spillover deployment. The agent a row is filed
+# under is the one in its metadata (an A2A route writes it there too), and no route writes response headers here.
+_ROW_ATTRIBUTION_ROOT_FIELDS: Final = frozenset(("agent_id", "response_headers"))
 
 
 def _failure_spend_rows(
@@ -334,28 +359,44 @@ class _ProxyDBLogger(CustomLogger):
             if guardrail_info is not None:
                 existing_metadata["standard_logging_guardrail_information"] = guardrail_info
 
-        if "litellm_params" not in request_data:
-            request_data["litellm_params"] = {}
-
-        existing_litellm_params: Final = request_data.get("litellm_params", {})
-        existing_litellm_metadata: Final = existing_litellm_params.get("metadata", {}) or {}
+        # post_call_failure_hook dropped any litellm_params the request carried and, when the request has a logging
+        # object, lifted that object's in their place. Then the API base, provider, deployment, group and agent of
+        # the row are the logging object's, and the request's own metadata keeps the identity, labels and guardrail
+        # record. A request without one (the SDK built its own) keeps the attribution its metadata holds.
+        lifted_litellm_params: Final = request_data.get("litellm_params")
+        logged_litellm_params: Final = _str_keyed_fields(lifted_litellm_params)
+        attributed_metadata: Final = (
+            _str_keyed_fields(logged_litellm_params.get("metadata"))
+            if lifted_litellm_params is not None
+            else existing_metadata
+        )
 
         # Preserve tags from existing metadata
-        if existing_litellm_metadata.get("tags"):
-            existing_metadata["tags"] = existing_litellm_metadata.get("tags")
+        if attributed_metadata.get("tags"):
+            existing_metadata["tags"] = attributed_metadata.get("tags")
 
-        request_data["litellm_params"]["proxy_server_request"] = (
-            request_data.get("proxy_server_request") or existing_litellm_params.get("proxy_server_request") or {}
-        )
-        request_data["litellm_params"]["metadata"] = existing_metadata
+        request_data["litellm_params"] = {
+            **logged_litellm_params,
+            "proxy_server_request": request_data.get("proxy_server_request")
+            or logged_litellm_params.get("proxy_server_request")
+            or {},
+            "metadata": {
+                **{
+                    key: value
+                    for key, value in existing_metadata.items()
+                    if key not in _ROW_ATTRIBUTION_METADATA_FIELDS
+                },
+                **{key: value for key, value in attributed_metadata.items() if key in _ROW_ATTRIBUTION_METADATA_FIELDS},
+            },
+        }
 
-        # Preserve model name and custom_llm_provider
-        if "model" not in request_data:
-            request_data["model"] = existing_litellm_params.get("model") or request_data.get("model", "")
-        if "custom_llm_provider" not in request_data:
-            request_data["custom_llm_provider"] = existing_litellm_params.get(
-                "custom_llm_provider"
-            ) or request_data.get("custom_llm_provider", "")
+        request_data.setdefault("model", "")
+        for field in _ROW_ATTRIBUTION_ROOT_FIELDS & request_data.keys():
+            request_data.pop(field)
+        if lifted_litellm_params is not None:
+            request_data["custom_llm_provider"] = logged_litellm_params.get("custom_llm_provider") or ""
+        else:
+            request_data.setdefault("custom_llm_provider", "")
 
         # Propagate standard_logging_object and litellm_trace_id from the Logging
         # instance so the failure row carries the same trace_id Langfuse received.

@@ -54,7 +54,6 @@ from litellm import _custom_logger_compatible_callbacks_literal
 from litellm.constants import (
     DEFAULT_MODEL_CREATED_AT_TIME,
     FILE_USAGE_MAX_TRACKED_COUNTERS,
-    INTERNAL_CALL_ORIGIN_METADATA_KEY,
     LITELLM_HTTP_STATUS_CLIENT_DISCONNECTED,
     LITELLM_LOGGING_NO_UPSTREAM_LLM_CALL,
     MAX_TEAM_LIST_LIMIT,
@@ -151,7 +150,11 @@ from litellm.litellm_core_utils.core_helpers import (
     is_expected_client_error,
 )
 from litellm.litellm_core_utils.duration_parser import get_budget_window_start
-from litellm.litellm_core_utils.litellm_logging import Logging, deployment_pricing_model_info
+from litellm.litellm_core_utils.litellm_logging import (
+    Logging,
+    StandardLoggingPayloadSetup,
+    deployment_pricing_model_info,
+)
 from litellm.litellm_core_utils.llm_cost_calc.utils import generic_cost_per_token
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 from litellm.litellm_core_utils.safe_json_loads import safe_json_loads
@@ -1240,28 +1243,17 @@ def _reached_deployment(litellm_logging_obj: Logging) -> bool:
 _BODY_DEPLOYMENT_PARAMS: Final = frozenset(("model_info", "cooldown_time"))
 
 
-# What an auth-gate failure's spend row and daily aggregates read to name the provider, deployment, group, agent or
-# origin a request was served by or on behalf of. The proxy and the router write these only after authentication,
-# so at the auth gate each one present came from the unauthenticated body.
-_AUTH_GATE_CALLER_ROOT_FIELDS: Final = frozenset(
-    ("model_info", "custom_llm_provider", "agent_id", "response_headers", "proxy_server_request")
-)
-_AUTH_GATE_CALLER_METADATA_FIELDS: Final = frozenset(
-    (
-        "model_info",
-        "model_group",
-        "deployment",
-        "original_model_group",
-        "routing_decision",
-        "agent_id",
-        "actor_agent_id",
-        "target_agent_id",
-        "billing_agent_id",
-        "agent_execution_mode",
-        "verified_human_user_id",
-        INTERNAL_CALL_ORIGIN_METADATA_KEY,
-    )
-)
+# What the Prometheus failure hook reads from a refused request's own data to label its deployment and tags
+# (``model_info`` at the top level and in metadata, and the request snapshot). The proxy and the router write these
+# only for a request the gate authorized, so on one it refused each one present came from the body. The failure
+# spend row takes its attribution from the logging object instead (``_failure_litellm_params``).
+_AUTH_GATE_CALLER_ROOT_FIELDS: Final = frozenset(("model_info", "proxy_server_request"))
+_AUTH_GATE_CALLER_METADATA_FIELDS: Final = frozenset(("model_info",))
+
+
+# The metadata names the router writes once it picks a deployment. A logging object that reached none, and that
+# no pass-through route built, holds them only because the proxy copied the request body into it.
+_ROUTER_WRITTEN_METADATA_FIELDS: Final = frozenset(("model_info", "model_group", "deployment"))
 
 
 def _stamp_deployment_attribution(
@@ -1474,13 +1466,29 @@ def _provider_billed_the_failure(exception: Exception) -> bool:
     return _timed_out_reading_from_provider(exception) or _client_disconnected(exception)
 
 
+def _failure_litellm_params(
+    litellm_params: Mapping[str, object], model_call_details: Mapping[str, object]
+) -> Mapping[str, object] | None:
+    """The ``litellm_params`` the failure callbacks see, from the logging object alone: its API base and request
+    snapshot, its metadata with the model fields of ``litellm_metadata`` merged under it, and the provider it
+    resolved. Credentials and the rest of what it holds stay on it."""
+    provider: Final = model_call_details.get("custom_llm_provider")
+    if not litellm_params and not provider:
+        return None
+    return {
+        **{key: litellm_params[key] for key in ("api_base", "proxy_server_request") if key in litellm_params},
+        **({"custom_llm_provider": provider} if isinstance(provider, str) and provider else {}),
+        "metadata": StandardLoggingPayloadSetup.merge_litellm_metadata(litellm_params),
+    }
+
+
 def _failure_fields_to_lift(request_data: Mapping[str, object], provider_billed: bool = False) -> Mapping[str, object]:
     """Failure-path callbacks run after ``litellm_logging_obj`` is popped from
     request_data (it is not serialisable), so the caller merges these fields
     onto request_data first: the request start and first-handoff instants for
     duration and preprocessing latency, the call type, recovered or estimated
-    usage for token counts, and the standard logging object for deployment
-    attribution on failed-request spend logs."""
+    usage for token counts, and the standard logging object and litellm_params
+    for deployment attribution on failed-request spend logs."""
     _logging_obj: Final = request_data.get("litellm_logging_obj")
     if _logging_obj is None:
         return _EMPTY_LIFT
@@ -1516,6 +1524,7 @@ def _failure_fields_to_lift(request_data: Mapping[str, object], provider_billed:
         ("combined_usage_object", None if _usage_to_lift is None else _usage_to_lift[0]),
         ("response_cost", None if _usage_to_lift is None else (_usage_to_lift[1] or 0.0)),
         ("standard_logging_object", _model_call_details.get("standard_logging_object")),
+        ("litellm_params", _failure_litellm_params(_as_str_mapping(_litellm_params), _model_call_details)),
         ("billed_failed_attempts", _earlier_attempts or None),
     )
     return MappingProxyType({key: value for key, value in _entries if value is not None})
@@ -3706,8 +3715,10 @@ class ProxyLogging:
 
         # Auth and pass-through failure bodies are unstripped client input, and
         # the logging handler below flattens body keys into model_call_details,
-        # so drop the key before it can masquerade as the built payload.
+        # so drop the keys before they can masquerade as the built payload. The
+        # lift below puts back what the logging object holds.
         request_data.pop("standard_logging_object", None)
+        request_data.pop("litellm_params", None)
 
         ### LOGGING ###
         if self._is_proxy_only_llm_api_error(
@@ -3853,8 +3864,9 @@ class ProxyLogging:
                 # here is the caller's, and the failure spend row would bill its cost.
                 strip_client_guardrail_information(request_data)
                 if error_type == ProxyErrorTypes.auth_error:
-                    # Nobody is authenticated at the auth gate: the failure record takes its deployment, group and
-                    # provider from the router config and names no agent, never what the body says.
+                    # The gate did not authorize this request, so nothing its body claims about the deployment,
+                    # group, provider or agent is taken. The spend row reads those from the logging object; this
+                    # drops the ones the Prometheus failure hook reads from the request itself.
                     for field in _AUTH_GATE_CALLER_ROOT_FIELDS & request_data.keys():
                         request_data.pop(field)
                     request_data.update(
@@ -3888,13 +3900,9 @@ class ProxyLogging:
             _litellm_params: Final = {}
 
             litellm_param_keys: Final = LoggedLiteLLMParams.__annotations__.keys()
-            # A pass-through route puts the litellm_params and call_type it built into request_data itself, and
-            # returns below before any failure handler runs; on every other route the body adds only the allowlist.
-            logged_fields: Final = (
-                request_data
-                if litellm_logging_obj.call_type == CallTypes.pass_through.value
-                else _proxy_only_error_log_fields(request_data, logged_metadata_keys)
-            )
+            # The body adds only the allowlist. A pass-through route that built its litellm_params put them, its
+            # call type and its provider on this logging object itself.
+            logged_fields: Final = _proxy_only_error_log_fields(request_data, logged_metadata_keys)
             for k, v in logged_fields.items():
                 if k in litellm_param_keys:
                     _litellm_params[k] = v
@@ -3926,11 +3934,16 @@ class ProxyLogging:
                 litellm_logging_obj.litellm_params = {
                     key: value for key, value in existing.items() if key not in _BODY_DEPLOYMENT_PARAMS
                 }
-                # A request that reached no deployment has no API base, deployment or group of its own, and the
-                # failure spend row prefers a root litellm_params over the payload built here. Only a pass-through
-                # route writes one itself; on any other route it is the body's.
-                if litellm_logging_obj.call_type != CallTypes.pass_through.value:
-                    request_data.pop("litellm_params", None)
+                if "passthrough_logging_payload" not in litellm_logging_obj.model_call_details:
+                    # The router never ran and no pass-through route resolved a deployment, so the routing fields a
+                    # metadata bucket holds came from the body; the router config fills them below.
+                    litellm_params.update(
+                        {
+                            bucket: {k: v for k, v in held.items() if k not in _ROUTER_WRITTEN_METADATA_FIELDS}
+                            for bucket in ("metadata", "litellm_metadata")
+                            if isinstance(held := litellm_params.get(bucket, existing.get(bucket)), Mapping)
+                        }
+                    )
             attribution: Final = _stamp_deployment_attribution(
                 litellm_params,
                 request_data.get("model"),

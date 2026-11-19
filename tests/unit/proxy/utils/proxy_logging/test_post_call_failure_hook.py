@@ -8,16 +8,17 @@ import json
 import threading
 from datetime import datetime
 from types import MappingProxyType, SimpleNamespace
-from typing import Final
+from typing import Final, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 
 import litellm
 from litellm.constants import PROXY_REJECTED_BEFORE_ROUTING_KEY
 from litellm.exceptions import GuardrailRaisedException
 from litellm.integrations.custom_logger import CustomLogger
+from litellm.litellm_core_utils.litellm_logging import Logging
 from litellm.proxy._types import ProxyErrorTypes, UserAPIKeyAuth
 from litellm.proxy.common_utils.proxy_rate_limit_error import ProxyRateLimitError
 from litellm.proxy.utils import ProxyLogging
@@ -990,12 +991,10 @@ async def test_handle_logging_proxy_only_path_skips_for_pass_through(proxy_loggi
     logging_obj.model_call_details = {}
     logging_obj.async_failure_handler = AsyncMock()
     logging_obj.pre_call = MagicMock()
-    route_litellm_params = {"api_base": "https://upstream.invalid", "metadata": {"model_info": {"id": "routed"}}}
     request_data = {
         "litellm_logging_obj": logging_obj,
         "messages": [{"role": "user"}],
         "model": "m",
-        "litellm_params": route_litellm_params,
     }
     await proxy_logging._handle_logging_proxy_only_error(
         request_data=request_data,
@@ -1005,7 +1004,6 @@ async def test_handle_logging_proxy_only_path_skips_for_pass_through(proxy_loggi
     )
     logging_obj.pre_call.assert_not_called()
     logging_obj.async_failure_handler.assert_not_called()
-    assert request_data["litellm_params"] is route_litellm_params
 
 
 @pytest.mark.asyncio
@@ -1420,7 +1418,7 @@ _AUTH_GATE_BODY_CLAIMS: Final = (
 async def test_auth_gate_failure_spend_row_takes_its_deployment_from_the_router_not_the_body(
     proxy_logging, monkeypatch, place: str, field: str, claim: object
 ):
-    """Nobody is authenticated at the auth gate, so nothing the body says about the provider, deployment, group,
+    """The gate did not authorize this request, so nothing the body says about the provider, deployment, group,
     agent or origin, at the top level or in either metadata bucket, may reach the failure row it is filed under."""
     from litellm.proxy import proxy_server
     from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
@@ -1463,9 +1461,14 @@ async def test_auth_gate_failure_spend_row_takes_its_deployment_from_the_router_
         kwargs={**row_kwargs, "completion_start_time": now}, response_obj=None, start_time=now, end_time=now
     )
     attribution_columns: Final = ("model_id", "model_group", "model", "api_base", "custom_llm_provider", "agent_id")
+    read_by_the_row: Final = {
+        "row": payload,
+        "litellm_params": row_kwargs["litellm_params"],
+        **{name: row_kwargs.get(name) for name in ("custom_llm_provider", "agent_id", "response_headers")},
+    }
     assert {
         "attribution": {key: payload[key] for key in attribution_columns},
-        "names_the_claim": "victim" in json.dumps({"row": payload, "request_data": row_kwargs}, default=str),
+        "names_the_claim": "victim" in json.dumps(read_by_the_row, default=str),
     } == {
         "attribution": {
             "model_id": "configured-deployment",
@@ -1548,6 +1551,315 @@ async def test_pre_call_refusal_spend_row_takes_no_deployment_from_a_body_litell
     }
 
 
+_DISPATCHED_API_BASE: Final = "https://configured.invalid/v1"
+_BODY_ATTRIBUTION_CLAIMS: Final = (
+    (
+        "root",
+        "litellm_params",
+        {
+            "api_base": "https://victim.invalid",
+            "user_api_key_end_user_id": "victim-customer",
+            "metadata": {"model_group": "victim-group", "agent_id": "victim-agent"},
+            "litellm_metadata": {
+                "model_info": {"id": "victim-deployment"},
+                "model_group": "victim-group",
+                "agent_id": "victim-agent",
+            },
+        },
+    ),
+    ("root", "custom_llm_provider", "victim-provider"),
+    ("root", "agent_id", "victim-agent"),
+    *(
+        (bucket, field, claim)
+        for bucket in ("metadata", "litellm_metadata")
+        for field, claim in (
+            ("model_group", "victim-group"),
+            ("model_info", {"id": "victim-deployment"}),
+            ("deployment", "openai/victim-model"),
+            ("agent_id", "victim-agent"),
+        )
+    ),
+)
+
+
+async def _preprocessed_request_with_its_logging_object(
+    body: dict[str, object], user_api_key_dict: UserAPIKeyAuth
+) -> dict[str, object]:
+    """The request data a route holds when its pre-call hooks run: the body after add_litellm_data_to_request,
+    and the logging object the proxy builds from it."""
+    from litellm.proxy.litellm_pre_call_utils import add_litellm_data_to_request
+
+    request: Final = MagicMock(spec=Request)
+    request.url = MagicMock()
+    request.url.path = "/chat/completions"
+    request.url.__str__.return_value = "http://localhost/chat/completions"
+    request.method = "POST"
+    request.query_params = {}
+    request.headers = {"content-type": "application/json"}
+    request.client = MagicMock()
+    request.client.host = "127.0.0.1"
+    data: Final = await add_litellm_data_to_request(
+        data=dict(body),
+        request=request,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+    logging_obj, _ = litellm.utils.function_setup(
+        original_function="acompletion", rules_obj=litellm.utils.Rules(), start_time=datetime.now(), **data
+    )
+    return {**data, "litellm_logging_obj": logging_obj}
+
+
+def _dispatch_to_the_configured_deployment(request_data: dict[str, object]) -> None:
+    """What the router and the provider call write before a post-call guardrail blocks the output: the deployment
+    in the request's metadata, its API base and provider on the logging object, the handoff instant, and the
+    guardrail's record of what its check cost."""
+    metadata: Final = cast(dict[str, object], request_data["metadata"])  # cast-ok: preprocessing wrote this bucket
+    metadata.update(
+        {"model_group": "internal-model", "deployment": "openai/gpt-4.1", "model_info": {"id": "configured-deployment"}}
+    )
+    metadata["standard_logging_guardrail_information"] = [
+        {"guardrail_name": "output-check", "guardrail_status": "guardrail_intervened", "guardrail_cost": 0.25}
+    ]
+    logging_obj: Final = cast(Logging, request_data["litellm_logging_obj"])  # cast-ok: built by the preprocessing step
+    logging_obj.update_environment_variables(
+        model="openai/gpt-4.1",
+        user=None,
+        optional_params={},
+        litellm_params={"api_base": _DISPATCHED_API_BASE, "metadata": metadata},
+        custom_llm_provider="openai",
+    )
+    logging_obj.model_call_details["first_api_call_start_time"] = datetime.now()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ("auth-gate", "pre-call", "after-dispatch"))
+@pytest.mark.parametrize(
+    ("place", "field", "claim"),
+    _BODY_ATTRIBUTION_CLAIMS,
+    ids=[f"{place}.{field}" for place, field, _ in _BODY_ATTRIBUTION_CLAIMS],
+)
+async def test_failure_spend_row_takes_its_attribution_from_the_logging_object_not_the_body(
+    proxy_logging, make_user_api_key_auth, monkeypatch, stage: str, place: str, field: str, claim: object
+):
+    """The failure spend row names its deployment, group, API base, provider, agent and customer from the logging
+    object alone: what the router config gives a request that reached no deployment, and what the router and the
+    provider call wrote for one that did. Nothing the body claims, at the top level, in a root litellm_params or in
+    either metadata bucket, reaches the row or the agent counter that takes its agent, and a cost the guardrail
+    recorded after dispatch is still billed."""
+    from litellm.proxy import proxy_server
+    from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+
+    body: Final[dict[str, object]] = {
+        "model": "internal-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "litellm_call_id": f"{stage}-{place}-{field}",
+        **({field: claim} if place == "root" else {place: {field: claim}}),
+    }
+    authenticated: Final = make_user_api_key_auth(request_route="/chat/completions", agent_id="key-agent")
+    request_data: Final = (
+        body if stage == "auth-gate" else await _preprocessed_request_with_its_logging_object(body, authenticated)
+    )
+    monkeypatch.setattr(
+        proxy_server,
+        "llm_router",
+        litellm.Router(
+            model_list=[
+                {
+                    "model_name": "internal-model",
+                    "litellm_params": {"model": "openai/gpt-4.1", "api_key": "sk-test"},
+                    "model_info": {"id": "configured-deployment"},
+                }
+            ]
+        ),
+    )
+    update_database: Final = _record_failure_spend_rows(monkeypatch)
+    proxy_logging.alert_types = []
+    if stage == "after-dispatch":
+        _dispatch_to_the_configured_deployment(request_data)
+
+    await proxy_logging.post_call_failure_hook(
+        request_data=request_data,
+        original_exception=(
+            HTTPException(status_code=401, detail="Invalid virtual key")
+            if stage == "auth-gate"
+            else GuardrailRaisedException(guardrail_name="local-block", message="blocked")
+        ),
+        user_api_key_dict=UserAPIKeyAuth(request_route="/chat/completions") if stage == "auth-gate" else authenticated,
+        error_type=ProxyErrorTypes.auth_error if stage == "auth-gate" else None,
+        route="/chat/completions",
+    )
+
+    update_database.assert_awaited_once()
+    now: Final = datetime.now()
+    payload: Final = get_logging_payload(
+        kwargs={**update_database.call_args.kwargs["kwargs"], "completion_start_time": now},
+        response_obj=None,
+        start_time=now,
+        end_time=now,
+    )
+    columns: Final = ("model_id", "model_group", "model", "api_base", "custom_llm_provider", "agent_id", "end_user")
+    assert {"spend": update_database.call_args.kwargs["response_cost"], **{key: payload[key] for key in columns}} == {
+        "spend": 0.25 if stage == "after-dispatch" else 0.0,
+        "model_id": "configured-deployment",
+        "model_group": "internal-model",
+        "model": "openai/gpt-4.1",
+        "api_base": _DISPATCHED_API_BASE if stage == "after-dispatch" else "",
+        "custom_llm_provider": "openai",
+        "agent_id": None if stage == "auth-gate" else "key-agent",
+        "end_user": "",
+    }
+
+
+_FORGED_LITELLM_PARAMS: Final = {
+    "api_base": "https://victim.invalid",
+    "user_api_key_end_user_id": "victim-customer",
+    "litellm_metadata": {
+        "model_info": {"id": "victim-deployment"},
+        "model_group": "victim-group",
+        "agent_id": "victim-agent",
+    },
+}
+_GEMINI_CONTENTS: Final = [{"role": "user", "parts": [{"text": "hi"}]}]
+
+
+def _pass_through_logging_object(call_id: str) -> Logging:
+    """The logging object a pass-through route builds before its pre-call hooks, with the provider it forwards to."""
+    logging_obj: Final = Logging(
+        model="gemini-2.5-flash",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=False,
+        call_type=CallTypes.pass_through.value,
+        start_time=datetime.now(),
+        litellm_call_id=call_id,
+        function_id="1245",
+    )
+    logging_obj.model_call_details["custom_llm_provider"] = "vertex_ai"
+    return logging_obj
+
+
+@pytest.mark.asyncio
+async def test_pass_through_refused_in_the_pre_call_hooks_takes_nothing_from_a_body_litellm_params(
+    proxy_logging, make_user_api_key_auth, monkeypatch
+):
+    """A pass-through request refused in its pre-call hooks reaches the failure hook before its route built any
+    litellm_params: the route forwards its parsed body, which still holds the caller's. The logging object holds
+    nothing of the body, so the row takes nothing from that dict, only the provider the route forwards to."""
+    from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+
+    update_database: Final = _record_failure_spend_rows(monkeypatch)
+    proxy_logging.alert_types = []
+
+    await proxy_logging.post_call_failure_hook(
+        request_data={
+            "contents": _GEMINI_CONTENTS,
+            "litellm_params": _FORGED_LITELLM_PARAMS,
+            "litellm_logging_obj": _pass_through_logging_object("pass-through-refusal"),
+            "model": "",
+            "custom_llm_provider": "vertex_ai",
+        },
+        original_exception=GuardrailRaisedException(guardrail_name="local-block", message="blocked"),
+        user_api_key_dict=make_user_api_key_auth(request_route="/chat/completions"),
+        route="/chat/completions",
+    )
+
+    update_database.assert_awaited_once()
+    now: Final = datetime.now()
+    payload: Final = get_logging_payload(
+        kwargs={**update_database.call_args.kwargs["kwargs"], "completion_start_time": now},
+        response_obj=None,
+        start_time=now,
+        end_time=now,
+    )
+    columns: Final = ("model_id", "model_group", "api_base", "custom_llm_provider", "agent_id", "end_user")
+    assert {key: payload[key] for key in columns} == {
+        "model_id": "",
+        "model_group": "",
+        "api_base": "",
+        "custom_llm_provider": "vertex_ai",
+        "agent_id": None,
+        "end_user": "",
+    }
+
+
+@pytest.mark.asyncio
+async def test_pass_through_failure_after_its_route_built_its_params_keeps_the_routes_values(
+    proxy_logging, make_user_api_key_auth, monkeypatch
+):
+    """Once a pass-through route built its litellm_params it put them on its logging object: the deployment it
+    resolved, the request it forwards and its provider. A failure after that files its row under those."""
+    from httpx import URL
+    from starlette.datastructures import Headers
+
+    from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+        LITELLM_PASS_THROUGH_DEPLOYMENT_MODEL_INFO_STATE_KEY,
+        HttpPassThroughEndpointHelpers,
+    )
+    from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+    from litellm.types.passthrough_endpoints.pass_through_endpoints import PassthroughStandardLoggingPayload
+
+    update_database: Final = _record_failure_spend_rows(monkeypatch)
+    proxy_logging.alert_types = []
+    authenticated: Final = make_user_api_key_auth(request_route="/chat/completions")
+    route_url: Final = (
+        "http://0.0.0.0:4000/vertex_ai/v1/projects/p/locations/global/publishers/google/models/"
+        "gemini-2.5-flash:generateContent"
+    )
+    request: Final = MagicMock(spec=Request)
+    request.method = "POST"
+    request.url = URL(route_url)
+    request.headers = Headers({})
+    request.scope = {}
+    request.state = SimpleNamespace(
+        **{LITELLM_PASS_THROUGH_DEPLOYMENT_MODEL_INFO_STATE_KEY: {"id": "routed-deployment"}}
+    )
+    logging_obj: Final = _pass_through_logging_object("pass-through-after-dispatch")
+    route_kwargs: Final = HttpPassThroughEndpointHelpers.init_kwargs_for_pass_through_endpoint(
+        user_api_key_dict=authenticated,
+        _parsed_body={"contents": _GEMINI_CONTENTS},
+        passthrough_logging_payload=PassthroughStandardLoggingPayload(
+            url=route_url, request_body={"contents": _GEMINI_CONTENTS}, request_method="POST"
+        ),
+        litellm_call_id="pass-through-after-dispatch",
+        request=request,
+        logging_obj=logging_obj,
+    )
+    logging_obj.update_environment_variables(
+        model="gemini-2.5-flash",
+        user="unknown",
+        optional_params={},
+        litellm_params=route_kwargs["litellm_params"],
+        call_type=CallTypes.pass_through.value,
+    )
+
+    await proxy_logging.post_call_failure_hook(
+        request_data={
+            "contents": _GEMINI_CONTENTS,
+            **route_kwargs,
+            "litellm_logging_obj": logging_obj,
+            "model": "gemini-2.5-flash",
+            "custom_llm_provider": "vertex_ai",
+        },
+        original_exception=HTTPException(status_code=502, detail="upstream failed"),
+        user_api_key_dict=authenticated,
+        route="/chat/completions",
+    )
+
+    update_database.assert_awaited_once()
+    row_kwargs: Final = update_database.call_args.kwargs["kwargs"]
+    now: Final = datetime.now()
+    payload: Final = get_logging_payload(
+        kwargs={**row_kwargs, "completion_start_time": now}, response_obj=None, start_time=now, end_time=now
+    )
+    assert {
+        "model_id": payload["model_id"],
+        "custom_llm_provider": payload["custom_llm_provider"],
+        "forwarded_url": row_kwargs["litellm_params"]["proxy_server_request"]["url"],
+    } == {"model_id": "routed-deployment", "custom_llm_provider": "vertex_ai", "forwarded_url": route_url}
+
+
 _LOGGING_OBJECT_FIELDS: Final = (
     "litellm_params",
     "optional_params",
@@ -1561,15 +1873,15 @@ _LOGGING_OBJECT_FIELDS: Final = (
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "call_type, passed_as_optional_params",
-    (("acompletion", False), (CallTypes.pass_through.value, True)),
+    (("acompletion", False), (CallTypes.pass_through.value, False)),
     ids=("body", "pass-through"),
 )
 async def test_handle_logging_proxy_only_path_keeps_body_keys_off_the_logging_object_fields(
     proxy_logging, make_user_api_key_auth, call_type: str, passed_as_optional_params: bool
 ):
     """update_environment_variables spreads optional_params over the fields it writes from the logging
-    object, so a body key of one of those names must not get there. A pass-through route's request_data
-    carries the litellm_params and call_type the route built itself, and keeps them."""
+    object, so a body key of one of those names must not get there. A pass-through route that built its
+    litellm_params put them on its logging object itself, so request_data adds nothing on that route either."""
     logging_obj = MagicMock()
     logging_obj.call_type = call_type
     logging_obj.model_call_details = {}
