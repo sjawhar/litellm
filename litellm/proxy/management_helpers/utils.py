@@ -1,6 +1,6 @@
 # What is this?
 ## Helper utils for the management endpoints (keys/users/teams)
-from collections.abc import Callable, Mapping, MutableMapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, MutableMapping, Sequence
 from collections.abc import Set as AbstractSet
 from datetime import datetime
 from functools import wraps
@@ -192,6 +192,7 @@ async def handle_budget_for_entity(
     prisma_client: PrismaClient,
     litellm_proxy_admin_name: str,
     cleared_budget_fields: AbstractSet[str] = frozenset(),
+    before_relink: Callable[[], Awaitable[None]] | None = None,
 ) -> str | None:
     """
     Common helper to handle budget creation/updates for entities (organizations, tags, etc).
@@ -207,6 +208,8 @@ async def handle_budget_for_entity(
         user_api_key_dict: User authentication info
         prisma_client: Database client
         litellm_proxy_admin_name: Admin name for audit trail
+        before_relink: Awaited before anything is written when the entity is pointed at another budget row, or at
+            its first, so an update can revoke the entity's last good entries while nothing has changed yet
 
     Returns:
         Optional[str]: The budget_id to use, or None if no budget was created/updated
@@ -232,6 +235,13 @@ async def handle_budget_for_entity(
 
     # Check if budget_id is explicitly provided in the data
     data_budget_id: Final[str | None] = getattr(data, "budget_id", None)
+
+    # Pointing the entity at another budget row, or at its first, changes the budget its last good entries carry
+    relinks: Final = (data_budget_id is not None and data_budget_id != existing_budget_id) or (
+        existing_budget_id is None and bool(_budget_data)
+    )
+    if relinks and before_relink is not None:
+        await before_relink()
 
     # Case 1: Creating new entity - no existing budget_id
     if existing_budget_id is None:

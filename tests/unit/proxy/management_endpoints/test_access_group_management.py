@@ -902,6 +902,43 @@ async def test_put_access_group_budget_links_an_existing_budget_without_creating
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body", [{"max_budget": 100.0}, {"budget_id": "shared-budget"}], ids=["first_budget", "linked_budget"]
+)
+async def test_put_access_group_budget_writes_nothing_when_redis_cannot_record_the_revocation(body: dict):
+    """A group given its first budget row, or linked to another, joins the registry of budgeted groups and carries a
+    new budget, so its entry and the registry's are revoked before anything is written; a Redis that cannot record that
+    leaves the group as it was."""
+    from fastapi import HTTPException
+
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from litellm.proxy.management_endpoints.model_access_group_management_endpoints import (
+        set_access_group_budget,
+    )
+    from litellm.types.proxy.management_endpoints.model_management_endpoints import (
+        AccessGroupBudgetRequest,
+    )
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    prisma = _FakePrismaClient([], deployments=[_deployment()])
+    prisma.budget_table.rows["shared-budget"] = _FakeBudgetRow(budget_id="shared-budget", max_budget=7.0)
+    redis = fake_redis_cache()
+    redis.server.connected = False
+
+    with _proxy(prisma), pytest.raises(HTTPException) as refused:
+        await set_access_group_budget(
+            access_group="prod-models",
+            data=AccessGroupBudgetRequest(**body),
+            user_api_key_dict=_admin(),
+            auth_cache=UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True),
+        )
+
+    assert refused.value.status_code == 503
+    assert prisma.budget_table.create_calls == []
+    assert "prod-models" not in prisma.access_group_budget_table.rows
+
+
+@pytest.mark.asyncio
 async def test_put_access_group_budget_rejects_an_empty_body():
     """An empty PUT would register the group as budgeted while enforcing nothing."""
     from fastapi import HTTPException
