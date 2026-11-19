@@ -40,10 +40,12 @@ from litellm.proxy.common_utils.timezone_utils import (
 from litellm.proxy.common_utils.user_api_key_cache import (
     AUTH_OBJECTS_TARGET,
     end_user_cache_key,
+    forget_last_good,
     model_access_group_cache_key,
     model_access_group_spend_counter_key,
     project_cache_key,
     project_spend_counter_key,
+    serves_last_good_entries,
     tag_cache_key,
 )
 from litellm.proxy.db.budget_window_spend_writer import roll_window_spend_row
@@ -389,6 +391,7 @@ async def _write_key_windows(prisma_client: PrismaClient, row_id: str, payload: 
             where={"token": row_id},
             data={"budget_limits": payload},
         )
+    await _forget_reset_last_good((row_id,))
 
 
 async def _write_team_windows(prisma_client: PrismaClient, row_id: str, payload: str) -> None:
@@ -397,6 +400,21 @@ async def _write_team_windows(prisma_client: PrismaClient, row_id: str, payload:
             where={"team_id": row_id},
             data={"budget_limits": payload},
         )
+    await _forget_reset_last_good((f"team_id:{row_id}",))
+
+
+async def _forget_reset_last_good(cache_keys: Sequence[str]) -> None:
+    """A reset rewrites spend and budget windows, so the last good entries holding the old ones go too. Best effort,
+    like the cache invalidation around it: the reset has committed."""
+    try:
+        from litellm.proxy.proxy_server import user_api_key_cache
+
+        if not serves_last_good_entries(user_api_key_cache):
+            return
+        for cache_key in cache_keys:
+            await forget_last_good(user_api_key_cache, cache_key)
+    except Exception as e:  # noqa: BLE001  # the reset committed; a failed eviction must not undo or abort it
+        verbose_proxy_logger.warning("Failed to drop the last good entries of %d reset rows: %s", len(cache_keys), e)
 
 
 @dataclass(frozen=True, slots=True)
@@ -657,6 +675,7 @@ class ResetBudgetJob:
                     await spend_counter_cache.async_delete_cache_keys(keys)
                 case "user_api_key_cache":
                     await user_api_key_cache.async_delete_cache_keys(keys)
+                    await _forget_reset_last_good(keys)
                 case _:
                     assert_never(cache)
         except Exception as e:
