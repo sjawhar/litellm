@@ -529,7 +529,8 @@ async def _resolve_key_hash_to_object_permission_id(
     key_hash: str,
 ) -> str | None:
     """Resolve key (hash or raw) to object_permission_id; create permission if key has none."""
-    from litellm.proxy.proxy_server import hash_token
+    from litellm.proxy.common_utils.user_api_key_cache import revoke_last_good
+    from litellm.proxy.proxy_server import hash_token, user_api_key_cache
 
     hashed: Final = key_hash if "sk-" not in (key_hash or "") else hash_token(key_hash)
     if not hashed:
@@ -540,6 +541,8 @@ async def _resolve_key_hash_to_object_permission_id(
     op_id: Final = row.object_permission_id
     if op_id:
         return op_id
+    # The key's entry carries its object_permission_id, by which the tool policy guardrail finds its blocked tools
+    await revoke_last_good(user_api_key_cache, (hashed,))
     new_id: Final = str(uuid.uuid4())
     await _typed_table(ObjectPermissionRepository(prisma_client)).create(
         data={"object_permission_id": new_id, "blocked_tools": []}
@@ -560,6 +563,13 @@ async def _resolve_team_id_to_object_permission_id(
     team_id: str,
 ) -> str | None:
     """Resolve team_id to object_permission_id; create permission if team has none."""
+    from litellm.proxy.auth.auth_checks import team_cache_keys
+    from litellm.proxy.common_utils.user_api_key_cache import revoke_last_good
+    from litellm.proxy.management_endpoints.team_endpoints import (
+        _team_key_tokens,  # pyright: ignore[reportPrivateUsage]  # the team update's own strict reader of its keys
+    )
+    from litellm.proxy.proxy_server import user_api_key_cache
+
     if not team_id or not team_id.strip():
         return None
     team_id_clean: Final = team_id.strip()
@@ -569,6 +579,10 @@ async def _resolve_team_id_to_object_permission_id(
     op_id: Final = row.object_permission_id
     if op_id:
         return op_id
+    # The team's entry and its keys' entries (as team_object_permission_id) carry the id by which the tool policy
+    # guardrail finds the team's blocked tools
+    team_key_tokens: Final = await _team_key_tokens(prisma_client, team_id_clean, user_api_key_cache)
+    await revoke_last_good(user_api_key_cache, (*team_cache_keys(team_id_clean, row.team_alias), *team_key_tokens))
     new_id: Final = str(uuid.uuid4())
     await _typed_table(ObjectPermissionRepository(prisma_client)).create(
         data={"object_permission_id": new_id, "blocked_tools": []}

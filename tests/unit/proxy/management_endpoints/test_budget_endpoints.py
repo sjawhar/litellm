@@ -15,13 +15,15 @@ from litellm.proxy._types import UserAPIKeyAuth, LitellmUserRoles, CommonProxyEr
 
 
 class _KeyRows:
-    """The key table, answering a column filter, or the OR of column filters a budget change selects keys with."""
+    """The key table, answering a column filter, or the AND or OR of column filters a budget change reads keys by."""
 
     def __init__(self, *rows: types.SimpleNamespace) -> None:
         self._rows = rows
 
     async def find_many(self, where: dict) -> list[types.SimpleNamespace]:
         def matches(row: types.SimpleNamespace, clause: dict) -> bool:
+            if "AND" in clause:
+                return all(matches(row, part) for part in clause["AND"])
             return all(
                 getattr(row, column) in wanted["in"] if isinstance(wanted, dict) else getattr(row, column) == wanted
                 for column, wanted in clause.items()
@@ -754,3 +756,54 @@ async def test_a_read_in_flight_across_a_budget_update_leaves_no_holder_the_old_
             reading_pod, team_membership_auth_cache_key(team_id="t1", user_id="u1"), LiteLLM_TeamMembership
         ),
     } == {"customer": None, "key": None, "team membership": None}
+
+
+class _HandedBackKeyRows(_KeyRows):
+    """The key table, remembering every row it hands back."""
+
+    def __init__(self, *rows: types.SimpleNamespace) -> None:
+        super().__init__(*rows)
+        self.handed_back: list[types.SimpleNamespace] = []
+
+    async def find_many(self, where: dict) -> list[types.SimpleNamespace]:
+        rows: Final = await super().find_many(where)
+        self.handed_back.extend(rows)
+        return rows
+
+
+@pytest.mark.asyncio
+async def test_a_budget_on_memberships_in_two_teams_reads_each_members_keys_in_that_team_only(
+    client_and_mocks, monkeypatch
+):
+    """A key carries the member budget of its own team's membership, so the revocation reads each member's keys in that
+    team only: a member's keys in other teams are never loaded, however many teams the member is in."""
+    from litellm.proxy._types import LiteLLM_TeamMembership
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from litellm.proxy.management_endpoints.budget_management_endpoints import read_budget_holders
+
+    _, mock_prisma, _ = client_and_mocks
+    mock_prisma.db.litellm_teammembership.find_many = AsyncMock(
+        return_value=[
+            LiteLLM_TeamMembership(user_id="u1", team_id="t1", budget_id="b1"),
+            LiteLLM_TeamMembership(user_id="u2", team_id="t2", budget_id="b1"),
+        ]
+    )
+
+    def key(token: str, user_id: str, team_id: str) -> types.SimpleNamespace:
+        return types.SimpleNamespace(
+            token=token, budget_id=None, organization_id=None, team_id=team_id, user_id=user_id
+        )
+
+    keys: Final = _HandedBackKeyRows(
+        key("u1-in-t1", "u1", "t1"),
+        key("u1-in-t2", "u1", "t2"),
+        key("u2-in-t2", "u2", "t2"),
+        key("u2-in-t1", "u2", "t1"),
+    )
+    mock_prisma.db.litellm_verificationtoken = keys
+    monkeypatch.setattr(ps, "user_api_key_cache", UserApiKeyCache(serve_last_good_entries=True))
+
+    holders: Final = await read_budget_holders("b1")
+
+    assert sorted(row.token for row in keys.handed_back) == ["u1-in-t1", "u2-in-t2"]
+    assert sorted(holders.hashed_tokens) == ["u1-in-t1", "u2-in-t2"]

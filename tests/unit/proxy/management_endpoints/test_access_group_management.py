@@ -939,6 +939,44 @@ async def test_put_access_group_budget_writes_nothing_when_redis_cannot_record_t
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [{"max_budget": 10.0}, {"soft_budget": 5.0}, {"budget_duration": "1d"}],
+    ids=["max_budget", "soft_budget", "budget_duration"],
+)
+async def test_put_access_group_budget_in_place_writes_nothing_when_redis_cannot_record_the_revocation(body: dict):
+    """A PUT that rewrites the group's budget row in place changes the budget its entry carries as a relink does, so the
+    entry is revoked through the endpoint's auth cache before the budget row or the group row is written."""
+    from fastapi import HTTPException
+
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from litellm.proxy.management_endpoints.model_access_group_management_endpoints import (
+        set_access_group_budget,
+    )
+    from litellm.types.proxy.management_endpoints.model_management_endpoints import (
+        AccessGroupBudgetRequest,
+    )
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    prisma = _FakePrismaClient([], deployments=[_deployment()])
+    _seed_budget(prisma, "prod-models", max_budget=100.0, soft_budget=80.0, budget_duration="30d")
+    redis = fake_redis_cache()
+    redis.server.connected = False
+
+    with _proxy(prisma), pytest.raises(HTTPException) as refused:
+        await set_access_group_budget(
+            access_group="prod-models",
+            data=AccessGroupBudgetRequest(**body),
+            user_api_key_dict=_admin(),
+            auth_cache=UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True),
+        )
+
+    assert refused.value.status_code == 503
+    assert prisma.budget_table.update_calls == []
+    assert prisma.access_group_budget_table.upsert_calls == []
+
+
+@pytest.mark.asyncio
 async def test_put_access_group_budget_rejects_an_empty_body():
     """An empty PUT would register the group as budgeted while enforcing nothing."""
     from fastapi import HTTPException

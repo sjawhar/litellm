@@ -166,7 +166,7 @@ async def update_budget(
     - model_max_budget: Optional[dict] - Specify max budget for a given model. Example: {"openai/gpt-4o-mini": {"max_budget": 100.0, "budget_duration": "1d", "tpm_limit": 100000, "rpm_limit": 100000}}
     - budget_reset_at: Optional[datetime] - Update the Datetime when the budget was last reset.
     """
-    from litellm.proxy.proxy_server import litellm_proxy_admin_name, prisma_client, user_api_key_cache
+    from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
 
     if prisma_client is None:
         raise HTTPException(
@@ -175,6 +175,18 @@ async def update_budget(
         )
     if budget_obj.budget_id is None:
         raise HTTPException(status_code=400, detail={"error": "budget_id is required"})
+
+    budget_obj_jsonified: Final = budget_update_data(budget_obj, user_api_key_dict)
+    # Every holder's last good entry is revoked before the write, so a lowered limit cannot stay in one
+    holders: Final = await read_budget_holders(budget_obj.budget_id)
+    await revoke_last_good(user_api_key_cache, holders.last_good_keys)
+    return await write_budget_update(budget_obj.budget_id, budget_obj_jsonified, holders)
+
+
+def budget_update_data(budget_obj: BudgetNewRequest, user_api_key_dict: UserAPIKeyAuth) -> Mapping[str, object]:
+    """The budget row columns ``/budget/update`` writes for ``budget_obj``. A value it refuses raises 400 before
+    anything is read or written, so a caller that revokes before its first write validates with this first."""
+    from litellm.proxy.proxy_server import litellm_proxy_admin_name
 
     # Validate budget values are not negative
     if budget_obj.max_budget is not None and (not math.isfinite(budget_obj.max_budget) or budget_obj.max_budget < 0):
@@ -219,15 +231,24 @@ async def update_budget(
             "updated_by": user_api_key_dict.user_id or litellm_proxy_admin_name,
         }
     )
+    return budget_obj_jsonified
 
-    # Every holder's last good entry is revoked before the write, so a lowered limit cannot stay in one
-    holders: Final = await read_budget_holders(budget_obj.budget_id)
-    await revoke_last_good(user_api_key_cache, holders.last_good_keys)
+
+async def write_budget_update(budget_id: str, data: Mapping[str, object], holders: "BudgetHolders"):
+    """Write ``data`` from ``budget_update_data`` to budget ``budget_id``, then evict ``holders``. The caller read
+    them with ``read_budget_holders`` and revoked their ``last_good_keys`` before the first write of its request."""
+    from litellm.proxy.proxy_server import prisma_client
+
+    if prisma_client is None:
+        raise HTTPException(
+            status_code=500,
+            detail={"error": CommonProxyErrors.db_not_connected_error.value},
+        )
     response: Final = await BudgetRepository(prisma_client).table.update(
-        where={"budget_id": budget_obj.budget_id},
-        data=budget_obj_jsonified,
+        where={"budget_id": budget_id},
+        data=data,
     )
-    await evict_budget_holders(budget_obj.budget_id, holders)
+    await evict_budget_holders(budget_id, holders)
 
     return response
 
@@ -295,14 +316,19 @@ class BudgetHolders:
 
 async def _team_member_keys(prisma_client: PrismaClient, memberships: Sequence[tuple[str, str]]) -> tuple[str, ...]:
     """Hashed tokens of the keys each ``(user_id, team_id)`` member holds in that team; a key's entry carries the
-    rate limits of its member budget."""
-    wanted: Final = frozenset(memberships)
-    if not wanted:
-        return ()
-    keys: Final = await find_many_in(
-        VerificationTokenRepository(prisma_client).table, "user_id", sorted(user_id for user_id, _ in wanted)
+    rate limits of its member budget. One read per team, filtered by it, so a member's keys in other teams are not
+    loaded."""
+    members_by_team: Final[dict[str, list[str]]] = {}  # mutable-ok: grouped once, read below
+    for user_id, team_id in dict.fromkeys(memberships):
+        members_by_team.setdefault(team_id, []).append(user_id)
+    table: Final = VerificationTokenRepository(prisma_client).table
+    return tuple(
+        [
+            key.token
+            for team_id, user_ids in members_by_team.items()
+            for key in await find_many_in(table, "user_id", user_ids, where={"team_id": team_id})
+        ]
     )
-    return tuple(key.token for key in keys if (key.user_id, key.team_id) in wanted)
 
 
 async def read_budget_holders(budget_id: str) -> BudgetHolders:
