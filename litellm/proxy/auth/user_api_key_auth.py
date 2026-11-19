@@ -160,7 +160,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
 )
 from litellm.proxy.db.db_lookup_gate import bounded_db_lookup
 from litellm.proxy.db.db_span import db_span
-from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
+from litellm.proxy.db.exception_handler import LastGoodEntryMissing, PrismaDBExceptionHandler
 from litellm.proxy.litellm_pre_call_utils import LiteLLMProxyRequestSetup
 from litellm.proxy.spend_tracking.carried_budget_state import carry_team_and_user_budget_state
 from litellm.proxy.spend_tracking.spend_counter_batch import (
@@ -2115,7 +2115,9 @@ async def user_api_key_auth_builder(
                             end_user_id=end_user_id,
                         )
             except Exception as e:
-                if isinstance(e, litellm.BudgetExceededError):
+                # A customer or default budget the database cannot read and no last good entry holds refuses the
+                # call, as on the virtual key path, rather than letting it go on without that customer's limits
+                if isinstance(e, (litellm.BudgetExceededError, LastGoodEntryMissing)):
                     raise e
                 verbose_proxy_logger.debug("Unable to find user in db. Error - %s", e)
 
@@ -3907,7 +3909,8 @@ async def _lookup_end_user_and_apply_budget(
                 if valid_token.end_user_max_budget is None:
                     valid_token.end_user_max_budget = default_budget.max_budget
     except Exception as e:
-        if isinstance(e, litellm.BudgetExceededError):
+        # As in the builder: a customer or default budget with no last good entry in an outage refuses the call
+        if isinstance(e, (litellm.BudgetExceededError, LastGoodEntryMissing)):
             raise e
         verbose_proxy_logger.debug("Unable to find user in db. Error - %s", e)
     return valid_token, end_user_object

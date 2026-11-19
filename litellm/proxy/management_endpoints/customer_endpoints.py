@@ -30,6 +30,7 @@ import litellm
 from litellm._logging import verbose_proxy_logger
 from litellm.litellm_core_utils.duration_parser import duration_in_seconds
 from litellm.proxy._types import *
+from litellm.proxy.auth.auth_checks import END_USER_RESTRICTION_COLUMNS, end_user_row_is_restricted
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.user_api_key_cache import (
     end_user_cache_key,
@@ -422,6 +423,7 @@ async def new_end_user(
         litellm_proxy_admin_name,
         llm_router,
         prisma_client,
+        user_api_key_cache,
     )
 
     if prisma_client is None:
@@ -447,8 +449,18 @@ async def new_end_user(
 
         new_end_user_obj: dict[str, object] = {}
 
-        ## CREATE BUDGET ## if set
         _new_budget: Final = new_budget_request(data)
+        _user_data: Final = _STR_OBJECT_DICT.validate_python(data.dict(exclude_none=True))
+        # The row as it will be written: a budget created or named here links by budget_id, an object permission by
+        # object_permission_id. When the restricted registry would hold it, the registry and the id's entry are revoked
+        # before any write, as for a block, so neither Redis failing at the eviction nor a registry read in flight
+        # keeps a copy that leaves this customer out
+        if end_user_row_is_restricted(
+            {**_user_data, "budget_id": _new_budget or data.budget_id, "object_permission_id": data.object_permission}
+        ):
+            await revoke_last_good(user_api_key_cache, _end_user_cache_keys((data.user_id,)))
+
+        ## CREATE BUDGET ## if set
         if _new_budget is not None:
             try:
                 budget_record: Final = await _typed_table(BudgetRepository(prisma_client)).create(
@@ -464,8 +476,6 @@ async def new_end_user(
             new_end_user_obj["budget_id"] = budget_record.budget_id
         elif data.budget_id is not None:
             new_end_user_obj["budget_id"] = data.budget_id
-
-        _user_data: Final = _STR_OBJECT_DICT.validate_python(data.dict(exclude_none=True))
 
         for k, v in _user_data.items():
             if k not in BudgetNewRequest.model_fields:
@@ -693,8 +703,6 @@ async def update_end_user(
             )
 
         end_user_table_data_typed: Final = LiteLLM_EndUserTable.model_validate(end_user_table_data.model_dump())
-        if non_default_values.get("blocked") is True:
-            await revoke_last_good(user_api_key_cache, _end_user_cache_keys((data.user_id,)))
 
         ## Get budget table data ##
         end_user_budget_table: Final = end_user_table_data_typed.litellm_budget_table
@@ -711,6 +719,18 @@ async def update_end_user(
 
             elif k in LiteLLM_EndUserTable.model_fields:
                 update_end_user_table_data[k] = v
+
+        # The row columns this update writes: an object permission links by object_permission_id, and a budget it
+        # creates by budget_id. When one is a column the restricted registry reads, the registry and the customer's
+        # entry are revoked before any write, as for a block, so neither Redis failing at the eviction nor a registry
+        # read in flight keeps a copy from before the change
+        written_columns: Final = {
+            *update_end_user_table_data,
+            *(("object_permission_id",) if "object_permission" in non_default_values else ()),
+            *(("budget_id",) if budget_table_data and end_user_budget_table is None else ()),
+        }
+        if not END_USER_RESTRICTION_COLUMNS.isdisjoint(written_columns):
+            await revoke_last_good(user_api_key_cache, _end_user_cache_keys((data.user_id,)))
 
         ## Handle object permission updates (MCP servers, vector stores, etc.)
         await _handle_customer_object_permission_update(

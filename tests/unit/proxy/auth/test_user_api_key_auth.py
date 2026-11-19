@@ -2198,3 +2198,52 @@ async def test_master_key_call_after_one_for_a_customer_served_from_its_last_goo
     )
 
     assert (limited, await master_key_call("c-free")) == ((1, ("LiteLLM_EndUserTable",)), (None, ()))
+
+
+@pytest.mark.asyncio
+async def test_master_key_call_for_a_customer_with_no_last_good_entry_is_refused_while_the_database_is_stopped(
+    monkeypatch,
+):
+    """A customer the stopped database cannot answer for, and that no last good entry holds, refuses a master key call
+    with 503 as it refuses a virtual key call, rather than letting the call go on as if the customer limited nothing."""
+    from litellm.proxy.auth.user_api_key_auth import user_api_key_auth_builder
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+
+    monkeypatch.setattr(litellm.proxy.proxy_server, "user_api_key_cache", UserApiKeyCache(serve_last_good_entries=True))
+    monkeypatch.setattr(litellm.proxy.proxy_server, "master_key", MASTER_KEY)
+    monkeypatch.setattr(litellm.proxy.proxy_server, "prisma_client", _StoppedDatabase())
+    request: Final = FastAPIRequest(
+        scope={"type": "http", "method": "POST", "path": "/chat/completions", "headers": []}
+    )
+    request._url = URL(url="/chat/completions")
+    master_key_bearer: Final = "Bearer " + MASTER_KEY
+
+    with pytest.raises(ProxyException) as refused:
+        await user_api_key_auth_builder(
+            request=request,
+            api_key=master_key_bearer,
+            azure_api_key_header="",
+            anthropic_api_key_header=None,
+            google_ai_studio_api_key_header=None,
+            azure_apim_header=None,
+            request_data={"user": "c-unknown"},
+        )
+    assert (str(refused.value.code), refused.value.type) == ("503", "no_db_connection")
+
+
+@pytest.mark.asyncio
+async def test_custom_auth_customer_lookup_with_no_last_good_entry_is_refused_while_the_database_is_stopped():
+    """The post custom auth checks look the customer up the same way, and refuse the same way."""
+    from litellm.proxy.auth.user_api_key_auth import _lookup_end_user_and_apply_budget
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from litellm.proxy.db.exception_handler import LastGoodEntryMissing
+
+    with pytest.raises(LastGoodEntryMissing):
+        await _lookup_end_user_and_apply_budget(
+            valid_token=UserAPIKeyAuth(end_user_id="c-unknown"),
+            route="/chat/completions",
+            parent_otel_span=None,
+            prisma_client=_StoppedDatabase(),
+            user_api_key_cache=UserApiKeyCache(serve_last_good_entries=True),
+            proxy_logging_obj=None,
+        )

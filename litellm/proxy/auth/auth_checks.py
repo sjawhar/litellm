@@ -1797,6 +1797,11 @@ _check_end_user_budget: Final = check_end_user_budget
 #: Columns whose non-null value makes an end-user row restrict something auth enforces. ``blocked``
 #: is separate: it restricts when true rather than when merely set.
 _RESTRICTED_COLUMNS: Final = ("budget_id", "allowed_model_region", "default_model", "object_permission_id")
+#: List columns that restrict when they hold at least one element.
+_RESTRICTED_LIST_COLUMNS: Final = ("models",)
+_BLOCKED_COLUMN: Final = "blocked"
+#: Every column ``_restricted_end_user_where`` reads: a write that sets one can move the row into or out of it.
+END_USER_RESTRICTION_COLUMNS: Final = frozenset((_BLOCKED_COLUMN, *_RESTRICTED_COLUMNS, *_RESTRICTED_LIST_COLUMNS))
 
 
 def _column_is_set(column: str) -> Mapping[str, object]:
@@ -1811,8 +1816,20 @@ def _array_is_not_empty(column: str) -> Mapping[str, object]:
 
 def _restricted_end_user_where() -> Mapping[str, object]:
     """Prisma filter selecting every end-user row that carries a restriction auth enforces."""
-    restrictions: Final = (*map(_column_is_set, _RESTRICTED_COLUMNS), _array_is_not_empty("models"))
-    return {"OR": [{"blocked": True}, *restrictions]}
+    restrictions: Final = (
+        *map(_column_is_set, _RESTRICTED_COLUMNS),
+        *map(_array_is_not_empty, _RESTRICTED_LIST_COLUMNS),
+    )
+    return {"OR": [{_BLOCKED_COLUMN: True}, *restrictions]}
+
+
+def end_user_row_is_restricted(row: Mapping[str, object]) -> bool:
+    """Whether an end-user row with these column values matches ``_restricted_end_user_where``."""
+    return (
+        row.get(_BLOCKED_COLUMN) is True
+        or any(row.get(column) is not None for column in _RESTRICTED_COLUMNS)
+        or any(row.get(column) for column in _RESTRICTED_LIST_COLUMNS)
+    )
 
 
 class _RegistryNotCached:

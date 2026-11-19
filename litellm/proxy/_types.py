@@ -2959,7 +2959,10 @@ class ConfigGeneralSettings(LiteLLMPydanticObjectBase):
             "key's spend and limit headers come from; a response built another way does not carry it, for example "
             "the pass-through routes such as /anthropic/* and the error answers of the image and rerank endpoints. "
             "The logging payload and the spend log row of every call that is logged, a failed one included, carry "
-            "the same value as metadata.user_api_key_auth_entries"
+            "the same value as metadata.user_api_key_auth_entries. Creating a customer that is blocked or has a "
+            "budget, models, a region, a default model or an object permission, or an update that sets any of them, "
+            "also answers 503 and changes nothing when Redis cannot record the revocation of the customer's entry "
+            "and of the registry of restricted customers"
         ),
     )
     max_request_size_mb: int | None = Field(
