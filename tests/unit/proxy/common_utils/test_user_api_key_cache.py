@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 from typing import Any
@@ -17,6 +18,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     forget_last_good,
     get_management_object_ttl,
     is_user_key_cache_key,
+    last_good_auth_entries_scope,
     recall_last_good,
     remember_last_good,
     revoke_last_good,
@@ -605,6 +607,49 @@ class TestLastGoodEntries:
         first.models.append("leaked")
 
         assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) == self._team("t1")
+
+    @pytest.mark.asyncio
+    async def test_a_recalled_entry_is_recorded_in_the_open_scope(self):
+        cache = UserApiKeyCache(serve_last_good_entries=True)
+        await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        with last_good_auth_entries_scope() as scope:
+            await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj)
+
+        assert scope.served == ("LiteLLM_TeamTableCachedObj",)
+
+    @pytest.mark.asyncio
+    async def test_a_recall_that_finds_no_entry_records_nothing(self):
+        cache = UserApiKeyCache(serve_last_good_entries=True)
+
+        with last_good_auth_entries_scope() as scope:
+            assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
+
+        assert scope.served == ()
+
+    @pytest.mark.asyncio
+    async def test_a_recall_in_a_gather_child_is_recorded_in_the_parents_scope(self):
+        cache = UserApiKeyCache(serve_last_good_entries=True)
+        await remember_last_good(cache, "team_id:t1", self._team("t1"))
+        await remember_last_good(cache, HASHED_TOKEN, UserAPIKeyAuth(token=HASHED_TOKEN))
+
+        with last_good_auth_entries_scope() as scope:
+            await asyncio.gather(
+                recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj),
+                recall_last_good(cache, HASHED_TOKEN, UserAPIKeyAuth),
+            )
+
+        assert sorted(scope.served) == ["LiteLLM_TeamTableCachedObj", "UserAPIKeyAuth"]
+
+    @pytest.mark.asyncio
+    async def test_a_recall_with_no_open_scope_records_nowhere(self):
+        cache = UserApiKeyCache(serve_last_good_entries=True)
+        await remember_last_good(cache, "team_id:t1", self._team("t1"))
+        with last_good_auth_entries_scope() as closed:
+            pass
+
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) == self._team("t1")
+        assert closed.served == ()
 
     def test_memory_line_drops_the_least_recently_written_entry_first(self):
         memory = LastGoodMemory(max_entries=2)

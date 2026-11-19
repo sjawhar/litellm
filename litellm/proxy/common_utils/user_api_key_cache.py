@@ -5,6 +5,8 @@ import re
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
+from contextvars import ContextVar, Token
+from types import TracebackType
 from typing import TYPE_CHECKING, Any, Final, TypeVar, cast, overload
 
 from fastapi import HTTPException
@@ -536,12 +538,50 @@ async def remember_last_good(cache: DualCache, cache_key: str, value: BaseModel)
     _ = store.last_good_memory.set(cache_key, payload)
 
 
+_active_auth_entries_scope: Final[ContextVar[last_good_auth_entries_scope | None]] = ContextVar(
+    "last_good_auth_entries_scope", default=None
+)
+
+
+class last_good_auth_entries_scope:
+    """Records the type of each last good entry ``recall_last_good`` serves inside the scope, from ``asyncio.gather``
+    children too, since they share the scope object the parent opened."""
+
+    __slots__ = ("_token", "served")
+
+    def __init__(self) -> None:
+        self.served: tuple[str, ...] = ()
+        self._token: Token[last_good_auth_entries_scope | None] | None = None
+
+    def record(self, entry_type: str) -> None:
+        self.served = (*self.served, entry_type)
+
+    def __enter__(self) -> last_good_auth_entries_scope:
+        self._token = _active_auth_entries_scope.set(self)
+        return self
+
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None
+    ) -> None:
+        if self._token is not None:
+            _active_auth_entries_scope.reset(self._token)
+
+
 async def recall_last_good(cache: DualCache, cache_key: str, model_type: type[T]) -> T | None:
-    """The last good entry for ``cache_key``. Redis answers first, and its miss is final, because another pod may
-    have forgotten the entry before this pod heard of it; this pod's memory answers only when Redis cannot."""
+    """The last good entry for ``cache_key``, recorded in the open ``last_good_auth_entries_scope`` when found."""
     store: Final = _last_good_store(cache)
     if store is None or not store.serve_last_good_entries:
         return None
+    entry: Final = await _read_last_good(store, cache_key, model_type)
+    scope: Final = _active_auth_entries_scope.get()
+    if entry is not None and scope is not None:
+        scope.record(model_type.__name__)
+    return entry
+
+
+async def _read_last_good(store: UserApiKeyCache, cache_key: str, model_type: type[T]) -> T | None:
+    """Redis answers first, and its miss is final, because another pod may have forgotten the entry before this pod
+    heard of it; this pod's memory answers only when Redis cannot."""
     if store.redis_cache is not None:
         try:
             return CacheCodec.deserialize(

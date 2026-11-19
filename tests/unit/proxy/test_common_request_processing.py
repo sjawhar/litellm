@@ -1922,6 +1922,15 @@ class TestProxyBaseLLMRequestProcessing:
         assert "x-litellm-key-spend" in headers_7
         assert float(headers_7["x-litellm-key-spend"]) == 0.001  # Should use original spend on error
 
+    @pytest.mark.parametrize("auth_entries", ["fresh", "last_good", None])
+    def test_get_custom_headers_carries_the_auth_entries_mark(self, auth_entries):
+        user_api_key_dict = UserAPIKeyAuth(token="hashed-token")
+        user_api_key_dict.auth_entries = auth_entries
+
+        headers = ProxyBaseLLMRequestProcessing.get_custom_headers(user_api_key_dict=user_api_key_dict, call_id="call-1")
+
+        assert headers.get("x-litellm-auth-entries") == auth_entries
+
     @pytest.mark.parametrize(
         ("hidden_params", "request_data", "expected_call_id"),
         [

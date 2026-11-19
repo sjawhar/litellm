@@ -2019,7 +2019,52 @@ async def test_key_of_a_team_member_is_served_while_the_database_is_stopped(monk
 
     served = await user_api_key_auth(request=request, api_key="Bearer " + user_key)
 
-    assert (served.user_id, served.team_id) == ("u-member", "t-lane")
+    assert (served.user_id, served.team_id, served.auth_entries) == ("u-member", "t-lane", "last_good")
+
+
+class _KeyOnlyDatabase(_StoppedDatabase):
+    """Answers the key read with ``key``; every other read fails the way an unreachable Postgres does."""
+
+    def __init__(self, key: UserAPIKeyAuth) -> None:
+        super().__init__()
+        self.key = key
+
+    async def get_data(self, **kwargs: object) -> object:
+        if kwargs.get("table_name") == "combined_view":
+            return self.key
+        return await super().get_data(**kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("serve_last_good_entries", "auth_entries"), [(True, "fresh"), (False, None)], ids=["setting_on", "setting_off"]
+)
+async def test_key_the_database_answers_for_reads_fresh_only_while_last_good_entries_are_served(
+    monkeypatch, serve_last_good_entries: bool, auth_entries: str | None
+):
+    import time
+
+    from litellm.proxy._types import hash_token
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+
+    user_key: Final = "sk-key-the-database-answers-for"
+    monkeypatch.setattr(
+        litellm.proxy.proxy_server,
+        "user_api_key_cache",
+        UserApiKeyCache(serve_last_good_entries=serve_last_good_entries),
+    )
+    monkeypatch.setattr(litellm.proxy.proxy_server, "master_key", MASTER_KEY)
+    monkeypatch.setattr(
+        litellm.proxy.proxy_server,
+        "prisma_client",
+        _KeyOnlyDatabase(UserAPIKeyAuth(token=hash_token(user_key), last_refreshed_at=time.time())),
+    )
+    request: Final = FastAPIRequest(scope={"type": "http", "method": "POST", "path": "/chat/completions", "headers": []})
+    request._url = URL(url="/chat/completions")
+
+    served: Final = await user_api_key_auth(request=request, api_key="Bearer " + user_key)
+
+    assert (served.token, served.auth_entries) == (hash_token(user_key), auth_entries)
 
 
 async def _key_with_user_and_project_held(monkeypatch, user_key: str, project: object | None) -> FastAPIRequest:

@@ -72,6 +72,7 @@ from litellm.types.router import AllowedModelRegion, RouterErrors, UpdateRouterC
 from litellm.types.router_weights import validate_router_settings_dict
 from litellm.types.secret_managers.main import KeyManagementSystem
 from litellm.types.utils import (
+    AuthEntriesSource,
     AzureSpillover,
     CallTypes,
     CostBreakdown,
@@ -2950,7 +2951,10 @@ class ConfigGeneralSettings(LiteLLMPydanticObjectBase):
             "database reported missing, or that was deleted or blocked, is still refused, and a request whose limits "
             "have no entry is refused with 503, whatever allow_requests_on_db_unavailable says. While this is on, "
             "deleting or blocking a key or team answers 503 and changes nothing when Redis cannot record the "
-            "revocation, so retry it once Redis is reachable"
+            "revocation, so retry it once Redis is reachable. Every response to a request user_api_key_auth admitted "
+            "carries the header x-litellm-auth-entries: last_good when an entry the request was checked against was "
+            "served from its last good entry, and fresh otherwise. The request's logging payload and spend log carry "
+            "the same value as metadata.user_api_key_auth_entries"
         ),
     )
     max_request_size_mb: int | None = Field(
@@ -3545,6 +3549,15 @@ class UserAPIKeyAuth(LiteLLM_VerificationTokenView):  # the expected response ob
             "user id."
         ),
     )
+    auth_entries: AuthEntriesSource | None = Field(
+        default=None,
+        exclude=True,
+        description=(
+            "Set per request by user_api_key_auth while serve_last_good_auth_entries is on: last_good when an entry "
+            "the request was checked against was served from its last good entry, else fresh. Sent as the "
+            "x-litellm-auth-entries header and logged as user_api_key_auth_entries"
+        ),
+    )
     invoked_agent_id: str | None = Field(default=None, exclude=True)
     invoked_agent_policy: AgentResponse | None = Field(default=None, exclude=True)
     agent_invocation_cost: float | None = Field(default=None, exclude=True)
@@ -3595,6 +3608,7 @@ class UserAPIKeyAuth(LiteLLM_VerificationTokenView):  # the expected response ob
         values.pop("mcp_session_resource_server_id", None)
         values.pop("mcp_toolset_id", None)
         values.pop("via_virtual_key", None)
+        values.pop("auth_entries", None)
         values.pop("authenticated_by_custom_auth", None)
         values.pop("agent_caller", None)
         values.pop("managed_agent_context", None)
@@ -4320,6 +4334,7 @@ class SpendLogsMetadata(TypedDict):
     user_api_key_org_id: str | None
     user_api_key_user_id: str | None
     user_api_key_team_alias: str | None
+    user_api_key_auth_entries: ReadOnly[NotRequired[AuthEntriesSource | None]]
     spend_logs_metadata: dict | None  # special param to log k,v pairs to spendlogs for a call
     requester_ip_address: str | None
     user_agent: ReadOnly[str | None]

@@ -152,6 +152,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     end_user_cache_key,
     end_user_restricted_registry_cache_key,
     forget_missing_last_good,
+    last_good_auth_entries_scope,
     model_access_group_registry_cache_key,
     remember_last_good,
     serves_last_good_entries,
@@ -177,6 +178,7 @@ from litellm.repositories.verification_token_repository import VerificationToken
 from litellm.router_utils.common_utils import resolve_model_group_alias
 from litellm.secret_managers.main import get_secret_bool
 from litellm.types.services import ServiceTypes
+from litellm.types.utils import AuthEntriesSource
 
 try:
     from litellm_enterprise.proxy.auth.user_api_key_auth import (
@@ -3472,6 +3474,14 @@ def _spend_counter_redis_cache() -> RedisCache | None:
     return spend_counter_cache.redis_cache
 
 
+def _auth_entries_source(scope: last_good_auth_entries_scope) -> AuthEntriesSource | None:
+    from litellm.proxy.proxy_server import user_api_key_cache
+
+    if not serves_last_good_entries(user_api_key_cache):
+        return None
+    return "last_good" if scope.served else "fresh"
+
+
 def _identity_cache_keys(api_key: str, *, end_user_id: str | None, key_is_resolved: bool) -> tuple[str, ...]:
     """Cache keys auth reads before it knows the key's owners, all known from the request alone. A key object is
     cached under the hash of the bearer, so the bearer itself never reaches Redis."""
@@ -3601,6 +3611,7 @@ async def user_api_key_auth(
         phase_span(f"auth {route}"),
         service_target(AUTH_OBJECTS_TARGET),
         spend_counter_batch_scope(_spend_counter_redis_cache()),
+        last_good_auth_entries_scope() as auth_entries_scope,
     ):
         try:
             user_api_key_auth_obj: Final = await user_api_key_auth_builder(
@@ -3640,7 +3651,10 @@ async def user_api_key_auth(
                 api_key=api_key,
             )
             if recovered_auth_obj is not None:
+                recovered_auth_obj.auth_entries = _auth_entries_source(auth_entries_scope)
                 return recovered_auth_obj
+
+    user_api_key_auth_obj.auth_entries = _auth_entries_source(auth_entries_scope)
 
     # Identity is now resolved. Seed it AFTER the auth span closes so the Baggage
     # persists on the request task (detaching the span's context token inside the

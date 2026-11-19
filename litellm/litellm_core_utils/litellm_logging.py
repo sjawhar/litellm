@@ -5939,6 +5939,7 @@ class StandardLoggingPayloadSetup:
             requester_custom_headers=None,
             cold_storage_object_key=None,
             user_api_key_auth_metadata=None,
+            user_api_key_auth_entries=None,
             team_alias=None,
             team_id=None,
             used_client_oauth_token=resolve_used_client_oauth_token(
@@ -6986,6 +6987,7 @@ def get_standard_logging_metadata(
         user_api_key_request_route=None,
         cold_storage_object_key=None,
         user_api_key_auth_metadata=None,
+        user_api_key_auth_entries=None,
         team_alias=None,
         team_id=None,
         used_client_oauth_token=None,

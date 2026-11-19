@@ -4416,6 +4416,7 @@ def copy_user_api_key_auth_for_cache(
 ) -> UserAPIKeyAuth:
     copied_key_obj: Final = user_api_key_obj.model_copy()
     copied_key_obj.budget_reservation = None
+    copied_key_obj.auth_entries = None
     copied_key_obj.budget_throttle_pct = None
     copied_key_obj.parent_otel_span = None
     copied_key_obj.request_route = None

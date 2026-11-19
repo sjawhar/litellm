@@ -117,6 +117,15 @@ def _statuses(proxy: Gateway, callers: dict[str, str]) -> dict[str, int | str]:
     return {name: _outcome(_chat(proxy, credential)) for name, credential in callers.items()}
 
 
+def _auth_entries(proxy: Gateway, callers: dict[str, str]) -> dict[str, int | str | None]:
+    """The x-litellm-auth-entries header of each served call, or the outcome of a refused one."""
+    replies: Final = {name: _chat(proxy, credential) for name, credential in callers.items()}
+    return {
+        name: reply.headers.get("x-litellm-auth-entries") if reply.status_code == 200 else _outcome(reply)
+        for name, reply in replies.items()
+    }
+
+
 def _outlive_the_cache() -> None:
     time.sleep(CACHE_TTL_SECONDS + 1)
 
@@ -181,12 +190,13 @@ def test_callers_the_gateway_last_read_are_served_while_the_database_is_stopped(
             deleted: Final = string_value(proxy.post("/key/generate", {"models": [MODEL]})["key"])
 
             assert _statuses(proxy, {**served, "deleted": deleted}) == dict.fromkeys((*served, "deleted"), 200)
+            assert _auth_entries(proxy, served) == dict.fromkeys(served, "fresh"), "the database answers"
             assert _over_budget(_chat(proxy, spent_user_key)), "the user's budget is spent"
             _outlive_the_cache()
             proxy.post("/key/delete", {"keys": [deleted]})
             database.cut()
 
-            assert _statuses(proxy, served) == dict.fromkeys(served, 200), "the database is stopped"
+            assert _auth_entries(proxy, served) == dict.fromkeys(served, "last_good"), "the database is stopped"
             assert _over_budget(_chat(proxy, spent_user_key)), "the user's budget holds while the database is stopped"
             refused: Final = _statuses(proxy, {"deleted": deleted, "never_read": f"sk-{uuid.uuid4().hex}"})
             assert all(str(outcome).split()[0] in ("401", "503") for outcome in refused.values()), refused
