@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 
 from litellm.proxy._types import (
     BlockUsers,
+    LiteLLM_BudgetTable,
     LiteLLM_EndUserTable,
     LitellmUserRoles,
     NewCustomerRequest,
@@ -1164,13 +1165,15 @@ def test_customer_delete_invalidates_end_user_and_registry_caches(mock_prisma_cl
 class _EndUserRows:
     """The end-user table a block, a create or an update writes and auth reads. While ``stopped`` every read fails the
     way an unreachable Postgres does; ``pause_next_registry_read`` holds the next restricted-registry read once it has
-    its rows."""
+    its rows, and ``pause_next_row_read`` the next read of one customer's row once it has the row."""
 
     def __init__(self, *rows: LiteLLM_EndUserTable) -> None:
         self.rows = {row.user_id: row for row in rows}
         self.stopped = False
         self.registry_read_held = asyncio.Event()
+        self.row_read_held = asyncio.Event()
         self._release: asyncio.Event | None = None
+        self._row_release: asyncio.Event | None = None
 
     def _answer(self) -> None:
         if self.stopped:
@@ -1179,6 +1182,10 @@ class _EndUserRows:
     def pause_next_registry_read(self) -> asyncio.Event:
         self._release = asyncio.Event()
         return self._release
+
+    def pause_next_row_read(self) -> asyncio.Event:
+        self._row_release = asyncio.Event()
+        return self._row_release
 
     async def upsert(self, where: dict[str, str], data: dict[str, dict[str, object]]) -> LiteLLM_EndUserTable:
         self._answer()
@@ -1205,7 +1212,13 @@ class _EndUserRows:
         return self.rows.get(where["user_id"])
 
     async def find_unique(self, where: dict[str, str], include: object = None) -> LiteLLM_EndUserTable | None:
-        return await self.find_first(where)
+        row = await self.find_first(where)
+        release = self._row_release
+        if release is not None:
+            self._row_release = None
+            self.row_read_held.set()
+            await release.wait()
+        return row
 
     async def find_many(self, where: object = None, take: int | None = None) -> list[LiteLLM_EndUserTable]:
         self._answer()
@@ -1218,9 +1231,24 @@ class _EndUserRows:
         return restricted
 
 
-def _serve_end_user_rows(monkeypatch: pytest.MonkeyPatch, rows: _EndUserRows, cache: UserApiKeyCache) -> None:
+class _BudgetRows:
+    """The budget table a customer update writes."""
+
+    def __init__(self, *rows: LiteLLM_BudgetTable) -> None:
+        self.rows = {row.budget_id: row for row in rows}
+
+    async def update(self, where: dict[str, str], data: dict[str, object]) -> LiteLLM_BudgetTable:
+        row = self.rows[where["budget_id"]].model_copy(update=data)
+        self.rows[where["budget_id"]] = row
+        return row
+
+
+def _serve_end_user_rows(
+    monkeypatch: pytest.MonkeyPatch, rows: _EndUserRows, cache: UserApiKeyCache, budgets: _BudgetRows | None = None
+) -> None:
     monkeypatch.setattr(
-        "litellm.proxy.proxy_server.prisma_client", SimpleNamespace(db=SimpleNamespace(litellm_endusertable=rows))
+        "litellm.proxy.proxy_server.prisma_client",
+        SimpleNamespace(db=SimpleNamespace(litellm_endusertable=rows, litellm_budgettable=budgets)),
     )
     monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
 
@@ -1395,6 +1423,72 @@ async def test_after_a_customer_gains_a_restriction_a_registry_read_in_flight_ca
         await update_end_user(data=UpdateCustomerRequest(user_id="c1", models=["m1"]), user_api_key_dict=_ADMIN)
     release.set()
     assert await in_flight is None
+    for key in ("end_user_id:c1", "end_user_restricted_registry"):
+        await cache.async_delete_cache(key)
+    rows.stopped = True
+
+    with pytest.raises(LastGoodEntryMissing):
+        await customer()
+
+
+def _budgeted_customer() -> tuple[_EndUserRows, _BudgetRows]:
+    """Customer c1 on its own budget b1 with max_budget 10."""
+    budget: Final = LiteLLM_BudgetTable(budget_id="b1", max_budget=10.0)
+    return (
+        _EndUserRows(LiteLLM_EndUserTable(user_id="c1", blocked=False, budget_id="b1", litellm_budget_table=budget)),
+        _BudgetRows(budget),
+    )
+
+
+@pytest.mark.asyncio
+async def test_customer_update_of_its_existing_budget_answers_503_and_writes_nothing_when_redis_cannot_record_it(
+    monkeypatch,
+):
+    """The customer's entry carries its budget. Lowering that budget revokes the entry first, so a Redis that cannot
+    record it refuses the update rather than leave the higher limit for the next outage."""
+    from litellm.proxy.management_endpoints.customer_endpoints import update_end_user
+
+    redis = fake_redis_cache()
+    redis.server.connected = False
+    rows, budgets = _budgeted_customer()
+    _serve_end_user_rows(
+        monkeypatch, rows, UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True), budgets
+    )
+
+    with pytest.raises(ProxyException) as refused:
+        await update_end_user(data=UpdateCustomerRequest(user_id="c1", max_budget=5.0), user_api_key_dict=_ADMIN)
+
+    assert (str(refused.value.code), budgets.rows["b1"].max_budget) == ("503", 10.0)
+
+
+@pytest.mark.asyncio
+async def test_after_a_customer_budget_is_lowered_a_read_in_flight_cannot_keep_the_higher_limit_for_an_outage(
+    monkeypatch,
+):
+    """A read of the customer's row that took the row before its budget was lowered, and finishes after, must not keep
+    the higher limit as the customer's entry: the next outage refuses the customer instead of serving it."""
+    from litellm.proxy.auth.auth_checks import get_end_user_object
+    from litellm.proxy.db.exception_handler import LastGoodEntryMissing
+    from litellm.proxy.management_endpoints.customer_endpoints import update_end_user
+
+    rows, budgets = _budgeted_customer()
+    cache = UserApiKeyCache(serve_last_good_entries=True)
+    _serve_end_user_rows(monkeypatch, rows, cache, budgets)
+    database = SimpleNamespace(db=SimpleNamespace(litellm_endusertable=rows))
+
+    async def customer() -> LiteLLM_EndUserTable | None:
+        return await get_end_user_object(
+            end_user_id="c1",
+            prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+            user_api_key_cache=cache,
+        )
+
+    release = rows.pause_next_row_read()
+    in_flight = asyncio.create_task(customer())
+    await rows.row_read_held.wait()
+    await update_end_user(data=UpdateCustomerRequest(user_id="c1", max_budget=5.0), user_api_key_dict=_ADMIN)
+    release.set()
+    assert (await in_flight).litellm_budget_table.max_budget == 10.0
     for key in ("end_user_id:c1", "end_user_restricted_registry"):
         await cache.async_delete_cache(key)
     rows.stopped = True
