@@ -2109,3 +2109,59 @@ async def test_a_streamed_v1_messages_response_settles_the_providers_uncached_co
     )
 
     assert await _settled_increments(monkeypatch, rate_limit_type, assembled) == [counted, counted]
+
+
+def _cached_responses_api_response():
+    """A Responses API response of 1,000 input tokens, 900 of them cache reads, and 10 output
+    tokens: its input_tokens hold the cache reads that input_tokens_details.cached_tokens names."""
+    from litellm.types.llms.openai import InputTokensDetails, ResponseAPIUsage, ResponsesAPIResponse
+
+    return ResponsesAPIResponse(
+        id="resp_cached",
+        created_at=1,
+        object="response",
+        status="completed",
+        model="gpt-4o-mini",
+        output=[],
+        usage=ResponseAPIUsage(
+            input_tokens=1000,
+            input_tokens_details=InputTokensDetails(cached_tokens=900),
+            output_tokens=10,
+            total_tokens=1010,
+        ),
+    )
+
+
+@pytest.mark.parametrize(("rate_limit_type", "counted"), _UNCACHED_COUNTS)
+@pytest.mark.asyncio
+async def test_a_responses_api_response_settles_the_providers_uncached_count(
+    monkeypatch: pytest.MonkeyPatch, rate_limit_type: str, counted: int
+):
+    """A non-streamed Responses API call reaches the hook as a ResponsesAPIResponse, not a
+    ModelResponse, whose usage logging has turned into a chat-shaped Usage."""
+    logging_obj = _logging_obj(model="gpt-4o-mini", call_type="aresponses", stream=False)
+    logged = logging_obj._transform_usage_objects(result=_cached_responses_api_response())
+
+    assert await _settled_increments(monkeypatch, rate_limit_type, logged) == [counted, counted]
+
+
+@pytest.mark.parametrize(("rate_limit_type", "counted"), _UNCACHED_COUNTS)
+@pytest.mark.asyncio
+async def test_a_streamed_responses_api_response_settles_the_providers_uncached_count(
+    monkeypatch: pytest.MonkeyPatch, rate_limit_type: str, counted: int
+):
+    """A streamed Responses API call reaches the hook as the ResponsesAPIResponse of its
+    response.completed event, whose usage logging has turned into a chat-shaped dict."""
+    from litellm.types.llms.openai import ResponseCompletedEvent
+
+    logging_obj = _logging_obj(model="gpt-4o-mini", call_type="aresponses", stream=True)
+    now = datetime.now()
+    assembled = logging_obj._get_assembled_streaming_response(
+        result=ResponseCompletedEvent(type="response.completed", response=_cached_responses_api_response()),
+        start_time=now,
+        end_time=now,
+        is_async=True,
+        streaming_chunks=[],
+    )
+
+    assert await _settled_increments(monkeypatch, rate_limit_type, assembled) == [counted, counted]
