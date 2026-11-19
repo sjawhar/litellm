@@ -26,6 +26,7 @@ from litellm.proxy.auth.auth_utils import (  # noqa: F401  # legacy module expor
     is_invalid_virtual_key_error,
     mark_invalid_virtual_key_error,
     normalize_request_route,
+    request_names_provider_fallback_models,
 )
 from litellm.proxy.auth.model_access_denied import ModelAccessDeniedHTTPException
 from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
@@ -154,8 +155,11 @@ class UserAPIKeyAuthExceptionHandler:
             proxy_logging_obj,
         )
 
+        # The fallback identity carries none of the checks a model in Anthropic's own fallbacks needs, so such a request
+        # gets the error as with the setting off
         if (
-            PrismaDBExceptionHandler.should_allow_request_on_db_unavailable()
+            not request_names_provider_fallback_models(request_data, route, request)
+            and PrismaDBExceptionHandler.should_allow_request_on_db_unavailable()
             and PrismaDBExceptionHandler.is_database_connection_error(e)
         ):
             # log this as a DB failure on prometheus

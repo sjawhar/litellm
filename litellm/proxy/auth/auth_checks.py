@@ -886,8 +886,9 @@ def _deployment_sends_name_to_anthropic(deployment: object, name: str) -> bool:
 def _deployments_under_name(model: str, llm_router: Router) -> Iterator[object]:
     """
     Every deployment the router can serve ``model`` from, whichever team asks: the deployments of that name and the
-    members of the routing group of that name, each team's deployments published under that name, and the deployment
-    of every wildcard route that matches it, the proxy's and each team's, with the model the route fills in.
+    members of the routing group of that name, each team's deployments published under that name, the deployment of
+    every wildcard route that matches it, the proxy's and each team's, with the model the route fills in, the deployment
+    whose id it is, and the deployments whose provider model it is.
     """
     yield from llm_router.get_model_list(model_name=model) or ()
     for team_id, public_name in llm_router.team_model_to_deployment_indices:
@@ -895,6 +896,12 @@ def _deployments_under_name(model: str, llm_router: Router) -> Iterator[object]:
             yield from llm_router.get_all_deployments(model_name=model, team_id=team_id)
     for pattern_router in (llm_router.pattern_router, *llm_router.team_pattern_routers.values()):
         yield from pattern_router.get_deployments_by_pattern(model=model)
+    deployment_with_that_id: Final = llm_router.get_deployment(model_id=model)
+    if deployment_with_that_id is not None:
+        yield deployment_with_that_id.model_dump(exclude_none=True)
+    # The router serves a name with no deployment of its own from the deployments whose provider model it is, through
+    # its own lookup
+    yield from llm_router._get_deployment_by_litellm_model(model=model)  # pyright: ignore[reportPrivateUsage]  # see above
 
 
 def _reject_provider_fallback_served_as_another_model(*, model: str, llm_router: Router | None) -> None:
