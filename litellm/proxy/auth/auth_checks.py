@@ -795,6 +795,33 @@ async def _run_project_checks(
         )
 
 
+def _check_fallback_against_unread_team(*, model: str, valid_token: UserAPIKeyAuth, llm_router: Router | None) -> None:
+    """
+    A fallback target of a team key whose team could not be read for this request. The team models the token records
+    stand in for the team, as they do for the requested model when the token vouches for its team; with none recorded
+    the target cannot be checked, so the request is refused until the team can be read.
+    """
+    if not valid_token.team_models:
+        raise ProxyException(
+            message=(
+                f"Fallback models cannot be checked while Team={valid_token.team_id} cannot be read. "
+                "Retry the request, or send it without fallbacks."
+            ),
+            type=ProxyErrorTypes.no_db_connection,
+            param="fallbacks",
+            code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    can_object_call_model(
+        model=model,
+        llm_router=llm_router,
+        models=valid_token.team_models,
+        team_model_aliases=valid_token.team_model_aliases,
+        team_id=valid_token.team_id,
+        key_model_aliases=key_model_aliases_for_auth_check(valid_token),
+        object_type="team",
+    )
+
+
 async def _run_fallback_model_checks(
     *,
     fallback_models: Sequence[str],
@@ -809,7 +836,8 @@ async def _run_fallback_model_checks(
 ) -> None:
     """
     The team, team member, user, project and agent model checks common_checks() runs on the requested model, run on
-    each fallback target: a target can serve the request in the requested model's place.
+    each fallback target: a target can serve the request in the requested model's place. A team key whose team could
+    not be read is held to the team models its token records.
     """
     from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
 
@@ -848,13 +876,16 @@ async def _run_fallback_model_checks(
                     team_membership_loaded=team_membership_loaded,
                     key_model_aliases=key_model_aliases,
                 )
-        elif user_object is not None:
-            await can_user_call_model(
-                model=model,
-                llm_router=llm_router,
-                user_object=user_object,
-                key_model_aliases=key_model_aliases,
-            )
+        else:
+            if valid_token is not None and valid_token.team_id is not None:
+                _check_fallback_against_unread_team(model=model, valid_token=valid_token, llm_router=llm_router)
+            if user_object is not None:
+                await can_user_call_model(
+                    model=model,
+                    llm_router=llm_router,
+                    user_object=user_object,
+                    key_model_aliases=key_model_aliases,
+                )
         if project_object is not None and len(project_object.models) > 0:
             can_project_access_model(
                 model=model,
