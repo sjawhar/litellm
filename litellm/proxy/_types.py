@@ -2951,11 +2951,13 @@ class ConfigGeneralSettings(LiteLLMPydanticObjectBase):
             "database reported missing, or that was deleted or blocked, is still refused, and a request whose limits "
             "have no entry is refused with 503, whatever allow_requests_on_db_unavailable says. While this is on, "
             "deleting or blocking a key or team answers 503 and changes nothing when Redis cannot record the "
-            "revocation, so retry it once Redis is reachable. For a request user_api_key_auth admitted, each response "
-            "that carries LiteLLM's other x-litellm-* call headers (x-litellm-call-id and the model and cost headers) "
-            "also carries x-litellm-auth-entries: last_good when an entry the request was checked against was served "
-            "from its last good entry, and fresh otherwise; management and listing endpoints do not send it. The "
-            "request's logging payload and spend log row, a failed request's included, carry the same value as "
+            "revocation, so retry it once Redis is reachable. For a request user_api_key_auth admitted, the header "
+            "x-litellm-auth-entries says last_good when an entry the request was checked against was served from its "
+            "last good entry, and fresh otherwise. It is added where the proxy builds a call's headers with "
+            "ProxyBaseLLMRequestProcessing.get_custom_headers, the same place the key's spend and limit headers come "
+            "from; a response built another way does not carry it, for example the pass-through routes such as "
+            "/anthropic/* and the error answers of the image and rerank endpoints. The logging payload and the spend "
+            "log row of every call that is logged, a failed one included, carry the same value as "
             "metadata.user_api_key_auth_entries"
         ),
     )
