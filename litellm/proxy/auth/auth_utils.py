@@ -641,6 +641,23 @@ def key_fallback_model_names(
     )
 
 
+def request_names_provider_fallback_models(
+    request_body: Mapping[str, object], route: str, request: Request | None
+) -> bool:
+    """
+    Whether the body's ``fallbacks`` is Anthropic's server-side fallback list and names a model, which reaches Anthropic
+    as sent. ``"default"`` names none. A list nested too deep to read counts as naming one.
+    """
+    readable_request: Final = request if request is not None and "headers" in request.scope else None
+    if not body_fallbacks_go_to_anthropic(route, readable_request):
+        return False
+    try:
+        _, provider_fallback_models = key_fallback_model_names(request_body, anthropic_owns_body_fallbacks=True)
+    except ValueError:
+        return True
+    return bool(provider_fallback_models)
+
+
 def _reject_fallback_target_credentials(target: Mapping[str, object], allows_client_credentials: bool) -> None:
     """A caller credential, endpoint or mock param never rides on a fallback target; the opt-in admits only the first two"""
     mocked: Final = sorted(field for field in target if field in _FALLBACK_TARGET_MOCK_FIELDS)

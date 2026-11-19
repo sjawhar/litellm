@@ -587,6 +587,7 @@ class _Gateway:
         routing_groups: Sequence[Mapping[str, object]] = (),
         token_team_models: tuple[str, ...] | None = None,
         allow_requests_on_db_unavailable: bool = False,
+        user_id: str | None = None,
     ) -> "_GatewayResult":
         import httpx
         import respx
@@ -629,6 +630,7 @@ class _Gateway:
             user_role=LitellmUserRoles.INTERNAL_USER,
             models=list(key_models),
             team_id=team_id,
+            user_id=user_id,
             team_models=(
                 list(token_team_models) if token_team_models is not None else ["requested", "other"] if team_id else []
             ),
@@ -637,6 +639,8 @@ class _Gateway:
             team_model_aliases=dict(team_aliases) if team_aliases is not None else None,
         )
         await cache.async_set_cache(key=hash_token(_CALLER_KEY), value=token)
+        if user_id is not None:
+            await cache.async_set_cache(key=user_id, value=LiteLLM_UserTable(user_id=user_id))
         if team_id is not None:
             await cache.async_set_cache(
                 key=f"team_id:{team_id}",
@@ -1112,18 +1116,31 @@ _OPUS: Final = "claude-opus-4-8"
 
 
 def _opus_deployment(
-    litellm_model: str, access_group: str, model_name: str = _OPUS, *, team_id: str | None = None
+    litellm_model: str,
+    access_group: str,
+    model_name: str = _OPUS,
+    *,
+    team_id: str | None = None,
+    deployment_id: str | None = None,
+    custom_llm_provider: str | None = None,
 ) -> Mapping[str, object]:
     """
     A deployment under ``model_name`` in one access group; its host counts as the forbidden one, which nothing calls. A
     team's deployment is published under that name for the team, the way the proxy stores one.
     """
     team_fields: Final = {"team_id": team_id, "team_public_model_name": model_name} if team_id is not None else {}
+    id_field: Final = {"id": deployment_id} if deployment_id is not None else {}
+    provider_field: Final = {"custom_llm_provider": custom_llm_provider} if custom_llm_provider is not None else {}
     return MappingProxyType[str, object](
         {
             "model_name": model_name if team_id is None else f"model_name_{team_id}_0",
-            "litellm_params": {"model": litellm_model, "api_key": _DEPLOYMENT_KEY, "api_base": _FORBIDDEN_HOST},
-            "model_info": {"access_groups": [access_group], **team_fields},
+            "litellm_params": {
+                "model": litellm_model,
+                "api_key": _DEPLOYMENT_KEY,
+                "api_base": _FORBIDDEN_HOST,
+                **provider_field,
+            },
+            "model_info": {"access_groups": [access_group], **team_fields, **id_field},
         }
     )
 
@@ -1212,6 +1229,24 @@ _KEY_WITH_THE_NAME: Final = ("requested", _OPUS)
             ({"group_name": _OPUS, "models": ["haiku-member"], "routing_strategy": "simple-shuffle"},),
             id="routing-group-of-another-model",
         ),
+        pytest.param(
+            (
+                _opus_deployment(
+                    "anthropic/claude-haiku-4-5", "cheap", model_name="haiku-deployment", deployment_id=_OPUS
+                ),
+            ),
+            _KEY_WITH_THE_NAME,
+            {},
+            (),
+            id="deployment-id-of-another-model",
+        ),
+        pytest.param(
+            (_opus_deployment(_OPUS, "cheap", model_name="opus-elsewhere", custom_llm_provider="openai"),),
+            _KEY_WITH_THE_NAME,
+            {},
+            (),
+            id="provider-model-on-another-provider",
+        ),
     ],
 )
 async def test_a_name_in_anthropics_fallbacks_the_router_can_serve_as_another_model_is_refused(
@@ -1261,6 +1296,11 @@ async def test_a_name_in_anthropics_fallbacks_the_router_can_serve_as_another_mo
             ("requested", "every-claude"),
             id="pattern-route-that-forwards-the-name",
         ),
+        pytest.param(
+            (_opus_deployment(f"anthropic/{_OPUS}", "expensive", model_name="opus-by-id", deployment_id=_OPUS),),
+            _KEY_WITH_THE_NAME,
+            id="deployment-id-that-sends-the-name",
+        ),
     ],
 )
 async def test_a_name_in_anthropics_fallbacks_that_means_one_model_still_serves_the_request(
@@ -1277,12 +1317,22 @@ async def test_a_name_in_anthropics_fallbacks_that_means_one_model_still_serves_
 
 
 @pytest.mark.asyncio
-async def test_an_aliased_name_in_anthropics_fallbacks_is_refused_before_an_unreadable_team_can_fail_open(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("fallback", "key_aliases", "status", "error_type"),
+    [
+        # The alias refusal runs in the key's own check, before the team check that would answer 503
+        pytest.param(_ALIASED_PROVIDER_FALLBACK, {_ALIASED_PROVIDER_FALLBACK: "other"}, 403, "key_model_access_denied"),
+        # A clean name reaches the team check, whose 503 is no longer recovered into a fallback identity
+        pytest.param("other", {}, 503, "no_db_connection"),
+    ],
+    ids=["aliased-name", "clean-name"],
+)
+async def test_a_name_in_anthropics_fallbacks_is_refused_while_a_team_without_a_recorded_grant_cannot_be_read(
+    monkeypatch: pytest.MonkeyPatch, fallback: str, key_aliases: Mapping[str, str], status: int, error_type: str
 ) -> None:
     """
-    The team lookup is swallowed into no team and the token records no team models, so the team check answers 503,
-    which allow_requests_on_db_unavailable recovers into a fallback identity that goes on; the alias refusal comes first
+    The team lookup is swallowed into no team and the token records no team models, so the team check answers 503;
+    allow_requests_on_db_unavailable does not recover a request whose Anthropic fallbacks name a model
     """
     from litellm.proxy.auth import user_api_key_auth
 
@@ -1296,17 +1346,96 @@ async def test_an_aliased_name_in_anthropics_fallbacks_is_refused_before_an_unre
 
     monkeypatch.setattr(user_api_key_auth, "_safe_fetch", swallows_the_team_lookup)
     result: Final = await _Gateway(monkeypatch, requested_answers=True).send(
-        {"fallbacks": [{"model": _ALIASED_PROVIDER_FALLBACK}]},
+        {"fallbacks": [{"model": fallback}]},
         beta=True,
         team_router_settings={},
         token_team_models=(),
-        key_aliases={_ALIASED_PROVIDER_FALLBACK: "other"},
+        key_aliases=key_aliases,
         allow_requests_on_db_unavailable=True,
     )
 
-    assert result.response.status_code == 403, result.response.text
-    assert "key_model_access_denied" in result.response.text
+    assert result.response.status_code == status, result.response.text
+    assert error_type in result.response.text
     assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+
+
+def _membership_read_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    """common_checks' read of the caller's team membership, before any fallback check, misses its deadline"""
+    from litellm.proxy.auth import auth_checks
+    from litellm.proxy.db.db_lookup_gate import DBLookupDeadlineExceeded
+
+    monkeypatch.setattr(
+        auth_checks,
+        "get_team_membership",
+        AsyncMock(side_effect=DBLookupDeadlineExceeded("team membership", 1.0)),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fallback", "deployments", "status", "error_type"),
+    [
+        # The targets cannot be checked while the membership cannot be read, so the outage answers as unrecovered
+        pytest.param("other", (), 503, "no_db_connection", id="clean-name"),
+        # A virtual key's own check runs both refusals before common_checks reads the membership
+        pytest.param(
+            _OPUS,
+            (_opus_deployment("anthropic/claude-haiku-4-5", "cheap"),),
+            403,
+            "key_model_access_denied",
+            id="name-the-router-serves-as-another-model",
+        ),
+    ],
+)
+async def test_a_database_outage_is_not_recovered_for_a_request_that_names_models_in_anthropics_fallbacks(
+    monkeypatch: pytest.MonkeyPatch,
+    fallback: str,
+    deployments: Sequence[Mapping[str, object]],
+    status: int,
+    error_type: str,
+) -> None:
+    _membership_read_times_out(monkeypatch)
+    result: Final = await _Gateway(monkeypatch, requested_answers=True).send(
+        {"fallbacks": [{"model": fallback}]},
+        beta=True,
+        team_router_settings={},
+        key_models=("requested", "other", _OPUS),
+        user_id="caller",
+        extra_deployments=deployments,
+        allow_requests_on_db_unavailable=True,
+    )
+
+    assert result.response.status_code == status, result.response.text
+    assert error_type in result.response.text
+    assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body_fields", "beta", "forwarded_fallbacks"),
+    [
+        pytest.param({}, True, None, id="no-fallbacks"),
+        pytest.param({"fallbacks": "default"}, True, "default", id="default-names-no-model"),
+        pytest.param({"fallbacks": [{"requested": ["other"]}]}, False, None, id="litellm-fallbacks-without-the-beta"),
+    ],
+)
+async def test_a_database_outage_still_recovers_a_request_whose_anthropic_fallbacks_name_no_model(
+    monkeypatch: pytest.MonkeyPatch, body_fields: dict[str, object], beta: bool, forwarded_fallbacks: str | None
+) -> None:
+    """The membership read fails as above; with no model in Anthropic's fallbacks the fallback identity still serves"""
+    _membership_read_times_out(monkeypatch)
+    result: Final = await _Gateway(monkeypatch, requested_answers=True).send(
+        body_fields,
+        beta=beta,
+        team_router_settings={},
+        user_id="caller",
+        allow_requests_on_db_unavailable=True,
+    )
+
+    assert result.response.status_code == 200, result.response.text
+    assert result.calls == {"requested": 1, "other": 0, "forbidden": 0, "attacker": 0}
+    sent: Final = [body for body in result.requested_bodies if isinstance(body, dict)]
+    assert [body.get("fallbacks") for body in sent] == [forwarded_fallbacks]
 
 
 @pytest.mark.asyncio
