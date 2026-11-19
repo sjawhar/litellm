@@ -6,23 +6,37 @@ The in-memory Prisma here follows the one in
 table and the membership/budget relation the bulk budget writer needs.
 """
 
+import asyncio
 import copy
 import json
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Final
 
+import httpx
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, ConfigDict, Field
 
-from litellm.proxy._types import LiteLLM_TeamTable, LitellmUserRoles, Member, UserAPIKeyAuth
+from litellm.proxy._types import (
+    LiteLLM_BudgetTable,
+    LiteLLM_EndUserTable,
+    LiteLLM_TeamTable,
+    LitellmUserRoles,
+    Member,
+    UserAPIKeyAuth,
+)
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.user_api_key_cache import (
     UserApiKeyCache,
+    end_user_cache_key,
+    end_user_restricted_registry_cache_key,
+    recall_last_good,
+    remember_last_good,
     team_membership_auth_cache_key,
     team_membership_reservation_cache_key,
 )
@@ -72,6 +86,15 @@ class _MembershipRow(BaseModel):
     litellm_budget_table: _BudgetRow | None = None
 
 
+class _HolderRow(BaseModel):
+    """A row of another table that can point at a budget row: a key, organization, project, customer, tag or model
+    access group, carrying only the columns its holder read uses."""
+
+    model_config = ConfigDict(extra="allow")
+
+    budget_id: str | None = None
+
+
 def _wanted(where: Mapping[str, object], field: str) -> set[str] | None:
     clause: Final = where.get(field)
     if isinstance(clause, dict) and "in" in clause:
@@ -109,6 +132,7 @@ class _MembershipTable:
     def __init__(self, budgets: _BudgetTable, memberships: Sequence[_MembershipRow]) -> None:
         self._budgets = budgets
         self.rows: list[_MembershipRow] = list(memberships)
+        self.reads: list[Mapping[str, object]] = []
 
     def _index_of(self, user_id: str, team_id: str) -> int | None:
         return next(
@@ -119,6 +143,7 @@ class _MembershipTable:
     async def find_many(
         self, where: Mapping[str, object], include: Mapping[str, bool] | None = None
     ) -> list[_MembershipRow]:
+        self.reads.append(where)
         matched: Final = [r for r in self.rows if _matches(r.model_dump(), where)]
         if not include:
             return matched
@@ -146,6 +171,18 @@ class _MembershipTable:
         return self.rows[index]
 
 
+class _HolderTable:
+    """One of the other tables a budget row's holders are listed from; it records each read."""
+
+    def __init__(self, rows: Sequence[_HolderRow] = ()) -> None:
+        self.rows: tuple[_HolderRow, ...] = tuple(rows)
+        self.reads: list[Mapping[str, object]] = []
+
+    async def find_many(self, where: Mapping[str, object]) -> list[_HolderRow]:
+        self.reads.append(where)
+        return [r for r in self.rows if _matches(r.model_dump(), where)]
+
+
 class _TeamTable:
     """`find_many` and `create` are what `RoutingPrismaWrapper` keys read routing off, so a fake
     table without them would silently never route and pass a reader-staleness test on the writer."""
@@ -171,10 +208,17 @@ class _Db:
         teams: Sequence[LiteLLM_TeamTable],
         memberships: Sequence[_MembershipRow],
         budgets: Sequence[_BudgetRow],
+        customers: Sequence[_HolderRow] = (),
     ) -> None:
         self.litellm_teamtable = _TeamTable(teams)
         self.litellm_budgettable = _BudgetTable(budgets)
         self.litellm_teammembership = _MembershipTable(self.litellm_budgettable, memberships)
+        self.litellm_organizationtable = _HolderTable()
+        self.litellm_projecttable = _HolderTable()
+        self.litellm_endusertable = _HolderTable(customers)
+        self.litellm_tagtable = _HolderTable()
+        self.litellm_modelaccessgroupbudgettable = _HolderTable()
+        self.litellm_verificationtoken = _HolderTable()
 
 
 class _FakePrisma:
@@ -183,8 +227,9 @@ class _FakePrisma:
         teams: Sequence[LiteLLM_TeamTable] = (),
         memberships: Sequence[_MembershipRow] = (),
         budgets: Sequence[_BudgetRow] = (),
+        customers: Sequence[_HolderRow] = (),
     ) -> None:
-        self.db = _Db(teams, memberships, budgets)
+        self.db = _Db(teams, memberships, budgets, customers)
 
     @asynccontextmanager
     async def tx(self, *, timeout: object = None):
@@ -532,7 +577,8 @@ async def test_a_batch_whose_revocation_redis_cannot_record_answers_503_and_writ
     redis: Final = fake_redis_cache()
     redis.server.connected = False
     cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
-    # This fake has no key table, so the members' keys are left unread; their memberships alone must refuse
+    # No proxy database is set, so neither the members' keys nor the other holders of their rows are read; their
+    # memberships alone must refuse
     monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", None)
     monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
     prisma: Final = _FakePrisma(
@@ -550,6 +596,207 @@ async def test_a_batch_whose_revocation_redis_cannot_record_answers_503_and_writ
     assert _budget_of(prisma, "m1").max_budget == 1.0
     assert _budget_id_of(prisma, "m2") is None
     assert set(prisma.db.litellm_budgettable.rows) == {"priv-m1"}
+
+
+_CUSTOMER_ID: Final = "c1"
+
+
+def _list_holders_from(monkeypatch: pytest.MonkeyPatch, prisma: _FakePrisma, cache: UserApiKeyCache) -> None:
+    """The holder reads use the proxy's own database and cache, the same objects the route passes in."""
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", prisma)
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
+
+
+def _customer_on(budget_id: str) -> _HolderRow:
+    return _HolderRow(budget_id=budget_id, user_id=_CUSTOMER_ID)
+
+
+def _customer_row(budget_id: str, max_budget: float) -> LiteLLM_EndUserTable:
+    return LiteLLM_EndUserTable(
+        user_id=_CUSTOMER_ID,
+        blocked=False,
+        budget_id=budget_id,
+        litellm_budget_table=LiteLLM_BudgetTable(budget_id=budget_id, max_budget=max_budget),
+    )
+
+
+async def _warm_customer(cache: UserApiKeyCache, budget_id: str, max_budget: float) -> None:
+    await remember_last_good(cache, end_user_cache_key(_CUSTOMER_ID), _customer_row(budget_id, max_budget))
+
+
+async def _customer_entry(cache: UserApiKeyCache) -> LiteLLM_EndUserTable | None:
+    return await recall_last_good(cache, end_user_cache_key(_CUSTOMER_ID), LiteLLM_EndUserTable)
+
+
+class _HeldCustomerRow:
+    """The customer table auth reads one customer from. ``hold_next_row_read`` holds the next read of the row once it
+    has the row; while ``stopped`` every read fails the way an unreachable Postgres does."""
+
+    def __init__(self, row: LiteLLM_EndUserTable) -> None:
+        self.row = row
+        self.stopped = False
+        self.row_read_held = asyncio.Event()
+        self._release: asyncio.Event | None = None
+
+    def _answer(self) -> None:
+        if self.stopped:
+            raise httpx.ConnectError("All connection attempts failed")
+
+    def hold_next_row_read(self) -> asyncio.Event:
+        self._release = asyncio.Event()
+        return self._release
+
+    async def find_many(self, where: object = None, take: int | None = None) -> list[LiteLLM_EndUserTable]:
+        """The restricted-customer registry: a customer with a budget is listed in it."""
+        self._answer()
+        return [self.row]
+
+    async def find_unique(self, where: object = None, include: object = None) -> LiteLLM_EndUserTable:
+        self._answer()
+        release: Final = self._release
+        if release is not None:
+            self._release = None
+            self.row_read_held.set()
+            await release.wait()
+        return self.row
+
+
+def _member_and_customer_on_one_row(*extra_budgets: _BudgetRow) -> _FakePrisma:
+    return _FakePrisma(
+        teams=[_team("m1")],
+        memberships=[_membership("m1", "private-b")],
+        budgets=[_budget("private-b", max_budget=100.0), *extra_budgets],
+        customers=[_customer_on("private-b")],
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_customer_read_held_across_the_batch_cannot_keep_the_old_cap_of_the_row_it_shares_with_a_member(
+    monkeypatch,
+):
+    """A row only one membership points at is written in place, so a customer on the same row is held to the new cap
+    too. A read of that customer that took the row before the batch and finishes after must not keep the old cap as
+    its last good entry: the next outage refuses the customer instead of serving it."""
+    from litellm.proxy.auth.auth_checks import get_end_user_object
+    from litellm.proxy.db.exception_handler import LastGoodEntryMissing
+
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    prisma: Final = _member_and_customer_on_one_row()
+    _list_holders_from(monkeypatch, prisma, cache)
+    customer_rows: Final = _HeldCustomerRow(_customer_row("private-b", max_budget=100.0))
+    auth_database: Final = SimpleNamespace(db=SimpleNamespace(litellm_endusertable=customer_rows))
+
+    async def customer() -> LiteLLM_EndUserTable | None:
+        return await get_end_user_object(
+            end_user_id=_CUSTOMER_ID,
+            prisma_client=auth_database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+            user_api_key_cache=cache,
+        )
+
+    release: Final = customer_rows.hold_next_row_read()
+    in_flight: Final = asyncio.create_task(customer())
+    await customer_rows.row_read_held.wait()
+    await _bulk_update(prisma, [{"user_id": "m1", "max_budget_in_team": 10}], cache=cache)
+    release.set()
+    read_before_the_write: Final = await in_flight
+    assert read_before_the_write is not None and read_before_the_write.litellm_budget_table is not None
+    assert read_before_the_write.litellm_budget_table.max_budget == 100.0
+    assert prisma.db.litellm_budgettable.rows["private-b"].max_budget == 10.0
+    assert await _customer_entry(cache) is None
+    for key in (end_user_cache_key(_CUSTOMER_ID), end_user_restricted_registry_cache_key()):
+        await cache.async_delete_cache(key)
+    customer_rows.stopped = True
+
+    with pytest.raises(LastGoodEntryMissing):
+        await customer()
+
+
+@pytest.mark.asyncio
+async def test_a_batch_writing_a_row_a_customer_shares_answers_503_and_writes_nothing_when_redis_cannot_record_it(
+    monkeypatch,
+):
+    """Redis becomes unreachable once the customer on the member's row is listed among that row's holders, so the
+    customer's revocation cannot be recorded and the row it shares with the member is left as it was."""
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis: Final = fake_redis_cache()
+    cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+    prisma: Final = _member_and_customer_on_one_row()
+    _list_holders_from(monkeypatch, prisma, cache)
+    await _warm_customer(cache, "private-b", max_budget=100.0)
+    customers: Final = prisma.db.litellm_endusertable
+    list_customers: Final = customers.find_many
+
+    async def list_customers_then_lose_redis(where: Mapping[str, object]) -> list[_HolderRow]:
+        listed: Final = await list_customers(where=where)
+        redis.server.connected = False
+        return listed
+
+    monkeypatch.setattr(customers, "find_many", list_customers_then_lose_redis)
+
+    with pytest.raises(ManagementProblem) as refused:
+        await _bulk_update(prisma, [{"user_id": "m1", "max_budget_in_team": 10}], cache=cache)
+
+    assert refused.value.problem.status == 503
+    assert prisma.db.litellm_budgettable.rows["private-b"].max_budget == 100.0
+
+
+@pytest.mark.asyncio
+async def test_with_last_good_entries_off_a_batch_reads_no_holder_and_writes_while_redis_is_down(monkeypatch):
+    """Nothing is revoked with the setting off, so the batch makes the reads it always made and Redis being down does
+    not stop it."""
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis: Final = fake_redis_cache()
+    redis.server.connected = False
+    cache: Final = UserApiKeyCache(redis_cache=redis.cache)
+    prisma: Final = _member_and_customer_on_one_row()
+    _list_holders_from(monkeypatch, prisma, cache)
+
+    results = await _bulk_update(prisma, [{"user_id": "m1", "max_budget_in_team": 10}], cache=cache)
+
+    assert [(r.success, r.max_budget) for r in results] == [(True, 10.0)]
+    assert prisma.db.litellm_budgettable.rows["private-b"].max_budget == 10.0
+    members_of_the_team: Final = {"team_id": TEAM_ID, "user_id": {"in": ["m1"]}}
+    assert prisma.db.litellm_teammembership.reads == [
+        members_of_the_team,
+        {"budget_id": {"in": ["private-b"]}},
+        members_of_the_team,
+    ]
+    # One of the tables only the holder read of a budget row lists; the keys are read by the eviction as before
+    assert prisma.db.litellm_endusertable.reads == []
+
+
+@pytest.mark.asyncio
+async def test_a_member_moved_to_another_row_after_its_holders_were_read_refuses_the_batch_and_writes_nothing(
+    monkeypatch,
+):
+    """The holders revoked before the transaction are those of the row the member pointed at then; a member moved to
+    another row in between would have that row written with none of its holders revoked."""
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    prisma: Final = _member_and_customer_on_one_row(_budget("other-b", max_budget=50.0))
+    _list_holders_from(monkeypatch, prisma, cache)
+    memberships: Final = prisma.db.litellm_teammembership
+    read: Final = memberships.find_many
+
+    async def read_then_move_the_member(
+        where: Mapping[str, object], include: Mapping[str, bool] | None = None
+    ) -> list[_MembershipRow]:
+        rows: Final = await read(where=where, include=include)
+        if where == {"budget_id": "private-b"}:
+            memberships.rows[0] = memberships.rows[0].model_copy(update={"budget_id": "other-b"})
+        return rows
+
+    monkeypatch.setattr(memberships, "find_many", read_then_move_the_member)
+
+    with pytest.raises(ManagementProblem) as refused:
+        await _bulk_update(prisma, [{"user_id": "m1", "max_budget_in_team": 10}], cache=cache)
+
+    assert refused.value.problem.status == 409
+    assert {budget_id: row.max_budget for budget_id, row in prisma.db.litellm_budgettable.rows.items()} == {
+        "private-b": 100.0,
+        "other-b": 50.0,
+    }
 
 
 @pytest.mark.asyncio

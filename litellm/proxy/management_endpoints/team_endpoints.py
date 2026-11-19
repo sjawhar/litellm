@@ -185,6 +185,7 @@ from litellm.proxy.management_helpers.object_permission_utils import (  # noqa: 
     enforce_all_proxy_mcp_servers_grant_is_admin_only,
     handle_update_object_permission_common,
     invalidate_cached_object_permissions,
+    object_permission_holder_keys,
     set_object_permission,
 )
 from litellm.proxy.management_helpers.team_member_permission_checks import (
@@ -1953,9 +1954,11 @@ async def fetch_and_validate_organization(
     llm_router: Router | None,
     prisma_client: PrismaClient,
     user_api_key_dict: UserAPIKeyAuth | None = None,
-) -> "prisma_models.LiteLLM_OrganizationTable":
+) -> LiteLLM_OrganizationTableWithMembers:
     """
-    Fetch and validate an organization for team update operations.
+    Fetch and validate an organization for team update operations. It writes nothing: the members a proxy admin's
+    move adds to the organization (``_auto_add_team_members_to_organization``) are added by the caller once the
+    request's checks passed and its last good entries are revoked.
 
     Args:
         organization_id: The organization ID to fetch
@@ -1964,7 +1967,7 @@ async def fetch_and_validate_organization(
         prisma_client: The Prisma database client
 
     Returns:
-        The organization row from the database
+        The validated organization, with its members
 
     Raises:
         HTTPException: If llm_router is None, organization not found, or validation fails
@@ -1992,14 +1995,7 @@ async def fetch_and_validate_organization(
         is_proxy_admin=is_proxy_admin,
     )
 
-    if is_proxy_admin:
-        await _auto_add_team_members_to_organization(
-            team=LiteLLM_TeamTable.model_validate(existing_team_row.model_dump()),
-            organization=organization,
-            prisma_client=prisma_client,
-        )
-
-    return organization_row
+    return organization
 
 
 def validate_team_org_change(
@@ -2139,58 +2135,47 @@ async def _evict_created_membership_caches(
     )
 
 
-# Metadata-backed fields that set a limit or decide how one binds; the others set access, expiry, caching or estimates
-TEAM_METADATA_LIMIT_FIELDS: Final = frozenset(
-    {
-        "model_rpm_limit",
-        "model_tpm_limit",
-        "model_itpm_limit",
-        "model_otpm_limit",
-        "mcp_rpm_limit",
-        "tag_rpm_limit",
-        "rpm_limit_type",
-        "tpm_limit_type",
-        "temp_budget_increase",
-        "temp_budget_expiry",
-        "throttle_on_budget_exceeded",
-        "end_user_budget_id",
-    }
-)
-
-# /team/update fields a last good entry carries as a limit: the team's own, and every key's copy of the team's limits.
-# The member default budget fields count too: creating that budget writes its id into the team's metadata.
-TEAM_BUDGET_FIELDS: Final = frozenset(
-    {
-        "max_budget",
-        "soft_budget",
-        "tpm_limit",
-        "rpm_limit",
-        "tpd_limit",
-        "budget_duration",
-        "budget_limits",
-        "model_max_budget",
-        "team_member_budget",
-        "team_member_rpm_limit",
-        "team_member_tpm_limit",
-        "team_member_budget_duration",
-        *TEAM_METADATA_LIMIT_FIELDS,
-    }
+# /team/update fields no request-path check reads from a team's or a key's last good entry: only /team/member_add and
+# key generation read them, each on its way to a database write
+TEAM_FIELDS_NOT_ENFORCED: Final = frozenset({"default_team_member_models", "team_member_key_duration"})
+# Team columns the key's combined view leaves out, so no key's last good entry embeds them; the team's own entry does
+TEAM_FIELDS_NO_KEY_ENTRY_EMBEDS: Final = frozenset(
+    {"budget_duration", "budget_limits", "router_settings", "access_group_ids", *TEAM_FIELDS_NOT_ENFORCED}
 )
 
 
-def team_update_changes_budget(data: UpdateTeamRequest, stored_metadata: object) -> bool:
-    """Whether a /team/update changes a budget or limit a last good entry carries: it sets a field of
-    ``TEAM_BUDGET_FIELDS``, or its ``metadata``, which replaces the stored one, gives a key of
-    ``TEAM_METADATA_LIMIT_FIELDS`` another value than the stored metadata holds."""
-    if not TEAM_BUDGET_FIELDS.isdisjoint(data.model_fields_set):
-        return True
-    if "metadata" not in data.model_fields_set:
-        return False
-    sent: Final[Mapping[str, object]] = data.metadata or MappingProxyType({})  # pyright: ignore[reportUnknownMemberType]  # request models declare `metadata` as bare dict
-    stored: Final[Mapping[str, object]] = (
-        stored_metadata if isinstance(stored_metadata, Mapping) else MappingProxyType({})
+def _team_metadata_as_written(metadata: object) -> Mapping[str, object]:
+    """The metadata without the system-managed keys, which a /team/update neither takes from the caller nor drops."""
+    if not isinstance(metadata, Mapping):
+        return MappingProxyType({})
+    view: Final = cast(  # cast-ok: stored and sent team metadata are JSON objects keyed by name
+        "Mapping[str, object]", metadata
     )
-    return any(sent.get(field) != stored.get(field) for field in TEAM_METADATA_LIMIT_FIELDS)
+    return MappingProxyType(
+        {key: value for key, value in view.items() if key not in TeamMemberBudgetHandler.SYSTEM_MANAGED_METADATA_KEYS}
+    )
+
+
+def _team_update_changed_fields(data: UpdateTeamRequest, stored_metadata: object) -> frozenset[str]:
+    """The fields a /team/update sends, ``metadata`` only where it differs from the stored one, which it replaces."""
+    sent: Final = frozenset(data.model_fields_set - {"team_id"})
+    sent_metadata: Final[object] = data.metadata  # pyright: ignore[reportUnknownMemberType]  # request models declare `metadata` as bare dict
+    if "metadata" in sent and _team_metadata_as_written(sent_metadata) == _team_metadata_as_written(stored_metadata):
+        return sent - {"metadata"}
+    return sent
+
+
+def team_update_changes_team_entry(data: UpdateTeamRequest, stored_metadata: object) -> bool:
+    """Fail-closed: the team's last good entries carry its whole row, so any changed field other than
+    ``TEAM_FIELDS_NOT_ENFORCED`` revokes them."""
+    return not _team_update_changed_fields(data, stored_metadata) <= TEAM_FIELDS_NOT_ENFORCED
+
+
+def team_update_changes_key_entries(data: UpdateTeamRequest, stored_metadata: object) -> bool:
+    """Fail-closed: a key's last good entry embeds its team's limits, models, alias, organization, metadata, blocked
+    flag, permission id and model aliases, and its membership's budget, so any changed field other than
+    ``TEAM_FIELDS_NO_KEY_ENTRY_EMBEDS`` revokes the entries of the team's keys."""
+    return not _team_update_changed_fields(data, stored_metadata) <= TEAM_FIELDS_NO_KEY_ENTRY_EMBEDS
 
 
 async def _team_key_tokens(
@@ -2426,6 +2411,8 @@ async def update_team(
                         },
                     )
 
+        # Set when a proxy admin moves the team: its missing members join the organization after the revocation below
+        organization_to_join: LiteLLM_OrganizationTableWithMembers | None = None
         if data.organization_id is not None and len(data.organization_id) > 0:  # allow unsetting the organization_id
             # If the caller is relocating the team to a different org, they
             # must also be PROXY_ADMIN or an org-admin of the DESTINATION org.
@@ -2462,13 +2449,15 @@ async def update_team(
                         },
                     )
 
-            await fetch_and_validate_organization(
+            destination_organization: Final = await fetch_and_validate_organization(
                 organization_id=data.organization_id,
                 existing_team_row=existing_team_row,
                 llm_router=llm_router,
                 prisma_client=prisma_client,
                 user_api_key_dict=user_api_key_dict,
             )
+            if user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN:
+                organization_to_join = destination_organization  # rebind-ok: only a proxy admin's move adds members
         elif data.organization_id is not None and len(data.organization_id) == 0:
             # unsetting the organization_id
             data.organization_id = None
@@ -2570,14 +2559,49 @@ async def update_team(
                     },
                 }
 
+        # A check, so it refuses before anything is revoked or written
+        if data.object_permission is not None:
+            await enforce_all_proxy_mcp_servers_grant_is_admin_only(
+                requested_mcp_servers=data.object_permission.mcp_servers,
+                existing_object_permission_id=existing_team_row.object_permission_id,
+                is_proxy_admin=user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN,
+                prisma_client=prisma_client,
+            )
+
         # After the request's checks and before the budget and team writes, so no block or old limit outlives the change
-        changes_budget: Final = team_update_changes_budget(data, existing_team_row.metadata)
-        if data.blocked is True or changes_budget:
+        changes_key_entries: Final = team_update_changes_key_entries(data, existing_team_row.metadata)
+        if changes_key_entries or team_update_changes_team_entry(data, existing_team_row.metadata):
             team_key_tokens: Final = (
-                await _team_key_tokens(prisma_client, data.team_id, user_api_key_cache) if changes_budget else ()
+                await _team_key_tokens(prisma_client, data.team_id, user_api_key_cache) if changes_key_entries else ()
+            )
+            # The member default budget write and its membership backfill reach every member's membership entry
+            member_entries: Final = (
+                tuple(
+                    team_membership_auth_cache_key(team_id=data.team_id, user_id=user_id)
+                    for user_id in _member_user_ids(existing_team_row.members_with_roles)
+                )
+                if _team_member_fields_in_request and existing_team_row.members_with_roles
+                else ()
+            )
+            permission_holders: Final = (
+                await object_permission_holder_keys(
+                    existing_team_row.object_permission_id, prisma_client, user_api_key_cache
+                )
+                if data.object_permission is not None
+                else ()
             )
             await revoke_last_good(
-                user_api_key_cache, (*team_cache_keys(data.team_id, existing_team.team_alias), *team_key_tokens)
+                user_api_key_cache,
+                tuple(
+                    dict.fromkeys(
+                        (
+                            *team_cache_keys(data.team_id, existing_team.team_alias),
+                            *team_key_tokens,
+                            *member_entries,
+                            *permission_holders,
+                        )
+                    )
+                ),
             )
 
         if _team_member_fields_in_request and TeamMemberBudgetHandler.should_create_budget(
@@ -2624,12 +2648,6 @@ async def update_team(
 
         # Check object permission
         if data.object_permission is not None:
-            await enforce_all_proxy_mcp_servers_grant_is_admin_only(
-                requested_mcp_servers=data.object_permission.mcp_servers,
-                existing_object_permission_id=existing_team_row.object_permission_id,
-                is_proxy_admin=user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN,
-                prisma_client=prisma_client,
-            )
             updated_kv = await handle_update_object_permission(
                 data_json=updated_kv,
                 existing_team_row=existing_team_row,
@@ -2659,6 +2677,11 @@ async def update_team(
 
         updated_kv = prisma_client.jsonify_team_object(db_data=updated_kv)
         team_update_data: Final[Mapping[str, object]] = updated_kv
+        # After every revocation, the member budget's and the permission's included, so a refused move joins no member
+        if organization_to_join is not None:
+            await _auto_add_team_members_to_organization(
+                team=existing_team, organization=organization_to_join, prisma_client=prisma_client
+            )
         team_row: Final = await _write_team_update(prisma_client, data.team_id, team_update_data, max_budget_guard)
 
         if team_row is None or team_row.team_id is None:
@@ -3820,7 +3843,19 @@ async def _team_member_delete(
             hashed_tokens=tuple(key.token for key in keys_to_delete),
             prisma_client=prisma_client,
         )
-        await revoke_last_good(user_api_key_cache, tuple(key.token for key in keys_to_delete))
+        # The roster rides on the team's entry, the team on each user's entry and the member limits on each membership's
+        await revoke_last_good(
+            user_api_key_cache,
+            (
+                *(team_cache_keys(data.team_id, existing_team_row.team_alias) if removed_team_members else ()),
+                *(user.user_id for user in stale_user_rows),
+                *(
+                    team_membership_auth_cache_key(team_id=data.team_id, user_id=user_id)
+                    for user_id in sorted(user_ids_to_delete)
+                ),
+                *(key.token for key in keys_to_delete),
+            ),
+        )
 
         if removed_team_members:
             await _team_tx_db(tx).update(
@@ -4007,19 +4042,26 @@ async def team_member_update(
 
     ### upsert new budget
     budget_patch: Final = member_budget_patch(data)
-    # A private budget row is written in place, so its other holders change too; the shared default is cloned instead
+    # A private budget row is written in place, so its other holders change too; the shared default is cloned instead.
+    # Only their last good entries need them listed, so with the setting off nothing more is read or evicted.
     budget_written_in_place: Final = (
         identified_budget_id
-        if budget_patch and identified_budget_id is not None and identified_budget_id != team_default_budget_id
+        if serves_last_good_entries(user_api_key_cache)
+        and budget_patch
+        and identified_budget_id is not None
+        and identified_budget_id != team_default_budget_id
         else None
     )
     budget_holders: Final = (
         await read_budget_holders(budget_written_in_place) if budget_written_in_place is not None else BudgetHolders()
     )
-    if budget_patch:
+    # The team's entry carries the roster with each member's role, and each key of the member its row of the roster
+    roster_entries: Final = team_cache_keys(data.team_id, existing_team_row.team_alias) if data.role is not None else ()
+    if budget_patch or roster_entries:
         member_holders: Final = await read_team_member_holders(data.team_id, (received_user_id,))
         await revoke_last_good(
-            user_api_key_cache, tuple(dict.fromkeys((*member_holders.last_good_keys, *budget_holders.last_good_keys)))
+            user_api_key_cache,
+            tuple(dict.fromkeys((*roster_entries, *member_holders.last_good_keys, *budget_holders.last_good_keys))),
         )
     async with prisma_client.tx() as tx:
         role_change: Final = (
@@ -4241,6 +4283,7 @@ async def reset_team_member_budget_fn(
     Drops the member's own budget row link so team-wide changes made through /team/update
     reach them again. Leaves the member with no budget when the team has no default. Spend is untouched.
     """
+    from litellm.proxy.management_endpoints.budget_management_endpoints import read_team_member_holders
     from litellm.proxy.proxy_server import prisma_client, proxy_logging_obj, user_api_key_cache
 
     if prisma_client is None:
@@ -4268,6 +4311,9 @@ async def reset_team_member_budget_fn(
         if team_default_budget_id is not None
         else {"disconnect": True}
     )
+    # The membership's entry and the member's keys carry the budget this re-points, which can be the stricter one
+    member_holders: Final = await read_team_member_holders(team_id, (user_id,))
+    await revoke_last_good(user_api_key_cache, member_holders.last_good_keys)
     await _team_membership_db(prisma_client).update(
         where=membership_where,
         data={"litellm_budget_table": budget_link},

@@ -1173,13 +1173,14 @@ async def set_access_group_budget(
     await _raise_404_if_model_access_group_missing(access_group=access_group, prisma_client=prisma_client)
 
     existing_row: Final = await _model_access_group_budget_row(access_group, prisma_client)
+    # Every field of this request is a budget the group's entry carries, so every PUT revokes it before the first write
+    await revoke_last_good(auth_cache, _model_access_group_cache_keys(access_group))
     budget_id: Final = await handle_budget_for_entity(
         data=data,
         existing_budget_id=existing_row.budget_id if existing_row is not None else None,
         user_api_key_dict=user_api_key_dict,
         prisma_client=prisma_client,
         litellm_proxy_admin_name=litellm_proxy_admin_name,
-        before_relink=lambda: revoke_last_good(auth_cache, _model_access_group_cache_keys(access_group)),
     )
     actor: Final = user_api_key_dict.user_id or litellm_proxy_admin_name
     upsert_data: Final[_ModelAccessGroupBudgetUpsert] = {

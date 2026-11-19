@@ -155,11 +155,16 @@ async def _permission_write(
     existing_id: str | None,
     client: PrismaClient,
 ) -> AgentPermissionWrite | None:
+    from litellm.proxy.common_utils.user_api_key_cache import revoke_last_good
+    from litellm.proxy.proxy_server import user_api_key_cache
+
     raw: Final = incoming.get("object_permission")
     if raw is None:
         return None
     permission: Final = _AGENT_PARAMS_ADAPTER.validate_python(raw)
     prepared: Final = await prepare_object_permission_upsert(permission, existing_id, client)
+    # Returned for the agent's own write, so the other objects linked to the row lose their last good entries first
+    await revoke_last_good(user_api_key_cache, prepared.holder_keys)
     if existing_id is None:
         created: Final[AgentPermissionWrite] = {"create": prepared.record}
         return created

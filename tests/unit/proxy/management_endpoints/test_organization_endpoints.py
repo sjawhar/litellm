@@ -724,8 +724,8 @@ async def test_organization_member_update_budget_omission_and_null_preserve_exis
         row.model_dump.side_effect = dump
         return row
 
-    async def update_budget(*, budget_obj, user_api_key_dict):
-        budget_state.store(budget_obj.max_budget)
+    async def write_budget_update(budget_id, data, holders):
+        budget_state.store(data.get("max_budget"))
 
     mock_db = SimpleNamespace(
         litellm_organizationtable=SimpleNamespace(find_unique=AsyncMock(return_value=SimpleNamespace())),
@@ -739,7 +739,7 @@ async def test_organization_member_update_budget_omission_and_null_preserve_exis
     )
     mock_prisma = SimpleNamespace(db=mock_db)
     monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", mock_prisma)
-    monkeypatch.setattr(organization_endpoints, "update_budget", update_budget)
+    monkeypatch.setattr(organization_endpoints, "write_budget_update", write_budget_update)
     monkeypatch.setattr(
         "litellm.proxy.management_endpoints.organization_endpoints._verify_org_access",
         AsyncMock(),
@@ -813,6 +813,8 @@ async def _run_update_organization_v2(
     existing_object_permission_id=None,
     existing_object_permission_row=None,
     key_rows=(),
+    org_update: Optional[AsyncMock] = None,
+    budget_update: Optional[AsyncMock] = None,
 ):
     from litellm.proxy._types import (
         LitellmUserRoles,
@@ -834,8 +836,8 @@ async def _run_update_organization_v2(
     existing_org.metadata = existing_metadata
 
     mock_prisma_client.db.litellm_organizationtable.find_unique = AsyncMock(return_value=existing_org)
-    mock_prisma_client.db.litellm_organizationtable.update = AsyncMock(return_value=MagicMock())
-    mock_prisma_client.db.litellm_budgettable.update = AsyncMock()
+    mock_prisma_client.db.litellm_organizationtable.update = org_update or AsyncMock(return_value=MagicMock())
+    mock_prisma_client.db.litellm_budgettable.update = budget_update or AsyncMock()
     mock_prisma_client.db.litellm_objectpermissiontable.find_unique = AsyncMock(
         return_value=existing_object_permission_row
     )
@@ -1162,8 +1164,16 @@ async def test_v2_serializes_model_max_budget_on_budget_write(monkeypatch):
 
 
 async def _run_legacy_update_organization(
-    monkeypatch: pytest.MonkeyPatch, *, body: dict[str, object], existing_budget_id: str
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    body: dict[str, object],
+    existing_budget_id: str,
+    existing_object_permission_id: Optional[str] = None,
+    key_rows: tuple[SimpleNamespace, ...] = (),
+    org_update: Optional[AsyncMock] = None,
+    budget_update: Optional[AsyncMock] = None,
 ) -> AsyncMock:
+    """org-1 is the only holder of its budget row besides ``key_rows``, which the key table answers for every read."""
     from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
     from litellm.proxy.management_endpoints import organization_endpoints
     from litellm.proxy.management_endpoints.organization_endpoints import update_organization
@@ -1175,9 +1185,26 @@ async def _run_legacy_update_organization(
     existing_org = MagicMock()
     existing_org.budget_id = existing_budget_id
     existing_org.metadata = {}
+    existing_org.object_permission_id = existing_object_permission_id
     mock_prisma_client.db.litellm_organizationtable.find_unique = AsyncMock(return_value=existing_org)
-    mock_prisma_client.db.litellm_organizationtable.update = AsyncMock(return_value=MagicMock())
-    mock_prisma_client.db.litellm_budgettable.update = AsyncMock()
+    mock_prisma_client.db.litellm_organizationtable.find_many = AsyncMock(
+        return_value=[SimpleNamespace(organization_id="org-1")]
+    )
+    mock_prisma_client.db.litellm_organizationtable.update = org_update or AsyncMock(return_value=MagicMock())
+    mock_prisma_client.db.litellm_budgettable.update = budget_update or AsyncMock()
+    for holder_table in (
+        "litellm_teammembership",
+        "litellm_projecttable",
+        "litellm_endusertable",
+        "litellm_tagtable",
+        "litellm_modelaccessgroupbudgettable",
+    ):
+        getattr(mock_prisma_client.db, holder_table).find_many = AsyncMock(return_value=[])
+    mock_prisma_client.db.litellm_verificationtoken.find_many = AsyncMock(return_value=list(key_rows))
+    mock_prisma_client.db.litellm_objectpermissiontable.find_unique = AsyncMock(return_value=None)
+    mock_prisma_client.db.litellm_objectpermissiontable.upsert = AsyncMock(
+        return_value=SimpleNamespace(object_permission_id=existing_object_permission_id or "permission-1")
+    )
 
     monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", mock_prisma_client)
     monkeypatch.setattr(organization_endpoints, "verify_org_access", AsyncMock())
@@ -1740,34 +1767,295 @@ async def test_v2_update_evicts_the_organization_and_its_last_good_entries(monke
     assert not any((await _org_served_while_the_database_is_stopped(cache, reads, "org-1")).values())
 
 
+def _redis_down_cache(serving: bool):
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis: Final = fake_redis_cache()
+    redis.server.connected = False
+    return UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=serving)
+
+
+_ORG_KEY: Final = "hashed-org-key"
+
+
+def _write_checking_the_org_key_entry(cache, gone_at_write: list[bool]) -> AsyncMock:
+    """A row write that records whether the organization key's last good entry was already revoked when it ran. An
+    eviction after the write cannot make it record True, only a revocation before it."""
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.common_utils.user_api_key_cache import recall_last_good
+
+    async def write(**_: object) -> MagicMock:
+        gone_at_write.append(await recall_last_good(cache, _ORG_KEY, UserAPIKeyAuth) is None)
+        return MagicMock()
+
+    return AsyncMock(side_effect=write)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "body, evicted",
-    [({"max_budget": 1.0}, True), ({"metadata": {"lane": "a"}}, False)],
-    ids=["budget_changed", "budget_untouched"],
+    "version, body, revoked",
+    [
+        # The rate limiter reads the key entry's organization_metadata: parallel_request_limiter_v3.py:2808 and :2805
+        pytest.param("v1", {"model_rpm_limit": {"gpt-4o": 1}}, True, id="v1-model_rpm_limit"),
+        pytest.param("v1", {"metadata": {"model_tpm_limit": {"gpt-4o": 1}}}, True, id="v1-metadata.model_tpm_limit"),
+        pytest.param("v2", {"metadata": {"model_rpm_limit": {"gpt-4o": 1}}}, True, id="v2-metadata.model_rpm_limit"),
+        pytest.param("v2", {"metadata": {"model_tpm_limit": {"gpt-4o": 1}}}, True, id="v2-metadata.model_tpm_limit"),
+        # ... and its organization_rpm_limit and organization_tpm_limit: parallel_request_limiter_v3.py:2787-2795
+        pytest.param("v1", {"rpm_limit": 1}, True, id="v1-rpm_limit"),
+        pytest.param("v2", {"tpm_limit": 1}, True, id="v2-tpm_limit"),
+        # A key's entry embeds no organization models (utils.py:5552-5556): the organization's own entry carries them
+        pytest.param("v1", {"models": ["gpt-4o"]}, False, id="v1-models"),
+        pytest.param("v2", {"models": ["gpt-4o"]}, False, id="v2-models"),
+    ],
 )
-async def test_v2_budget_change_drops_the_last_good_entries_of_the_organizations_keys(
-    monkeypatch, body: dict, evicted: bool
+async def test_organization_update_revokes_its_keys_entries_before_writing_what_they_embed(
+    monkeypatch, version: str, body: dict, revoked: bool
 ):
-    """A key's own entry carries its organization's budget, which a v2 update writes straight to the budget row."""
+    """A key's own entry embeds its organization's metadata, alias and budget row, and the rate limiter enforces the
+    organization's model and request limits from it, so an update of those revokes the keys' entries before its first
+    write. Its models, which no key entry embeds, leave them."""
     from litellm.proxy._types import UserAPIKeyAuth
-    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, recall_last_good, remember_last_good
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, remember_last_good
 
     cache: Final = UserApiKeyCache(serve_last_good_entries=True)
-    await remember_last_good(
-        cache, "hashed-org-key", UserAPIKeyAuth(token="hashed-org-key", organization_max_budget=50.0)
-    )
+    await remember_last_good(cache, _ORG_KEY, UserAPIKeyAuth(token=_ORG_KEY, organization_rpm_limit=5))
     monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
+    gone_at_write: Final[list[bool]] = []
+    key_rows: Final = (SimpleNamespace(token=_ORG_KEY),)
+    org_update: Final = _write_checking_the_org_key_entry(cache, gone_at_write)
+    budget_update: Final = _write_checking_the_org_key_entry(cache, gone_at_write)
 
-    await _run_update_organization_v2(
-        monkeypatch,
-        body=body,
-        existing_budget_id="b-org",
-        existing_metadata=None,
-        key_rows=(SimpleNamespace(token="hashed-org-key"),),
+    if version == "v1":
+        await _run_legacy_update_organization(
+            monkeypatch,
+            body={"organization_id": "org-1", **body},
+            existing_budget_id="b-org",
+            key_rows=key_rows,
+            org_update=org_update,
+            budget_update=budget_update,
+        )
+    else:
+        await _run_update_organization_v2(
+            monkeypatch,
+            body=body,
+            existing_budget_id="b-org",
+            existing_metadata=None,
+            key_rows=key_rows,
+            org_update=org_update,
+            budget_update=budget_update,
+        )
+
+    assert gone_at_write
+    assert all(gone is revoked for gone in gone_at_write)
+
+
+def test_an_organization_field_nobody_classified_revokes_the_keys_entries():
+    from litellm.proxy.management_endpoints.organization_endpoints import (
+        ORG_FIELDS_NO_KEY_ENTRY_EMBEDS,
+        organization_update_changes_key_entries,
     )
 
-    assert (await recall_last_good(cache, "hashed-org-key", UserAPIKeyAuth) is None) is evicted
+    assert organization_update_changes_key_entries({"models", "a_field_nobody_classified"})
+    assert not organization_update_changes_key_entries(ORG_FIELDS_NO_KEY_ENTRY_EMBEDS)
+
+
+# One body per field of the v2 request: the organization's own entries carry its whole row, so no field is harmless
+_V2_BODY_PER_FIELD: Final = MappingProxyType(
+    {
+        "organization_alias": {"organization_alias": "renamed"},
+        "models": {"models": ["gpt-4o"]},
+        "metadata": {"metadata": {"lane": "a"}},
+        "tpm_limit": {"tpm_limit": 1},
+        "rpm_limit": {"rpm_limit": 1},
+        "max_budget": {"max_budget": 1.0},
+        "soft_budget": {"soft_budget": 1.0},
+        "max_parallel_requests": {"max_parallel_requests": 1},
+        "model_max_budget": {"model_max_budget": {"gpt-4o": {"max_budget": 10}}},
+        "budget_duration": {"budget_duration": "30d"},
+        "object_permission": {"object_permission": {"vector_stores": ["vs-1"]}},
+    }
+)
+
+
+def test_the_v2_bodies_cover_every_field_of_the_request():
+    from litellm.proxy._types import OrganizationUpdateRequestV2
+
+    assert set(_V2_BODY_PER_FIELD) == set(OrganizationUpdateRequestV2.model_fields)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", sorted(_V2_BODY_PER_FIELD))
+async def test_v2_update_of_any_field_writes_nothing_when_redis_cannot_record_the_revocation(monkeypatch, field: str):
+    """Every update revokes the organization's own entries before its transaction, so while last good entries are
+    served a Redis that cannot record that leaves the permission, the budget and the organization as they were."""
+    import litellm.proxy.proxy_server as proxy_server
+
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints.validate_model_max_budget",
+        lambda _: None,
+    )
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", _redis_down_cache(serving=True))
+
+    with pytest.raises(HTTPException) as refused:
+        await _run_update_organization_v2(
+            monkeypatch, body=dict(_V2_BODY_PER_FIELD[field]), existing_budget_id="b-org", existing_metadata=None
+        )
+
+    assert refused.value.status_code == 503
+    client: Final = cast(AsyncMock, proxy_server.prisma_client)
+    client.tx.litellm_objectpermissiontable.upsert.assert_not_awaited()
+    client.db.litellm_budgettable.update.assert_not_awaited()
+    client.db.litellm_organizationtable.update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@_SERVING
+async def test_v1_update_of_permission_and_budget_writes_nothing_when_redis_cannot_record_the_revocation(
+    monkeypatch, serving: bool
+):
+    """The legacy update upserts the permission row before it writes the budget row in place, so its revocation comes
+    before the upsert: while last good entries are served, a Redis that cannot record it leaves the permission, the
+    budget and the organization as they were. With them off, nothing is revoked and all three are written."""
+    import litellm.proxy.proxy_server as proxy_server
+
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", _redis_down_cache(serving))
+
+    async def update() -> None:
+        await _run_legacy_update_organization(
+            monkeypatch,
+            body={"organization_id": "org-1", "object_permission": {"vector_stores": ["vs-1"]}, "max_budget": 1.0},
+            existing_budget_id="b-org",
+            existing_object_permission_id="permission-1",
+        )
+
+    def tables() -> AsyncMock:
+        return cast(AsyncMock, proxy_server.prisma_client).db
+
+    if not serving:
+        await update()
+        tables().litellm_objectpermissiontable.upsert.assert_awaited_once()
+        tables().litellm_budgettable.update.assert_awaited_once()
+        tables().litellm_organizationtable.update.assert_awaited_once()
+        return
+    with pytest.raises(HTTPException) as refused:
+        await update()
+
+    assert refused.value.status_code == 503
+    tables().litellm_objectpermissiontable.upsert.assert_not_awaited()
+    tables().litellm_budgettable.update.assert_not_awaited()
+    tables().litellm_organizationtable.update.assert_not_awaited()
+
+
+def _wire_organization_member(monkeypatch, cache, membership_budget_id: Optional[str]) -> MagicMock:
+    """org-1 with member-1, an organization admin whose membership points at ``membership_budget_id``; every other
+    holder table answers empty. Returns the client to inspect the membership and budget writes."""
+    from datetime import datetime
+
+    from litellm.proxy.management_endpoints import organization_endpoints
+
+    def membership_row(**_: object) -> MagicMock:
+        row = MagicMock()
+        row.budget_id = membership_budget_id
+        row.model_dump.return_value = {
+            "user_id": "member-1",
+            "organization_id": "org-1",
+            "user_role": "org_admin",
+            "budget_id": membership_budget_id,
+            "created_at": datetime(2024, 1, 1),
+            "updated_at": datetime(2024, 1, 1),
+        }
+        return row
+
+    prisma: Final = MagicMock()
+    prisma.db.litellm_organizationtable.find_unique = AsyncMock(return_value=SimpleNamespace())
+    prisma.db.litellm_usertable.find_unique = AsyncMock(return_value=SimpleNamespace(user_role="internal_user"))
+    prisma.db.litellm_organizationmembership.find_unique = AsyncMock(side_effect=membership_row)
+    prisma.db.litellm_organizationmembership.update = AsyncMock()
+    prisma.db.litellm_organizationmembership.delete = AsyncMock(side_effect=membership_row)
+    prisma.db.litellm_budgettable.update = AsyncMock()
+    for holder_table in (
+        "litellm_organizationtable",
+        "litellm_teammembership",
+        "litellm_projecttable",
+        "litellm_endusertable",
+        "litellm_tagtable",
+        "litellm_modelaccessgroupbudgettable",
+        "litellm_verificationtoken",
+    ):
+        getattr(prisma.db, holder_table).find_many = AsyncMock(return_value=[])
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", prisma)
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
+    monkeypatch.setattr(organization_endpoints, "verify_org_access", AsyncMock())
+    return prisma
+
+
+_ORG_MEMBER_ADMIN: Final = MappingProxyType({"user_id": "admin", "user_role": "proxy_admin"})
+
+
+@pytest.mark.asyncio
+@_SERVING
+@pytest.mark.parametrize(
+    "change",
+    [{"role": "internal_user"}, {"role": "internal_user", "max_budget_in_organization": 5.0}],
+    ids=["role", "role-and-budget-in-place"],
+)
+async def test_member_update_writes_nothing_when_redis_cannot_record_the_revocation(
+    monkeypatch, serving: bool, change: dict
+):
+    """The organization route checks read a member's role from the user's own entry (auth_checks_organization.py:131
+    and :169), and a budget row written in place may have other holders, so both are revoked before the role write:
+    while last good entries are served, a Redis that cannot record it leaves the membership and its budget as they
+    were. With them off, both are written as before."""
+    from litellm.proxy._types import OrganizationMemberUpdateRequest, UserAPIKeyAuth
+    from litellm.proxy.management_endpoints.organization_endpoints import organization_member_update
+
+    prisma: Final = _wire_organization_member(monkeypatch, _redis_down_cache(serving), "b-member")
+
+    async def update() -> None:
+        await organization_member_update(
+            data=OrganizationMemberUpdateRequest(organization_id="org-1", user_id="member-1", **change),
+            user_api_key_dict=UserAPIKeyAuth(**_ORG_MEMBER_ADMIN),
+        )
+
+    if not serving:
+        await update()
+        prisma.db.litellm_organizationmembership.update.assert_awaited()
+        assert prisma.db.litellm_budgettable.update.await_count == ("max_budget_in_organization" in change)
+        return
+    with pytest.raises(HTTPException) as refused:
+        await update()
+
+    assert refused.value.status_code == 503
+    prisma.db.litellm_organizationmembership.update.assert_not_awaited()
+    prisma.db.litellm_budgettable.update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@_SERVING
+async def test_member_removal_writes_nothing_when_redis_cannot_record_the_revocation(monkeypatch, serving: bool):
+    """A removed member's user entry still lists the membership and its role until it is revoked, so the removal
+    revokes it first: while last good entries are served, a Redis that cannot record it keeps the membership."""
+    from litellm.proxy._types import OrganizationMemberDeleteRequest, UserAPIKeyAuth
+    from litellm.proxy.management_endpoints.organization_endpoints import organization_member_delete
+
+    prisma: Final = _wire_organization_member(monkeypatch, _redis_down_cache(serving), None)
+
+    async def remove() -> None:
+        await organization_member_delete(
+            data=OrganizationMemberDeleteRequest(organization_id="org-1", user_id="member-1"),
+            user_api_key_dict=UserAPIKeyAuth(**_ORG_MEMBER_ADMIN),
+        )
+
+    if not serving:
+        await remove()
+        prisma.db.litellm_organizationmembership.delete.assert_awaited_once()
+        return
+    with pytest.raises(HTTPException) as refused:
+        await remove()
+
+    assert refused.value.status_code == 503
+    prisma.db.litellm_organizationmembership.delete.assert_not_awaited()
 
 
 @pytest.mark.asyncio

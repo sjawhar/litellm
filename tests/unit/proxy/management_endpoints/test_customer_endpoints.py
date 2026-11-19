@@ -1,5 +1,7 @@
 import asyncio
+from collections.abc import Awaitable
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Final
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,6 +16,7 @@ from fastapi.testclient import TestClient
 from litellm.proxy._types import (
     BlockUsers,
     LiteLLM_BudgetTable,
+    LiteLLM_BudgetTableFull,
     LiteLLM_EndUserTable,
     LitellmUserRoles,
     NewCustomerRequest,
@@ -22,7 +25,11 @@ from litellm.proxy._types import (
 )
 from litellm.proxy.auth.user_api_key_auth import UserAPIKeyAuth, user_api_key_auth
 from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
-from litellm.proxy.management_endpoints.customer_endpoints import _should_update_field, router
+from litellm.proxy.management_endpoints.customer_endpoints import (
+    END_USER_UNENFORCED_FIELDS,
+    _should_update_field,
+    router,
+)
 from tests.unit.caching.fake_redis_cache import fake_redis_cache
 from litellm.types.proxy.management_endpoints.common_daily_activity import (
     SpendAnalyticsPaginatedResponse,
@@ -1173,7 +1180,8 @@ def test_customer_delete_invalidates_end_user_and_registry_caches(mock_prisma_cl
 class _EndUserRows:
     """The end-user table a block, a create or an update writes and auth reads. While ``stopped`` every read fails the
     way an unreachable Postgres does; ``pause_next_registry_read`` holds the next restricted-registry read once it has
-    its rows, and ``pause_next_row_read`` the next read of one customer's row once it has the row."""
+    its rows, and ``pause_next_row_read`` the next read of one customer's row once it has the row. ``holder_reads``
+    counts the reads that list a budget's customers."""
 
     def __init__(self, *rows: LiteLLM_EndUserTable) -> None:
         self.rows = {row.user_id: row for row in rows}
@@ -1182,6 +1190,7 @@ class _EndUserRows:
         self.row_read_held = asyncio.Event()
         self._release: asyncio.Event | None = None
         self._row_release: asyncio.Event | None = None
+        self.holder_reads = 0
 
     def _answer(self) -> None:
         if self.stopped:
@@ -1215,6 +1224,10 @@ class _EndUserRows:
         self.rows[row.user_id] = row
         return row
 
+    async def delete_many(self, where: dict[str, dict[str, list[str]]]) -> int:
+        self._answer()
+        return len([user_id for user_id in where["user_id"]["in"] if self.rows.pop(user_id, None) is not None])
+
     async def find_first(self, where: dict[str, str], include: object = None) -> LiteLLM_EndUserTable | None:
         self._answer()
         return self.rows.get(where["user_id"])
@@ -1232,6 +1245,7 @@ class _EndUserRows:
         self._answer()
         if isinstance(where, dict) and "budget_id" in where:
             # A budget's holder read: the customers on that budget, never held like a registry read
+            self.holder_reads += 1
             return [row for row in self.rows.values() if row.budget_id == where["budget_id"]]
         restricted = [row for row in self.rows.values() if row.blocked or row.models or row.budget_id]
         release = self._release
@@ -1256,16 +1270,18 @@ class _BudgetRows:
 
 class _EmptyTable:
     """A table with no row for any lookup: a budget's holders other than customers, or the user table. While ``stopped``
-    every read fails the way an unreachable Postgres does."""
+    every read fails the way an unreachable Postgres does; ``reads`` counts the lists asked of it."""
 
     def __init__(self) -> None:
         self.stopped = False
+        self.reads = 0
 
     def _answer(self) -> None:
         if self.stopped:
             raise httpx.ConnectError("All connection attempts failed")
 
     async def find_many(self, where: object = None, take: int | None = None) -> list[object]:
+        self.reads += 1
         self._answer()
         return []
 
@@ -1288,20 +1304,20 @@ def _serve_end_user_rows(
     cache: UserApiKeyCache,
     budgets: _BudgetRows | None = None,
     keys: _EmptyTable | None = None,
-) -> None:
-    """The customer and budget tables, and every other table a budget's holders are read from, holding none."""
-    monkeypatch.setattr(
-        "litellm.proxy.proxy_server.prisma_client",
-        SimpleNamespace(
-            db=SimpleNamespace(
-                litellm_endusertable=rows,
-                litellm_budgettable=budgets,
-                litellm_verificationtoken=keys or _EmptyTable(),
-                **{table: _EmptyTable() for table in _OTHER_BUDGET_HOLDER_TABLES},
-            )
-        ),
+) -> SimpleNamespace:
+    """The customer and budget tables, and every other table a budget's holders are read from, holding none. Returns
+    the database."""
+    database: Final = SimpleNamespace(
+        db=SimpleNamespace(
+            litellm_endusertable=rows,
+            litellm_budgettable=budgets,
+            litellm_verificationtoken=keys or _EmptyTable(),
+            **{table: _EmptyTable() for table in _OTHER_BUDGET_HOLDER_TABLES},
+        )
     )
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", database)
     monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
+    return database
 
 
 @pytest.mark.asyncio
@@ -1482,13 +1498,37 @@ async def test_after_a_customer_gains_a_restriction_a_registry_read_in_flight_ca
         await customer()
 
 
+class _DbBudgetRow(LiteLLM_BudgetTableFull):
+    """A budget row with every column the database returns: each row has its audit columns, and the customer response
+    requires ``created_at``."""
+
+    created_by: str
+    updated_at: datetime
+    updated_by: str
+
+
+class _CustomerRowWithBudget(LiteLLM_EndUserTable):
+    """A customer row as a read or write with ``include={"litellm_budget_table": True}`` returns it: with its whole
+    budget row, which a dump of ``LiteLLM_EndUserTable`` would cut down to the writable budget fields."""
+
+    litellm_budget_table: _DbBudgetRow | None = None  # pyright: ignore[reportIncompatibleVariableOverride]  # whole row
+
+
 def _budgeted_customer(*others: str) -> tuple[_EndUserRows, _BudgetRows]:
-    """Customer c1, and each of ``others``, on one budget b1 with max_budget 10."""
-    budget: Final = LiteLLM_BudgetTable(budget_id="b1", max_budget=10.0)
+    """Customer c1, and each of ``others``, on one budget b1 with max_budget 10, as the database returns them."""
+    created: Final = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    budget: Final = _DbBudgetRow(
+        budget_id="b1",
+        max_budget=10.0,
+        created_at=created,
+        created_by="admin",
+        updated_at=created,
+        updated_by="admin",
+    )
     return (
         _EndUserRows(
             *(
-                LiteLLM_EndUserTable(user_id=user_id, blocked=False, budget_id="b1", litellm_budget_table=budget)
+                _CustomerRowWithBudget(user_id=user_id, blocked=False, budget_id="b1", litellm_budget_table=budget)
                 for user_id in ("c1", *others)
             )
         ),
@@ -1606,24 +1646,30 @@ async def test_customer_budget_update_answers_503_and_writes_nothing_when_a_hold
 
 
 @pytest.mark.asyncio
-async def test_customer_shared_budget_update_writes_and_evicts_its_holders_with_redis_down_and_the_setting_off(
+async def test_customer_shared_budget_update_with_last_good_entries_off_reads_no_holder_and_writes_while_redis_is_down(
     monkeypatch,
 ):
-    """With last good entries not served nothing is revoked, so Redis being down refuses nothing, and the other
-    customer on the budget is still evicted after the write."""
+    """With last good entries not served nothing is revoked, so Redis being down refuses nothing, and the update lists
+    none of its budget's holders and evicts none of them: it reads and evicts what it did before last good entries
+    existed, which leaves the other customer on the budget cached."""
     from litellm.proxy.management_endpoints.customer_endpoints import update_end_user
 
-    redis = fake_redis_cache()
+    redis: Final = fake_redis_cache()
     redis.server.connected = False
     rows, budgets = _budgeted_customer("c2")
-    cache = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=False)
-    _serve_end_user_rows(monkeypatch, rows, cache, budgets)
-    await cache.async_set_cache("end_user_id:c2", rows.rows["c2"], local_only=True)
+    cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=False)
+    database: Final = _serve_end_user_rows(monkeypatch, rows, cache, budgets)
+    # What auth caches for c2: the row as LiteLLM_EndUserTable
+    entry: Final = LiteLLM_EndUserTable.model_validate(rows.rows["c2"].model_dump())
+    await cache.async_set_cache("end_user_id:c2", entry, local_only=True)
 
     await update_end_user(data=UpdateCustomerRequest(user_id="c1", max_budget=5.0), user_api_key_dict=_ADMIN)
-    cached: Final = await cache.async_get_cache("end_user_id:c2", local_only=True)
+    holder_reads: Final = rows.holder_reads + sum(
+        getattr(database.db, table).reads for table in ("litellm_verificationtoken", *_OTHER_BUDGET_HOLDER_TABLES)
+    )
+    cached: Final = await cache.async_get_cache("end_user_id:c2", local_only=True, model_type=LiteLLM_EndUserTable)
 
-    assert (budgets.rows["b1"].max_budget, cached) == (5.0, None)
+    assert (holder_reads, budgets.rows["b1"].max_budget, cached) == (0, 5.0, entry)
 
 
 @pytest.mark.asyncio
@@ -1652,3 +1698,117 @@ async def test_a_customer_created_after_a_request_found_its_id_invalid_is_kept_b
     await new_end_user(data=NewCustomerRequest(user_id="c1", models=["m1"]), user_api_key_dict=_ADMIN)
 
     assert await resolve() == "c1"
+
+
+_UNRESTRICTED_CUSTOMER: Final = LiteLLM_EndUserTable(user_id="c1", blocked=False)
+
+#: An update of each column the restricted registry filters on (END_USER_RESTRICTION_COLUMNS, which
+#: litellm/proxy/auth/auth_checks.py:1819-1825 reads), by the request field that writes the column
+_UPDATE_OF_EACH_RESTRICTION_COLUMN: Final[dict[str, dict[str, object]]] = {
+    "blocked": {"blocked": True},
+    "budget_id": {"budget_id": "b-paid"},
+    "allowed_model_region": {"allowed_model_region": "eu"},
+    "default_model": {"default_model": "gpt-4o"},
+    "models": {"models": ["m1"]},
+    "object_permission_id": {"object_permission": {"vector_stores": ["vs-1"]}},
+}
+
+
+async def _status_of(update: Awaitable[object]) -> str:
+    """The status code ``update`` ends with: "200" when it returns."""
+    try:
+        await update
+    except ProxyException as refused:
+        return str(refused.code)
+    return "200"
+
+
+async def _customer_update_outcome(
+    monkeypatch: pytest.MonkeyPatch, update: UpdateCustomerRequest
+) -> tuple[str, LiteLLM_EndUserTable]:
+    """The status of ``update`` of the unrestricted customer c1 while Redis is down, and c1's row after it."""
+    from litellm.proxy.management_endpoints.customer_endpoints import update_end_user
+
+    redis: Final = fake_redis_cache()
+    redis.server.connected = False
+    rows: Final = _EndUserRows(_UNRESTRICTED_CUSTOMER)
+    _serve_end_user_rows(monkeypatch, rows, UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True))
+    code: Final = await _status_of(update_end_user(data=update, user_api_key_dict=_ADMIN))
+    return code, rows.rows["c1"]
+
+
+@pytest.mark.asyncio
+async def test_a_customer_update_of_each_field_enforced_from_its_entry_answers_503_and_writes_nothing_without_redis(
+    monkeypatch,
+):
+    """Auth enforces each restriction column and the budget from a customer's last good entry, so an update of any one
+    of them revokes that entry first; while Redis cannot record the revocation the update is refused before it
+    writes."""
+    from litellm.proxy.auth.auth_checks import END_USER_RESTRICTION_COLUMNS
+
+    updates: Final = {
+        **_UPDATE_OF_EACH_RESTRICTION_COLUMN,
+        # litellm/proxy/auth/auth_checks.py:1774 reads the entry's budget row
+        "max_budget": {"max_budget": 5.0},
+    }
+    outcomes: Final = {
+        column: await _customer_update_outcome(monkeypatch, UpdateCustomerRequest(user_id="c1", **update))
+        for column, update in updates.items()
+    }
+
+    assert (frozenset(_UPDATE_OF_EACH_RESTRICTION_COLUMN), outcomes) == (
+        END_USER_RESTRICTION_COLUMNS,
+        {column: ("503", _UNRESTRICTED_CUSTOMER) for column in updates},
+    )
+
+
+class _UpdateWithAnUnclassifiedColumn(UpdateCustomerRequest):
+    """An update of a customer column nobody classified for the update endpoint: the row's spend, which the request
+    type does not offer today."""
+
+    spend: float | None = None
+
+
+@pytest.mark.asyncio
+async def test_a_customer_update_of_a_field_no_one_classified_answers_503_and_writes_nothing_without_redis(
+    monkeypatch,
+):
+    """A column outside the list of fields proven unenforced revokes the customer's entry, whether or not a check is
+    known to read it, so its update is refused while Redis cannot record the revocation."""
+    unclassified: Final = _UpdateWithAnUnclassifiedColumn(user_id="c1", spend=3.0)
+
+    outcome: Final = await _customer_update_outcome(monkeypatch, unclassified)
+
+    assert outcome == ("503", _UNRESTRICTED_CUSTOMER)
+
+
+@pytest.mark.asyncio
+async def test_a_customer_update_of_only_its_unenforced_fields_writes_while_redis_cannot_record_a_revocation(
+    monkeypatch,
+):
+    """Nothing on the request path reads a customer's alias from its entry, so an update of only that revokes nothing,
+    and Redis being down refuses nothing."""
+    renamed: Final = dict.fromkeys(END_USER_UNENFORCED_FIELDS, "renamed")
+
+    outcome: Final = await _customer_update_outcome(monkeypatch, UpdateCustomerRequest(user_id="c1", **renamed))
+
+    assert outcome == ("200", _UNRESTRICTED_CUSTOMER.model_copy(update=renamed))
+
+
+@pytest.mark.asyncio
+async def test_customer_delete_answers_503_and_deletes_nothing_when_redis_cannot_record_it(monkeypatch):
+    """A deleted customer is held to the default end-user budget, which can be lower than its own, so the entry that
+    keeps its own budget is revoked before the delete, and a Redis that cannot record that refuses the delete."""
+    from litellm.proxy._types import DeleteCustomerRequest
+    from litellm.proxy.management_endpoints.customer_endpoints import delete_end_user
+
+    redis: Final = fake_redis_cache()
+    redis.server.connected = False
+    rows, _ = _budgeted_customer()
+    _serve_end_user_rows(monkeypatch, rows, UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True))
+
+    code: Final = await _status_of(
+        delete_end_user(data=DeleteCustomerRequest(user_ids=["c1"]), user_api_key_dict=_ADMIN)
+    )
+
+    assert (code, list(rows.rows)) == ("503", ["c1"])

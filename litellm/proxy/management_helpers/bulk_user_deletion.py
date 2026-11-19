@@ -28,9 +28,17 @@ from litellm.proxy._types import (
     MemberDeleteRequest,
     UserAPIKeyAuth,
 )
-from litellm.proxy.auth.auth_checks import delete_cache_key_objects, get_jwt_key_mapping_cache_keys_for_tokens
+from litellm.proxy.auth.auth_checks import (
+    delete_cache_key_objects,
+    get_jwt_key_mapping_cache_keys_for_tokens,
+    team_cache_keys,
+)
 from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_broadcast
-from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, revoke_last_good
+from litellm.proxy.common_utils.user_api_key_cache import (
+    UserApiKeyCache,
+    revoke_last_good,
+    team_membership_auth_cache_key,
+)
 from litellm.proxy.hooks.key_management_event_hooks import KeyManagementEventHooks
 from litellm.proxy.hooks.user_management_event_hooks import UserManagementEventHooks
 from litellm.proxy.list_api.common import PROBLEM_TYPE_BASE, ManagementProblem
@@ -207,6 +215,18 @@ def _error_message(exc: BaseException) -> str:
     return str(exc) or type(exc).__name__
 
 
+def _revocation_refused(refused: HTTPException) -> ManagementProblem:
+    """The routes answer any other exception with a generic 500; a refused revocation must stay a 503."""
+    return ManagementProblem(
+        ProblemDetail(
+            type=f"{PROBLEM_TYPE_BASE}service-unavailable",
+            title="Service unavailable",
+            status=503,
+            detail=_error_message(refused),
+        )
+    )
+
+
 async def _bounded(awaitables: Iterable[Awaitable[object]]) -> tuple[object | BaseException, ...]:
     semaphore: Final = asyncio.Semaphore(_AUDIT_LOG_CONCURRENCY)
 
@@ -221,6 +241,7 @@ async def _remove_members_from_team(
     prisma_client: PrismaClient,
     tx: "Prisma",
     team_id: str,
+    team_alias: str | None,
     members: Sequence[MemberDeleteRequest],
     user_api_key_dict: UserAPIKeyAuth,
     user_api_key_cache: UserApiKeyCache,
@@ -258,7 +279,19 @@ async def _remove_members_from_team(
         hashed_tokens=tuple(k.token for k in keys),
         prisma_client=prisma_client,
     )
-    await revoke_last_good(user_api_key_cache, tuple(k.token for k in keys))
+    # The roster rides on the team's entry, the team on each user's entry and the member limits on each membership's
+    try:
+        await revoke_last_good(
+            user_api_key_cache,
+            (
+                *(team_cache_keys(team_id, team_alias) if removed_members else ()),
+                *(row.user_id for row in stale_rows),
+                *(team_membership_auth_cache_key(team_id=team_id, user_id=user_id) for user_id in sorted(cleanup_ids)),
+                *(k.token for k in keys),
+            ),
+        )
+    except HTTPException as refused:
+        raise _revocation_refused(refused) from refused
 
     if removed_members:
         roster_data: Final[_RosterData] = {
@@ -336,7 +369,7 @@ async def bulk_remove_team_members(
     members: Final = tuple(data.members[i] for i in kept_indexes)
     async with prisma_client.tx(timeout=_BATCH_TX_TIMEOUT) as tx:
         removal: Final = await _remove_members_from_team(
-            prisma_client, tx, team_id, members, user_api_key_dict, user_api_key_cache
+            prisma_client, tx, team_id, team.team_alias, members, user_api_key_dict, user_api_key_cache
         )
     if removal.deleted_keys:
         KeyManagementEventHooks.create_key_deleted_audit_logs(
@@ -443,12 +476,14 @@ async def _delete_users_tx(
             where=_in_filter("team_id", frozenset(t for teams in teams_of.values() for t in teams))
         )
         team_ids: Final = tuple(sorted(t.team_id for t in team_rows))
+        alias_of: Final = MappingProxyType({t.team_id: t.team_alias for t in team_rows})
         removals: Final = MappingProxyType(
             {
                 tid: await _remove_members_from_team(
                     prisma_client,
                     tx,
                     tid,
+                    alias_of[tid],
                     tuple(
                         MemberDeleteRequest(user_id=u.user_id, user_email=u.user_email)
                         for u in users

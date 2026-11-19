@@ -433,6 +433,9 @@ async def update_tag(
         if existing_tag is None:
             raise HTTPException(status_code=404, detail=f"Tag {tag.name} not found")
 
+        # The tag's entry carries its budget and models, so every update revokes it before the first write
+        await revoke_last_good(user_api_key_cache, (tag_cache_key(tag.name),))
+
         from litellm.proxy.proxy_server import litellm_proxy_admin_name
 
         # Handle budget updates using common helper
@@ -443,7 +446,6 @@ async def update_tag(
             prisma_client=prisma_client,
             litellm_proxy_admin_name=litellm_proxy_admin_name,
             cleared_budget_fields=frozenset(field for field in tag.model_fields_set if getattr(tag, field) is None),
-            before_relink=lambda: revoke_last_good(user_api_key_cache, (tag_cache_key(tag.name),)),
         )
 
         # Get model names for model_info
@@ -483,6 +485,9 @@ async def update_tag(
             "message": f"Tag {tag.name} updated successfully",
             "tag": tag_config,
         }
+    except HTTPException:
+        # keep its status: a missing tag stays a 404, and a 503 refusal means nothing was written
+        raise
     except Exception as e:
         verbose_proxy_logger.exception("Error updating tag: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
