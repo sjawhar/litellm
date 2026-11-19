@@ -795,6 +795,75 @@ async def _run_project_checks(
         )
 
 
+async def _run_fallback_model_checks(
+    *,
+    fallback_models: Sequence[str],
+    team_object: LiteLLM_TeamTable | None,
+    user_object: LiteLLM_UserTable | None,
+    project_object: LiteLLM_ProjectTableCachedObj | None,
+    llm_router: Router | None,
+    valid_token: UserAPIKeyAuth | None,
+    proxy_logging_obj: ProxyLogging,
+    team_membership: LiteLLM_TeamMembership | None,
+    team_membership_loaded: bool,
+) -> None:
+    """
+    The team, team member, user and project model checks common_checks() runs on the requested model, run on each
+    fallback target: a target can serve the request in the requested model's place.
+    """
+    from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
+
+    key_model_aliases: Final = key_model_aliases_for_auth_check(valid_token)
+    for model in fallback_models:
+        if team_object is not None:
+            try:
+                await can_team_access_model(
+                    model=model,
+                    team_object=team_object,
+                    llm_router=llm_router,
+                    team_model_aliases=(valid_token.team_model_aliases if valid_token else None),
+                    key_model_aliases=key_model_aliases,
+                )
+            except ProxyException as team_denial:
+                if team_denial.type != ProxyErrorTypes.team_model_access_denied:
+                    raise
+                if not await key_access_group_grants_model(
+                    model=model,
+                    valid_token=valid_token,
+                    team_object=team_object,
+                    llm_router=llm_router,
+                    key_model_aliases=key_model_aliases,
+                ):
+                    raise
+            if valid_token is not None and valid_token.user_id:
+                await check_team_member_model_access(
+                    model=model,
+                    team_object=team_object,
+                    valid_token=valid_token,
+                    llm_router=llm_router,
+                    prisma_client=prisma_client,
+                    user_api_key_cache=user_api_key_cache,
+                    proxy_logging_obj=proxy_logging_obj,
+                    team_membership=team_membership,
+                    team_membership_loaded=team_membership_loaded,
+                    key_model_aliases=key_model_aliases,
+                )
+        elif user_object is not None:
+            await can_user_call_model(
+                model=model,
+                llm_router=llm_router,
+                user_object=user_object,
+                key_model_aliases=key_model_aliases,
+            )
+        if project_object is not None and len(project_object.models) > 0:
+            can_project_access_model(
+                model=model,
+                project_object=project_object,
+                llm_router=llm_router,
+                key_model_aliases=key_model_aliases,
+            )
+
+
 def _enforce_user_param_check(general_settings: dict, request: Request, request_body: dict, route: str) -> None:
     if not general_settings.get("enforce_user_param", False):
         return
@@ -1184,6 +1253,21 @@ async def common_checks(
             skip_budget_checks=skip_all_budget_checks,
             valid_token=valid_token,
             proxy_logging_obj=proxy_logging_obj,
+        )
+
+    # 2.4 A fallback target can serve the request in the requested model's place, so it passes the same team, team
+    # member, user and project model checks
+    with tracer.trace("litellm.proxy.auth.common_checks.run_fallback_model_checks"):
+        await _run_fallback_model_checks(
+            fallback_models=request_fallback_model_names(_typed_request_body(request_body)),
+            team_object=team_object,
+            user_object=user_object,
+            project_object=project_object,
+            llm_router=llm_router,
+            valid_token=valid_token,
+            proxy_logging_obj=proxy_logging_obj,
+            team_membership=loaded_team_membership,
+            team_membership_loaded=team_membership_loaded,
         )
 
     # 2.3 Which model access groups authorized this request

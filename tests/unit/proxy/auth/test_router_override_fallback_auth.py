@@ -8,7 +8,7 @@ execute requests against models their API key cannot call.
 import ast
 import importlib
 import sys
-from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType, ModuleType
@@ -20,7 +20,17 @@ import pytest
 from starlette.requests import Request
 
 from litellm import Router
-from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
+from litellm.proxy._types import (
+    LiteLLM_BudgetTable,
+    LiteLLM_ProjectTableCachedObj,
+    LiteLLM_TeamMembership,
+    LiteLLM_TeamTable,
+    LiteLLM_UserTable,
+    LitellmUserRoles,
+    ModelAccessDeniedProxyException,
+    ProxyErrorTypes,
+    UserAPIKeyAuth,
+)
 from litellm.proxy.auth.auth_utils import fallback_target_model_name, iter_request_fallback_targets
 from litellm.proxy.auth.user_api_key_auth import enforce_key_and_fallback_model_access
 
@@ -417,7 +427,7 @@ def test_body_router_fallbacks_get_the_banned_param_check():
 @pytest.mark.asyncio
 async def test_body_router_fallbacks_need_key_model_access():
     router = _router_without_fallback_group()
-    with pytest.raises(Exception, match="claude-opus-4-8"):
+    with pytest.raises(ModelAccessDeniedProxyException, match="'claude-opus-4-8'") as exc_info:
         await enforce_key_and_fallback_model_access(
             valid_token=_key_with_models(["primary"]),
             request_data={"model": "primary", "router_fallbacks": [{"primary": ["claude-opus-4-8"]}]},
@@ -427,11 +437,14 @@ async def test_body_router_fallbacks_need_key_model_access():
             llm_router=router,
         )
 
+    # The key refuses the target; the Router-group check, which would also fail on it, never runs
+    assert exc_info.value.type == ProxyErrorTypes.key_model_access_denied
+
 
 @pytest.mark.asyncio
 async def test_client_router_settings_override_fallbacks_are_checked_when_anthropic_owns_the_body_field():
     router = _router_without_fallback_group()
-    with pytest.raises(Exception, match="claude-opus-4-8"):
+    with pytest.raises(ModelAccessDeniedProxyException, match="'claude-opus-4-8'") as exc_info:
         await enforce_key_and_fallback_model_access(
             valid_token=_key_with_models(["primary"]),
             request_data={
@@ -444,6 +457,9 @@ async def test_client_router_settings_override_fallbacks_are_checked_when_anthro
             llm_model_list=router.get_model_list(),
             llm_router=router,
         )
+
+    # The key refuses the target; the Router-group check, which would also fail on it, never runs
+    assert exc_info.value.type == ProxyErrorTypes.key_model_access_denied
 
 
 # ── Every fallback field, end to end through a proxy with a mock upstream ────
@@ -538,10 +554,16 @@ def _mock_params() -> tuple[str, ...]:
 
 class _Gateway:
     def __init__(
-        self, monkeypatch: pytest.MonkeyPatch, requested_error: tuple[int, str, str] = (500, "api_error", "x")
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        requested_error: tuple[int, str, str] = (500, "api_error", "x"),
+        *,
+        requested_answers: bool = False,
     ) -> None:
         self._monkeypatch = monkeypatch
         self._requested_error = requested_error
+        # The requested deployment answers instead of failing, as Anthropic does when it serves a fallback itself
+        self._requested_answers = requested_answers
 
     async def send(
         self,
@@ -626,7 +648,9 @@ class _Gateway:
         with respx.mock(assert_all_called=False) as upstream:
             routes = {
                 "requested": upstream.post(url__startswith=_REQUESTED_HOST).mock(
-                    return_value=httpx.Response(
+                    return_value=httpx.Response(200, json=_messages_reply("claude-requested"))
+                    if self._requested_answers
+                    else httpx.Response(
                         self._requested_error[0],
                         json={
                             "type": "error",
@@ -962,16 +986,150 @@ async def test_a_fallback_the_upstream_error_triggers_never_reaches_a_model_the_
     assert result.calls["forbidden"] == 0
 
 
+# A fallback target outside the team's models, in LiteLLM's own list and in Anthropic's list under the beta
+_FALLBACKS_OUTSIDE_THE_TEAM: Final = (
+    pytest.param([{"requested": ["forbidden"]}], False, id="litellm-fallbacks"),
+    pytest.param([{"model": "forbidden"}], True, id="anthropic-fallbacks"),
+)
+
+
 @pytest.mark.asyncio
-async def test_an_all_team_models_key_gets_its_fallback_targets_checked_against_the_team(gateway: _Gateway):
+@pytest.mark.parametrize(("fallbacks", "beta"), _FALLBACKS_OUTSIDE_THE_TEAM)
+async def test_an_all_team_models_key_gets_its_fallback_targets_checked_against_the_team(
+    gateway: _Gateway, fallbacks: Sequence[object], beta: bool
+) -> None:
     result = await gateway.send(
-        {"fallbacks": [{"requested": ["forbidden"]}]},
+        {"fallbacks": fallbacks},
+        beta=beta,
         team_router_settings={},
         key_models=("all-team-models",),
     )
 
     assert result.response.status_code in (401, 403), result.response.text
     assert result.calls["forbidden"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("fallbacks", "beta"), _FALLBACKS_OUTSIDE_THE_TEAM)
+async def test_a_key_without_a_model_list_gets_its_fallback_targets_checked_against_the_team(
+    gateway: _Gateway, fallbacks: Sequence[object], beta: bool
+) -> None:
+    """The key may call every model, so the team's model list is the restriction a fallback target must pass"""
+    result: Final = await gateway.send({"fallbacks": fallbacks}, beta=beta, team_router_settings={}, key_models=())
+
+    assert result.response.status_code == 403, result.response.text
+    assert "team_model_access_denied" in result.response.text
+    assert "The requested model 'forbidden' is not available" in result.response.text
+    assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fallbacks", "beta", "calls"),
+    [
+        # The Router serves LiteLLM's list from the next group; under the beta Anthropic serves its own list itself
+        pytest.param(
+            [{"requested": ["other"]}],
+            False,
+            {"requested": 1, "other": 1, "forbidden": 0, "attacker": 0},
+            id="litellm-fallbacks",
+        ),
+        pytest.param(
+            [{"model": "other"}],
+            True,
+            {"requested": 1, "other": 0, "forbidden": 0, "attacker": 0},
+            id="anthropic-fallbacks",
+        ),
+    ],
+)
+async def test_a_fallback_target_in_the_team_still_serves_a_key_without_a_model_list(
+    monkeypatch: pytest.MonkeyPatch, fallbacks: Sequence[object], beta: bool, calls: Mapping[str, int]
+) -> None:
+    result: Final = await _Gateway(monkeypatch, requested_answers=beta).send(
+        {"fallbacks": fallbacks}, beta=beta, team_router_settings={}, key_models=()
+    )
+
+    assert result.response.status_code == 200, result.response.text
+    assert result.calls == calls
+
+
+async def _common_checks_with_fallback(
+    fallback: str,
+    valid_token: UserAPIKeyAuth,
+    *,
+    team_object: LiteLLM_TeamTable | None = None,
+    membership: LiteLLM_TeamMembership | None = None,
+    user_object: LiteLLM_UserTable | None = None,
+    project_object: LiteLLM_ProjectTableCachedObj | None = None,
+) -> bool:
+    """common_checks on a /v1/messages request for `requested` that names `fallback` in its fallbacks"""
+    from litellm.proxy.auth.auth_checks import common_checks
+
+    with patch("litellm.proxy.auth.auth_checks.get_team_membership", new=AsyncMock(return_value=membership)):
+        return await common_checks(
+            request_body={
+                "model": "requested",
+                "max_tokens": 5,
+                "messages": [{"role": "user", "content": "hi"}],
+                "fallbacks": [{"model": fallback}],
+            },
+            team_object=team_object,
+            user_object=user_object,
+            end_user_object=None,
+            global_proxy_spend=None,
+            general_settings={},
+            route="/v1/messages",
+            llm_router=None,
+            proxy_logging_obj=MagicMock(),
+            valid_token=valid_token,
+            request=MagicMock(spec=Request),
+            skip_budget_checks=True,
+            project_object=project_object,
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_fallback_target_outside_the_team_members_own_models_is_refused() -> None:
+    member: Final = UserAPIKeyAuth(user_id="caller", team_id="fallback-team")
+    team: Final = LiteLLM_TeamTable(team_id="fallback-team", models=["requested", "other"])
+    membership: Final = LiteLLM_TeamMembership(
+        user_id="caller",
+        team_id="fallback-team",
+        litellm_budget_table=LiteLLM_BudgetTable(allowed_models=["requested"]),
+    )
+
+    assert await _common_checks_with_fallback("requested", member, team_object=team, membership=membership) is True
+    with pytest.raises(ModelAccessDeniedProxyException, match="'other'") as exc_info:
+        await _common_checks_with_fallback("other", member, team_object=team, membership=membership)
+
+    assert exc_info.value.type == ProxyErrorTypes.team_model_access_denied
+    assert exc_info.value.code == "403"
+
+
+@pytest.mark.asyncio
+async def test_a_fallback_target_outside_a_personal_keys_user_models_is_refused() -> None:
+    personal_key: Final = UserAPIKeyAuth(user_id="caller")
+    user: Final = LiteLLM_UserTable(user_id="caller", models=["requested"])
+
+    assert await _common_checks_with_fallback("requested", personal_key, user_object=user) is True
+    with pytest.raises(ModelAccessDeniedProxyException, match="'other'") as exc_info:
+        await _common_checks_with_fallback("other", personal_key, user_object=user)
+
+    assert exc_info.value.type == ProxyErrorTypes.user_model_access_denied
+    assert exc_info.value.code == "403"
+
+
+@pytest.mark.asyncio
+async def test_a_fallback_target_outside_the_projects_models_is_refused() -> None:
+    project_key: Final = UserAPIKeyAuth(project_id="fallback-project")
+    project: Final = LiteLLM_ProjectTableCachedObj(project_id="fallback-project", models=["requested"])
+
+    assert await _common_checks_with_fallback("requested", project_key, project_object=project) is True
+    with pytest.raises(ModelAccessDeniedProxyException, match="'other'") as exc_info:
+        await _common_checks_with_fallback("other", project_key, project_object=project)
+
+    assert exc_info.value.type == ProxyErrorTypes.project_model_access_denied
+    assert exc_info.value.code == "403"
 
 
 @pytest.mark.asyncio
