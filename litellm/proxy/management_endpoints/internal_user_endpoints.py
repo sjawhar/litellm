@@ -33,6 +33,7 @@ from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.proxy._types import *
 from litellm.proxy.auth.auth_checks import (
     delete_cache_key_objects,
+    delete_cache_team_object,
     forget_missing_user,
     get_jwt_key_mapping_cache_keys_for_tokens,
     get_team_object,
@@ -49,6 +50,7 @@ from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_
 from litellm.proxy.common_utils.user_api_key_cache import (
     AUTH_OBJECTS_TARGET,
     object_permission_cache_key,
+    revoke_last_good,
     user_object_permission_id_cache_key,
 )
 from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
@@ -2520,6 +2522,14 @@ async def delete_user(
                     },
                 )
 
+        await revoke_last_good(
+            user_api_key_cache,
+            tuple(
+                key.token
+                for key in await _verification_token_table(prisma_client).find_many(where={"user_id": user_id})
+            ),
+        )
+
         # we do this after the first for loop, since first for loop is for validation. we only want this inserted after validation passes
         if is_audit_logging_enabled():
             # make an audit log for each team deleted
@@ -2549,7 +2559,7 @@ async def delete_user(
         fetch_all_teams: Sequence[prisma_models.LiteLLM_TeamTable] = await TeamRepository(
             prisma_client
         ).table.find_many(where={"team_id": {"in": user_row.teams}})
-        teams_to_update: list[tuple[str, str]] = []
+        teams_to_update: list[tuple[str, str, str | None]] = []
         for team in fetch_all_teams:
             removed_team_members, new_team_members = cleanup_members_with_roles(
                 existing_team_row=LiteLLM_TeamTable.model_validate(team.model_dump()),
@@ -2561,14 +2571,20 @@ async def delete_user(
             )
             if removed_team_members:
                 _db_new_team_members: list[dict] = [m.model_dump() for m in new_team_members]
-                teams_to_update.append((team.team_id, json.dumps(_db_new_team_members)))
+                teams_to_update.append((team.team_id, json.dumps(_db_new_team_members), team.team_alias))
 
         ## update teams
 
-        for team_id, members_with_roles in teams_to_update:
+        for team_id, members_with_roles, team_alias in teams_to_update:
             await TeamRepository(prisma_client).table.update(
                 where={"team_id": team_id},
                 data={"members_with_roles": members_with_roles},
+            )
+            await delete_cache_team_object(
+                team_id=team_id,
+                team_alias=team_alias,
+                user_api_key_cache=user_api_key_cache,
+                proxy_logging_obj=proxy_logging_obj,
             )
     # End of Audit logging
 
@@ -2591,6 +2607,7 @@ async def delete_user(
         hashed_tokens=hashed_tokens_to_delete,
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
+        revoked=True,
     )
     await evict_and_broadcast(cache_keys=jwt_mapping_cache_keys, user_api_key_cache=user_api_key_cache)
 

@@ -19,6 +19,7 @@ import fastapi
 import orjson
 from fastapi import HTTPException, Request, WebSocket, status
 from fastapi.security.api_key import APIKeyHeader
+from pydantic import BaseModel, ConfigDict
 from starlette.exceptions import WebSocketException
 
 import litellm
@@ -76,6 +77,8 @@ from litellm.proxy.auth.auth_checks import (  # noqa: F401  # legacy module expo
     is_valid_fallback_model,
     jwt_key_mapping_cache_key,
     key_model_aliases_for_auth_check,
+    recall_last_good_after,
+    recall_last_good_limits_after,
     resolve_and_validate_end_user_id,
     resolve_default_end_user_budget,
     team_member_max_budget_alert_check,
@@ -148,7 +151,10 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     UserApiKeyCache,
     end_user_cache_key,
     end_user_restricted_registry_cache_key,
+    forget_missing_last_good,
     model_access_group_registry_cache_key,
+    remember_last_good,
+    serves_last_good_entries,
     team_membership_auth_cache_key,
 )
 from litellm.proxy.db.db_lookup_gate import bounded_db_lookup
@@ -761,6 +767,14 @@ def update_valid_token_with_end_user_params(valid_token: UserAPIKeyAuth, end_use
 _global_spend_coordinator: Final = EventDrivenCacheCoordinator(log_prefix="[GLOBAL SPEND]")
 
 
+class _ProxyBudgetSpend(BaseModel):
+    """The proxy budget row's spend when the database last answered for it."""
+
+    model_config = ConfigDict(frozen=True)
+
+    spend: float
+
+
 async def fetch_global_spend_with_event_coordination(
     cache_key: str,
     user_api_key_cache: UserApiKeyCache,
@@ -772,14 +786,26 @@ async def fetch_global_spend_with_event_coordination(
 
     Reads the proxy budget aggregate user row, which accrues proxy-wide spend
     per request and is zeroed by ResetBudgetJob every ``litellm.budget_duration``.
+    While the database is unreachable, the spend it last returned answers.
     """
 
     async def _load_global_spend() -> float | None:
-        proxy_budget_row: Final = await bounded_db_lookup(
-            prisma_client.db.litellm_usertable.find_unique(where={"user_id": LITELLM_PROXY_BUDGET_NAME}),
-            name="proxy_budget",
-        )
-        return float(proxy_budget_row.spend) if proxy_budget_row is not None else None
+        try:
+            proxy_budget_row: Final = await bounded_db_lookup(
+                prisma_client.db.litellm_usertable.find_unique(where={"user_id": LITELLM_PROXY_BUDGET_NAME}),
+                name="proxy_budget",
+            )
+        except Exception as e:
+            served: Final = await recall_last_good_limits_after(e, user_api_key_cache, cache_key, _ProxyBudgetSpend)
+            if served is None:
+                raise
+            return served.spend
+        if proxy_budget_row is None:
+            await forget_missing_last_good(user_api_key_cache, cache_key)
+            return None
+        spend: Final = float(proxy_budget_row.spend)
+        await remember_last_good(user_api_key_cache, cache_key, _ProxyBudgetSpend(spend=spend))
+        return spend
 
     return await _global_spend_coordinator.get_or_load(
         cache_key=cache_key,
@@ -2404,29 +2430,9 @@ async def validate_resolved_virtual_key(  # noqa: C901  # Preserve ordering of e
             _user_id: Final = valid_token.user_id
             _team_id: Final = valid_token.team_id
             if prisma_client is not None and _user_id is not None and _team_id is not None:
-                _cache_key: Final = team_membership_auth_cache_key(team_id=_team_id, user_id=_user_id)
-
-                team_member_info = await user_api_key_cache.async_get_cache(
-                    key=_cache_key,
-                    model_type=LiteLLM_TeamMembership,
+                team_member_info: Final = await _read_team_membership(
+                    prisma_client, user_api_key_cache, team_id=_team_id, user_id=_user_id
                 )
-                if team_member_info is None:
-                    # read from DB
-                    _db_member: Final = await TeamMembershipRepository(prisma_client).table.find_first(
-                        where={
-                            "user_id": _user_id,
-                            "team_id": _team_id,
-                        },
-                        include={"litellm_budget_table": True},
-                    )
-                    if _db_member is not None:
-                        team_member_info = LiteLLM_TeamMembership.model_validate(_db_member.model_dump())
-                        await user_api_key_cache.async_set_cache(
-                            key=_cache_key,
-                            value=team_member_info,
-                            model_type=LiteLLM_TeamMembership,
-                            ttl=5,
-                        )
 
                 if team_member_info is not None and team_member_info.litellm_budget_table is not None:
                     team_member_budget: Final = team_member_info.litellm_budget_table.effective_max_budget(
@@ -2595,7 +2601,11 @@ async def validate_resolved_virtual_key(  # noqa: C901  # Preserve ordering of e
                         parent_otel_span=parent_otel_span,
                         proxy_logging_obj=proxy_logging_obj,
                     )
-            except HTTPException:
+            except HTTPException as team_lookup_error:
+                if serves_last_good_entries(
+                    user_api_key_cache
+                ) and PrismaDBExceptionHandler.is_database_unreachable_error(team_lookup_error):
+                    raise
                 token_team_models: Final = _token_team_models(valid_token)
                 _team_obj = LiteLLM_TeamTableCachedObj(
                     team_id=valid_token.team_id,
@@ -2758,7 +2768,9 @@ def _team_obj_from_token(valid_token: UserAPIKeyAuth) -> LiteLLM_TeamTableCached
     )
 
 
-def _token_can_vouch_for_team(valid_token: UserAPIKeyAuth, lookup_error: BaseException) -> bool:
+def _token_can_vouch_for_team(
+    valid_token: UserAPIKeyAuth, lookup_error: BaseException, *, serving_last_good: bool = False
+) -> bool:
     """Whether the token's own team fields may stand in for a team that failed to
     resolve, without widening access.
 
@@ -2771,6 +2783,10 @@ def _token_can_vouch_for_team(valid_token: UserAPIKeyAuth, lookup_error: BaseExc
     not a degraded read, so nothing may stand in for it and no setting may
     override that.
 
+    While last good entries are served and the database is unreachable, the team's own last good entry is the
+    authority: the token itself may be a last good entry older than the block or delete that dropped the team's,
+    so it may not stand in either.
+
     Otherwise the team's grant is merely unknown. A token carrying one may vouch,
     since replaying a recorded grant cannot widen it and denying every team key
     while the row is briefly unreadable would trade the widening for an outage. A
@@ -2782,6 +2798,8 @@ def _token_can_vouch_for_team(valid_token: UserAPIKeyAuth, lookup_error: BaseExc
     if valid_token.team_id == UI_TEAM_ID:
         return True
     if isinstance(lookup_error, TeamNotFoundError):
+        return False
+    if serving_last_good and PrismaDBExceptionHandler.is_database_unreachable_error(lookup_error):
         return False
     if valid_token.team_models:
         return True
@@ -3052,7 +3070,9 @@ async def run_centralized_common_checks(
         # _team_obj_from_token asserts that precondition.
         if user_api_key_auth_obj.team_id is None:
             team_object = None
-        elif _token_can_vouch_for_team(user_api_key_auth_obj, team_result):
+        elif _token_can_vouch_for_team(
+            user_api_key_auth_obj, team_result, serving_last_good=serves_last_good_entries(user_api_key_cache)
+        ):
             team_object = _team_obj_from_token(user_api_key_auth_obj)
         else:
             raise team_result
@@ -3465,6 +3485,34 @@ def _identity_cache_keys(api_key: str, *, end_user_id: str | None, key_is_resolv
         )
         if key is not None
     )
+
+
+async def _read_team_membership(
+    prisma_client: PrismaClient, user_api_key_cache: UserApiKeyCache, *, team_id: str, user_id: str
+) -> LiteLLM_TeamMembership | None:
+    """The member's membership row: the short-lived cache, else the database, else, while the database is
+    unreachable, the last good entry it returned."""
+    cache_key: Final = team_membership_auth_cache_key(team_id=team_id, user_id=user_id)
+    cached: Final = await user_api_key_cache.async_get_cache(key=cache_key, model_type=LiteLLM_TeamMembership)
+    if cached is not None:
+        return cached
+    try:
+        db_member: Final = await TeamMembershipRepository(prisma_client).table.find_first(
+            where={"user_id": user_id, "team_id": team_id},
+            include={"litellm_budget_table": True},
+        )
+    except Exception as e:
+        served: Final = await recall_last_good_after(e, user_api_key_cache, cache_key, LiteLLM_TeamMembership)
+        if served is None:
+            raise
+        return served
+    if db_member is None:
+        await forget_missing_last_good(user_api_key_cache, cache_key)
+        return None
+    member: Final = LiteLLM_TeamMembership.model_validate(db_member.model_dump())
+    await user_api_key_cache.async_set_cache(key=cache_key, value=member, model_type=LiteLLM_TeamMembership, ttl=5)
+    await remember_last_good(user_api_key_cache, cache_key, member)
+    return member
 
 
 async def _prefetch_referenced_auth_objects(

@@ -28,7 +28,8 @@ from litellm.proxy.auth.auth_checks import (  # noqa: F401  # legacy module expo
     get_team_object_from_cache,
 )
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
-from litellm.proxy.common_utils.user_api_key_cache import AUTH_OBJECTS_TARGET
+from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import forget_last_good_and_broadcast
+from litellm.proxy.common_utils.user_api_key_cache import AUTH_OBJECTS_TARGET, UserApiKeyCache
 from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
 from litellm.proxy.management_helpers.access_group_team_sync import invalidate_access_group_cache
 from litellm.proxy.management_helpers.resource_display_names import (
@@ -407,7 +408,7 @@ def _detach_access_group_from_agent_registry(agent_ids: Sequence[str], access_gr
 async def _patch_team_caches_add_access_group(
     team_ids: list[str],
     access_group_id: str,
-    user_api_key_cache,
+    user_api_key_cache: UserApiKeyCache,
     proxy_logging_obj,
 ) -> None:
     """Patch cached team objects to include access_group_id."""
@@ -431,12 +432,13 @@ async def _patch_team_caches_add_access_group(
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
         )
+    await forget_last_good_and_broadcast(tuple(f"team_id:{team_id}" for team_id in team_ids), user_api_key_cache)
 
 
 async def _patch_team_caches_remove_access_group(
     team_ids: list[str],
     access_group_id: str,
-    user_api_key_cache,
+    user_api_key_cache: UserApiKeyCache,
     proxy_logging_obj,
 ) -> None:
     """Patch cached team objects to remove access_group_id."""
@@ -454,13 +456,14 @@ async def _patch_team_caches_remove_access_group(
                 user_api_key_cache=user_api_key_cache,
                 proxy_logging_obj=proxy_logging_obj,
             )
+    await forget_last_good_and_broadcast(tuple(f"team_id:{team_id}" for team_id in team_ids), user_api_key_cache)
 
 
 @with_service_target(AUTH_OBJECTS_TARGET)
 async def _patch_key_caches_add_access_group(
     key_tokens: list[str],
     access_group_id: str,
-    user_api_key_cache,
+    user_api_key_cache: UserApiKeyCache,
     proxy_logging_obj,
 ) -> None:
     """Patch cached key objects to include access_group_id."""
@@ -483,13 +486,14 @@ async def _patch_key_caches_add_access_group(
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
         )
+    await forget_last_good_and_broadcast(tuple(key_tokens), user_api_key_cache)
 
 
 @with_service_target(AUTH_OBJECTS_TARGET)
 async def _patch_key_caches_remove_access_group(
     key_tokens: list[str],
     access_group_id: str,
-    user_api_key_cache,
+    user_api_key_cache: UserApiKeyCache,
     proxy_logging_obj,
 ) -> None:
     """Patch cached key objects to remove access_group_id."""
@@ -506,6 +510,7 @@ async def _patch_key_caches_remove_access_group(
                 user_api_key_cache=user_api_key_cache,
                 proxy_logging_obj=proxy_logging_obj,
             )
+    await forget_last_good_and_broadcast(tuple(key_tokens), user_api_key_cache)
 
 
 # ---------------------------------------------------------------------------

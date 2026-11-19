@@ -5604,6 +5604,96 @@ async def test_delete_verification_tokens_evicts_jwt_key_mapping_cache(monkeypat
     )
 
 
+async def _next_invalidation(pubsub) -> str:
+    for _ in range(200):
+        message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.01)
+        if message is not None:
+            return json.loads(message["data"])["cache_key"]
+    raise AssertionError("no auth cache invalidation was published")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("passed_as", ["hashed_token", "raw_key"])
+async def test_delete_verification_tokens_forgets_the_last_good_entry_here_and_on_every_pod(monkeypatch, passed_as):
+    """A deleted key is refused even when the database stops right after the delete: its cached object and last
+    good entry go from Redis and this pod's memory, and the eviction is broadcast so every other pod drops its
+    copy. Both are stored under the hashed token, whichever form /key/delete was given."""
+    from litellm.proxy._types import hash_token
+    from litellm.proxy.auth.auth_checks import cache_key_object
+    from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import AUTH_CACHE_INVALIDATION_CHANNEL
+    from litellm.proxy.common_utils.user_api_key_cache import recall_last_good, remember_last_good
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    raw_key = "sk-lane-key-1"
+    hashed = hash_token(raw_key)
+    redis = fake_redis_cache()
+    cache = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+    await cache_key_object(
+        hashed_token=hashed, user_api_key_obj=UserAPIKeyAuth(token=hashed), user_api_key_cache=cache, proxy_logging_obj=None
+    )
+    await remember_last_good(cache, hashed, UserAPIKeyAuth(token=hashed))
+    pubsub = redis.cache.init_async_client().pubsub()
+    await pubsub.subscribe(AUTH_CACHE_INVALIDATION_CHANNEL)
+
+    mock_prisma_client = AsyncMock()
+    mock_prisma_client.db.litellm_verificationtoken.find_many = AsyncMock(
+        return_value=[LiteLLM_VerificationToken(token=hashed, key_alias="lane")]
+    )
+    mock_prisma_client.db.litellm_jwtkeymapping = _CascadingJWTMappingTable([])
+    mock_prisma_client.db.litellm_deletedverificationtoken.create_many = AsyncMock()
+    mock_prisma_client.delete_data = AsyncMock(return_value=[hashed])
+    monkeypatch.setattr(
+        "litellm.proxy.common_utils.auth_cache_invalidation_pubsub.coordination_redis_cache", lambda: redis.cache
+    )
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", mock_prisma_client)
+
+    await delete_verification_tokens(
+        tokens=[hashed if passed_as == "hashed_token" else raw_key],
+        user_api_key_cache=cache,
+        user_api_key_dict=UserAPIKeyAuth(user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN.value),
+    )
+
+    assert await cache.async_get_cache(key=hashed, model_type=UserAPIKeyAuth) is None
+    assert await recall_last_good(cache, hashed, UserAPIKeyAuth) is None
+    redis.server.connected = False
+    assert await recall_last_good(cache, hashed, UserAPIKeyAuth) is None
+    redis.server.connected = True
+    assert await _next_invalidation(pubsub) == hashed
+    await pubsub.aclose()
+
+
+@pytest.mark.asyncio
+async def test_delete_verification_tokens_refuses_and_changes_nothing_when_redis_cannot_record_it(monkeypatch):
+    """With last good entries on, a delete that cannot tombstone the key in Redis would leave a revoked key that a
+    later database outage serves, so the request is refused with 503 before any row changes."""
+    from fastapi import HTTPException
+
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis = fake_redis_cache()
+    redis.server.connected = False
+    cache = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+    mock_prisma_client = AsyncMock()
+    mock_prisma_client.db.litellm_verificationtoken.find_many = AsyncMock(
+        return_value=[LiteLLM_VerificationToken(token="hashed-token-1", key_alias="lane")]
+    )
+    mock_prisma_client.db.litellm_jwtkeymapping = _CascadingJWTMappingTable([])
+    mock_prisma_client.db.litellm_deletedverificationtoken.create_many = AsyncMock()
+    mock_prisma_client.delete_data = AsyncMock(return_value=["hashed-token-1"])
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", mock_prisma_client)
+
+    with pytest.raises(HTTPException) as refused:
+        await delete_verification_tokens(
+            tokens=["hashed-token-1"],
+            user_api_key_cache=cache,
+            user_api_key_dict=UserAPIKeyAuth(user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN.value),
+        )
+
+    assert refused.value.status_code == 503
+    mock_prisma_client.delete_data.assert_not_awaited()
+    mock_prisma_client.db.litellm_deletedverificationtoken.create_many.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_delete_key_fn_persists_deleted_keys(monkeypatch):
     from litellm.proxy._types import KeyRequest
@@ -11528,6 +11618,42 @@ async def test_update_key_non_budget_rejects_cross_user_modification(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_update_key_to_blocked_refuses_and_writes_nothing_when_redis_cannot_record_it(monkeypatch):
+    """Blocking a key through /key/update is a revocation like /key/block: with last good entries on and Redis
+    unable to record it, the request answers 503 before any row changes."""
+    from litellm.proxy.management_endpoints.key_management_endpoints import update_key_fn
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    test_hashed_token = "b10cked0" * 8
+    existing_key = MagicMock(token=test_hashed_token, user_id="admin", team_id=None, project_id=None, models=[])
+    existing_key.model_dump.return_value = {"token": test_hashed_token, "user_id": "admin", "team_id": None}
+    mock_prisma_client = AsyncMock()
+    mock_prisma_client.get_data = AsyncMock(return_value=existing_key)
+    mock_prisma_client.db.litellm_verificationtoken.find_unique = AsyncMock(return_value=existing_key)
+    redis = fake_redis_cache()
+    redis.server.connected = False
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", mock_prisma_client)
+    monkeypatch.setattr(
+        "litellm.proxy.proxy_server.user_api_key_cache",
+        UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True),
+    )
+    monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", MagicMock())
+    monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", None)
+    monkeypatch.setattr("litellm.proxy.proxy_server.premium_user", True)
+
+    with pytest.raises(ProxyException) as refused:
+        await update_key_fn(
+            request=MagicMock(query_params={}),
+            data=UpdateKeyRequest(key=test_hashed_token, blocked=True),
+            user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN, api_key="sk-admin", user_id="admin"),
+            litellm_changed_by=None,
+        )
+
+    assert str(refused.value.code) == "503"
+    mock_prisma_client.update_data.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_update_key_creator_reassigned_key_blocked(monkeypatch):
     """Regression: creator who no longer owns the key (user_id ≠ caller) must
     not bypass _check_key_admin_access via the caller_is_creator shortcut."""
@@ -12941,6 +13067,37 @@ async def test_execute_virtual_key_regeneration_allows_within_limit_duration(mon
             proxy_logging_obj=MagicMock(),
         )
     assert mock_prisma_client.db.litellm_verificationtoken.update.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_virtual_key_regeneration_refuses_and_writes_nothing_when_redis_cannot_record_it():
+    """Regenerate retires the old hash, so with last good entries on it records that before writing; a Redis that
+    cannot take it refuses the rotation rather than leave the old hash where a later outage serves it."""
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis = fake_redis_cache()
+    redis.server.connected = False
+    mock_prisma_client = _make_regenerate_mock_prisma()
+
+    with patch(
+        "litellm.proxy.management_endpoints.key_management_endpoints.get_new_token",
+        new_callable=AsyncMock,
+        return_value="sk-newtoken1234ab12",
+    ), pytest.raises(HTTPException) as refused:
+        await _execute_virtual_key_regeneration(
+            prisma_client=mock_prisma_client,
+            key_in_db=_make_regenerate_existing_key(),
+            hashed_api_key="abc123",
+            key="abc123",
+            data=RegenerateKeyRequest(),
+            user_api_key_dict=_make_regenerate_user_api_key_dict(),
+            litellm_changed_by=None,
+            user_api_key_cache=UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True),
+            proxy_logging_obj=MagicMock(),
+        )
+
+    assert refused.value.status_code == 503
+    assert mock_prisma_client.db.litellm_verificationtoken.update.await_count == 0
 
 
 @pytest.mark.asyncio
@@ -14718,6 +14875,38 @@ async def test_process_single_key_update_cache_invalidation_with_token_hash():
         call_kwargs = mock_delete_cache.call_args.kwargs
         # The token hash should be passed as-is, NOT double-hashed
         assert call_kwargs["hashed_token"] == token_hash
+
+
+@pytest.mark.asyncio
+async def test_process_single_key_update_to_blocked_refuses_when_redis_cannot_record_it():
+    """The bulk update routes block keys through this path too, so a block Redis cannot record is refused there."""
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    token_hash = "b1c0ffee" * 8
+    existing_key = MagicMock(token=token_hash, user_id="admin-user", team_id=None, project_id=None, models=[])
+    existing_key.model_dump.return_value = {"token": token_hash, "user_id": "admin-user"}
+    mock_prisma_client = AsyncMock()
+    mock_prisma_client.get_data = AsyncMock(return_value=existing_key)
+    mock_prisma_client.db.litellm_verificationtoken.find_unique = AsyncMock(return_value=existing_key)
+    redis = fake_redis_cache()
+    redis.server.connected = False
+
+    with patch(
+        "litellm.proxy.management_endpoints.key_management_endpoints.prepare_key_update_data",
+        return_value={"blocked": True},
+    ), pytest.raises(HTTPException) as refused:
+        await _process_single_key_update(
+            update_key_request=UpdateKeyRequest(key=token_hash, blocked=True),
+            user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN, api_key="sk-admin", user_id="admin-user"),
+            litellm_changed_by=None,
+            prisma_client=mock_prisma_client,
+            user_api_key_cache=UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True),
+            proxy_logging_obj=MagicMock(),
+            llm_router=MagicMock(),
+        )
+
+    assert refused.value.status_code == 503
+    mock_prisma_client.update_data.assert_not_awaited()
 
 
 @pytest.mark.asyncio
