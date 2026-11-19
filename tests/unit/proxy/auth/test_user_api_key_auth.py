@@ -2134,3 +2134,67 @@ async def test_key_whose_project_has_no_entry_is_refused_while_the_database_is_s
     with pytest.raises(ProxyException) as refused:
         await user_api_key_auth(request=request, api_key="Bearer sk-project-unknown")
     assert (str(refused.value.code), refused.value.type) == ("503", "no_db_connection")
+
+
+@pytest.mark.asyncio
+async def test_master_key_call_after_one_for_a_customer_served_from_its_last_good_entry_has_its_own_customers_limits(
+    monkeypatch,
+):
+    """A master key call for a customer its last good entry answers for builds the master key's object with that
+    customer's limits. The object is not cached: the next master key call, for a customer without limits, would keep
+    every limit the merge does not overwrite, and read fresh."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from litellm.proxy._types import LiteLLM_BudgetTable, LiteLLM_EndUserTable
+    from litellm.proxy.auth.user_api_key_auth import user_api_key_auth_builder
+    from litellm.proxy.common_utils.user_api_key_cache import (
+        UserApiKeyCache,
+        end_user_cache_key,
+        last_good_auth_entries_scope,
+        remember_last_good,
+    )
+
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    await remember_last_good(
+        cache,
+        end_user_cache_key("c-limited"),
+        LiteLLM_EndUserTable(
+            user_id="c-limited",
+            blocked=False,
+            budget_id="b-limited",
+            litellm_budget_table=LiteLLM_BudgetTable(budget_id="b-limited", rpm_limit=1),
+        ),
+    )
+    monkeypatch.setattr(litellm.proxy.proxy_server, "user_api_key_cache", cache)
+    monkeypatch.setattr(litellm.proxy.proxy_server, "master_key", MASTER_KEY)
+
+    async def master_key_call(end_user_id: str) -> tuple[int | None, tuple[str, ...]]:
+        request: Final = FastAPIRequest(
+            scope={"type": "http", "method": "POST", "path": "/chat/completions", "headers": []}
+        )
+        request._url = URL(url="/chat/completions")
+        master_key_bearer: Final = "Bearer " + MASTER_KEY
+        with last_good_auth_entries_scope() as scope:
+            served: Final = await user_api_key_auth_builder(
+                request=request,
+                api_key=master_key_bearer,
+                azure_api_key_header="",
+                anthropic_api_key_header=None,
+                google_ai_studio_api_key_header=None,
+                azure_apim_header=None,
+                request_data={"user": end_user_id},
+            )
+        for _ in range(5):
+            await asyncio.sleep(0)  # the call caches the master key object from a task it starts
+        return served.end_user_rpm_limit, scope.served
+
+    monkeypatch.setattr(litellm.proxy.proxy_server, "prisma_client", _StoppedDatabase())
+    limited: Final = await master_key_call("c-limited")
+    # The database answers again, and has no row for the next customer
+    customers: Final = SimpleNamespace(find_unique=AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        litellm.proxy.proxy_server, "prisma_client", SimpleNamespace(db=SimpleNamespace(litellm_endusertable=customers))
+    )
+
+    assert (limited, await master_key_call("c-free")) == ((1, ("LiteLLM_EndUserTable",)), (None, ()))

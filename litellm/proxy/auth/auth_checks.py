@@ -2094,19 +2094,23 @@ async def get_end_user_object(
             await forget_missing_last_good(user_api_key_cache, _key)
             return None
 
-        end_user_row: Final = await _apply_default_budget_to_end_user(
-            end_user_obj=LiteLLM_EndUserTable.model_validate(response.dict()),
-            prisma_client=prisma_client,
-            user_api_key_cache=user_api_key_cache,
-            parent_otel_span=parent_otel_span,
-        )
+        with last_good_auth_entries_scope() as default_budget_scope:
+            end_user_row: Final = await _apply_default_budget_to_end_user(
+                end_user_obj=LiteLLM_EndUserTable.model_validate(response.dict()),
+                prisma_client=prisma_client,
+                user_api_key_cache=user_api_key_cache,
+                parent_otel_span=parent_otel_span,
+            )
 
-        await user_api_key_cache.async_set_cache(
-            key=_key,
-            value=end_user_row,
-            model_type=LiteLLM_EndUserTable,
-            ttl=get_management_object_ttl(user_api_key_cache),
-        )
+        # Not cached when the default budget came from a last good entry: a later read that resolves no default keeps
+        # the cached row's budget, and that read would be fresh
+        if not default_budget_scope.served:
+            await user_api_key_cache.async_set_cache(
+                key=_key,
+                value=end_user_row,
+                model_type=LiteLLM_EndUserTable,
+                ttl=get_management_object_ttl(user_api_key_cache),
+            )
         await remember_last_good(user_api_key_cache, _key, end_user_row)
 
         if key_end_user_budget_id is None:

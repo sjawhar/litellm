@@ -1856,7 +1856,10 @@ async def user_api_key_auth_builder(
                     # standard JWT auth_builder below
 
                 if do_standard_jwt_auth:
-                    with tracer.trace("litellm.proxy.auth.jwt_auth_builder"):
+                    with (
+                        tracer.trace("litellm.proxy.auth.jwt_auth_builder"),
+                        last_good_auth_entries_scope() as jwt_auth_scope,
+                    ):
                         result: Final = await JWTAuthManager.auth_builder(
                             request_data=request_data,
                             general_settings=general_settings,
@@ -1899,7 +1902,9 @@ async def user_api_key_auth_builder(
                         # DB mapping lookup in _resolve_jwt_to_virtual_key.
                         # Without this, every proxy-admin request under
                         # AUTO_REGISTER re-hits get_jwt_key_mapping_object.
-                        if pending_auto_register is not None:
+                        # Not cached when auth_builder served a last good entry, which the role may rest on: the marker
+                        # would skip the mapping lookup and key reuse once the database answers with the current role
+                        if pending_auto_register is not None and not jwt_auth_scope.served:
                             await user_api_key_cache.async_set_cache(
                                 key=pending_auto_register.cache_key,
                                 value=_JWT_PROXY_ADMIN_SENTINEL,
@@ -2053,6 +2058,8 @@ async def user_api_key_auth_builder(
         ## Check END-USER OBJECT
         _end_user_object = None
         end_user_params: Final = {}
+        # Records whether the end user's limits came from a last good entry, so the master key object is not cached
+        end_user_scope: Final = last_good_auth_entries_scope()
 
         raw_end_user_id: Final = get_end_user_id_from_request_body(request_data, safe_get_request_headers(request))
         end_user_id = await resolve_and_validate_end_user_id(
@@ -2072,7 +2079,7 @@ async def user_api_key_auth_builder(
             try:
                 end_user_params["end_user_id"] = end_user_id
 
-                with tracer.trace("litellm.proxy.auth.get_end_user_object"):
+                with tracer.trace("litellm.proxy.auth.get_end_user_object"), end_user_scope:
                     _end_user_object = await get_end_user_object(
                         end_user_id=end_user_id,
                         prisma_client=prisma_client,
@@ -2095,11 +2102,12 @@ async def user_api_key_auth_builder(
                         get_default_end_user_budget,
                     )
 
-                    default_budget: Final = await get_default_end_user_budget(
-                        prisma_client=prisma_client,
-                        user_api_key_cache=user_api_key_cache,
-                        parent_otel_span=parent_otel_span,
-                    )
+                    with end_user_scope:
+                        default_budget: Final = await get_default_end_user_budget(
+                            prisma_client=prisma_client,
+                            user_api_key_cache=user_api_key_cache,
+                            parent_otel_span=parent_otel_span,
+                        )
                     if default_budget is not None:
                         _apply_budget_limits_to_end_user_params(
                             end_user_params=end_user_params,
@@ -2254,14 +2262,17 @@ async def user_api_key_auth_builder(
                 route=route,
                 start_time=start_time,
             )
-            asyncio.create_task(
-                cache_key_object(
-                    hashed_token=hash_token(master_key),
-                    user_api_key_obj=_user_api_key_obj,
-                    user_api_key_cache=user_api_key_cache,
-                    proxy_logging_obj=proxy_logging_obj,
+            # Not cached when the end user's limits came from a last good entry: the merge for a later master key call
+            # keeps every limit its own end user leaves unset, and that call would read fresh
+            if not end_user_scope.served:
+                asyncio.create_task(
+                    cache_key_object(
+                        hashed_token=hash_token(master_key),
+                        user_api_key_obj=_user_api_key_obj,
+                        user_api_key_cache=user_api_key_cache,
+                        proxy_logging_obj=proxy_logging_obj,
+                    )
                 )
-            )
 
             _user_api_key_obj = update_valid_token_with_end_user_params(
                 valid_token=_user_api_key_obj, end_user_params=end_user_params
