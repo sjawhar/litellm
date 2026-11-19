@@ -76,6 +76,7 @@ from litellm.proxy.auth.auth_checks import (  # noqa: F401  # legacy module expo
     is_valid_fallback_model,
     jwt_key_mapping_cache_key,
     key_model_aliases_for_auth_check,
+    reject_ambiguous_provider_fallbacks,
     resolve_and_validate_end_user_id,
     resolve_default_end_user_budget,
     team_member_max_budget_alert_check,
@@ -3839,6 +3840,10 @@ async def enforce_key_and_fallback_model_access(
     fallback_names, anthropic_fallback_names = key_fallback_model_names(
         request_data, anthropic_owns_body_fallbacks=body_fallbacks_go_to_anthropic(route, request)
     )
+    # Refused before any check on them, as in common_checks, so no error a request can be recovered from comes first
+    reject_ambiguous_provider_fallbacks(
+        provider_fallback_models=anthropic_fallback_names, valid_token=valid_token, llm_router=llm_router
+    )
 
     for _name in fallback_names:
         await can_key_call_model(
@@ -3853,8 +3858,9 @@ async def enforce_key_and_fallback_model_access(
             user_model=None,
         )
 
-    # Anthropic serves its own fallback models, so they need the key's model access but no Router group. common_checks
-    # refuses a name there that the proxy grants as another model: an alias, or another deployment's access group.
+    # Anthropic serves its own fallback models, so they need the key's model access but no Router group. A name there
+    # that is an alias, or that the router serves from another model, is refused above, so this check reads each name
+    # as Anthropic gets it.
     for _name in anthropic_fallback_names:
         await can_key_call_model(
             model=_name,

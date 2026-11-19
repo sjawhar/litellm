@@ -10,7 +10,7 @@ import copy
 import importlib
 import json
 import sys
-from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping, Sequence
+from collections.abc import Callable, Coroutine, Iterable, Iterator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -584,6 +584,9 @@ class _Gateway:
         team_aliases: Mapping[str, str] | None = None,
         router_aliases: Mapping[str, str] | None = None,
         extra_deployments: Sequence[Mapping[str, object]] = (),
+        routing_groups: Sequence[Mapping[str, object]] = (),
+        token_team_models: tuple[str, ...] | None = None,
+        allow_requests_on_db_unavailable: bool = False,
     ) -> "_GatewayResult":
         import httpx
         import respx
@@ -599,8 +602,9 @@ class _Gateway:
             model_list=[
                 {
                     "model_name": name,
+                    # Each group sends its own name to Anthropic, so a name Anthropic gets means the same model here
                     "litellm_params": {
-                        "model": f"anthropic/claude-{name}",
+                        "model": f"anthropic/{name}",
                         "api_key": _DEPLOYMENT_KEY,
                         "api_base": host,
                     },
@@ -614,6 +618,7 @@ class _Gateway:
             + [copy.deepcopy(dict(deployment)) for deployment in extra_deployments],
             num_retries=0,
             model_group_alias=dict(router_aliases or {}),
+            routing_groups=[dict(group) for group in routing_groups] or None,
         )
         router.fallback_target_credentials_allowed = (lambda: True) if credentials_allowed else None
         cache = DualCache()
@@ -624,7 +629,9 @@ class _Gateway:
             user_role=LitellmUserRoles.INTERNAL_USER,
             models=list(key_models),
             team_id=team_id,
-            team_models=["requested", "other"] if team_id else [],
+            team_models=(
+                list(token_team_models) if token_team_models is not None else ["requested", "other"] if team_id else []
+            ),
             router_settings=key_router_settings,
             aliases=dict(key_aliases or {}),
             team_model_aliases=dict(team_aliases) if team_aliases is not None else None,
@@ -643,7 +650,7 @@ class _Gateway:
             "user_api_key_cache": cache,
             "llm_router": router,
             "llm_model_list": router.get_model_list(),
-            "general_settings": {},
+            "general_settings": {"allow_requests_on_db_unavailable": True} if allow_requests_on_db_unavailable else {},
             "user_custom_auth": None,
             "proxy_logging_obj": ProxyLogging(user_api_key_cache=cache),
         }.items():
@@ -757,7 +764,7 @@ def _shaped(target: dict, shape: str) -> list:
 def _endpoint_target(param: str, shape: str):
     def make(field: str):
         if field == "context_window_fallback_dict":
-            return {"anthropic/claude-requested": _ATTACKER_HOST}
+            return {"anthropic/requested": _ATTACKER_HOST}
         return _shaped({"model": "other", param: _PARAM_VALUES[param]}, shape)
 
     return make
@@ -766,7 +773,7 @@ def _endpoint_target(param: str, shape: str):
 def _mock_target(shape: str):
     def make(field: str):
         if field == "context_window_fallback_dict":
-            return {"anthropic/claude-requested": "other"}
+            return {"anthropic/requested": "other"}
         return _shaped({"model": "other", "mock_response": "served by a mock"}, shape)
 
     return make
@@ -788,7 +795,7 @@ _FORBIDDEN_SHAPES: Final[Mapping[str, object]] = MappingProxyType[str, object](
 def _forbidden_target(shape: str) -> Callable[[str], object]:
     def make(field: str) -> object:
         if field == "context_window_fallback_dict":
-            return {"anthropic/claude-requested": "forbidden"}
+            return {"anthropic/requested": "forbidden"}
         return _FORBIDDEN_SHAPES[shape]
 
     return make
@@ -1104,13 +1111,19 @@ async def test_a_name_in_anthropics_fallbacks_that_has_an_alias_is_refused(
 _OPUS: Final = "claude-opus-4-8"
 
 
-def _opus_deployment(litellm_model: str, access_group: str, model_name: str = _OPUS) -> Mapping[str, object]:
-    """A deployment under the name, in one access group; its host counts as the forbidden one, which nothing calls"""
+def _opus_deployment(
+    litellm_model: str, access_group: str, model_name: str = _OPUS, *, team_id: str | None = None
+) -> Mapping[str, object]:
+    """
+    A deployment under ``model_name`` in one access group; its host counts as the forbidden one, which nothing calls. A
+    team's deployment is published under that name for the team, the way the proxy stores one.
+    """
+    team_fields: Final = {"team_id": team_id, "team_public_model_name": model_name} if team_id is not None else {}
     return MappingProxyType[str, object](
         {
-            "model_name": model_name,
+            "model_name": model_name if team_id is None else f"model_name_{team_id}_0",
             "litellm_params": {"model": litellm_model, "api_key": _DEPLOYMENT_KEY, "api_base": _FORBIDDEN_HOST},
-            "model_info": {"access_groups": [access_group]},
+            "model_info": {"access_groups": [access_group], **team_fields},
         }
     )
 
@@ -1120,63 +1133,218 @@ _MIXED_GROUP: Final = (
     _opus_deployment(f"anthropic/{_OPUS}", "expensive"),
     _opus_deployment("anthropic/claude-haiku-4-5", "cheap"),
 )
+# The same model on Anthropic and on Bedrock: the Bedrock deployment sends Bedrock's id, never the name
+_ANTHROPIC_AND_BEDROCK_GROUP: Final = (
+    _opus_deployment(f"anthropic/{_OPUS}", "expensive"),
+    _opus_deployment("bedrock/us.anthropic.claude-opus-4-8-v1:0", "cheap"),
+)
+_KEY_WITH_CHEAP: Final = ("requested", "cheap")
+_KEY_WITH_THE_NAME: Final = ("requested", _OPUS)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "deployments",
+    ("deployments", "key_models", "key_aliases", "routing_groups"),
     [
-        pytest.param((_opus_deployment("anthropic/claude-haiku-4-5", "cheap"),), id="one-deployment-of-another-model"),
-        pytest.param(_MIXED_GROUP, id="mixed-group"),
+        pytest.param(
+            (_opus_deployment("anthropic/claude-haiku-4-5", "cheap"),),
+            _KEY_WITH_CHEAP,
+            {},
+            (),
+            id="one-deployment-of-another-model",
+        ),
+        pytest.param(_MIXED_GROUP, _KEY_WITH_CHEAP, {}, (), id="mixed-group"),
+        pytest.param(_MIXED_GROUP, _KEY_WITH_THE_NAME, {}, (), id="mixed-group-key-holds-the-name"),
+        pytest.param(
+            _MIXED_GROUP,
+            ("requested", "cheap", "claude-haiku-4-5"),
+            {"expensive": "claude-haiku-4-5"},
+            (),
+            id="mixed-group-key-alias-named-like-a-group",
+        ),
+        pytest.param(
+            (
+                _opus_deployment(f"anthropic/{_OPUS}", "claude-haiku-grant"),
+                _opus_deployment("anthropic/claude-haiku-4-5", "cheap"),
+            ),
+            ("requested", "cheap", "claude-haiku-*"),
+            {},
+            (),
+            id="mixed-group-key-wildcard-matching-a-group",
+        ),
+        pytest.param(_ANTHROPIC_AND_BEDROCK_GROUP, _KEY_WITH_CHEAP, {}, (), id="other-provider"),
+        pytest.param(_ANTHROPIC_AND_BEDROCK_GROUP, _KEY_WITH_THE_NAME, {}, (), id="other-provider-key-holds-the-name"),
+        pytest.param(
+            (_opus_deployment("anthropic/claude-haiku-*", "cheap", model_name="claude-opus-*"),),
+            _KEY_WITH_CHEAP,
+            {},
+            (),
+            id="pattern-route-to-another-model",
+        ),
+        pytest.param(
+            (_opus_deployment("anthropic/claude-haiku-4-5", "cheap", model_name="claude-opus-*"),),
+            _KEY_WITH_CHEAP,
+            {},
+            (),
+            id="pattern-route-to-a-fixed-model",
+        ),
         pytest.param(
             (
                 _opus_deployment(f"anthropic/{_OPUS}", "expensive"),
-                _opus_deployment("bedrock/us.anthropic.claude-opus-4-8-v1:0", "cheap"),
+                _opus_deployment("anthropic/claude-haiku-4-5", "cheap", team_id="haiku-team"),
             ),
-            id="other-provider",
+            ("requested", "expensive"),
+            {},
+            (),
+            id="another-teams-deployment-under-the-name",
         ),
         pytest.param(
-            (_opus_deployment("anthropic/claude-haiku-*", "cheap", model_name="claude-opus-*"),),
-            id="wildcard-route-to-another-model",
+            (_opus_deployment("anthropic/claude-haiku-*", "cheap", model_name="claude-opus-*", team_id="haiku-team"),),
+            _KEY_WITH_THE_NAME,
+            {},
+            (),
+            id="another-teams-pattern-route",
+        ),
+        pytest.param(
+            (_opus_deployment("anthropic/claude-haiku-4-5", "cheap", model_name="haiku-member"),),
+            _KEY_WITH_THE_NAME,
+            {},
+            ({"group_name": _OPUS, "models": ["haiku-member"], "routing_strategy": "simple-shuffle"},),
+            id="routing-group-of-another-model",
         ),
     ],
 )
-async def test_a_name_in_anthropics_fallbacks_granted_only_through_another_deployments_access_group_is_refused(
-    monkeypatch: pytest.MonkeyPatch, deployments: Sequence[Mapping[str, object]]
+async def test_a_name_in_anthropics_fallbacks_the_router_can_serve_as_another_model_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+    deployments: Sequence[Mapping[str, object]],
+    key_models: tuple[str, ...],
+    key_aliases: Mapping[str, str],
+    routing_groups: Sequence[Mapping[str, object]],
 ) -> None:
-    """The key holds `cheap`, whose deployment does not send the name to Anthropic, so `cheap` does not grant it"""
+    """
+    A deployment under the name, for any team or through any route, sends another model: a check could grant the name
+    through it while Anthropic serves the name, so the name is refused whatever the key holds
+    """
     result: Final = await _Gateway(monkeypatch, requested_answers=True).send(
         {"fallbacks": [{"model": _OPUS}]},
         beta=True,
-        key_models=("requested", "cheap"),
+        key_models=key_models,
+        key_aliases=key_aliases,
         extra_deployments=deployments,
+        routing_groups=routing_groups,
     )
 
     assert result.response.status_code == 403, result.response.text
     assert "key_model_access_denied" in result.response.text
+    assert '"param":"fallbacks"' in result.response.text.replace(" ", "")
     assert f"The requested model '{_OPUS}' is not available" in result.response.text
     assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "key_models",
+    ("deployments", "key_models"),
     [
-        pytest.param(("requested", "expensive"), id="group-of-the-deployment-that-sends-the-name"),
-        pytest.param(("requested", _OPUS), id="the-name-itself"),
+        pytest.param(
+            (_opus_deployment(f"anthropic/{_OPUS}", "expensive"), _opus_deployment(f"anthropic/{_OPUS}", "premium")),
+            ("requested", "expensive"),
+            id="two-anthropic-deployments-key-holds-one-group",
+        ),
+        pytest.param(
+            (_opus_deployment(f"anthropic/{_OPUS}", "expensive"), _opus_deployment(f"anthropic/{_OPUS}", "premium")),
+            ("requested", "premium"),
+            id="two-anthropic-deployments-key-holds-the-other-group",
+        ),
+        pytest.param((), _KEY_WITH_THE_NAME, id="no-deployment-key-holds-the-name"),
+        pytest.param(
+            (_opus_deployment("anthropic/*", "every-claude", model_name="anthropic/*"),),
+            ("requested", "every-claude"),
+            id="pattern-route-that-forwards-the-name",
+        ),
     ],
 )
-async def test_a_name_in_anthropics_fallbacks_the_key_may_call_as_named_still_serves_the_request(
-    monkeypatch: pytest.MonkeyPatch, key_models: tuple[str, ...]
+async def test_a_name_in_anthropics_fallbacks_that_means_one_model_still_serves_the_request(
+    monkeypatch: pytest.MonkeyPatch, deployments: Sequence[Mapping[str, object]], key_models: tuple[str, ...]
 ) -> None:
     result: Final = await _Gateway(monkeypatch, requested_answers=True).send(
-        {"fallbacks": [{"model": _OPUS}]}, beta=True, key_models=key_models, extra_deployments=_MIXED_GROUP
+        {"fallbacks": [{"model": _OPUS}]}, beta=True, key_models=key_models, extra_deployments=deployments
     )
 
     assert result.response.status_code == 200, result.response.text
     assert result.calls == {"requested": 1, "other": 0, "forbidden": 0, "attacker": 0}
-    # Anthropic gets the list as sent, so the refusal above is the one place the name could switch models
+    # Anthropic gets the list as sent, so the refusals above are the one place the name could switch models
     assert [body["fallbacks"] for body in result.requested_bodies if isinstance(body, dict)] == [[{"model": _OPUS}]]
+
+
+@pytest.mark.asyncio
+async def test_an_aliased_name_in_anthropics_fallbacks_is_refused_before_an_unreadable_team_can_fail_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The team lookup is swallowed into no team and the token records no team models, so the team check answers 503,
+    which allow_requests_on_db_unavailable recovers into a fallback identity that goes on; the alias refusal comes first
+    """
+    from litellm.proxy.auth import user_api_key_auth
+
+    safe_fetch: Final = user_api_key_auth._safe_fetch
+
+    async def swallows_the_team_lookup(label: str, awaitable: Coroutine[object, object, object]) -> object:
+        if label == "team":
+            awaitable.close()
+            return None
+        return await safe_fetch(label, awaitable)
+
+    monkeypatch.setattr(user_api_key_auth, "_safe_fetch", swallows_the_team_lookup)
+    result: Final = await _Gateway(monkeypatch, requested_answers=True).send(
+        {"fallbacks": [{"model": _ALIASED_PROVIDER_FALLBACK}]},
+        beta=True,
+        team_router_settings={},
+        token_team_models=(),
+        key_aliases={_ALIASED_PROVIDER_FALLBACK: "other"},
+        allow_requests_on_db_unavailable=True,
+    )
+
+    assert result.response.status_code == 403, result.response.text
+    assert "key_model_access_denied" in result.response.text
+    assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+
+
+@pytest.mark.asyncio
+async def test_common_checks_refuses_an_aliased_name_in_anthropics_fallbacks_before_the_unread_team_check() -> None:
+    """The same order where common_checks is the only check, as for a JWT: the alias refusal comes before the 503"""
+    team_key: Final = UserAPIKeyAuth(team_id="fallback-team", aliases={_ALIASED_PROVIDER_FALLBACK: "requested"})
+
+    with pytest.raises(ModelAccessDeniedProxyException, match=f"'{_ALIASED_PROVIDER_FALLBACK}'") as exc_info:
+        await _common_checks_with_fallbacks(
+            [_ALIASED_PROVIDER_FALLBACK], team_key, request=_messages_request(_SERVER_SIDE_FALLBACK_BETA)
+        )
+
+    assert exc_info.value.type == ProxyErrorTypes.key_model_access_denied
+    assert exc_info.value.code == "403"
+
+
+@pytest.mark.parametrize(
+    ("deployment", "sends"),
+    [
+        pytest.param({"litellm_params": {"model": f"anthropic/{_OPUS}"}}, True, id="anthropic-prefix"),
+        pytest.param(
+            {"litellm_params": {"model": _OPUS, "custom_llm_provider": "anthropic"}}, True, id="declared-provider"
+        ),
+        pytest.param({"litellm_params": {"model": "anthropic/claude-haiku-4-5"}}, False, id="another-model"),
+        pytest.param({"litellm_params": {"model": "bedrock/us.anthropic.claude-opus-4-8-v1:0"}}, False, id="bedrock"),
+        pytest.param({"litellm_params": {"model": "unmapped-provider/xyz"}}, False, id="unreadable-provider"),
+        pytest.param({"litellm_params": {"model": 42}}, False, id="unreadable-model"),
+        pytest.param({"litellm_params": {}}, False, id="no-model"),
+        pytest.param({"litellm_params": None}, False, id="unreadable-params"),
+        pytest.param({}, False, id="no-params"),
+    ],
+)
+def test_a_deployment_sends_a_name_to_anthropic_only_when_its_provider_and_model_read_as_that_name(
+    deployment: object, sends: bool
+) -> None:
+    from litellm.proxy.auth.auth_checks import _deployment_sends_name_to_anthropic
+
+    assert _deployment_sends_name_to_anthropic(deployment, _OPUS) is sends
 
 
 async def _common_checks_with_fallbacks(
@@ -1187,8 +1355,12 @@ async def _common_checks_with_fallbacks(
     membership: LiteLLM_TeamMembership | None = None,
     user_object: LiteLLM_UserTable | None = None,
     project_object: LiteLLM_ProjectTableCachedObj | None = None,
+    request: Request | None = None,
 ) -> bool:
-    """common_checks on a /v1/messages request for `requested` that names `fallbacks`, or none when it is empty"""
+    """
+    common_checks on a /v1/messages request for `requested` that names `fallbacks`, or none when it is empty; they are
+    Anthropic's own list when `request` carries the server-side-fallback beta
+    """
     from litellm.proxy.auth.auth_checks import common_checks
 
     with patch("litellm.proxy.auth.auth_checks.get_team_membership", new=AsyncMock(return_value=membership)):
@@ -1208,7 +1380,7 @@ async def _common_checks_with_fallbacks(
             llm_router=None,
             proxy_logging_obj=MagicMock(),
             valid_token=valid_token,
-            request=MagicMock(spec=Request),
+            request=request if request is not None else MagicMock(spec=Request),
             skip_budget_checks=True,
             project_object=project_object,
         )
