@@ -117,6 +117,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     forget_last_good,
     forget_missing_last_good,
     get_management_object_ttl,
+    last_good_auth_entries_scope,
     model_access_group_cache_key,
     model_access_group_registry_cache_key,
     model_access_group_spend_counter_key,
@@ -124,6 +125,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     project_cache_key,
     project_spend_counter_key,
     recall_last_good,
+    record_last_good_served,
     remember_last_good,
     serves_last_good_entries,
     tag_cache_key,
@@ -1825,26 +1827,39 @@ _END_USER_REGISTRY_LOAD_LOCK: Final = asyncio.Lock()
 _MODEL_ACCESS_GROUP_REGISTRY_LOAD_LOCK: Final = asyncio.Lock()
 
 
+class _RegistryIds(BaseModel):
+    """The ids a registry held when the database last answered for it."""
+
+    model_config = ConfigDict(frozen=True)
+
+    ids: tuple[str, ...]
+
+
 @with_service_target(AUTH_OBJECTS_TARGET)
 async def _cached_registry(
     cache_key: str,
     overflow_sentinel: str,
     user_api_key_cache: UserApiKeyCache,
 ) -> frozenset[str] | None | _RegistryNotCached:
-    """The cached registry answer, or ``_REGISTRY_NOT_CACHED`` when the caller has to query."""
+    """The cached registry answer, or ``_REGISTRY_NOT_CACHED`` when the caller has to query. A registry its last good
+    entry answered is cached as that entry, so a request that reads it back records it like the one that recalled it."""
     cached: Final = await _raw_cache(user_api_key_cache).async_get_cache(key=cache_key)
     if cached == overflow_sentinel:
         return None
     # Memory hands back the tuple that was written; Redis round-trips it through JSON as a list.
     if isinstance(cached, (list, tuple)):
         return frozenset(entry for entry in cached if isinstance(entry, str))
-    return _REGISTRY_NOT_CACHED
+    served_from_last_good: Final = CacheCodec.deserialize(cached, _RegistryIds)
+    if served_from_last_good is None:
+        return _REGISTRY_NOT_CACHED
+    record_last_good_served(_RegistryIds.__name__)
+    return frozenset(served_from_last_good.ids)
 
 
 @with_service_target(AUTH_OBJECTS_TARGET)
 async def _cache_registry_answer(
     cache_key: str,
-    value: tuple[str, ...] | str,
+    value: tuple[str, ...] | str | _RegistryIds,
     ttl: float,
     user_api_key_cache: UserApiKeyCache,
 ) -> None:
@@ -1853,14 +1868,6 @@ async def _cache_registry_answer(
         await user_api_key_cache.async_set_cache(key=cache_key, value=value, ttl=ttl)
     except Exception as e:  # noqa: BLE001  # best-effort cache write: auth must survive a cache backend error
         verbose_proxy_logger.warning("Failed to cache registry %s: %s", cache_key, e)
-
-
-class _RegistryIds(BaseModel):
-    """The ids a registry held when the database last answered for it."""
-
-    model_config = ConfigDict(frozen=True)
-
-    ids: tuple[str, ...]
 
 
 async def _fetch_and_cache_registry(
@@ -1891,7 +1898,7 @@ async def _fetch_and_cache_registry(
         )
         await _cache_registry_answer(
             cache_key=cache_key,
-            value=overflow_sentinel if kept is None else kept.ids,
+            value=overflow_sentinel if kept is None else kept,
             ttl=REGISTRY_ERROR_NEGATIVE_CACHE_TTL,
             user_api_key_cache=user_api_key_cache,
         )
@@ -2151,6 +2158,8 @@ async def last_good_end_user_blocked(error: Exception, end_user_id: str, user_ap
 
 _END_USER_VALIDATION_NEGATIVE_TTL: Final = 60
 _END_USER_VALIDATION_POSITIVE_TTL: Final = 300
+#: The validation verdict of an id only a last good entry vouched for: a request that reads it back reads last_good.
+_END_USER_VALID_FROM_LAST_GOOD: Final = "valid_from_last_good"
 
 
 @with_service_target(AUTH_OBJECTS_TARGET)
@@ -2194,23 +2203,30 @@ async def resolve_and_validate_end_user_id(
     has_default_budget: Final = bool(litellm.max_end_user_budget_id) or key_end_user_budget_id is not None
     cache_key: Final = f"end_user_validation:{raw_end_user_id}"
     cached: Final = await _raw_cache(user_api_key_cache).async_get_cache(key=cache_key)
+    if cached == _END_USER_VALID_FROM_LAST_GOOD:
+        record_last_good_served(_END_USER_VALID_FROM_LAST_GOOD)
+        return raw_end_user_id
     if cached == "valid":
         return raw_end_user_id
     if cached == "invalid":
         return raw_end_user_id if has_default_budget else None
 
-    is_valid: Final = await _end_user_id_exists_in_db(
-        end_user_id=raw_end_user_id,
-        prisma_client=prisma_client,
-        user_api_key_cache=user_api_key_cache,
-        parent_otel_span=parent_otel_span,
-        proxy_logging_obj=proxy_logging_obj,
-        route=route,
-    )
+    with last_good_auth_entries_scope() as validation_scope:
+        is_valid: Final = await _end_user_id_exists_in_db(
+            end_user_id=raw_end_user_id,
+            prisma_client=prisma_client,
+            user_api_key_cache=user_api_key_cache,
+            parent_otel_span=parent_otel_span,
+            proxy_logging_obj=proxy_logging_obj,
+            route=route,
+        )
 
+    verdict: Final = (
+        "invalid" if not is_valid else _END_USER_VALID_FROM_LAST_GOOD if validation_scope.served else "valid"
+    )
     await user_api_key_cache.async_set_cache(
         key=cache_key,
-        value="valid" if is_valid else "invalid",
+        value=verdict,
         ttl=(_END_USER_VALIDATION_POSITIVE_TTL if is_valid else _END_USER_VALIDATION_NEGATIVE_TTL),
     )
 
@@ -2612,25 +2628,14 @@ async def _load_team_membership_on_cache_miss(
     if not isinstance(redis_membership, _TeamMembershipCacheMiss):
         return redis_membership
 
-    try:
-        return await _fetch_team_membership_from_db(
-            user_id=user_id,
-            team_id=team_id,
-            prisma_client=prisma_client,
-            user_api_key_cache=user_api_key_cache,
-            parent_otel_span=parent_otel_span,
-            proxy_logging_obj=proxy_logging_obj,
-        )
-    except Exception as e:
-        served: Final = await recall_last_good_after(
-            e,
-            user_api_key_cache,
-            team_membership_auth_cache_key(team_id=team_id, user_id=user_id),
-            LiteLLM_TeamMembership,
-        )
-        if served is None:
-            raise
-        return served
+    return await _fetch_team_membership_from_db(
+        user_id=user_id,
+        team_id=team_id,
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+        parent_otel_span=parent_otel_span,
+        proxy_logging_obj=proxy_logging_obj,
+    )
 
 
 @with_service_target(AUTH_OBJECTS_TARGET)
@@ -2659,7 +2664,7 @@ async def get_team_membership(
 
     inflight: Final[object] = _team_membership_inflight.get(_key)
     if isinstance(inflight, asyncio.Task):
-        return _membership_from_shared_load(await asyncio.shield(inflight))
+        return await _shared_membership_or_last_good(inflight, user_api_key_cache, team_id=team_id, user_id=user_id)
 
     if prisma_client is None:
         raise Exception("No db connected")
@@ -2682,7 +2687,31 @@ async def get_team_membership(
             _team_membership_inflight.pop(_key, None)
 
     task.add_done_callback(_clear_inflight)
-    return _membership_from_shared_load(await asyncio.shield(task))
+    return await _shared_membership_or_last_good(task, user_api_key_cache, team_id=team_id, user_id=user_id)
+
+
+async def _shared_membership_or_last_good(
+    load: asyncio.Future[LiteLLM_TeamMembership | None],
+    user_api_key_cache: UserApiKeyCache,
+    *,
+    team_id: str,
+    user_id: str,
+) -> LiteLLM_TeamMembership | None:
+    """The shared load's membership. When it fails, each caller recalls the last good entry itself rather than share
+    one caller's recall, so every request served from it records that in its own scope."""
+    try:
+        loaded: Final = await asyncio.shield(load)
+    except Exception as e:
+        served: Final = await recall_last_good_after(
+            e,
+            user_api_key_cache,
+            team_membership_auth_cache_key(team_id=team_id, user_id=user_id),
+            LiteLLM_TeamMembership,
+        )
+        if served is None:
+            raise
+        return served
+    return _membership_from_shared_load(loaded)
 
 
 def model_in_access_group(model: str, team_models: list[str] | None, llm_router: Router | None) -> bool:
@@ -4665,14 +4694,15 @@ async def get_org_object_for_request(
     proxy_logging_obj: ProxyLogging | None,
 ) -> LiteLLM_OrganizationTable | None:
     try:
-        org: Final = await get_org_object(
-            org_id=org_id,
-            prisma_client=prisma_client,
-            user_api_key_cache=user_api_key_cache,
-            parent_otel_span=parent_otel_span,
-            proxy_logging_obj=proxy_logging_obj,
-            include_budget_table=True,
-        )
+        with last_good_auth_entries_scope() as org_scope:
+            org: Final = await get_org_object(
+                org_id=org_id,
+                prisma_client=prisma_client,
+                user_api_key_cache=user_api_key_cache,
+                parent_otel_span=parent_otel_span,
+                proxy_logging_obj=proxy_logging_obj,
+                include_budget_table=True,
+            )
     except OrganizationNotFoundError:
         return None
     except LastGoodEntryMissing:
@@ -4692,7 +4722,8 @@ async def get_org_object_for_request(
         raise
     if org is None:
         return None
-    await _keep_last_known_org(org, org_id, user_api_key_cache)
+    if not org_scope.served:
+        await _keep_last_known_org(org, org_id, user_api_key_cache)
     return org
 
 

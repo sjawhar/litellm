@@ -2857,6 +2857,139 @@ class TestLastGoodLimitsWhileTheDatabaseIsUnreachable:
         assert await request() == (99.0, ("_ProxyBudgetSpend",))
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("read_back_from", ["memory", "redis"])
+    async def test_a_request_that_reads_back_a_registry_its_last_good_entry_answered_reads_last_good(
+        self, read_back_from: str
+    ):
+        """The registry the last good entry answered is cached for the error TTL. A request inside that window rests on
+        it as much as the request that recalled it, so both record it, whether memory or Redis hands it back."""
+        from litellm.proxy._types import LiteLLM_EndUserTable
+        from litellm.proxy.common_utils.user_api_key_cache import last_good_auth_entries_scope
+
+        database = _LimitsDatabase()
+        database.customers.rows["c-restricted"] = LiteLLM_EndUserTable(user_id="c-restricted", blocked=True)
+        cache = _serving_cache(redis_cache=fake_redis_cache().cache)
+        assert await self._customer(database, cache, "c-free") is None
+        await self._expire(cache, "end_user_restricted_registry")
+        database.stopped_with = _STOPPED
+
+        async def request() -> tuple[object, tuple[str, ...]]:
+            with last_good_auth_entries_scope() as scope:
+                customer: Final = await self._customer(database, cache, "c-free")
+            return customer, scope.served
+
+        recalled: Final = await request()
+        if read_back_from == "redis":
+            cache.in_memory_cache.delete_cache("end_user_restricted_registry")
+
+        assert (recalled, await request()) == ((None, ("_RegistryIds",)), (None, ("_RegistryIds",)))
+
+    @pytest.mark.asyncio
+    async def test_each_request_waiting_on_a_membership_load_records_the_last_good_membership(self):
+        """Concurrent requests share one membership load. When it fails, each of them is served the last good
+        membership, so each of them reads last_good, not only the request that ran the load."""
+        from litellm.proxy._types import LiteLLM_TeamMembership
+        from litellm.proxy.auth.auth_checks import get_team_membership
+        from litellm.proxy.common_utils.user_api_key_cache import (
+            last_good_auth_entries_scope,
+            team_membership_auth_cache_key,
+        )
+
+        load_started: Final = asyncio.Event()
+        release: Final = asyncio.Event()
+
+        async def stalled(where: object = None, include: object = None) -> BaseModel | None:
+            load_started.set()
+            await release.wait()
+            raise _STOPPED
+
+        memberships: Final = SimpleNamespace(find_unique=stalled)
+        database: Final = SimpleNamespace(db=SimpleNamespace(litellm_teammembership=memberships))
+        cache = _serving_cache()
+        await remember_last_good(
+            cache,
+            team_membership_auth_cache_key(team_id="t-wait", user_id="u-wait"),
+            LiteLLM_TeamMembership(user_id="u-wait", team_id="t-wait"),
+        )
+
+        async def request() -> tuple[str | None, tuple[str, ...]]:
+            with last_good_auth_entries_scope() as scope:
+                membership: Final = await get_team_membership(
+                    user_id="u-wait",
+                    team_id="t-wait",
+                    prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+                    user_api_key_cache=cache,
+                )
+            return (None if membership is None else membership.team_id), scope.served
+
+        requests: Final = [asyncio.create_task(request()) for _ in range(2)]
+        await load_started.wait()
+        for _ in range(5):
+            await asyncio.sleep(0)
+        release.set()
+
+        assert await asyncio.gather(*requests) == [("t-wait", ("LiteLLM_TeamMembership",))] * 2
+
+    @pytest.mark.asyncio
+    async def test_an_organization_served_from_its_last_good_entry_is_not_kept_as_the_last_known_organization(self):
+        """The last known organization answers a database error that is not an outage, as an ordinary cache hit.
+        Kept from a last good entry, it would answer such a request as if the database had returned it."""
+        from litellm.proxy.auth.auth_checks import get_org_object_for_request
+
+        database = _LimitsDatabase()
+        database.organizations.rows["o-kept"] = LiteLLM_OrganizationTable(
+            organization_id="o-kept", budget_id="b-kept", created_by="admin", updated_by="admin"
+        )
+        cache = _serving_cache()
+
+        async def org_for_request() -> object:
+            return await get_org_object_for_request(
+                org_id="o-kept",
+                prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+                user_api_key_cache=cache,
+                parent_otel_span=None,
+                proxy_logging_obj=None,
+            )
+
+        await org_for_request()
+        await self._expire(cache, "org_id:o-kept:with_budget", "org_id:o-kept:with_budget:last_known")
+        database.stopped_with = _STOPPED
+        served_from_last_good: Final = await org_for_request()
+        database.stopped_with = Exception("cached plan must not change result type")
+
+        assert getattr(served_from_last_good, "organization_id", None) == "o-kept"
+        with pytest.raises(Exception, match="cached plan"):
+            await org_for_request()
+
+    @pytest.mark.asyncio
+    async def test_a_request_that_reads_back_an_end_user_verdict_a_last_good_entry_gave_reads_last_good(
+        self, monkeypatch
+    ):
+        from litellm.proxy._types import LiteLLM_EndUserTable
+        from litellm.proxy.auth.auth_checks import resolve_and_validate_end_user_id
+        from litellm.proxy.common_utils.user_api_key_cache import end_user_cache_key
+        from litellm.proxy.common_utils.user_api_key_cache import last_good_auth_entries_scope
+
+        monkeypatch.setattr(litellm, "validate_end_user_id_in_db", True)
+        database = _LimitsDatabase()
+        database.customers.rows["c-known"] = LiteLLM_EndUserTable(user_id="c-known", blocked=False)
+        cache = _serving_cache()
+        assert await self._customer(database, cache, "c-known") is not None
+        await self._expire(cache, end_user_cache_key("c-known"), "end_user_restricted_registry")
+        database.stopped_with = _STOPPED
+
+        async def request() -> tuple[str | None, bool]:
+            with last_good_auth_entries_scope() as scope:
+                end_user_id: Final = await resolve_and_validate_end_user_id(
+                    raw_end_user_id="c-known",
+                    prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+                    user_api_key_cache=cache,
+                )
+            return end_user_id, bool(scope.served)
+
+        assert (await request(), await request()) == (("c-known", True), ("c-known", True))
+
+    @pytest.mark.asyncio
     async def test_user_the_database_reported_missing_refuses_the_request(self, monkeypatch):
         from litellm.proxy.auth import auth_checks
         from litellm.types.proxy.auth.auth_checks import UserNotFoundError
