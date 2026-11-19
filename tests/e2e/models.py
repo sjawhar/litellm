@@ -1506,6 +1506,7 @@ class TeamData(BaseModel):
     team_alias: str | None = None
     models: list[str] = []
     members_with_roles: list[TeamMemberEntry] = []
+    metadata: TeamMetadata | None = None
 
 
 class TeamInfoResponse(BaseModel):

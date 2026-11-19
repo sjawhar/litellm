@@ -805,6 +805,8 @@ class PrometheusLogger(CustomLogger):
                 "litellm_model_group_saturation_ratio",
                 "Model group saturation ratio from the dynamic rate limiter",
                 labelnames=self.get_labels_for_metric("litellm_model_group_saturation_ratio"),
+                # workers read one shared window: keep the latest reading and drop an exited worker's
+                multiprocess_mode="livemostrecent",
             )
 
             self.litellm_deployment_cooled_down = self._counter_factory(
