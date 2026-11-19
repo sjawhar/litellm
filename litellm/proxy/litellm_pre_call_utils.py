@@ -1737,6 +1737,10 @@ class LiteLLMProxyRequestSetup:
         user_api_key_logged_metadata: Final = LiteLLMProxyRequestSetup.get_sanitized_user_information_from_key(
             user_api_key_dict=user_api_key_dict
         )
+        # A reader trusts requester_ip_address and user_agent in a bucket carrying this stamp, but until
+        # add_litellm_data_to_request writes the proxy's own values they are whatever the caller's metadata sent
+        data[_metadata_variable_name].pop("requester_ip_address", None)
+        data[_metadata_variable_name].pop("user_agent", None)
         data[_metadata_variable_name].update(user_api_key_logged_metadata)
         data[_metadata_variable_name]["user_api_key"] = LiteLLMProxyRequestSetup.get_logged_api_key(user_api_key_dict)
 
