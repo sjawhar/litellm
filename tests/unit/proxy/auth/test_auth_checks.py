@@ -3045,6 +3045,41 @@ class TestLastGoodLimitsWhileTheDatabaseIsUnreachable:
             assert (await request(), await request()) == ((1.0, ("LiteLLM_UserTable",)), (5.0, ()))
 
     @pytest.mark.asyncio
+    async def test_a_customer_read_after_one_composed_with_a_last_good_default_budget_has_the_budget_the_database_has(
+        self, monkeypatch
+    ):
+        """The database returns the customer, then cannot be read for the default budget, so the last good entry gives
+        it. The customer composed with that budget is not cached: a later read that resolves no default would keep the
+        cached budget, and read fresh."""
+        from litellm.proxy.auth.auth_checks import get_default_end_user_budget
+        from litellm.proxy.common_utils.user_api_key_cache import last_good_auth_entries_scope
+
+        monkeypatch.setattr(litellm, "max_end_user_budget_id", "b-default")
+        database = _LimitsDatabase()
+        database.customers.rows["c-default"] = LiteLLM_EndUserTable(user_id="c-default", blocked=False)
+        database.budgets.rows["b-default"] = LiteLLM_BudgetTable(budget_id="b-default", rpm_limit=1)
+        cache = _serving_cache()
+        await get_default_end_user_budget(prisma_client=database, user_api_key_cache=cache)  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+        await self._expire(cache, "default_end_user_budget:b-default")
+
+        async def stopped(where: object = None, include: object = None) -> BaseModel | None:
+            raise _STOPPED
+
+        async def request() -> tuple[int | None, tuple[str, ...]]:
+            with last_good_auth_entries_scope() as scope:
+                customer: Final = await self._customer(database, cache, "c-default")
+            budget: Final = None if customer is None else customer.litellm_budget_table
+            return (None if budget is None else budget.rpm_limit), scope.served
+
+        database.db.litellm_budgettable = SimpleNamespace(find_unique=stopped)
+        composed: Final = await request()
+        # The database answers again, and the default budget is gone
+        database.db.litellm_budgettable = database.budgets
+        del database.budgets.rows["b-default"]
+
+        assert (composed, await request()) == ((1, ("LiteLLM_BudgetTable",)), (None, ()))
+
+    @pytest.mark.asyncio
     async def test_user_the_database_reported_missing_refuses_the_request(self, monkeypatch):
         from litellm.proxy.auth import auth_checks
         from litellm.types.proxy.auth.auth_checks import UserNotFoundError
