@@ -1244,7 +1244,7 @@ _BODY_DEPLOYMENT_PARAMS: Final = frozenset(("model_info", "cooldown_time"))
 # origin a request was served by or on behalf of. The proxy and the router write these only after authentication,
 # so at the auth gate each one present came from the unauthenticated body.
 _AUTH_GATE_CALLER_ROOT_FIELDS: Final = frozenset(
-    ("litellm_params", "model_info", "custom_llm_provider", "agent_id", "response_headers", "proxy_server_request")
+    ("model_info", "custom_llm_provider", "agent_id", "response_headers", "proxy_server_request")
 )
 _AUTH_GATE_CALLER_METADATA_FIELDS: Final = frozenset(
     (
@@ -3926,6 +3926,11 @@ class ProxyLogging:
                 litellm_logging_obj.litellm_params = {
                     key: value for key, value in existing.items() if key not in _BODY_DEPLOYMENT_PARAMS
                 }
+                # A request that reached no deployment has no API base, deployment or group of its own, and the
+                # failure spend row prefers a root litellm_params over the payload built here. Only a pass-through
+                # route writes one itself; on any other route it is the body's.
+                if litellm_logging_obj.call_type != CallTypes.pass_through.value:
+                    request_data.pop("litellm_params", None)
             attribution: Final = _stamp_deployment_attribution(
                 litellm_params,
                 request_data.get("model"),

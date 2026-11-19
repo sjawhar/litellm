@@ -990,10 +990,12 @@ async def test_handle_logging_proxy_only_path_skips_for_pass_through(proxy_loggi
     logging_obj.model_call_details = {}
     logging_obj.async_failure_handler = AsyncMock()
     logging_obj.pre_call = MagicMock()
+    route_litellm_params = {"api_base": "https://upstream.invalid", "metadata": {"model_info": {"id": "routed"}}}
     request_data = {
         "litellm_logging_obj": logging_obj,
         "messages": [{"role": "user"}],
         "model": "m",
+        "litellm_params": route_litellm_params,
     }
     await proxy_logging._handle_logging_proxy_only_error(
         request_data=request_data,
@@ -1003,6 +1005,7 @@ async def test_handle_logging_proxy_only_path_skips_for_pass_through(proxy_loggi
     )
     logging_obj.pre_call.assert_not_called()
     logging_obj.async_failure_handler.assert_not_called()
+    assert request_data["litellm_params"] is route_litellm_params
 
 
 @pytest.mark.asyncio
@@ -1472,6 +1475,75 @@ async def test_auth_gate_failure_spend_row_takes_its_deployment_from_the_router_
             "custom_llm_provider": "openai",
             "agent_id": None,
         },
+        "names_the_claim": False,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "original_exception",
+    (
+        GuardrailRaisedException(guardrail_name="local-block", message="blocked"),
+        ProxyRateLimitError(detail="key over its rate limit"),
+    ),
+    ids=("guardrail", "rate-limited-key"),
+)
+async def test_pre_call_refusal_spend_row_takes_no_deployment_from_a_body_litellm_params(
+    proxy_logging, make_user_api_key_auth, monkeypatch, original_exception: Exception
+):
+    """A key refused in the pre-call hooks reached no deployment, so a root litellm_params in its body must not
+    name the API base, deployment or group of its failure row; the spend logger prefers it over the logged payload."""
+    from litellm.proxy import proxy_server
+    from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+
+    monkeypatch.setattr(
+        proxy_server,
+        "llm_router",
+        litellm.Router(
+            model_list=[
+                {
+                    "model_name": "internal-model",
+                    "litellm_params": {"model": "openai/gpt-4.1", "api_key": "sk-test"},
+                    "model_info": {"id": "configured-deployment"},
+                }
+            ]
+        ),
+    )
+    update_database: Final = _record_failure_spend_rows(monkeypatch)
+    proxy_logging.alert_types = []
+    authenticated: Final = make_user_api_key_auth(request_route="/chat/completions")
+    request_data: Final[dict[str, object]] = {
+        "model": "internal-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "litellm_call_id": "pre-call-refusal",
+        "metadata": {"user_api_key_auth": authenticated},
+        "litellm_params": {
+            "api_base": "https://victim.invalid",
+            "litellm_metadata": {"model_info": {"id": "victim-deployment"}, "model_group": "victim-group"},
+        },
+    }
+    logging_obj, _ = litellm.utils.function_setup(
+        original_function="acompletion", rules_obj=litellm.utils.Rules(), start_time=datetime.now(), **request_data
+    )
+
+    await proxy_logging.post_call_failure_hook(
+        request_data={**request_data, "litellm_logging_obj": logging_obj},
+        original_exception=original_exception,
+        user_api_key_dict=authenticated,
+        route="/chat/completions",
+    )
+
+    update_database.assert_awaited_once()
+    row_kwargs: Final = update_database.call_args.kwargs["kwargs"]
+    now: Final = datetime.now()
+    payload: Final = get_logging_payload(
+        kwargs={**row_kwargs, "completion_start_time": now}, response_obj=None, start_time=now, end_time=now
+    )
+    assert {
+        "attribution": {key: payload[key] for key in ("model_id", "model_group", "api_base")},
+        "names_the_claim": "victim" in json.dumps({"row": payload, "request_data": row_kwargs}, default=str),
+    } == {
+        "attribution": {"model_id": "configured-deployment", "model_group": "internal-model", "api_base": ""},
         "names_the_claim": False,
     }
 
