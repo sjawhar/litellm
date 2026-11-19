@@ -119,6 +119,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     forget_missing_last_good,
     get_management_object_ttl,
     last_good_auth_entries_scope,
+    last_good_read_start,
     model_access_group_cache_key,
     model_access_group_registry_cache_key,
     model_access_group_spend_counter_key,
@@ -1586,6 +1587,7 @@ async def get_default_end_user_budget(
     if cached_budget is not None:
         return cached_budget
 
+    read_started: Final = last_good_read_start(user_api_key_cache)
     try:
         budget_record: Final = await _dictable_table(BudgetRepository(prisma_client), "budget").find_unique(
             where={"budget_id": default_budget_id}
@@ -1607,7 +1609,7 @@ async def get_default_end_user_budget(
             model_type=LiteLLM_BudgetTable,
             ttl=get_management_object_ttl(user_api_key_cache),
         )
-        await remember_last_good(user_api_key_cache, cache_key, _budget_obj)
+        await remember_last_good(user_api_key_cache, cache_key, _budget_obj, read_started=read_started)
         return _budget_obj
 
     except Exception as e:
@@ -1649,6 +1651,7 @@ async def get_team_member_default_budget(
     if cached_budget is not None:
         return cached_budget
 
+    read_started: Final = last_good_read_start(user_api_key_cache)
     try:
         budget_record: Final = await _dictable_table(BudgetRepository(prisma_client), "budget").find_unique(
             where={"budget_id": budget_id}
@@ -1669,7 +1672,7 @@ async def get_team_member_default_budget(
         model_type=LiteLLM_BudgetTable,
         ttl=get_management_object_ttl(user_api_key_cache),
     )
-    await remember_last_good(user_api_key_cache, cache_key, budget)
+    await remember_last_good(user_api_key_cache, cache_key, budget, read_started=read_started)
 
     return budget
 
@@ -1900,6 +1903,7 @@ async def _fetch_and_cache_registry(
 ) -> frozenset[str] | None:
     """The registry as the database has it, cached whole, or ``None`` when it is unusable. With ``keep_last_good``,
     the last registry the database returned answers while the database is unreachable."""
+    read_started: Final = last_good_read_start(user_api_key_cache)
     try:
         registry_ids: Final = await fetch_ids()
     except Exception as e:  # noqa: BLE001  # fail-safe: any registry load error must degrade to per-id lookups, never break auth
@@ -1941,7 +1945,9 @@ async def _fetch_and_cache_registry(
         user_api_key_cache=user_api_key_cache,
     )
     if keep_last_good:
-        await remember_last_good(user_api_key_cache, cache_key, _RegistryIds(ids=registry_ids))
+        await remember_last_good(
+            user_api_key_cache, cache_key, _RegistryIds(ids=registry_ids), read_started=read_started
+        )
     return frozenset(registry_ids)
 
 
@@ -2103,6 +2109,7 @@ async def get_end_user_object(
     ):
         return None
 
+    read_started: Final = last_good_read_start(user_api_key_cache)
     try:
         response: Final = await _dictable_table(EndUserRepository(prisma_client), "end_user").find_unique(
             where={"user_id": end_user_id},
@@ -2130,7 +2137,7 @@ async def get_end_user_object(
                 model_type=LiteLLM_EndUserTable,
                 ttl=get_management_object_ttl(user_api_key_cache),
             )
-        await remember_last_good(user_api_key_cache, _key, end_user_row)
+        await remember_last_good(user_api_key_cache, _key, end_user_row, read_started=read_started)
 
         if key_end_user_budget_id is None:
             return end_user_row
@@ -2375,15 +2382,18 @@ async def _keep_last_good_rows(
     names: Sequence[str],
     fetched: Sequence[tuple[str, BaseModel]],
     cache_key: Callable[[str], str],
+    *,
+    read_started: float,
 ) -> None:
-    """Keep each row a batch read returned as its last good entry, and drop the entry of each name it did not return."""
+    """Keep each row a batch read returned as its last good entry, and drop the entry of each name it did not return.
+    ``read_started`` is the batch read's one start: every row came from it."""
     found: Final = MappingProxyType(dict(fetched))
     for name in names:
         row = found.get(name)
         if row is None:
             await forget_missing_last_good(user_api_key_cache, cache_key(name))
         else:
-            await remember_last_good(user_api_key_cache, cache_key(name), row)
+            await remember_last_good(user_api_key_cache, cache_key(name), row, read_started=read_started)
 
 
 @with_service_target(AUTH_OBJECTS_TARGET)
@@ -2401,6 +2411,7 @@ async def _fetch_uncached_model_access_group_budgets(
     if not uncached_groups:
         return ()
 
+    read_started: Final = last_good_read_start(user_api_key_cache)
     try:
         db_rows: Final = await _model_access_group_budget_table(
             ModelAccessGroupBudgetRepository(prisma_client)
@@ -2425,7 +2436,9 @@ async def _fetch_uncached_model_access_group_budgets(
     except Exception as e:  # noqa: BLE001  # fail-safe: a budget fetch error must yield "no budget rows", never break auth
         verbose_proxy_logger.debug("Error batch fetching model access group budgets from database: %s", e)
         return ()
-    await _keep_last_good_rows(user_api_key_cache, uncached_groups, fetched, model_access_group_cache_key)
+    await _keep_last_good_rows(
+        user_api_key_cache, uncached_groups, fetched, model_access_group_cache_key, read_started=read_started
+    )
     return fetched
 
 
@@ -2491,6 +2504,7 @@ async def _fetch_uncached_tags(
     if not tags_to_fetch:
         return ()
 
+    read_started: Final = last_good_read_start(user_api_key_cache)
     try:
         db_tags: Final = await _tag_table(TagRepository(prisma_client)).find_many(
             where={"tag_name": {"in": list(tags_to_fetch)}},
@@ -2511,7 +2525,7 @@ async def _fetch_uncached_tags(
     except Exception as e:  # noqa: BLE001  # fail-safe: a tag fetch error must yield "no budget objects", never break auth
         verbose_proxy_logger.debug("Error batch fetching tags from database: %s", e)
         return ()
-    await _keep_last_good_rows(user_api_key_cache, tags_to_fetch, fetched, tag_cache_key)
+    await _keep_last_good_rows(user_api_key_cache, tags_to_fetch, fetched, tag_cache_key, read_started=read_started)
     return fetched
 
 
@@ -2620,6 +2634,7 @@ async def _fetch_team_membership_from_db(
     proxy_logging_obj: ProxyLogging | None = None,
 ) -> LiteLLM_TeamMembership | None:
     _ = parent_otel_span, proxy_logging_obj
+    read_started: Final = last_good_read_start(user_api_key_cache)
     response: Final = await _dictable_table(TeamMembershipRepository(prisma_client), "team_membership").find_unique(
         where={"user_id_team_id": {"user_id": user_id, "team_id": team_id}},
         include={"litellm_budget_table": True},
@@ -2640,7 +2655,7 @@ async def _fetch_team_membership_from_db(
             value=membership,
             model_type=LiteLLM_TeamMembership,
         )
-        await remember_last_good(user_api_key_cache, last_good_key, membership)
+        await remember_last_good(user_api_key_cache, last_good_key, membership, read_started=read_started)
     return membership
 
 
@@ -2970,6 +2985,7 @@ async def get_user_object(
             db_cache_expiry=db_cache_expiry,
         )
 
+        read_started: Final = last_good_read_start(user_api_key_cache)
         if should_check_db:
             response = await _user_table(UserRepository(prisma_client, use_writer=bool(check_db_only))).find_unique(
                 where={"user_id": user_id}, include={"organization_memberships": True}
@@ -3058,7 +3074,7 @@ async def get_user_object(
             model_type=LiteLLM_UserTable,
             ttl=get_management_object_ttl(user_api_key_cache),
         )
-        await remember_last_good(user_api_key_cache, user_id, _response)
+        await remember_last_good(user_api_key_cache, user_id, _response, read_started=read_started)
 
         # save to db access time
         _update_last_db_access_time(
@@ -3162,7 +3178,11 @@ async def cache_team_object(
     team_table: LiteLLM_TeamTableCachedObj,
     user_api_key_cache: UserApiKeyCache,
     proxy_logging_obj: ProxyLogging | None,
+    *,
+    read_started: float | None,
 ) -> None:
+    """``read_started`` is ``last_good_read_start`` taken before the database read or write that returned
+    ``team_table``; ``None`` for a team patched in the cache, which is never kept as a last good entry."""
     ## CACHE REFRESH TIME!
     team_table.last_refreshed_at = time.time()
 
@@ -3182,7 +3202,8 @@ async def cache_team_object(
         proxy_logging_obj=proxy_logging_obj,
         model_type=LiteLLM_TeamTableCachedObj,
     )
-    await remember_last_good(user_api_key_cache, key, team_table)
+    if read_started is not None:
+        await remember_last_good(user_api_key_cache, key, team_table, read_started=read_started)
 
     # Invalidate the alias-keyed cache so the JWT auth path with
     # `team_alias_jwt_field` (which reads via `get_team_object_by_alias`)
@@ -3616,6 +3637,7 @@ async def _get_team_object_from_user_api_key_cache(
         last_db_access_time=last_db_access_time,
         db_cache_expiry=db_cache_expiry,
     )
+    read_started: Final = last_good_read_start(user_api_key_cache)
     if should_check_db:
         response = await _get_team_db_check(
             team_id=team_id, prisma_client=prisma_client, team_id_upsert=team_id_upsert, use_writer=use_writer
@@ -3659,6 +3681,7 @@ async def _get_team_object_from_user_api_key_cache(
         team_table=_response,
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
+        read_started=read_started,
     )
 
     # save to db access time
@@ -3907,6 +3930,7 @@ async def get_team_object_by_alias(
     if cached_team_obj is not None:
         return cached_team_obj
 
+    read_started: Final = last_good_read_start(user_api_key_cache)
     try:
         teams: Final = await _team_table(TeamRepository(prisma_client)).find_many(
             where={"team_alias": team_alias}, include=_TEAM_GRANT_RELATIONS
@@ -3965,6 +3989,7 @@ async def get_team_object_by_alias(
             team_table=team_obj,
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
+            read_started=read_started,
         )
         await _cache_management_object(
             key=cache_key,
@@ -3973,7 +3998,9 @@ async def get_team_object_by_alias(
             proxy_logging_obj=proxy_logging_obj,
             model_type=LiteLLM_TeamTableCachedObj,
         )
-        await remember_last_good(user_api_key_cache, cache_key, _TeamAliasTarget(team_id=team_obj.team_id))
+        await remember_last_good(
+            user_api_key_cache, cache_key, _TeamAliasTarget(team_id=team_obj.team_id), read_started=read_started
+        )
 
         return team_obj
 
@@ -4393,6 +4420,7 @@ async def get_key_object(
         raise Exception(f"Key doesn't exist in cache + check_cache_only=True. key={key}.")
 
     # else, check db
+    read_started: Final = last_good_read_start(user_api_key_cache)
     try:
         _valid_token: Final[BaseModel | None] = await fetch_key_object_from_db_with_reconnect(
             hashed_token=hashed_token,
@@ -4438,7 +4466,9 @@ async def get_key_object(
     if check_db_only:
         return _response
 
-    await _cache_key_read_from_db(hashed_token, _response, user_api_key_cache, proxy_logging_obj)
+    await _cache_key_read_from_db(
+        hashed_token, _response, user_api_key_cache, proxy_logging_obj, read_started=read_started
+    )
     return _response
 
 
@@ -4460,6 +4490,8 @@ async def _cache_key_read_from_db(
     key: UserAPIKeyAuth,
     user_api_key_cache: UserApiKeyCache,
     proxy_logging_obj: ProxyLogging | None,
+    *,
+    read_started: float,
 ) -> None:
     await cache_key_object(
         hashed_token=hashed_token,
@@ -4468,7 +4500,9 @@ async def _cache_key_read_from_db(
         proxy_logging_obj=proxy_logging_obj,
     )
     if key.token == hashed_token:
-        await remember_last_good(user_api_key_cache, hashed_token, copy_user_api_key_auth_for_cache(key))
+        await remember_last_good(
+            user_api_key_cache, hashed_token, copy_user_api_key_auth_for_cache(key), read_started=read_started
+        )
 
 
 def copy_user_api_key_auth_for_cache(
@@ -4654,6 +4688,7 @@ async def get_org_object(
     if deserialized_org is not None:
         return deserialized_org
     # else, check db
+    read_started: Final = last_good_read_start(user_api_key_cache)
     try:
         query_kwargs: Final[dict[str, Mapping[str, object]]] = {"where": {"organization_id": org_id}}
         if include_budget_table:
@@ -4684,7 +4719,7 @@ async def get_org_object(
         model_type=LiteLLM_OrganizationTable,
         ttl=DEFAULT_IN_MEMORY_TTL,
     )
-    await remember_last_good(user_api_key_cache, cache_key, _org_obj)
+    await remember_last_good(user_api_key_cache, cache_key, _org_obj, read_started=read_started)
 
     return _org_obj
 
@@ -7033,6 +7068,7 @@ async def get_project_object(
     if deserialized_project is not None:
         return deserialized_project
 
+    read_started: Final = last_good_read_start(user_api_key_cache)
     try:
         project_row: Final = await _model_dump_table(ProjectRepository(prisma_client), "project").find_unique(
             where={"project_id": project_id},
@@ -7060,7 +7096,7 @@ async def get_project_object(
         proxy_logging_obj=proxy_logging_obj,
         model_type=LiteLLM_ProjectTableCachedObj,
     )
-    await remember_last_good(user_api_key_cache, cache_key, project_obj)
+    await remember_last_good(user_api_key_cache, cache_key, project_obj, read_started=read_started)
 
     return project_obj
 

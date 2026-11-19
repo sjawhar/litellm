@@ -150,26 +150,40 @@ class AgentPermissionWrite(TypedDict, total=False):
     update: ReadOnly[Mapping[str, object]]
 
 
+class AgentPermissionChange(NamedTuple):
+    write: AgentPermissionWrite | None
+    # Revoked before the agent's own write; the caller re-arms them after it
+    revoked: tuple[str, ...]
+
+
 async def _permission_write(
     incoming: Mapping[str, object],
     existing_id: str | None,
     client: PrismaClient,
-) -> AgentPermissionWrite | None:
+) -> AgentPermissionChange:
     from litellm.proxy.common_utils.user_api_key_cache import revoke_last_good
     from litellm.proxy.proxy_server import user_api_key_cache
 
     raw: Final = incoming.get("object_permission")
     if raw is None:
-        return None
+        return AgentPermissionChange(write=None, revoked=())
     permission: Final = _AGENT_PARAMS_ADAPTER.validate_python(raw)
     prepared: Final = await prepare_object_permission_upsert(permission, existing_id, client)
     # Returned for the agent's own write, so the other objects linked to the row lose their last good entries first
     await revoke_last_good(user_api_key_cache, prepared.holder_keys)
     if existing_id is None:
         created: Final[AgentPermissionWrite] = {"create": prepared.record}
-        return created
+        return AgentPermissionChange(write=created, revoked=prepared.holder_keys)
     updated: Final[AgentPermissionWrite] = {"update": prepared.record}
-    return updated
+    return AgentPermissionChange(write=updated, revoked=prepared.holder_keys)
+
+
+async def _rearm_permission_holders(revoked: Sequence[str]) -> None:
+    """Tombstoned again from the agent's write, so a read in flight across it cannot keep the row's old grants."""
+    from litellm.proxy.common_utils.user_api_key_cache import rearm_last_good
+    from litellm.proxy.proxy_server import user_api_key_cache
+
+    await rearm_last_good(user_api_key_cache, revoked)
 
 
 async def _managed_fields(
@@ -652,7 +666,7 @@ class AgentRegistry:
             agent_card_params_dict: Final[dict[str, object]] = _dump_agent_params(agent_card_params_obj)
             agent_card_params: Final[str] = safe_dumps(agent_card_params_dict)
 
-            permission_write: Final = await _permission_write(agent, None, prisma_client)
+            permission_change: Final = await _permission_write(agent, None, prisma_client)
 
             # Serialize static_headers
             static_headers_obj: Final = agent.get("static_headers")
@@ -679,8 +693,8 @@ class AgentRegistry:
                 create_data["extra_headers"] = extra_headers_val
             if access_group_ids_val is not None:
                 create_data["access_group_ids"] = tuple(dict.fromkeys(access_group_ids_val))
-            if permission_write is not None:
-                create_data["object_permission"] = permission_write
+            if permission_change.write is not None:
+                create_data["object_permission"] = permission_change.write
 
             for rate_field in (
                 "tpm_limit",
@@ -787,11 +801,11 @@ class AgentRegistry:
             if "extra_headers" in agent:
                 extra_headers_value: Final = agent.get("extra_headers")
                 update_data["extra_headers"] = extra_headers_value if extra_headers_value is not None else []
-            permission_write: Final = await _permission_write(
+            permission_change: Final = await _permission_write(
                 agent, existing_record.object_permission_id, prisma_client
             )
-            if permission_write is not None:
-                update_data["object_permission"] = permission_write
+            if permission_change.write is not None:
+                update_data["object_permission"] = permission_change.write
             # Patch agent in DB
             patched_agent: Final = await agents_table(prisma_client).update(
                 where={"agent_id": agent_id},
@@ -805,6 +819,7 @@ class AgentRegistry:
                 },
                 include={"object_permission": True, "identity": True},
             )
+            await _rearm_permission_holders(permission_change.revoked)
             if patched_agent is None:
                 raise ValueError(f"Agent not found, passed agent_id={agent_id}")
             return AgentResponse.model_validate(patched_agent.model_dump())
@@ -891,11 +906,11 @@ class AgentRegistry:
                 if _val is not None:
                     update_data[rate_field] = _val
 
-            permission_write: Final = await _permission_write(
+            permission_change: Final = await _permission_write(
                 agent, existing_row.object_permission_id if existing_row is not None else None, prisma_client
             )
-            if permission_write is not None:
-                update_data["object_permission"] = permission_write
+            if permission_change.write is not None:
+                update_data["object_permission"] = permission_change.write
 
             # Update agent in DB
             updated_agent: Final = await agents_table(prisma_client).update(
@@ -911,6 +926,7 @@ class AgentRegistry:
                 },
                 include={"object_permission": True, "identity": True},
             )
+            await _rearm_permission_holders(permission_change.revoked)
 
             if updated_agent is None:
                 raise ValueError(f"Agent not found, passed agent_id={agent_id}")

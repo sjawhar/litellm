@@ -6975,6 +6975,27 @@ class ProxyConfig:
                     {"serve_last_good_auth_entries": typed_general_settings.get("serve_last_good_auth_entries", False)}
                 )
             ).serve_last_good_auth_entries
+            from litellm.constants import (
+                LAST_GOOD_STORE_MARGIN_SECONDS,
+                LAST_GOOD_TOMBSTONE_TTL_SECONDS,
+                PROXY_DB_LOOKUP_DEADLINE_SECONDS,
+            )
+
+            # A tombstone that lapses before a store in flight across the write is refused lets the old entry back.
+            if (
+                user_api_key_cache.serve_last_good_entries
+                and LAST_GOOD_TOMBSTONE_TTL_SECONDS <= PROXY_DB_LOOKUP_DEADLINE_SECONDS + LAST_GOOD_STORE_MARGIN_SECONDS
+            ):
+                verbose_proxy_logger.error(
+                    "general_settings.serve_last_good_auth_entries is turned off: LAST_GOOD_TOMBSTONE_TTL_SECONDS=%s "
+                    "must exceed PROXY_DB_LOOKUP_DEADLINE_SECONDS=%s plus LAST_GOOD_STORE_MARGIN_SECONDS=%s, the "
+                    "longest a store of a last good entry may take, or a read in flight across an update, a delete or "
+                    "a block could keep the old entry after its tombstone lapsed",
+                    LAST_GOOD_TOMBSTONE_TTL_SECONDS,
+                    PROXY_DB_LOOKUP_DEADLINE_SECONDS,
+                    LAST_GOOD_STORE_MARGIN_SECONDS,
+                )
+                user_api_key_cache.serve_last_good_entries = False
             verbose_proxy_logger.info(
                 "general_settings.serve_last_good_auth_entries=%s: the last good team and key entries are %s",
                 user_api_key_cache.serve_last_good_entries,

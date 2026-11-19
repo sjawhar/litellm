@@ -1,8 +1,10 @@
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import ExitStack
 from typing import Final
 from types import SimpleNamespace
+import asyncio
 import json
+import time
 from datetime import datetime, timedelta, timezone
 
 import litellm
@@ -5631,7 +5633,7 @@ async def test_delete_verification_tokens_forgets_the_last_good_entry_here_and_o
     await cache_key_object(
         hashed_token=hashed, user_api_key_obj=UserAPIKeyAuth(token=hashed), user_api_key_cache=cache, proxy_logging_obj=None
     )
-    await remember_last_good(cache, hashed, UserAPIKeyAuth(token=hashed))
+    await remember_last_good(cache, hashed, UserAPIKeyAuth(token=hashed), read_started=time.monotonic())
     pubsub = redis.cache.init_async_client().pubsub()
     await pubsub.subscribe(AUTH_CACHE_INVALIDATION_CHANNEL)
 
@@ -21591,7 +21593,12 @@ async def test_update_key_soft_budget_revokes_the_last_good_entry_of_another_key
 
     redis = fake_redis_cache()
     cache = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
-    await remember_last_good(cache, _PEER_KEY_TOKEN, UserAPIKeyAuth(token=_PEER_KEY_TOKEN, budget_id=_SHARED_BUDGET_ID))
+    await remember_last_good(
+        cache,
+        _PEER_KEY_TOKEN,
+        UserAPIKeyAuth(token=_PEER_KEY_TOKEN, budget_id=_SHARED_BUDGET_ID),
+        read_started=time.monotonic(),
+    )
     assert await recall_last_good(cache, _PEER_KEY_TOKEN, UserAPIKeyAuth) is not None
     prisma = _serve_key_update(monkeypatch, _limited_key_row(), cache)
     prisma.db.litellm_verificationtoken.find_many = AsyncMock(
@@ -21857,3 +21864,97 @@ async def test_update_key_soft_budget_reads_no_budget_holder_when_last_good_entr
 
     tx.litellm_budgettable.update.assert_awaited_once()
     assert {table: read.await_count for table, read in holder_reads.items()} == dict.fromkeys(holder_reads, 0)
+
+
+# ---------------------------------------------------------------------------
+# A key update re-arms, after its write, the tombstones it wrote before it
+# ---------------------------------------------------------------------------
+
+
+def _revoke_with_lapsed_tombstones(monkeypatch, module: str, redis) -> None:
+    """Wrap ``module``'s ``revoke_last_good`` so the Redis tombstones it writes before the write are gone when it
+    returns, as if the write outlasted ``LAST_GOOD_TOMBSTONE_TTL_SECONDS``. fakeredis expires keys on wall time, so the
+    lapse is simulated, not waited for; whatever the endpoint writes after its write is left alone."""
+    from litellm.proxy.common_utils import user_api_key_cache as cache_module
+
+    revoke: Final = cache_module.revoke_last_good
+
+    async def revoke_then_lapse(cache: UserApiKeyCache, cache_keys: Sequence[str]) -> None:
+        await revoke(cache, cache_keys)
+        for cache_key in cache_keys:
+            await redis.cache.async_delete_cache(f"last_good_tombstone:{cache_key}")
+
+    monkeypatch.setattr(f"{module}.revoke_last_good", revoke_then_lapse)
+
+
+class _HeldKeyRead:
+    """The key's row as the database held it before the update: the read takes it when it starts and answers only
+    once ``release`` is set."""
+
+    def __init__(self, row: LiteLLM_VerificationToken) -> None:
+        self.row: Final = row
+        self.started: Final = asyncio.Event()
+        self.release: Final = asyncio.Event()
+
+    async def get_data(self, **_: object) -> LiteLLM_VerificationToken:
+        self.started.set()
+        await self.release.wait()
+        return self.row
+
+    async def attempt_db_reconnect(self, **_: object) -> bool:
+        return False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rearm_removed", "kept"),
+    [(False, (None, False)), (True, (10.0, True))],
+    ids=["re-armed", "control-without-the-re-arm"],
+)
+async def test_a_key_read_in_flight_across_its_update_cannot_keep_the_old_budget_once_the_revocation_lapsed(
+    monkeypatch, rearm_removed, kept
+):
+    """Another pod reads the key before /key/update raises its max_budget and stores the row after the update
+    returns, when the tombstone written before the write has lapsed (a slow write outlasts it). The tombstone the
+    update writes again after its write refuses that store, so no pod keeps the old budget for the next outage; the
+    control shows the store goes through without it."""
+    from litellm.proxy.auth.auth_checks import get_key_object
+    from litellm.proxy.common_utils.user_api_key_cache import recall_last_good
+    from litellm.proxy.management_endpoints.key_management_endpoints import update_key_fn
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis: Final = fake_redis_cache()
+    updating_pod: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+    reading_pod: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+    row: Final = _limited_key_row()
+    prisma: Final = _serve_key_update(monkeypatch, row, updating_pod)
+    _revoke_with_lapsed_tombstones(monkeypatch, _BULK_PKG, redis)
+    if rearm_removed:
+        monkeypatch.setattr(f"{_BULK_PKG}.rearm_last_good", AsyncMock())
+    database: Final = _HeldKeyRead(row)
+    in_flight: Final = asyncio.create_task(
+        get_key_object(
+            hashed_token=_LIMITED_KEY_TOKEN,
+            prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+            user_api_key_cache=reading_pod,
+        )
+    )
+    await database.started.wait()
+
+    try:
+        await update_key_fn(
+            request=MagicMock(query_params={}),
+            data=UpdateKeyRequest(key=_LIMITED_KEY_TOKEN, max_budget=500.0),
+            user_api_key_dict=_admin(),
+            litellm_changed_by=None,
+        )
+    finally:
+        database.release.set()
+    await in_flight
+
+    prisma.update_data.assert_awaited_once()
+    entry: Final = await recall_last_good(reading_pod, _LIMITED_KEY_TOKEN, UserAPIKeyAuth)
+    assert (
+        entry.max_budget if entry is not None else None,
+        reading_pod.last_good_memory.get(_LIMITED_KEY_TOKEN) is not None,
+    ) == kept

@@ -24,6 +24,7 @@ from litellm.proxy.auth.auth_checks import delete_cached_project_object
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.user_api_key_cache import (
     project_cache_key,
+    rearm_last_good,
     revoke_last_good,
     serves_last_good_entries,
 )
@@ -851,23 +852,21 @@ async def update_project(
         # Fail closed: a field outside PROJECT_UNENFORCED_FIELDS may be enforced from the project's entry, so it revokes
         # that entry; updated_by is the audit stamp every update writes. Key entries embed only the project's alias
         project_entry_changes: Final = not {*update_data, *budget_updates} <= {"updated_by", *PROJECT_UNENFORCED_FIELDS}
-        await revoke_last_good(
-            user_api_key_cache,
-            tuple(
-                dict.fromkeys(
-                    (
-                        *((project_cache_key(data.project_id),) if project_entry_changes else ()),
-                        *budget_holders.last_good_keys,
-                        # The permission row is written in place below, and every object linked to it carries it
-                        *await object_permission_holder_keys(
-                            existing_project.object_permission_id if "object_permission" in update_data else None,
-                            prisma_client,
-                            user_api_key_cache,
-                        ),
-                    )
+        revoked: Final = tuple(
+            dict.fromkeys(
+                (
+                    *((project_cache_key(data.project_id),) if project_entry_changes else ()),
+                    *budget_holders.last_good_keys,
+                    # The permission row is written in place below, and every object linked to it carries it
+                    *await object_permission_holder_keys(
+                        existing_project.object_permission_id if "object_permission" in update_data else None,
+                        prisma_client,
+                        user_api_key_cache,
+                    ),
                 )
-            ),
+            )
         )
+        await revoke_last_good(user_api_key_cache, revoked)
 
         if shared_budget_id is not None:
             # Update existing budget
@@ -917,6 +916,8 @@ async def update_project(
             data=update_data,
             include={"litellm_budget_table": True, "object_permission": True},
         )
+        # Tombstoned again from the last write, so a read in flight across it cannot keep the old entry
+        await rearm_last_good(user_api_key_cache, revoked)
 
         await delete_cached_project_object(
             project_id=data.project_id,

@@ -3074,7 +3074,9 @@ async def test_delete_group_drops_and_tombstones_the_teams_last_good_entries(moc
 
     cache = UserApiKeyCache(serve_last_good_entries=True)
     for cache_key in ("team_id:test-team-123", "team_alias:lanes"):
-        await remember_last_good(cache, cache_key, LiteLLM_TeamTableCachedObj(team_id="test-team-123"))
+        await remember_last_good(
+            cache, cache_key, LiteLLM_TeamTableCachedObj(team_id="test-team-123"), read_started=time.monotonic()
+        )
     existing_team = mocker.MagicMock(team_alias="lanes", members_with_roles=[])
     mock_prisma_client = mocker.MagicMock()
     mock_prisma_client.db.litellm_teamtable.find_unique = AsyncMock(return_value=existing_team)
@@ -3088,7 +3090,9 @@ async def test_delete_group_drops_and_tombstones_the_teams_last_good_entries(moc
 
     await delete_group(group_id="test-team-123")
     for cache_key in ("team_id:test-team-123", "team_alias:lanes"):
-        await remember_last_good(cache, cache_key, LiteLLM_TeamTableCachedObj(team_id="test-team-123"))
+        await remember_last_good(
+            cache, cache_key, LiteLLM_TeamTableCachedObj(team_id="test-team-123"), read_started=time.monotonic()
+        )
 
     assert await recall_last_good(cache, "team_id:test-team-123", LiteLLM_TeamTableCachedObj) is None
     assert await recall_last_good(cache, "team_alias:lanes", LiteLLM_TeamTableCachedObj) is None

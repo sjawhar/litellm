@@ -41,6 +41,7 @@ from litellm.proxy.common_utils.callback_utils import (  # noqa: F401  # legacy 
     encrypt_callback_vars,
     is_sensitive_callback_key,
 )
+from litellm.proxy.common_utils.user_api_key_cache import last_good_read_start
 from litellm.proxy.litellm_pre_call_utils import (  # noqa: F401  # legacy module exports
     _get_validated_callback_metadata,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
     convert_key_logging_metadata_to_callback,
@@ -391,6 +392,7 @@ async def add_team_callbacks(
         team_metadata = encrypt_callback_vars(team_metadata)
         team_metadata_json: Final = json.dumps(team_metadata)  # update team_metadata
 
+        read_started: Final = last_good_read_start(user_api_key_cache)
         new_team_row: Final = await TeamRepository(prisma_client).table.update(
             where={"team_id": team_id},
             data={"metadata": team_metadata_json},
@@ -408,6 +410,7 @@ async def add_team_callbacks(
             team_row=new_team_row,
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
+            read_started=read_started,
         )
 
         await _emit_team_callback_audit_log(
@@ -521,6 +524,7 @@ async def delete_team_callback(
         encrypted_metadata: Final[object] = encrypt_callback_vars(updated_metadata)
         team_metadata_json: Final = json.dumps(encrypted_metadata)
 
+        read_started: Final = last_good_read_start(user_api_key_cache)
         updated_team: Final = await TeamRepository(prisma_client).table.update(
             where={"team_id": team_id},
             data={"metadata": team_metadata_json},
@@ -538,6 +542,7 @@ async def delete_team_callback(
             team_row=updated_team,
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
+            read_started=read_started,
         )
 
         await _emit_team_callback_audit_log(
@@ -659,6 +664,7 @@ async def disable_team_logging(
         team_metadata_json: Final = json.dumps(encrypted_metadata)
 
         # Update team in database
+        read_started: Final = last_good_read_start(user_api_key_cache)
         updated_team: Final = await TeamRepository(prisma_client).table.update(
             where={"team_id": team_id},
             data={"metadata": team_metadata_json},
@@ -680,6 +686,7 @@ async def disable_team_logging(
             team_row=updated_team,
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
+            read_started=read_started,
         )
 
         # Disabling a team's logging callbacks is itself a logging-control

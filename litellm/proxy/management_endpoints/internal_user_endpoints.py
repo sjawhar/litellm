@@ -50,6 +50,7 @@ from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_
 from litellm.proxy.common_utils.user_api_key_cache import (
     AUTH_OBJECTS_TARGET,
     object_permission_cache_key,
+    rearm_last_good,
     revoke_last_good,
     user_object_permission_id_cache_key,
 )
@@ -1597,9 +1598,9 @@ async def _update_single_user_helper(
     )
     written_user_id: Final = user_request.user_id or (user_with_email.user_id if user_with_email is not None else None)
     changes_entry: Final = _user_update_changes_its_entry(non_default_values, data_json, existing_metadata)
-    if changes_entry and written_user_id:
-        # Before the first write, the object permission upsert below, so a refused revocation changes nothing
-        await revoke_last_good(user_api_key_cache, (written_user_id,))
+    revoked: Final = (written_user_id,) if changes_entry and written_user_id else ()
+    # Before the first write, the object permission upsert below, so a refused revocation changes nothing
+    await revoke_last_good(user_api_key_cache, revoked)
 
     # Upsert the grants into their own row and link it, mirroring /key/update and /team/update.
     # This also removes object_permission from the payload, which is not a column on the user table.
@@ -1633,6 +1634,9 @@ async def _update_single_user_helper(
         non_default_values["user_email"] = user_request.user_email
         inserted_user_row: Final = await prisma_client.insert_data(data=non_default_values, table_name="user")
         response = inserted_user_row  # pyright: ignore[reportAssignmentType]  # insert_data returns a prisma row
+
+    # Tombstoned again from the commit, so a read in flight across the write cannot keep the old entry
+    await rearm_last_good(user_api_key_cache, revoked)
 
     if response is not None:
         if "password" in non_default_values:
@@ -2028,6 +2032,8 @@ async def bulk_user_update(
             )
 
             if changes_entry:
+                # Tombstoned again from the commit, so a read in flight across the write cannot keep the old entry
+                await rearm_last_good(user_api_key_cache, user_ids)
                 for start in range(0, len(all_users_in_db), _USER_BUDGET_CACHE_INVALIDATION_BATCH_SIZE):
                     await asyncio.gather(
                         *(

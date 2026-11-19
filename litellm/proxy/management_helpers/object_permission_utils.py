@@ -24,6 +24,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     end_user_cache_key,
     object_permission_cache_key,
     project_cache_key,
+    rearm_last_good,
     revoke_last_good,
     serves_last_good_entries,
 )
@@ -140,7 +141,8 @@ async def object_permission_holder_keys(
 class ObjectPermissionUpsert:
     object_permission_id: str
     record: dict[str, object]
-    # Last good entries of the objects linked to the existing row; whoever writes the row revokes them first
+    # Last good entries of the objects linked to the existing row; whoever writes the row revokes them first and
+    # re-arms them after its last write
     holder_keys: tuple[str, ...] = ()
 
 
@@ -166,7 +168,7 @@ async def prepare_object_permission_upsert(
 
     ``holder_keys`` lists the last good entries of every object linked to the existing
     row (see ``object_permission_holder_keys``); the caller revokes them before its
-    first write.
+    first write and re-arms them with ``rearm_last_good`` after its last write.
     """
     from litellm.proxy.proxy_server import user_api_key_cache
 
@@ -216,7 +218,7 @@ async def handle_update_object_permission_common(
     2. Looks up existing object permission if it exists
     3. Merges new permissions with existing ones
     4. Revokes the last good entries of every object linked to the existing row (503 if they cannot be revoked)
-    5. Upserts to the LiteLLM_ObjectPermissionTable
+    5. Upserts to the LiteLLM_ObjectPermissionTable, then re-arms those revocations from the commit
     6. Returns the object_permission_id
 
     Args:
@@ -256,6 +258,8 @@ async def handle_update_object_permission_common(
             "update": upsert.record,
         },
     )
+    # Tombstoned again from the commit, so a read in flight across the upsert cannot keep the old grants
+    await rearm_last_good(user_api_key_cache, upsert.holder_keys)
 
     verbose_proxy_logger.debug("created_object_permission_row: %s", created_object_permission_row)
 

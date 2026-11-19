@@ -9,6 +9,7 @@ table and the membership/budget relation the bulk budget writer needs.
 import asyncio
 import copy
 import json
+import time
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -621,7 +622,9 @@ def _customer_row(budget_id: str, max_budget: float) -> LiteLLM_EndUserTable:
 
 
 async def _warm_customer(cache: UserApiKeyCache, budget_id: str, max_budget: float) -> None:
-    await remember_last_good(cache, end_user_cache_key(_CUSTOMER_ID), _customer_row(budget_id, max_budget))
+    await remember_last_good(
+        cache, end_user_cache_key(_CUSTOMER_ID), _customer_row(budget_id, max_budget), read_started=time.monotonic()
+    )
 
 
 async def _customer_entry(cache: UserApiKeyCache) -> LiteLLM_EndUserTable | None:

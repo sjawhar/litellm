@@ -5,6 +5,7 @@
 import litellm.proxy
 import litellm.proxy.proxy_server
 
+from collections.abc import Iterator
 from typing import Dict, Final, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1958,8 +1959,11 @@ async def test_key_of_a_team_blocked_before_the_outage_is_refused_while_the_data
             team_models=team_models,
             last_refreshed_at=time.time(),
         ),
+        read_started=time.monotonic(),
     )
-    await remember_last_good(cache, "team_id:t-blocked", LiteLLM_TeamTableCachedObj(team_id="t-blocked"))
+    await remember_last_good(
+        cache, "team_id:t-blocked", LiteLLM_TeamTableCachedObj(team_id="t-blocked"), read_started=time.monotonic()
+    )
     await delete_cache_team_object(
         team_id="t-blocked", team_alias=None, user_api_key_cache=cache, proxy_logging_obj=None, revoked=True
     )
@@ -2003,14 +2007,18 @@ async def test_key_of_a_team_member_is_served_while_the_database_is_stopped(monk
             team_member_spend=0.0,
             last_refreshed_at=time.time(),
         ),
+        read_started=time.monotonic(),
     )
-    await remember_last_good(cache, "team_id:t-lane", LiteLLM_TeamTableCachedObj(team_id="t-lane"))
+    await remember_last_good(
+        cache, "team_id:t-lane", LiteLLM_TeamTableCachedObj(team_id="t-lane"), read_started=time.monotonic()
+    )
     await remember_last_good(
         cache,
         team_membership_auth_cache_key(team_id="t-lane", user_id="u-member"),
         LiteLLM_TeamMembership(user_id="u-member", team_id="t-lane"),
+        read_started=time.monotonic(),
     )
-    await remember_last_good(cache, "u-member", LiteLLM_UserTable(user_id="u-member"))
+    await remember_last_good(cache, "u-member", LiteLLM_UserTable(user_id="u-member"), read_started=time.monotonic())
     monkeypatch.setattr(litellm.proxy.proxy_server, "user_api_key_cache", cache)
     monkeypatch.setattr(litellm.proxy.proxy_server, "master_key", MASTER_KEY)
     monkeypatch.setattr(litellm.proxy.proxy_server, "prisma_client", _StoppedDatabase())
@@ -2081,10 +2089,11 @@ async def _key_with_user_and_project_held(monkeypatch, user_key: str, project: o
         UserAPIKeyAuth(
             token=hash_token(user_key), user_id="u-project", project_id="p-lane", last_refreshed_at=time.time()
         ),
+        read_started=time.monotonic(),
     )
-    await remember_last_good(cache, "u-project", LiteLLM_UserTable(user_id="u-project"))
+    await remember_last_good(cache, "u-project", LiteLLM_UserTable(user_id="u-project"), read_started=time.monotonic())
     if isinstance(project, LiteLLM_ProjectTableCachedObj):
-        await remember_last_good(cache, project_cache_key("p-lane"), project)
+        await remember_last_good(cache, project_cache_key("p-lane"), project, read_started=time.monotonic())
     monkeypatch.setattr(litellm.proxy.proxy_server, "user_api_key_cache", cache)
     monkeypatch.setattr(litellm.proxy.proxy_server, "master_key", MASTER_KEY)
     monkeypatch.setattr(litellm.proxy.proxy_server, "prisma_client", _StoppedDatabase())
@@ -2144,6 +2153,7 @@ async def test_master_key_call_after_one_for_a_customer_served_from_its_last_goo
     customer's limits. The object is not cached: the next master key call, for a customer without limits, would keep
     every limit the merge does not overwrite, and read fresh."""
     import asyncio
+    import time
     from types import SimpleNamespace
 
     from litellm.proxy._types import LiteLLM_BudgetTable, LiteLLM_EndUserTable
@@ -2165,6 +2175,7 @@ async def test_master_key_call_after_one_for_a_customer_served_from_its_last_goo
             budget_id="b-limited",
             litellm_budget_table=LiteLLM_BudgetTable(budget_id="b-limited", rpm_limit=1),
         ),
+        read_started=time.monotonic(),
     )
     monkeypatch.setattr(litellm.proxy.proxy_server, "user_api_key_cache", cache)
     monkeypatch.setattr(litellm.proxy.proxy_server, "master_key", MASTER_KEY)
@@ -2247,3 +2258,53 @@ async def test_custom_auth_customer_lookup_with_no_last_good_entry_is_refused_wh
             user_api_key_cache=UserApiKeyCache(serve_last_good_entries=True),
             proxy_logging_obj=None,
         )
+
+
+@pytest.fixture
+def _clear_db_lookup_stall() -> Iterator[None]:
+    """A read that hits its deadline marks the database stalled for the readiness check; later tests start unmarked."""
+    from litellm.proxy.db.db_lookup_gate import db_lookup_stall_tracker
+
+    db_lookup_stall_tracker.clear()
+    yield
+    db_lookup_stall_tracker.clear()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_clear_db_lookup_stall")
+async def test_a_membership_read_the_database_does_not_answer_gives_up_at_the_lookup_deadline(monkeypatch):
+    """The admission check's membership read is bounded like every read that stores a last good entry, so its store
+    starts within PROXY_DB_LOOKUP_DEADLINE_SECONDS of the read and fits inside a revocation's tombstone time."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from litellm.proxy.auth.user_api_key_auth import (
+        _read_team_membership,  # pyright: ignore[reportPrivateUsage]  # the admission check's read
+    )
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from litellm.proxy.db import db_lookup_gate
+    from litellm.proxy.db.db_lookup_gate import DBLookupDeadlineExceeded
+
+    never_answered: Final = asyncio.Event()
+
+    async def find_first(**kwargs: object) -> object:
+        await never_answered.wait()
+        return None
+
+    unanswering_database: Final = SimpleNamespace(
+        db=SimpleNamespace(litellm_teammembership=SimpleNamespace(find_first=find_first))
+    )
+    monkeypatch.setattr(db_lookup_gate, "PROXY_DB_LOOKUP_DEADLINE_SECONDS", 0.05)
+
+    with pytest.raises(DBLookupDeadlineExceeded) as gave_up:
+        await asyncio.wait_for(  # fails instead of hanging where the read is not bounded
+            _read_team_membership(
+                unanswering_database,  # pyright: ignore[reportArgumentType]  # stands in for the Prisma client
+                UserApiKeyCache(serve_last_good_entries=True),
+                team_id="t-lane",
+                user_id="u-member",
+            ),
+            timeout=5,
+        )
+
+    assert gave_up.value.lookup == "team_membership"

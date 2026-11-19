@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from collections.abc import Sequence
 from contextlib import AbstractContextManager, asynccontextmanager, contextmanager
 from dataclasses import dataclass
@@ -12598,7 +12599,9 @@ async def test_team_member_budget_change_drops_the_members_last_good_membership_
 
     cache: Final = UserApiKeyCache(serve_last_good_entries=True)
     key: Final = team_membership_auth_cache_key(team_id=_PATCH_TEAM_ID, user_id="member-1")
-    await remember_last_good(cache, key, LiteLLM_TeamMembership(user_id="member-1", team_id=_PATCH_TEAM_ID))
+    await remember_last_good(
+        cache, key, LiteLLM_TeamMembership(user_id="member-1", team_id=_PATCH_TEAM_ID), read_started=time.monotonic()
+    )
 
     with (
         patch("litellm.proxy.proxy_server.premium_user", True),  # test-quality-ok: proxy_server module global is the endpoint's only injection point
@@ -14060,6 +14063,7 @@ async def test_team_member_role_change_drops_the_teams_cached_and_last_good_entr
         team_table=LiteLLM_TeamTableCachedObj.model_validate(snapshot.model_dump()),
         user_api_key_cache=cache,
         proxy_logging_obj=None,
+        read_started=time.monotonic(),
     )
     mock_prisma_client = MagicMock()
     mock_prisma_client.db.litellm_teamtable.find_unique = AsyncMock(return_value=team_row)
@@ -16994,6 +16998,7 @@ async def test_team_block_and_unblock_drop_the_cached_team_and_its_last_good_ent
         team_table=LiteLLM_TeamTableCachedObj.model_validate(team.model_dump()),
         user_api_key_cache=cache,
         proxy_logging_obj=None,
+        read_started=time.monotonic(),
     )
     monkeypatch.setattr(
         "litellm.proxy.proxy_server.prisma_client", SimpleNamespace(db=SimpleNamespace(litellm_teamtable=_BlockableTeamRows(team)))
@@ -17054,7 +17059,12 @@ async def test_refresh_cached_team_overwrites_the_last_good_entry_and_tells_ever
 
     redis: Final = fake_redis_cache()
     cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
-    await remember_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj(team_id="t1", models=["claude-opus-4-8"]))
+    await remember_last_good(
+        cache,
+        "team_id:t1",
+        LiteLLM_TeamTableCachedObj(team_id="t1", models=["claude-opus-4-8"]),
+        read_started=time.monotonic(),
+    )
     pubsub: Final = redis.cache.init_async_client().pubsub()
     await pubsub.subscribe(AUTH_CACHE_INVALIDATION_CHANNEL)
     monkeypatch.setattr(
@@ -17065,6 +17075,7 @@ async def test_refresh_cached_team_overwrites_the_last_good_entry_and_tells_ever
         team_row=LiteLLM_TeamTable(team_id="t1", models=["claude-opus-5-5"]),
         user_api_key_cache=cache,
         proxy_logging_obj=None,  # pyright: ignore[reportArgumentType]  # no usage cache to clear in this test
+        read_started=time.monotonic(),
     )
 
     refreshed: Final = await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj)
@@ -17132,7 +17143,9 @@ async def test_team_budget_update_revokes_the_last_good_entry_of_each_key_of_the
 
     team_key: Final = "hashed-team-key"
     cache: Final = UserApiKeyCache(serve_last_good_entries=True)
-    await remember_last_good(cache, team_key, UserAPIKeyAuth(token=team_key, team_id=_PATCH_TEAM_ID))
+    await remember_last_good(
+        cache, team_key, UserAPIKeyAuth(token=team_key, team_id=_PATCH_TEAM_ID), read_started=time.monotonic()
+    )
     assert await recall_last_good(cache, team_key, UserAPIKeyAuth) is not None
 
     await _drive_team_write("post", payload={"tpm_limit": 5}, user_api_key_cache=cache, team_keys=(team_key,))
@@ -17874,8 +17887,12 @@ async def test_team_update_of_only_a_column_no_key_entry_embeds_revokes_the_team
     cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
     team_key: Final = "hashed-team-key"
     team_entry: Final = f"team_id:{_PATCH_TEAM_ID}"
-    await remember_last_good(cache, team_entry, LiteLLM_TeamTableCachedObj(team_id=_PATCH_TEAM_ID))
-    await remember_last_good(cache, team_key, UserAPIKeyAuth(token=team_key, team_id=_PATCH_TEAM_ID))
+    await remember_last_good(
+        cache, team_entry, LiteLLM_TeamTableCachedObj(team_id=_PATCH_TEAM_ID), read_started=time.monotonic()
+    )
+    await remember_last_good(
+        cache, team_key, UserAPIKeyAuth(token=team_key, team_id=_PATCH_TEAM_ID), read_started=time.monotonic()
+    )
     sink: Final[dict[str, AsyncMock | MagicMock]] = {}
 
     await _drive_team_write("post", payload=payload, user_api_key_cache=cache, mock_sink=sink, team_keys=(team_key,))
@@ -17933,7 +17950,10 @@ async def test_team_member_default_budget_revokes_each_membership_entry_before_t
     cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
     membership_entry: Final = team_membership_auth_cache_key(team_id=_PATCH_TEAM_ID, user_id="member-1")
     await remember_last_good(
-        cache, membership_entry, LiteLLM_TeamMembership(user_id="member-1", team_id=_PATCH_TEAM_ID, budget_id=None)
+        cache,
+        membership_entry,
+        LiteLLM_TeamMembership(user_id="member-1", team_id=_PATCH_TEAM_ID, budget_id=None),
+        read_started=time.monotonic(),
     )
     entry_at_backfill: Final[list[LiteLLM_TeamMembership | None]] = []
 
@@ -17990,3 +18010,90 @@ async def test_team_update_answers_503_and_writes_nothing_when_the_team_keys_can
     assert refused.value.code == "503"
     unreadable_keys.find_many.assert_awaited_once()
     sink["update"].assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# /team/update re-arms, after its write, the tombstones it wrote before it
+# ---------------------------------------------------------------------------
+
+
+def _revoke_with_lapsed_tombstones(monkeypatch, module: str, redis) -> None:
+    """Wrap ``module``'s ``revoke_last_good`` so the Redis tombstones it writes before the write are gone when it
+    returns, as if the write outlasted ``LAST_GOOD_TOMBSTONE_TTL_SECONDS``. fakeredis expires keys on wall time, so the
+    lapse is simulated, not waited for; whatever the endpoint writes after its write is left alone."""
+    from litellm.proxy.common_utils import user_api_key_cache as cache_module
+
+    revoke: Final = cache_module.revoke_last_good
+
+    async def revoke_then_lapse(cache: object, cache_keys: Sequence[str]) -> None:
+        await revoke(cache, cache_keys)  # pyright: ignore[reportArgumentType]  # passes the endpoint's cache through
+        for cache_key in cache_keys:
+            await redis.cache.async_delete_cache(f"last_good_tombstone:{cache_key}")
+
+    monkeypatch.setattr(f"{module}.revoke_last_good", revoke_then_lapse)
+
+
+class _HeldTeamRead:
+    """The team's row as the database held it before the update: the read takes it when it starts and answers only
+    once ``release`` is set."""
+
+    def __init__(self, row: LiteLLM_TeamTable) -> None:
+        self.row: Final = row
+        self.started: Final = asyncio.Event()
+        self.release: Final = asyncio.Event()
+        self.db: Final = SimpleNamespace(litellm_teamtable=SimpleNamespace(find_unique=self._find_unique))
+
+    async def _find_unique(self, where: object, include: object = None) -> LiteLLM_TeamTable:
+        self.started.set()
+        await self.release.wait()
+        return self.row
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rearm_removed", "kept"),
+    [(False, (None, False)), (True, (100, True))],
+    ids=["re-armed", "control-without-the-re-arm"],
+)
+async def test_a_team_read_in_flight_across_its_update_cannot_keep_the_old_limit_once_the_revocation_lapsed(
+    monkeypatch, rearm_removed, kept
+):
+    """Another pod reads the team before /team/update lowers its tpm_limit and stores the row after the update
+    returns, when the tombstone written before the write has lapsed (a slow write outlasts it). The tombstone the
+    update writes again after its write refuses that store, so no pod keeps the old limit for the next outage; the
+    control shows the store goes through without it."""
+    from litellm.proxy.auth.auth_checks import get_team_object
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, recall_last_good
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    team_module: Final = "litellm.proxy.management_endpoints.team_endpoints"
+    team_entry: Final = f"team_id:{_PATCH_TEAM_ID}"
+    redis: Final = fake_redis_cache()
+    updating_pod: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+    reading_pod: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+    _revoke_with_lapsed_tombstones(monkeypatch, team_module, redis)
+    if rearm_removed:
+        monkeypatch.setattr(f"{team_module}.rearm_last_good", AsyncMock())
+    database: Final = _HeldTeamRead(LiteLLM_TeamTable(team_id=_PATCH_TEAM_ID, team_alias="t", tpm_limit=100))
+    in_flight: Final = asyncio.create_task(
+        get_team_object(
+            team_id=_PATCH_TEAM_ID,
+            prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+            user_api_key_cache=reading_pod,
+        )
+    )
+    await database.started.wait()
+    sink: Final[dict[str, AsyncMock | MagicMock]] = {}
+
+    try:
+        await _drive_team_write("post", payload={"tpm_limit": 5}, user_api_key_cache=updating_pod, mock_sink=sink)
+    finally:
+        database.release.set()
+    await in_flight
+
+    sink["update"].assert_awaited_once()
+    entry: Final = await recall_last_good(reading_pod, team_entry, LiteLLM_TeamTableCachedObj)
+    assert (
+        entry.tpm_limit if entry is not None else None,
+        reading_pod.last_good_memory.get(team_entry) is not None,
+    ) == kept

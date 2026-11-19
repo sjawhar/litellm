@@ -2966,6 +2966,11 @@ class ConfigGeneralSettings(LiteLLMPydanticObjectBase):
             "project, organization, tag, access group or budget, or of an object permission row, first revokes the "
             "entries of everything that carries what it changes, unless it changes only fields no check reads from "
             "an entry, and changes nothing when Redis cannot record that or the database cannot list those holders"
+            ". For LAST_GOOD_TOMBSTONE_TTL_SECONDS (60 s by default) after an update, a delete or a block, a database "
+            "outage refuses that object with 503, and after a team or organization update also that team's or "
+            "organization's keys. LAST_GOOD_TOMBSTONE_TTL_SECONDS must exceed PROXY_DB_LOOKUP_DEADLINE_SECONDS plus "
+            "LAST_GOOD_STORE_MARGIN_SECONDS, the longest a database read and the storing of its entry may take; a "
+            "pair that does not turns this setting off at start-up with an error"
         ),
     )
     max_request_size_mb: int | None = Field(

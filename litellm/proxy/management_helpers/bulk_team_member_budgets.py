@@ -29,6 +29,7 @@ from litellm.proxy._types import (
 from litellm.proxy.auth.auth_checks import invalidate_team_member_spend_state
 from litellm.proxy.common_utils.user_api_key_cache import (
     UserApiKeyCache,
+    rearm_last_good,
     revoke_last_good,
     serves_last_good_entries,
 )
@@ -278,12 +279,10 @@ async def bulk_update_team_member_budgets(
         row_holders: Final = MappingProxyType(
             {budget_id: await read_budget_holders(budget_id) for budget_id in sorted(revoked_rows)}
         )
-        await revoke_last_good(
-            user_api_key_cache,
-            tuple(
-                dict.fromkeys(chain(member_holders.last_good_keys, *(h.last_good_keys for h in row_holders.values())))
-            ),
+        revoked: Final = tuple(
+            dict.fromkeys(chain(member_holders.last_good_keys, *(h.last_good_keys for h in row_holders.values())))
         )
+        await revoke_last_good(user_api_key_cache, revoked)
     except HTTPException as refused:
         raise _revocation_refused(refused) from refused
     async with prisma_client.tx(timeout=_BATCH_TX_TIMEOUT) as tx:
@@ -318,6 +317,8 @@ async def bulk_update_team_member_budgets(
             else None
         )
 
+    # Tombstoned again from the commit, so a read in flight across it cannot keep a member's old limits
+    await rearm_last_good(user_api_key_cache, revoked)
     for user_id in user_ids:
         await invalidate_team_member_spend_state(
             user_id=user_id, team_id=team_id, user_api_key_cache=user_api_key_cache
