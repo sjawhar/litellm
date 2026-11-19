@@ -4233,10 +4233,12 @@ def jwt_key_mapping_cache_key(jwt_claim_name: str, jwt_claim_value: str, jwt_iss
 
     The issuer and the claim name are length-prefixed, so two different scopes or claims never share a key, whatever
     ``:`` the issuer, the claim name or the claim value contain: a cached hit, a ``__NO_MAPPING__`` miss or a last good
-    entry of one is never served to another.
+    entry of one is never served to another. The ``jwt_key_mapping_v2:`` prefix keeps this text apart from the
+    ``jwt_key_mapping:{issuer}:{claim}:{value}`` text of earlier versions, which pods of both versions use side by side
+    during a rolling upgrade.
     """
     issuer: Final = jwt_issuer or ""
-    return f"jwt_key_mapping:{len(issuer)}:{issuer}:{len(jwt_claim_name)}:{jwt_claim_name}:{jwt_claim_value}"
+    return f"jwt_key_mapping_v2:{len(issuer)}:{issuer}:{len(jwt_claim_name)}:{jwt_claim_name}:{jwt_claim_value}"
 
 
 @log_db_metrics

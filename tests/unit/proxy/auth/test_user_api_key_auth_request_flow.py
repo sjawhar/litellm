@@ -2012,7 +2012,7 @@ async def test_auto_register_binds_api_key_to_token_hash():
             user_api_key_cache=user_api_key_cache,
             parent_otel_span=None,
             proxy_logging_obj=MagicMock(),
-            cache_key="jwt_key_mapping:sub:user1",
+            cache_key=jwt_key_mapping_cache_key("sub", "user1"),
             team_id="validated-team",
             user_id="validated-user",
             org_id="validated-org",
@@ -2066,7 +2066,7 @@ def _auto_register_kwargs(prisma_client, user_api_key_cache, jwt_handler, **over
         "user_api_key_cache": user_api_key_cache,
         "parent_otel_span": None,
         "proxy_logging_obj": MagicMock(),
-        "cache_key": "jwt_key_mapping:sub:validated-user",
+        "cache_key": jwt_key_mapping_cache_key("sub", "validated-user"),
         "team_id": "validated-team",
         "user_id": "validated-user",
         "org_id": "jwt-org",
@@ -2273,7 +2273,7 @@ async def test_auto_register_map_existing_key_reuses_when_the_user_was_matched_b
                 user_api_key_cache,
                 jwt_handler,
                 claim_value="idp-subject-not-the-db-user-id",
-                cache_key="jwt_key_mapping:sub:idp-subject-not-the-db-user-id",
+                cache_key=jwt_key_mapping_cache_key("sub", "idp-subject-not-the-db-user-id"),
             )
         )
 
@@ -2311,7 +2311,7 @@ async def test_auto_register_map_existing_key_mints_when_the_claim_is_not_a_user
                 jwt_handler,
                 virtual_key_claim_field="azp",
                 claim_value="shared-client-app",
-                cache_key="jwt_key_mapping:azp:shared-client-app",
+                cache_key=jwt_key_mapping_cache_key("azp", "shared-client-app"),
             )
         )
 
@@ -2439,7 +2439,7 @@ async def test_auto_register_map_existing_key_first_request_runs_key_checks(
             return_value=_PendingAutoRegister(
                 claim_field="sub",
                 claim_value="user1",
-                cache_key="jwt_key_mapping:sub:user1",
+                cache_key=jwt_key_mapping_cache_key("sub", "user1"),
             ),
         ),
         patch(
@@ -2547,7 +2547,7 @@ async def test_auto_register_first_request_propagates_user_email(active: bool) -
             return_value=_PendingAutoRegister(
                 claim_field="sub",
                 claim_value="user1",
-                cache_key="jwt_key_mapping:sub:user1",
+                cache_key=jwt_key_mapping_cache_key("sub", "user1"),
             ),
         ),
         patch(
@@ -2637,7 +2637,7 @@ async def test_auto_register_stamps_new_key_with_jwt_agent_id():
             user_api_key_cache=user_api_key_cache,
             parent_otel_span=None,
             proxy_logging_obj=MagicMock(),
-            cache_key="jwt_key_mapping:appid:2f5c9b1e-6a4d-4c8e-9f0b-7d1a3e5c9b21",
+            cache_key=jwt_key_mapping_cache_key("appid", "2f5c9b1e-6a4d-4c8e-9f0b-7d1a3e5c9b21"),
             team_id="validated-team",
             user_id="validated-user",
             agent_id="canonical-agent-id",
@@ -2702,7 +2702,7 @@ async def test_auto_register_race_loser_keeps_winners_agent_id(losing_agent_id: 
             user_api_key_cache=user_api_key_cache,
             parent_otel_span=None,
             proxy_logging_obj=MagicMock(),
-            cache_key="jwt_key_mapping:tid:shared-tenant",
+            cache_key=jwt_key_mapping_cache_key("tid", "shared-tenant"),
             team_id="validated-team",
             user_id="validated-user",
             agent_id=losing_agent_id,
@@ -2779,7 +2779,7 @@ async def test_jwt_auto_register_forwards_bound_agent_id():
             return_value=_PendingAutoRegister(
                 claim_field="sub",
                 claim_value="user1",
-                cache_key="jwt_key_mapping:sub:user1",
+                cache_key=jwt_key_mapping_cache_key("sub", "user1"),
             ),
         ),
         patch(  # test-quality-ok: the builder calls this static method directly; no dependency injection seam exists
@@ -3094,7 +3094,7 @@ class TestJWTOAuth2Coexistence:
                 return_value=_PendingAutoRegister(
                     claim_field="sub",
                     claim_value="user1",
-                    cache_key="jwt_key_mapping:sub:user1",
+                    cache_key=jwt_key_mapping_cache_key("sub", "user1"),
                 ),
             ),
             patch(
@@ -9867,6 +9867,28 @@ async def test_issuer_scopes_whose_parts_join_to_the_same_text_keep_separate_ent
         await resolve(first_issuer, "sub:v")
 
 
+def _earlier_version_mapping_key(jwt_claim_name: str, jwt_claim_value: str, jwt_issuer: str | None = None) -> str:
+    """The mapping cache key text of versions before the length-prefixed one, which a rolling upgrade still runs."""
+    if not jwt_issuer:
+        return f"jwt_key_mapping:{jwt_claim_name}:{jwt_claim_value}"
+    return f"jwt_key_mapping:{jwt_issuer}:{jwt_claim_name}:{jwt_claim_value}"
+
+
+@pytest.mark.parametrize(
+    ("earlier", "current"),
+    [
+        (("9", "https://a:3:sub:v", None), ("sub", "v", "https://a")),
+        (("sub", "v", "https://a"), ("9", "https://a:3:sub:v", None)),
+        (("sub", "v", None), ("sub", "v", None)),
+    ],
+    ids=["earlier_global_vs_issuer", "earlier_issuer_vs_global", "same_global_scope"],
+)
+def test_mapping_cache_key_never_equals_the_key_text_of_an_earlier_version(
+    earlier: tuple[str, str, str | None], current: tuple[str, str, str | None]
+):
+    assert jwt_key_mapping_cache_key(*current) != _earlier_version_mapping_key(*earlier)
+
+
 @pytest.mark.asyncio
 async def test_auth_flow_enters_virtual_key_mapping_when_only_an_issuer_configures_the_claim_field():
     jwt_token = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJzdmMtYWNjb3VudC03In0.signature"
@@ -10641,7 +10663,7 @@ async def test_auto_register_mapping_insert_emits_a_postgres_insert_event_for_th
             user_api_key_cache=user_api_key_cache,
             parent_otel_span=None,
             proxy_logging_obj=MagicMock(),
-            cache_key="jwt_key_mapping:sub:user1",
+            cache_key=jwt_key_mapping_cache_key("sub", "user1"),
             team_id="validated-team",
             user_id="validated-user",
         )

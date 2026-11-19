@@ -1331,7 +1331,7 @@ async def test_auto_register_race_conflict_tolerates_delete_failure():
             user_api_key_cache=user_api_key_cache,
             parent_otel_span=None,
             proxy_logging_obj=None,
-            cache_key="jwt_key_mapping:sub:user-42",
+            cache_key=jwt_key_mapping_cache_key("sub", "user-42"),
         )
 
     # Caller still receives the winner's mapping even when cleanup fails
@@ -1385,7 +1385,7 @@ async def test_auto_register_raises_503_when_winner_mapping_vanishes():
             user_api_key_cache=user_api_key_cache,
             parent_otel_span=None,
             proxy_logging_obj=None,
-            cache_key="jwt_key_mapping:sub:user-42",
+            cache_key=jwt_key_mapping_cache_key("sub", "user-42"),
         )
 
     assert exc_info.value.status_code == 503
@@ -1487,7 +1487,7 @@ async def test_auto_register_helper_stamps_validated_identity_context():
             user_api_key_cache=DualCache(),
             parent_otel_span=None,
             proxy_logging_obj=None,
-            cache_key="jwt_key_mapping:sub:new-user",
+            cache_key=jwt_key_mapping_cache_key("sub", "new-user"),
             team_id="validated-team",
             user_id="validated-user",
             org_id="validated-org",
@@ -1942,13 +1942,18 @@ async def test_a_read_that_started_before_a_repoint_cannot_keep_the_old_key_afte
 
 
 @pytest.mark.asyncio
-async def test_issuer_miss_paused_across_auto_registration_and_global_create_keeps_the_issuer_off_the_global_row():
+async def test_issuer_miss_paused_across_auto_registration_and_global_create_keeps_the_issuer_off_the_global_row(
+    monkeypatch,
+):
     """The paused read found no row for the issuer, then the issuer's row is auto-registered to a restricted key and a
     broader global row is created. The resumed read goes on to the global row for its own request, but no outage may
-    send the issuer's caller there: the store keeps no answer for a scope that had no row."""
+    send the issuer's caller there: the store keeps no answer for a scope that had no row. Tombstones lapse at once,
+    so the global row is kept as it would be once any tombstone a create wrote had lapsed."""
+    import litellm.proxy.common_utils.user_api_key_cache as user_api_key_cache_module
     from litellm.proxy._types import CreateJWTKeyMappingRequest, hash_token
     from litellm.proxy.auth.user_api_key_auth import _auto_register_jwt_mapping
 
+    monkeypatch.setattr(user_api_key_cache_module, "LAST_GOOD_TOMBSTONE_TTL_SECONDS", 0)
     minted = "minted-by-auto-registration"
     restricted = hash_token(minted)
     table = _MappingTable()
@@ -1984,6 +1989,10 @@ async def test_issuer_miss_paused_across_auto_registration_and_global_create_kee
         )
     release.set()
     assert (registered.token, (await read).token) == (restricted, _OLD_KEY)
+    global_entry = await recall_last_good(
+        user_api_key_cache, jwt_key_mapping_cache_key("sub", "svc-7"), _JWTKeyMappingTarget
+    )
+    assert global_entry == _JWTKeyMappingTarget(token=_OLD_KEY)
     await _expire_and_stop(table, user_api_key_cache, _ISSUER)
 
     with pytest.raises(httpx.ConnectError):
