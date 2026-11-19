@@ -112,6 +112,7 @@ from litellm.proxy.common_utils.sse_keepalive import (
     wrap_passthrough_sse_bytes_with_keepalive_pings,
 )
 from litellm.proxy.litellm_pre_call_utils import (  # noqa: F401  # legacy module exports
+    ROUTER_OWNED_REQUEST_FIELDS,
     LiteLLMProxyRequestSetup,
     _get_dynamic_logging_metadata,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
     _key_or_team_allows_client_pricing_override,  # pyright: ignore[reportPrivateUsage]  # reuse the proxy's pricing trust policy
@@ -154,7 +155,11 @@ router: Final = APIRouter()
 pass_through_endpoint_logging: Final = PassThroughEndpointLogging()
 
 _METADATA_KEYS: Final = frozenset(("litellm_metadata", "metadata"))
-_KEPT_OUT_OF_LITELLM_PARAMS: Final = _METADATA_KEYS | frozenset(wire_names(ProxyRequestState))
+# Router-owned deployment fields leave the forwarded body like every litellm-owned name, but never reach the logging
+# object, whose success callbacks would count usage against the deployment a body names.
+_KEPT_OUT_OF_LITELLM_PARAMS: Final = (
+    _METADATA_KEYS | frozenset(wire_names(ProxyRequestState)) | ROUTER_OWNED_REQUEST_FIELDS
+)
 
 # Global registry to track registered pass-through routes and prevent memory leaks
 _registered_pass_through_routes: Final[dict[str, dict[str, str | bool | list[str] | Mapping[str, object]]]] = {}

@@ -1378,12 +1378,47 @@ async def test_guardrail_refusal_past_pre_call_keeps_the_guardrail_cost_on_the_s
     assert update_database.call_args.kwargs["response_cost"] == pytest.approx(0.25)
 
 
+_AUTH_GATE_BODY_CLAIMS: Final = (
+    (
+        "root",
+        "litellm_params",
+        {"api_base": "https://victim.invalid", "litellm_metadata": {"model_info": {"id": "victim-deployment"}}},
+    ),
+    ("root", "model_info", {"id": "victim-deployment"}),
+    ("root", "custom_llm_provider", "victim-provider"),
+    ("root", "agent_id", "victim-agent"),
+    (
+        "root",
+        "response_headers",
+        {"x-ms-is-spilled-over": "true", "x-ms-spillover-from-deployment": "victim-deployment"},
+    ),
+    ("root", "proxy_server_request", {"url": "https://victim.invalid", "body": {"user": "victim-customer"}}),
+    ("metadata", "model_info", {"id": "victim-deployment"}),
+    ("metadata", "model_group", "victim-group"),
+    ("metadata", "deployment", "openai/victim-model"),
+    ("metadata", "original_model_group", "victim-group"),
+    ("metadata", "routing_decision", {"router_model_name": "victim-router", "routed_model": "victim-model"}),
+    ("metadata", "agent_id", "victim-agent"),
+    ("metadata", "actor_agent_id", "victim-agent"),
+    ("metadata", "target_agent_id", "victim-agent"),
+    ("metadata", "billing_agent_id", "victim-agent"),
+    ("metadata", "agent_execution_mode", "victim-mode"),
+    ("metadata", "verified_human_user_id", "victim-user"),
+    ("metadata", "internal_call_origin", "victim-origin"),
+)
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("place", "field", "claim"),
+    _AUTH_GATE_BODY_CLAIMS,
+    ids=[f"{place}.{field}" for place, field, _ in _AUTH_GATE_BODY_CLAIMS],
+)
 async def test_auth_gate_failure_spend_row_takes_its_deployment_from_the_router_not_the_body(
-    proxy_logging, monkeypatch
+    proxy_logging, monkeypatch, place: str, field: str, claim: object
 ):
-    """Nobody is authenticated at the auth gate, so model_info, model_group and deployment in either bucket, at
-    the top level or under a body litellm_params, must not name the deployment its failure row is filed under."""
+    """Nobody is authenticated at the auth gate, so nothing the body says about the provider, deployment, group,
+    agent or origin, at the top level or in either metadata bucket, may reach the failure row it is filed under."""
     from litellm.proxy import proxy_server
     from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
 
@@ -1402,20 +1437,15 @@ async def test_auth_gate_failure_spend_row_takes_its_deployment_from_the_router_
     )
     update_database: Final = _record_failure_spend_rows(monkeypatch)
     proxy_logging.alert_types = []
-    routing_claims: Final = {
-        "model_info": {"id": "victim-deployment"},
-        "model_group": "victim-group",
-        "deployment": "openai/victim-model",
-    }
+    claimed: Final = (
+        {field: claim} if place == "root" else {bucket: {field: claim} for bucket in ("metadata", "litellm_metadata")}
+    )
 
     await proxy_logging.post_call_failure_hook(
         request_data={
             "model": "internal-model",
             "messages": [{"role": "user", "content": "hi"}],
-            "metadata": dict(routing_claims),
-            "litellm_metadata": dict(routing_claims),
-            "model_info": {"id": "victim-deployment"},
-            "litellm_params": {"api_base": "https://victim.invalid", "litellm_metadata": dict(routing_claims)},
+            **claimed,
         },
         original_exception=HTTPException(status_code=401, detail="Invalid virtual key"),
         user_api_key_dict=UserAPIKeyAuth(request_route="/chat/completions"),
@@ -1424,18 +1454,25 @@ async def test_auth_gate_failure_spend_row_takes_its_deployment_from_the_router_
     )
 
     update_database.assert_awaited_once()
+    row_kwargs: Final = update_database.call_args.kwargs["kwargs"]
     now: Final = datetime.now()
     payload: Final = get_logging_payload(
-        kwargs={**update_database.call_args.kwargs["kwargs"], "completion_start_time": now},
-        response_obj=None,
-        start_time=now,
-        end_time=now,
+        kwargs={**row_kwargs, "completion_start_time": now}, response_obj=None, start_time=now, end_time=now
     )
-    assert {key: payload[key] for key in ("model_id", "model_group", "model", "api_base")} == {
-        "model_id": "configured-deployment",
-        "model_group": "internal-model",
-        "model": "openai/gpt-4.1",
-        "api_base": "",
+    attribution_columns: Final = ("model_id", "model_group", "model", "api_base", "custom_llm_provider", "agent_id")
+    assert {
+        "attribution": {key: payload[key] for key in attribution_columns},
+        "names_the_claim": "victim" in json.dumps({"row": payload, "request_data": row_kwargs}, default=str),
+    } == {
+        "attribution": {
+            "model_id": "configured-deployment",
+            "model_group": "internal-model",
+            "model": "openai/gpt-4.1",
+            "api_base": "",
+            "custom_llm_provider": "openai",
+            "agent_id": None,
+        },
+        "names_the_claim": False,
     }
 
 

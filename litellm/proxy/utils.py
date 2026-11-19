@@ -54,6 +54,7 @@ from litellm import _custom_logger_compatible_callbacks_literal
 from litellm.constants import (
     DEFAULT_MODEL_CREATED_AT_TIME,
     FILE_USAGE_MAX_TRACKED_COUNTERS,
+    INTERNAL_CALL_ORIGIN_METADATA_KEY,
     LITELLM_HTTP_STATUS_CLIENT_DISCONNECTED,
     LITELLM_LOGGING_NO_UPSTREAM_LLM_CALL,
     MAX_TEAM_LIST_LIMIT,
@@ -1239,9 +1240,28 @@ def _reached_deployment(litellm_logging_obj: Logging) -> bool:
 _BODY_DEPLOYMENT_PARAMS: Final = frozenset(("model_info", "cooldown_time"))
 
 
-# The metadata names the failure spend row reads its deployment id, model group and model name from. The router
-# writes them once it picks a deployment; on an auth-gate rejection only the caller can have.
-_ROUTING_METADATA_FIELDS: Final = frozenset(("model_info", "model_group", "deployment"))
+# What an auth-gate failure's spend row and daily aggregates read to name the provider, deployment, group, agent or
+# origin a request was served by or on behalf of. The proxy and the router write these only after authentication,
+# so at the auth gate each one present came from the unauthenticated body.
+_AUTH_GATE_CALLER_ROOT_FIELDS: Final = frozenset(
+    ("litellm_params", "model_info", "custom_llm_provider", "agent_id", "response_headers", "proxy_server_request")
+)
+_AUTH_GATE_CALLER_METADATA_FIELDS: Final = frozenset(
+    (
+        "model_info",
+        "model_group",
+        "deployment",
+        "original_model_group",
+        "routing_decision",
+        "agent_id",
+        "actor_agent_id",
+        "target_agent_id",
+        "billing_agent_id",
+        "agent_execution_mode",
+        "verified_human_user_id",
+        INTERNAL_CALL_ORIGIN_METADATA_KEY,
+    )
+)
 
 
 def _stamp_deployment_attribution(
@@ -3833,13 +3853,15 @@ class ProxyLogging:
                 # here is the caller's, and the failure spend row would bill its cost.
                 strip_client_guardrail_information(request_data)
                 if error_type == ProxyErrorTypes.auth_error:
-                    # Nobody is authenticated at the auth gate: the failure record takes its deployment and model
-                    # group from the router config alone, never from the body.
-                    request_data.pop("litellm_params", None)
-                    request_data.pop("model_info", None)
+                    # Nobody is authenticated at the auth gate: the failure record takes its deployment, group and
+                    # provider from the router config and names no agent, never what the body says.
+                    for field in _AUTH_GATE_CALLER_ROOT_FIELDS & request_data.keys():
+                        request_data.pop(field)
                     request_data.update(
                         {
-                            bucket: {k: v for k, v in caller_bucket.items() if k not in _ROUTING_METADATA_FIELDS}
+                            bucket: {
+                                k: v for k, v in caller_bucket.items() if k not in _AUTH_GATE_CALLER_METADATA_FIELDS
+                            }
                             for bucket in ("metadata", "litellm_metadata")
                             if isinstance(caller_bucket := request_data.get(bucket), dict)
                         }
