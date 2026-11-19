@@ -808,8 +808,8 @@ async def _run_fallback_model_checks(
     team_membership_loaded: bool,
 ) -> None:
     """
-    The team, team member, user and project model checks common_checks() runs on the requested model, run on each
-    fallback target: a target can serve the request in the requested model's place.
+    The team, team member, user, project and agent model checks common_checks() runs on the requested model, run on
+    each fallback target: a target can serve the request in the requested model's place.
     """
     from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
 
@@ -862,6 +862,20 @@ async def _run_fallback_model_checks(
                 llm_router=llm_router,
                 key_model_aliases=key_model_aliases,
             )
+
+    # The agent checks take every target at once, so a managed agent's access groups, read from the database on each
+    # check, load once per request
+    targets: Final = list(fallback_models)
+    _check_managed_agent_model_access(model=targets, valid_token=valid_token, llm_router=llm_router)
+    await _check_agent_access_group_model_access(model=targets, valid_token=valid_token, llm_router=llm_router)
+    await _check_agent_caller_model_access(
+        model=targets,
+        valid_token=valid_token,
+        llm_router=llm_router,
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+        proxy_logging_obj=proxy_logging_obj,
+    )
 
 
 def _enforce_user_param_check(general_settings: dict, request: Request, request_body: dict, route: str) -> None:
@@ -1191,21 +1205,7 @@ async def common_checks(
                         code=status.HTTP_400_BAD_REQUEST,
                     )
 
-    managed_policy: Final = managed_agent_policy(valid_token)
-    if _model and valid_token is not None and managed_policy is not None:
-        managed_models: Final = (managed_policy.object_permission or MappingProxyType({})).get("models", ())
-        if not isinstance(managed_models, (list, tuple)) or not managed_models:
-            raise HTTPException(403, "This agent has no model grants")
-        can_object_call_model(
-            model=_resolve_team_alias(
-                _model, team_model_aliases_for_auth_check(valid_token), valid_token.team_id, llm_router
-            ),
-            llm_router=llm_router,
-            models=list(managed_models),
-            team_id=valid_token.team_id,
-            object_type="agent",
-            key_model_aliases=key_model_aliases_for_auth_check(valid_token),
-        )
+    _check_managed_agent_model_access(model=_model, valid_token=valid_token, llm_router=llm_router)
 
     await _check_agent_access_group_model_access(model=_model, valid_token=valid_token, llm_router=llm_router)
     await _check_agent_caller_model_access(
@@ -1256,7 +1256,7 @@ async def common_checks(
         )
 
     # 2.4 A fallback target can serve the request in the requested model's place, so it passes the same team, team
-    # member, user and project model checks
+    # member, user, project and agent model checks
     with tracer.trace("litellm.proxy.auth.common_checks.run_fallback_model_checks"):
         await _run_fallback_model_checks(
             fallback_models=request_fallback_model_names(_typed_request_body(request_body)),
@@ -4839,6 +4839,29 @@ def _live_team_alias_target(
         and target not in llm_router.model_name_to_deployment_indices
     )
     return model if deleted_team_deployment else target
+
+
+def _check_managed_agent_model_access(
+    model: str | list[str] | None,  # mutable-ok: _can_object_call_model takes list[str]
+    valid_token: UserAPIKeyAuth | None,
+    llm_router: Router | None,
+) -> None:
+    """A managed agent identity may call only the models its policy grants."""
+    managed_policy: Final = managed_agent_policy(valid_token)
+    if model and valid_token is not None and managed_policy is not None:
+        managed_models: Final = (managed_policy.object_permission or MappingProxyType({})).get("models", ())
+        if not isinstance(managed_models, (list, tuple)) or not managed_models:
+            raise HTTPException(403, "This agent has no model grants")
+        can_object_call_model(
+            model=_resolve_team_alias(
+                model, team_model_aliases_for_auth_check(valid_token), valid_token.team_id, llm_router
+            ),
+            llm_router=llm_router,
+            models=list(managed_models),
+            team_id=valid_token.team_id,
+            object_type="agent",
+            key_model_aliases=key_model_aliases_for_auth_check(valid_token),
+        )
 
 
 async def _check_agent_access_group_model_access(

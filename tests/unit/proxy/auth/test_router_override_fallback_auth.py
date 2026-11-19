@@ -10,6 +10,7 @@ import importlib
 import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from types import MappingProxyType, ModuleType
 from typing import Final
@@ -31,8 +32,10 @@ from litellm.proxy._types import (
     ProxyErrorTypes,
     UserAPIKeyAuth,
 )
+from litellm.proxy.agent_endpoints.auth.agent_access_groups import AgentAccessGroupCeiling, CeilingResolver
 from litellm.proxy.auth.auth_utils import fallback_target_model_name, iter_request_fallback_targets
 from litellm.proxy.auth.user_api_key_auth import enforce_key_and_fallback_model_access
+from litellm.types.agents import AgentCaller, AgentResponse
 
 
 def _fallback_model_names(fallbacks):
@@ -1129,6 +1132,88 @@ async def test_a_fallback_target_outside_the_projects_models_is_refused() -> Non
         await _common_checks_with_fallback("other", project_key, project_object=project)
 
     assert exc_info.value.type == ProxyErrorTypes.project_model_access_denied
+    assert exc_info.value.code == "403"
+
+
+def _agent_access_group_ceiling(models: frozenset[str] | None) -> CeilingResolver:
+    """An agent's attached access groups with a fixed model ceiling, or no attached group when ``models`` is None"""
+
+    async def resolve(_agent_id: str) -> AgentAccessGroupCeiling | None:
+        if models is None:
+            return None
+        return AgentAccessGroupCeiling(
+            access_group_ids=("fallback-group",), models=models, mcp_server_ids=frozenset(), agent_ids=frozenset()
+        )
+
+    return resolve
+
+
+@pytest.mark.asyncio
+async def test_a_fallback_target_outside_a_managed_agents_model_grants_is_refused() -> None:
+    managed: Final = UserAPIKeyAuth(token="managed-token")
+    managed.managed_agent_policy = AgentResponse(
+        agent_id="managed", agent_name="Managed", agent_card_params={}, object_permission={"models": ["requested"]}
+    )
+
+    assert await _common_checks_with_fallback("requested", managed) is True
+    with pytest.raises(ModelAccessDeniedProxyException, match="'other'") as exc_info:
+        await _common_checks_with_fallback("other", managed)
+
+    assert exc_info.value.type == ProxyErrorTypes.agent_model_access_denied
+    assert exc_info.value.code == "403"
+
+
+@pytest.mark.asyncio
+async def test_a_fallback_target_outside_an_agents_access_groups_is_refused() -> None:
+    from litellm.proxy.auth import auth_checks
+
+    agent_key: Final = UserAPIKeyAuth(token="agent-token", agent_id="agent-1")
+    ceiling: Final = _agent_access_group_ceiling(frozenset({"requested"}))
+
+    with patch(
+        "litellm.proxy.auth.auth_checks._check_agent_access_group_model_access",
+        new=partial(auth_checks._check_agent_access_group_model_access, resolve_ceiling=ceiling),
+    ):
+        assert await _common_checks_with_fallback("requested", agent_key) is True
+        with pytest.raises(ModelAccessDeniedProxyException, match="'other'") as exc_info:
+            await _common_checks_with_fallback("other", agent_key)
+
+    assert exc_info.value.type == ProxyErrorTypes.agent_model_access_denied
+    assert exc_info.value.code == "403"
+
+
+@pytest.mark.asyncio
+async def test_a_fallback_target_outside_the_invoking_teams_models_is_refused() -> None:
+    """An agent key acting for a caller is held to the caller's team, so a target outside that team is refused"""
+    from litellm.proxy.auth import auth_checks
+
+    agent_key: Final = UserAPIKeyAuth(token="agent-token", agent_id="agent-1")
+    agent_key.agent_caller = AgentCaller(user_id="caller", team_id="caller-team")
+    caller_team: Final = LiteLLM_TeamTable(team_id="caller-team", models=["requested"])
+
+    async def load_team(_valid_token: UserAPIKeyAuth) -> LiteLLM_TeamTable | None:
+        return caller_team
+
+    async def load_user(_valid_token: UserAPIKeyAuth) -> LiteLLM_UserTable | None:
+        return None
+
+    with (
+        patch(
+            "litellm.proxy.auth.auth_checks._check_agent_access_group_model_access",
+            new=partial(
+                auth_checks._check_agent_access_group_model_access, resolve_ceiling=_agent_access_group_ceiling(None)
+            ),
+        ),
+        patch(
+            "litellm.proxy.auth.auth_checks._check_agent_caller_model_access",
+            new=partial(auth_checks._check_agent_caller_model_access, load_team=load_team, load_user=load_user),
+        ),
+    ):
+        assert await _common_checks_with_fallback("requested", agent_key) is True
+        with pytest.raises(ModelAccessDeniedProxyException, match="'other'") as exc_info:
+            await _common_checks_with_fallback("other", agent_key)
+
+    assert exc_info.value.type == ProxyErrorTypes.team_model_access_denied
     assert exc_info.value.code == "403"
 
 
