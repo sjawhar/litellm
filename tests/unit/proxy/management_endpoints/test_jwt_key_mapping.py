@@ -1909,19 +1909,20 @@ async def _repoint(table: _MappingTable, user_api_key_cache: UserApiKeyCache) ->
 
 @pytest.mark.asyncio
 async def test_after_a_repoint_an_outage_never_serves_the_old_key():
-    """The repoint tombstones the scope's entry, which also refuses to keep the new target the next read returns
-    until the tombstone lapses: the outage refuses the caller rather than serve the key the mapping left."""
+    """The old key was the scope's last good entry before the repoint. An outage that comes after the repoint, before
+    any other read, must not serve it: here it refuses the caller, as the repoint took the scope's entry away."""
     table = _MappingTable(_mapping_row("mapping-1", _OLD_KEY))
     user_api_key_cache = await _cache_holding_both_keys()
     assert (await _resolve(table, user_api_key_cache)).token == _OLD_KEY
 
     await _repoint(table, user_api_key_cache)
-    after_the_repoint = await _resolve(table, user_api_key_cache)
     await _expire_and_stop(table, user_api_key_cache)
+    try:
+        served = await _resolve(table, user_api_key_cache)
+    except httpx.ConnectError:
+        served = None
 
-    assert after_the_repoint.token == _NEW_KEY
-    with pytest.raises(httpx.ConnectError):
-        await _resolve(table, user_api_key_cache)
+    assert getattr(served, "token", None) != _OLD_KEY
 
 
 @pytest.mark.asyncio

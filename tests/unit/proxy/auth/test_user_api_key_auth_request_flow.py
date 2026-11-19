@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -9674,6 +9674,20 @@ async def _resolve_svc(table: _JWTKeyMappingTable, cache: UserApiKeyCache) -> ob
     )
 
 
+async def _resolve_unscoped_svc(table: _JWTKeyMappingTable, cache: UserApiKeyCache) -> object:
+    """A token no configured issuer stamped, so the lookup reads the global scope only."""
+    from litellm.proxy.auth.user_api_key_auth import _resolve_jwt_to_virtual_key
+
+    return await _resolve_jwt_to_virtual_key(
+        jwt_claims={"sub": "svc-7"},
+        jwt_handler=_per_issuer_virtual_key_jwt_handler(global_claim_field="sub", global_behavior="reject"),
+        prisma_client=SimpleNamespace(db=SimpleNamespace(litellm_jwtkeymapping=table)),
+        user_api_key_cache=cache,
+        parent_otel_span=None,
+        proxy_logging_obj=MagicMock(),
+    )
+
+
 async def _outlive_the_mapping_cache(cache: UserApiKeyCache) -> None:
     for jwt_issuer in (ISSUER_TWO, None):
         await cache.async_delete_cache(jwt_key_mapping_cache_key("sub", "svc-7", jwt_issuer))
@@ -9726,20 +9740,28 @@ async def test_mapping_row_never_read_is_refused_while_the_database_is_stopped()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("row_issuer", [ISSUER_TWO, ""], ids=["issuer_row", "global_row"])
-async def test_mapping_row_the_database_reported_missing_is_refused_in_a_later_outage(row_issuer: str):
+@pytest.mark.parametrize(
+    ("row_issuer", "resolve"),
+    [(ISSUER_TWO, _resolve_svc), ("", _resolve_unscoped_svc)],
+    ids=["issuer_row", "global_row"],
+)
+async def test_mapping_row_the_database_reported_missing_is_refused_in_a_later_outage(
+    row_issuer: str, resolve: Callable[[_JWTKeyMappingTable, UserApiKeyCache], Awaitable[object]]
+):
+    """Each case reads the row in its own scope, the issuer's or the global one, so the outage reads that same scope's
+    entry and fails if the row the database reported missing was not forgotten there."""
     cache: Final = await _cache_holding_keys("hashed-mapped-key")
     table: Final = _JWTKeyMappingTable(_svc_mapping("hashed-mapped-key", jwt_issuer=row_issuer))
-    await _resolve_svc(table, cache)
+    assert getattr(await resolve(table, cache), "token", None) == "hashed-mapped-key"
     table.rows.clear()
     await _outlive_the_mapping_cache(cache)
     with pytest.raises(HTTPException):
-        await _resolve_svc(table, cache)
+        await resolve(table, cache)
     await _outlive_the_mapping_cache(cache)
     table.stopped = True
 
     with pytest.raises(httpx.ConnectError):
-        await _resolve_svc(table, cache)
+        await resolve(table, cache)
 
 
 @pytest.mark.asyncio
