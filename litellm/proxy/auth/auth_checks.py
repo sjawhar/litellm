@@ -1211,6 +1211,7 @@ async def common_checks(
         proxy_logging_obj=proxy_logging_obj,
         team_membership=loaded_team_membership,
         team_membership_loaded=team_membership_loaded,
+        budgets_enforced=not skip_all_budget_checks,
     )
 
     # Run before apply_key_tags_pre_auth injects key metadata.tags into request_body.
@@ -2274,6 +2275,14 @@ async def _end_user_id_exists_in_db(
         )
         if end_user_obj is not None:
             return True
+    except LastGoodEntryMissing:
+        # An id the restricted registry's copy leaves out restricts nothing, whether or not its row exists, so it is
+        # validated as before; any other id may carry limits no entry keeps, and the request is refused
+        registry: Final = await _load_end_user_restricted_registry(
+            prisma_client=prisma_client, user_api_key_cache=user_api_key_cache
+        )
+        if registry is None or end_user_id in registry:
+            raise
     except Exception as e:
         verbose_proxy_logger.debug("end_user validation: get_end_user_object lookup failed: %s", e)
 
@@ -5306,6 +5315,9 @@ async def _org_granted_models(
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
         )
+    except LastGoodEntryMissing:
+        # A budgeted group serves the model and only the org can say whether it grants it
+        raise
     except Exception as e:  # noqa: BLE001  # fail-safe: attribution degrades to "no org grant", it must never break auth
         verbose_proxy_logger.debug("access group attribution: org lookup failed: %s", e)
         return ()
@@ -5494,9 +5506,11 @@ async def stamp_matched_model_access_groups(
     proxy_logging_obj: ProxyLogging,
     team_membership: LiteLLM_TeamMembership | None = None,
     team_membership_loaded: bool = False,
+    budgets_enforced: bool = False,
 ) -> tuple[str, ...]:
     """Record the groups that authorized this request on its auth object, for the post-call spend
-    writer and the reservation counters, and hand them back for the budget check."""
+    writer and the reservation counters, and hand them back for the budget check. With ``budgets_enforced``, an org
+    with no last good entry in an outage refuses the request rather than dropping the groups it may grant."""
     if valid_token is None:
         return ()
 
@@ -5513,6 +5527,10 @@ async def stamp_matched_model_access_groups(
             team_membership=team_membership,
             team_membership_loaded=team_membership_loaded,
         )
+    except LastGoodEntryMissing:
+        if budgets_enforced:
+            raise
+        return ()
     except Exception as e:  # noqa: BLE001  # fail-safe: attribution is spend telemetry, it must never break auth
         verbose_proxy_logger.debug("model access group attribution failed: %s", e)
         return ()

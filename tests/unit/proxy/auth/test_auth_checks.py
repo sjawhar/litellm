@@ -3080,6 +3080,92 @@ class TestLastGoodLimitsWhileTheDatabaseIsUnreachable:
         assert (composed, await request()) == ((1, ("LiteLLM_BudgetTable",)), (None, ()))
 
     @pytest.mark.asyncio
+    async def test_validating_a_customer_id_with_no_entry_refuses_only_one_the_registry_copy_holds(self, monkeypatch):
+        """With validate_end_user_id_in_db, a customer id is checked against its row. In an outage, an id the restricted
+        registry's copy holds may carry limits no entry keeps, so the request is refused; an id the copy leaves out
+        restricts nothing, and is validated as before."""
+        from litellm.proxy.auth.auth_checks import _load_end_user_restricted_registry, resolve_and_validate_end_user_id
+
+        monkeypatch.setattr(litellm, "validate_end_user_id_in_db", True)
+        database = _LimitsDatabase()
+        database.customers.rows["c-restricted"] = LiteLLM_EndUserTable(user_id="c-restricted", blocked=True)
+        cache = _serving_cache()
+        await _load_end_user_restricted_registry(prisma_client=database, user_api_key_cache=cache)  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+        await self._expire(cache, "end_user_restricted_registry")
+        database.stopped_with = _STOPPED
+
+        async def validated(end_user_id: str) -> str | None:
+            return await resolve_and_validate_end_user_id(
+                raw_end_user_id=end_user_id,
+                prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+                user_api_key_cache=cache,
+            )
+
+        assert await validated("c-unknown") is None
+        with pytest.raises(LastGoodEntryMissing):
+            await validated("c-restricted")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("skip_budget_checks", [False, True], ids=["budgets_checked", "budgets_skipped"])
+    async def test_an_access_group_only_the_org_may_grant_refuses_the_request_when_the_org_has_no_entry(
+        self, monkeypatch, skip_budget_checks: bool
+    ):
+        """A budgeted access group serves the model, and only the key's org could grant it. With no entry for the org,
+        the group's budget cannot be checked, so the request is refused, unless its budget checks are skipped."""
+        from litellm import Router
+        from litellm.proxy.auth.auth_checks import common_checks, get_org_object
+        from litellm.proxy.common_utils.user_api_key_cache import model_access_group_registry_cache_key
+
+        database = _LimitsDatabase()
+        database.organizations.rows["o-grants"] = LiteLLM_OrganizationTable(
+            organization_id="o-grants", models=["tier-a"], created_by="admin", updated_by="admin"
+        )
+        cache = _serving_cache()
+        # The organization budget check reads, and keeps, the entry with its budget; nothing read the plain one yet
+        await get_org_object(
+            org_id="o-grants",
+            prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+            user_api_key_cache=cache,
+            include_budget_table=True,
+        )
+        await cache.async_set_cache(key=model_access_group_registry_cache_key(), value=("tier-a",))
+        database.stopped_with = _STOPPED
+        monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", database)
+        monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
+
+        async def checked() -> bool:
+            return await common_checks(
+                request_body={"model": "gpt-4o", "messages": []},
+                team_object=None,
+                user_object=None,
+                end_user_object=None,
+                global_proxy_spend=None,
+                general_settings={},
+                route="/v1/chat/completions",
+                llm_router=Router(
+                    model_list=[
+                        {
+                            "model_name": "gpt-4o",
+                            "litellm_params": {"model": "openai/gpt-4o"},
+                            "model_info": {"access_groups": ["tier-a"]},
+                        }
+                    ]
+                ),
+                proxy_logging_obj=ProxyLogging(user_api_key_cache=cache),
+                valid_token=UserAPIKeyAuth(models=[], org_id="o-grants"),
+                request=SimpleNamespace(  # pyright: ignore[reportArgumentType]  # stands in for the request
+                    method="POST", headers={}, query_params={}, url=SimpleNamespace(path="/v1/chat/completions")
+                ),
+                skip_budget_checks=skip_budget_checks,
+            )
+
+        if skip_budget_checks:
+            assert await checked() is True
+        else:
+            with pytest.raises(LastGoodEntryMissing):
+                await checked()
+
+    @pytest.mark.asyncio
     async def test_user_the_database_reported_missing_refuses_the_request(self, monkeypatch):
         from litellm.proxy.auth import auth_checks
         from litellm.types.proxy.auth.auth_checks import UserNotFoundError
