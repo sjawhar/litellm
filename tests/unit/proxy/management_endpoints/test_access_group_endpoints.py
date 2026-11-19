@@ -2,6 +2,7 @@
 Tests for access group management endpoints.
 """
 
+import time
 import types
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -1372,7 +1373,9 @@ async def test_update_access_group_drops_the_last_good_entries_of_the_teams_and_
     cache = UserApiKeyCache(serve_last_good_entries=True)
     held = ("team_id:team-add", "team_id:team-remove", "key-add", "key-remove")
     for cache_key in held:
-        await remember_last_good(cache, cache_key, LiteLLM_TeamTableCachedObj(team_id="before-the-change"))
+        await remember_last_good(
+            cache, cache_key, LiteLLM_TeamTableCachedObj(team_id="before-the-change"), read_started=time.monotonic()
+        )
     monkeypatch.setattr(ps, "user_api_key_cache", cache)
 
     resp = client.put(

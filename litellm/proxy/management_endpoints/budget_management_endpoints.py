@@ -31,6 +31,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     end_user_cache_key,
     model_access_group_cache_key,
     project_cache_key,
+    rearm_last_good,
     revoke_last_good,
     serves_last_good_entries,
     tag_cache_key,
@@ -179,8 +180,12 @@ async def update_budget(
     budget_obj_jsonified: Final = budget_update_data(budget_obj, user_api_key_dict)
     # Every holder's last good entry is revoked before the write, so a lowered limit cannot stay in one
     holders: Final = await read_budget_holders(budget_obj.budget_id)
-    await revoke_last_good(user_api_key_cache, holders.last_good_keys)
-    return await write_budget_update(budget_obj.budget_id, budget_obj_jsonified, holders)
+    revoked: Final = holders.last_good_keys
+    await revoke_last_good(user_api_key_cache, revoked)
+    response: Final = await write_budget_update(budget_obj.budget_id, budget_obj_jsonified, holders)
+    # Tombstoned again from the commit, so a read in flight across the write cannot keep the old limit
+    await rearm_last_good(user_api_key_cache, revoked)
+    return response
 
 
 def budget_update_data(budget_obj: BudgetNewRequest, user_api_key_dict: UserAPIKeyAuth) -> Mapping[str, object]:
@@ -236,7 +241,8 @@ def budget_update_data(budget_obj: BudgetNewRequest, user_api_key_dict: UserAPIK
 
 async def write_budget_update(budget_id: str, data: Mapping[str, object], holders: "BudgetHolders"):
     """Write ``data`` from ``budget_update_data`` to budget ``budget_id``, then evict ``holders``. The caller read
-    them with ``read_budget_holders`` and revoked their ``last_good_keys`` before the first write of its request."""
+    them with ``read_budget_holders``, revoked their ``last_good_keys`` before the first write of its request, and
+    re-arms them with ``rearm_last_good`` after its last write."""
     from litellm.proxy.proxy_server import prisma_client
 
     if prisma_client is None:

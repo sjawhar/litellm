@@ -89,6 +89,7 @@ from litellm.proxy.common_utils.timezone_utils import get_budget_reset_time
 from litellm.proxy.common_utils.user_api_key_cache import (
     AUTH_OBJECTS_TARGET,
     UserApiKeyCache,
+    rearm_last_good,
     revoke_last_good,
     serves_last_good_entries,
 )
@@ -2944,7 +2945,8 @@ async def _process_single_key_update(
             detail={"error": "Database not connected"},
         )
 
-    await revoke_last_good(user_api_key_cache, _own_entry_to_revoke(key_request, existing_key_row, non_default_values))
+    revoked: Final = _own_entry_to_revoke(key_request, existing_key_row, non_default_values)
+    await revoke_last_good(user_api_key_cache, revoked)
     update_values: Final = await _handle_update_object_permission(
         data_json=non_default_values,
         existing_key_row=existing_key_row,
@@ -2979,6 +2981,8 @@ async def _process_single_key_update(
         data=key_request,
         existing_key_row=existing_key_row,
     )
+    # Tombstoned again from the last write, so a read in flight across it cannot keep the old entry
+    await rearm_last_good(user_api_key_cache, revoked)
 
     # Trigger async hook
     asyncio.create_task(
@@ -3637,11 +3641,12 @@ async def update_key_fn(
         budget_holders: Final = (
             await read_budget_holders(shared_budget_id) if shared_budget_id is not None else BudgetHolders()
         )
-        revoked_entries: Final = (
-            *_own_entry_to_revoke(data, existing_key_row, non_default_values),
-            *budget_holders.last_good_keys,
+        revoked_entries: Final = tuple(
+            dict.fromkeys(
+                (*_own_entry_to_revoke(data, existing_key_row, non_default_values), *budget_holders.last_good_keys)
+            )
         )
-        await revoke_last_good(user_api_key_cache, tuple(dict.fromkeys(revoked_entries)))
+        await revoke_last_good(user_api_key_cache, revoked_entries)
         update_values: Final = await _handle_update_object_permission(
             data_json=non_default_values,
             existing_key_row=existing_key_row,
@@ -3687,6 +3692,8 @@ async def update_key_fn(
             data=data,
             existing_key_row=existing_key_row,
         )
+        # Tombstoned again from the last write, so a read in flight across it cannot keep the old entry
+        await rearm_last_good(user_api_key_cache, revoked_entries)
 
         if data.spend is not None:
             from litellm.proxy.proxy_server import spend_counter_cache

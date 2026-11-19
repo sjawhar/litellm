@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 from itertools import chain
 from typing import Any, Final
 from unittest.mock import AsyncMock, MagicMock
@@ -1029,7 +1030,7 @@ async def test_a_team_refresh_inside_a_request_sends_its_set_and_alias_del_in_on
     proxy_logging_obj.internal_usage_cache = InternalUsageCache(dual_cache=usage_cache)
     team = LiteLLM_TeamTableCachedObj(team_id="t1", team_alias="alpha")
     with request_redis_batch_scope() as request:
-        await cache_team_object("t1", team, cache, proxy_logging_obj)
+        await cache_team_object("t1", team, cache, proxy_logging_obj, read_started=time.monotonic())
         assert [c[:2] for c in client.pipelines[0].commands] == [("SET", "team_id:t1"), ("DEL", "team_alias:alpha")], (
             "the alias DEL must reach Redis before the refresh returns, or another request can refill memory from it"
         )

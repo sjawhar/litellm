@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 import types
 from datetime import datetime, timedelta, timezone
 from typing import Final
@@ -155,7 +156,12 @@ async def test_update_budget_drops_the_last_good_entries_of_everything_on_it(cli
         "hashed-member-budget",
     )
     for key_name in (*keys, "hashed-unrelated"):
-        await remember_last_good(cache, key_name, LiteLLM_BudgetTable(budget_id="budget_shared", max_budget=50.0))
+        await remember_last_good(
+            cache,
+            key_name,
+            LiteLLM_BudgetTable(budget_id="budget_shared", max_budget=50.0),
+            read_started=time.monotonic(),
+        )
     monkeypatch.setattr(ps, "user_api_key_cache", cache)
 
     resp = client.post("/budget/update", json={"budget_id": "budget_shared", "max_budget": 5.0})
@@ -199,7 +205,7 @@ async def test_update_budget_refuses_and_writes_nothing_when_a_holder_table_cann
     )
     cache: Final = UserApiKeyCache(serve_last_good_entries=True)
     budget: Final = LiteLLM_BudgetTable(budget_id="budget_shared", max_budget=50.0)
-    await remember_last_good(cache, own_budget_key, budget)
+    await remember_last_good(cache, own_budget_key, budget, read_started=time.monotonic())
     monkeypatch.setattr(ps, "user_api_key_cache", cache)
 
     resp = client.post("/budget/update", json={"budget_id": "budget_shared", "max_budget": 5.0})

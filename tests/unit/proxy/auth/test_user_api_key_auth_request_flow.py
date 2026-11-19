@@ -2616,6 +2616,7 @@ async def test_auto_register_reuses_the_users_key_after_an_admin_role_its_last_g
         user_entries,
         "validated-user",
         LiteLLM_UserTable(user_id="validated-user", user_role=LitellmUserRoles.PROXY_ADMIN.value),
+        read_started=time.monotonic(),
     )
     user_rows: Final[list[LiteLLM_UserTable]] = []  # empty while the user read fails
 

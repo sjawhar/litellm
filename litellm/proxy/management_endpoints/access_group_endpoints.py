@@ -431,6 +431,8 @@ async def _patch_team_caches_add_access_group(
             team_table=cached_team,
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
+            # A team patched in the cache is no database read, so it is never kept as a last good entry
+            read_started=None,
         )
     await forget_last_good_and_broadcast(tuple(f"team_id:{team_id}" for team_id in team_ids), user_api_key_cache)
 
@@ -455,6 +457,7 @@ async def _patch_team_caches_remove_access_group(
                 team_table=cached_team,
                 user_api_key_cache=user_api_key_cache,
                 proxy_logging_obj=proxy_logging_obj,
+                read_started=None,
             )
     await forget_last_good_and_broadcast(tuple(f"team_id:{team_id}" for team_id in team_ids), user_api_key_cache)
 

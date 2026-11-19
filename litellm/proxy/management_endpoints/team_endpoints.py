@@ -125,6 +125,8 @@ from litellm.proxy.common_utils.json_merge_patch import apply_json_merge_patch
 from litellm.proxy.common_utils.user_api_key_cache import (
     UserApiKeyCache,
     forget_last_good,
+    last_good_read_start,
+    rearm_last_good,
     revoke_last_good,
     serves_last_good_entries,
     team_membership_auth_cache_key,
@@ -479,6 +481,8 @@ async def refresh_cached_team(
     team_row: _CacheableTeamRow,
     user_api_key_cache: UserApiKeyCache,
     proxy_logging_obj: ProxyLogging,
+    *,
+    read_started: float,
 ) -> None:
     """
     Refresh the in-memory cached team object after a DB write.
@@ -494,6 +498,8 @@ async def refresh_cached_team(
     via `model_dump()` to match the cache shape `_cache_team_object`
     expects. That write also replaces the team's last good entry, and the
     broadcast drops every other pod's copies of the team, by id and by alias.
+    `read_started` is `last_good_read_start` taken right before the write
+    that returned `team_row`.
     """
     team_table: Final = LiteLLM_TeamTableCachedObj.model_validate(team_row.model_dump())
     await cache_team_object(
@@ -501,6 +507,7 @@ async def refresh_cached_team(
         team_table=team_table,
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
+        read_started=read_started,
     )
     alias_keys: Final = (f"team_alias:{team_table.team_alias}",) if team_table.team_alias else ()
     for cache_key in (f"team_id:{team_row.team_id}", *alias_keys):
@@ -2570,39 +2577,41 @@ async def update_team(
 
         # After the request's checks and before the budget and team writes, so no block or old limit outlives the change
         changes_key_entries: Final = team_update_changes_key_entries(data, existing_team_row.metadata)
-        if changes_key_entries or team_update_changes_team_entry(data, existing_team_row.metadata):
-            team_key_tokens: Final = (
-                await _team_key_tokens(prisma_client, data.team_id, user_api_key_cache) if changes_key_entries else ()
+        changes_entries: Final = changes_key_entries or team_update_changes_team_entry(data, existing_team_row.metadata)
+        team_key_tokens: Final = (
+            await _team_key_tokens(prisma_client, data.team_id, user_api_key_cache) if changes_key_entries else ()
+        )
+        # The member default budget write and its membership backfill reach every member's membership entry
+        member_entries: Final = (
+            tuple(
+                team_membership_auth_cache_key(team_id=data.team_id, user_id=user_id)
+                for user_id in _member_user_ids(existing_team_row.members_with_roles)
             )
-            # The member default budget write and its membership backfill reach every member's membership entry
-            member_entries: Final = (
-                tuple(
-                    team_membership_auth_cache_key(team_id=data.team_id, user_id=user_id)
-                    for user_id in _member_user_ids(existing_team_row.members_with_roles)
-                )
-                if _team_member_fields_in_request and existing_team_row.members_with_roles
-                else ()
+            if changes_entries and _team_member_fields_in_request and existing_team_row.members_with_roles
+            else ()
+        )
+        permission_holders: Final = (
+            await object_permission_holder_keys(
+                existing_team_row.object_permission_id, prisma_client, user_api_key_cache
             )
-            permission_holders: Final = (
-                await object_permission_holder_keys(
-                    existing_team_row.object_permission_id, prisma_client, user_api_key_cache
-                )
-                if data.object_permission is not None
-                else ()
-            )
-            await revoke_last_good(
-                user_api_key_cache,
-                tuple(
-                    dict.fromkeys(
-                        (
-                            *team_cache_keys(data.team_id, existing_team.team_alias),
-                            *team_key_tokens,
-                            *member_entries,
-                            *permission_holders,
-                        )
+            if changes_entries and data.object_permission is not None
+            else ()
+        )
+        revoked: Final = (
+            tuple(
+                dict.fromkeys(
+                    (
+                        *team_cache_keys(data.team_id, existing_team.team_alias),
+                        *team_key_tokens,
+                        *member_entries,
+                        *permission_holders,
                     )
-                ),
+                )
             )
+            if changes_entries
+            else ()
+        )
+        await revoke_last_good(user_api_key_cache, revoked)
 
         if _team_member_fields_in_request and TeamMemberBudgetHandler.should_create_budget(
             team_member_budget=data.team_member_budget,
@@ -2682,6 +2691,7 @@ async def update_team(
             await _auto_add_team_members_to_organization(
                 team=existing_team, organization=organization_to_join, prisma_client=prisma_client
             )
+        read_started: Final = last_good_read_start(user_api_key_cache)
         team_row: Final = await _write_team_update(prisma_client, data.team_id, team_update_data, max_budget_guard)
 
         if team_row is None or team_row.team_id is None:
@@ -2692,6 +2702,8 @@ async def update_team(
 
         verbose_proxy_logger.info("Successfully updated team - %s, info", team_row.team_id)
         await sync_team_access_group_membership(prisma_client=prisma_client, team_id=team_row.team_id)
+        # Tombstoned again from the last write, so a read in flight across it cannot keep the old entry
+        await rearm_last_good(user_api_key_cache, revoked)
         await invalidate_cached_object_permissions(
             object_permission_ids=(existing_team.object_permission_id, team_row.object_permission_id),
             user_api_key_cache=user_api_key_cache,
@@ -2700,6 +2712,7 @@ async def update_team(
             team_row=team_row,
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
+            read_started=read_started,
         )
         if existing_team.team_alias and data.team_alias is not None and data.team_alias != existing_team.team_alias:
             await evict_and_broadcast(
@@ -3844,18 +3857,16 @@ async def _team_member_delete(
             prisma_client=prisma_client,
         )
         # The roster rides on the team's entry, the team on each user's entry and the member limits on each membership's
-        await revoke_last_good(
-            user_api_key_cache,
-            (
-                *(team_cache_keys(data.team_id, existing_team_row.team_alias) if removed_team_members else ()),
-                *(user.user_id for user in stale_user_rows),
-                *(
-                    team_membership_auth_cache_key(team_id=data.team_id, user_id=user_id)
-                    for user_id in sorted(user_ids_to_delete)
-                ),
-                *(key.token for key in keys_to_delete),
+        revoked: Final = (
+            *(team_cache_keys(data.team_id, existing_team_row.team_alias) if removed_team_members else ()),
+            *(user.user_id for user in stale_user_rows),
+            *(
+                team_membership_auth_cache_key(team_id=data.team_id, user_id=user_id)
+                for user_id in sorted(user_ids_to_delete)
             ),
+            *(key.token for key in keys_to_delete),
         )
+        await revoke_last_good(user_api_key_cache, revoked)
 
         if removed_team_members:
             await _team_tx_db(tx).update(
@@ -3892,6 +3903,9 @@ async def _team_member_delete(
                     "team_id": data.team_id,
                 }
             )
+
+    # Tombstoned again from the commit, so a read in flight across it cannot keep the old roster or member limits
+    await rearm_last_good(user_api_key_cache, revoked)
 
     if keys_to_delete:
         KeyManagementEventHooks.create_key_deleted_audit_logs(
@@ -4057,12 +4071,15 @@ async def team_member_update(
     )
     # The team's entry carries the roster with each member's role, and each key of the member its row of the roster
     roster_entries: Final = team_cache_keys(data.team_id, existing_team_row.team_alias) if data.role is not None else ()
-    if budget_patch or roster_entries:
-        member_holders: Final = await read_team_member_holders(data.team_id, (received_user_id,))
-        await revoke_last_good(
-            user_api_key_cache,
-            tuple(dict.fromkeys((*roster_entries, *member_holders.last_good_keys, *budget_holders.last_good_keys))),
-        )
+    member_holders: Final = (
+        await read_team_member_holders(data.team_id, (received_user_id,))
+        if budget_patch or roster_entries
+        else BudgetHolders()
+    )
+    revoked: Final = tuple(
+        dict.fromkeys((*roster_entries, *member_holders.last_good_keys, *budget_holders.last_good_keys))
+    )
+    await revoke_last_good(user_api_key_cache, revoked)
     async with prisma_client.tx() as tx:
         role_change: Final = (
             await _update_team_member_role(
@@ -4085,6 +4102,8 @@ async def team_member_update(
             budget_patch=budget_patch,
             team_default_budget_id=team_default_budget_id,
         )
+    # Tombstoned again from the commit, so a read in flight across it cannot keep the old role or member limits
+    await rearm_last_good(user_api_key_cache, revoked)
     if budget_patch:
         await invalidate_team_member_spend_state(
             user_id=received_user_id,
@@ -4313,11 +4332,14 @@ async def reset_team_member_budget_fn(
     )
     # The membership's entry and the member's keys carry the budget this re-points, which can be the stricter one
     member_holders: Final = await read_team_member_holders(team_id, (user_id,))
-    await revoke_last_good(user_api_key_cache, member_holders.last_good_keys)
+    revoked: Final = member_holders.last_good_keys
+    await revoke_last_good(user_api_key_cache, revoked)
     await _team_membership_db(prisma_client).update(
         where=membership_where,
         data={"litellm_budget_table": budget_link},
     )
+    # Tombstoned again from the commit, so a read in flight across it cannot keep the member's own budget
+    await rearm_last_good(user_api_key_cache, revoked)
     await invalidate_team_member_spend_state(
         user_id=user_id,
         team_id=team_id,
@@ -6342,6 +6364,7 @@ async def append_team_models(
         models_to_add,
         data.team_id,
     )
+    read_started: Final = last_good_read_start(user_api_key_cache)
     # Re-fetch via update (write-routed) instead of find_unique (read-routed)
     # to avoid returning stale data from a read replica. The models column
     # was already set by execute_raw above; this just retrieves the row from
@@ -6363,6 +6386,7 @@ async def append_team_models(
         team_row=updated_team,
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
+        read_started=read_started,
     )
 
     return updated_team
@@ -6430,6 +6454,7 @@ async def team_model_delete(
     # Remove specified models
     updated_models: Final = [m for m in current_models if m not in data.models]
 
+    read_started: Final = last_good_read_start(user_api_key_cache)
     # Update team. See team_model_add for the rationale on `include`.
     updated_team: Final = await _team_db(prisma_client).update(
         where={"team_id": data.team_id},
@@ -6446,6 +6471,7 @@ async def team_model_delete(
         team_row=updated_team,
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
+        read_started=read_started,
     )
 
     return updated_team
