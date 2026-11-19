@@ -3,6 +3,7 @@ import logging
 import sys
 from itertools import chain
 from typing import Final
+from unittest.mock import MagicMock, patch
 
 import pytest
 from prometheus_client import REGISTRY
@@ -444,6 +445,115 @@ async def test_client_failure_ip_and_agent_labels_ignore_a_body_the_proxy_never_
         assert "9.9.9.9" not in pair and "forged-agent" not in pair, pair
     if verified:
         assert all(pairs == {(verified, "real/1.0")} for pairs in observed.values()), observed
+
+
+_CLIENT_CONTEXT_ROUTES: Final = (("/v1/chat/completions", "metadata"), ("/v1/messages", "litellm_metadata"))
+
+
+def _authenticated_request(path: str) -> MagicMock:
+    from fastapi import Request
+
+    request: Final = MagicMock(spec=Request)
+    request.url = MagicMock()
+    request.url.path = path
+    request.url.__str__.return_value = f"http://localhost{path}"
+    request.method = "POST"
+    request.query_params = {}
+    request.headers = {"content-type": "application/json", "user-agent": "real-client/1.0"}
+    request.client = MagicMock()
+    request.client.host = "10.1.2.3"
+    return request
+
+
+def _body_forging_client_context() -> dict:
+    forged = {"requester_ip_address": "9.9.9.9", "user_agent": "forged-agent"}
+    return {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "hi"}],
+        "metadata": dict(forged),
+        "litellm_metadata": dict(forged),
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("path", "proxy_bucket"), _CLIENT_CONTEXT_ROUTES)
+async def test_client_failure_ip_and_agent_labels_ignore_the_body_when_the_request_fails_just_after_the_stamp(
+    path: str, proxy_bucket: str
+):
+    """add_litellm_data_to_request stamps the identity into the caller's own metadata bucket well before it writes
+    the proxy's requester_ip_address and user_agent there. A raise in between, for instance
+    _add_otel_traceparent_to_data on a body whose extra_headers is not a dict, hands the failure hook a stamped
+    bucket, and the hook trusts a stamped bucket, so the caller's strings must not still be in it."""
+    from litellm.proxy.litellm_pre_call_utils import add_litellm_data_to_request
+    from litellm.proxy.utils import proxy_stamped_metadata_bucket
+
+    data: Final = _body_forging_client_context()
+    with (
+        patch(
+            "litellm.proxy.litellm_pre_call_utils._add_otel_traceparent_to_data",
+            side_effect=TypeError("argument of type 'int' is not iterable"),
+        ),
+        pytest.raises(TypeError) as raised,
+    ):
+        await add_litellm_data_to_request(
+            data=data,
+            request=_authenticated_request(path),
+            user_api_key_dict=UserAPIKeyAuth(token="hashed-key"),
+            proxy_config=MagicMock(),
+            general_settings={},
+        )
+
+    stamped: Final = proxy_stamped_metadata_bucket(data)
+    assert stamped is data[proxy_bucket]
+    assert {"requester_ip_address", "user_agent"}.isdisjoint(stamped), stamped
+
+    _clear_prometheus_registry()
+    await PrometheusLogger().async_post_call_failure_hook(
+        request_data=data,
+        original_exception=raised.value,
+        user_api_key_dict=UserAPIKeyAuth(token="hashed-key"),
+    )
+
+    observed: Final = _client_labels_by_metric()
+    assert set(observed) == {
+        "litellm_proxy_failed_requests_metric_total",
+        "litellm_proxy_total_requests_metric_total",
+    }
+    for pair in chain.from_iterable(observed.values()):
+        assert "9.9.9.9" not in pair and "forged-agent" not in pair, pair
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("path", "proxy_bucket"), _CLIENT_CONTEXT_ROUTES)
+async def test_client_failure_ip_and_agent_labels_are_the_proxy_values_once_the_request_is_built(
+    path: str, proxy_bucket: str
+):
+    """Clearing the caller's strings at the stamp leaves the finished bucket as before: it holds the proxy's own
+    address and User-Agent, and a failure after that is labelled with them."""
+    from litellm.proxy.litellm_pre_call_utils import add_litellm_data_to_request
+
+    data: Final = await add_litellm_data_to_request(
+        data=_body_forging_client_context(),
+        request=_authenticated_request(path),
+        user_api_key_dict=UserAPIKeyAuth(token="hashed-key"),
+        proxy_config=MagicMock(),
+        general_settings={},
+    )
+
+    expected: Final = ("10.1.2.3", "real-client/1.0")
+    assert (data[proxy_bucket]["requester_ip_address"], data[proxy_bucket]["user_agent"]) == expected
+
+    _clear_prometheus_registry()
+    await PrometheusLogger().async_post_call_failure_hook(
+        request_data=data,
+        original_exception=litellm.BudgetExceededError(current_cost=2.0, max_budget=1.0),
+        user_api_key_dict=UserAPIKeyAuth(token="hashed-key"),
+    )
+
+    assert _client_labels_by_metric() == {
+        name: {expected}
+        for name in ("litellm_proxy_failed_requests_metric_total", "litellm_proxy_total_requests_metric_total")
+    }
 
 
 def test_virtual_key_rate_limit_metrics_accept_custom_metadata_labels(
