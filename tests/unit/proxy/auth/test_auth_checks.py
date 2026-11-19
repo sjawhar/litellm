@@ -2815,6 +2815,48 @@ class TestLastGoodLimitsWhileTheDatabaseIsUnreachable:
         assert loads.qsize() == 1
 
     @pytest.mark.asyncio
+    async def test_each_request_served_the_last_good_global_spend_records_it_in_its_own_scope(self):
+        """Concurrent requests share one global spend load. The spend recalled while the database is stopped is not
+        cached for them, so each request, a waiter and a later one included, recalls it and reads last_good."""
+        from litellm.constants import GLOBAL_PROXY_SPEND_CACHE_KEY, LITELLM_PROXY_BUDGET_NAME
+        from litellm.proxy._types import LiteLLM_UserTable
+        from litellm.proxy.auth.user_api_key_auth import fetch_global_spend_with_event_coordination
+        from litellm.proxy.common_utils.user_api_key_cache import last_good_auth_entries_scope
+
+        database = _LimitsDatabase()
+        database.users.rows[LITELLM_PROXY_BUDGET_NAME] = LiteLLM_UserTable(user_id=LITELLM_PROXY_BUDGET_NAME, spend=99.0)
+        cache = _serving_cache()
+
+        async def request() -> tuple[float | None, tuple[str, ...]]:
+            with last_good_auth_entries_scope() as scope:
+                spend: Final = await fetch_global_spend_with_event_coordination(
+                    cache_key=GLOBAL_PROXY_SPEND_CACHE_KEY,
+                    user_api_key_cache=cache,
+                    prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+                )
+            return spend, scope.served
+
+        assert await request() == (99.0, ())
+        await self._expire(cache, GLOBAL_PROXY_SPEND_CACHE_KEY)
+        load_started: Final = asyncio.Event()
+        release: Final = asyncio.Event()
+
+        async def stalled(where: dict[str, str], include: object = None) -> BaseModel | None:
+            load_started.set()
+            await release.wait()
+            raise _STOPPED
+
+        database.users.find_unique = stalled
+        requests: Final = [asyncio.create_task(request()) for _ in range(2)]
+        await load_started.wait()
+        for _ in range(5):
+            await asyncio.sleep(0)
+        release.set()
+
+        assert await asyncio.gather(*requests) == [(99.0, ("_ProxyBudgetSpend",))] * 2
+        assert await request() == (99.0, ("_ProxyBudgetSpend",))
+
+    @pytest.mark.asyncio
     async def test_user_the_database_reported_missing_refuses_the_request(self, monkeypatch):
         from litellm.proxy.auth import auth_checks
         from litellm.types.proxy.auth.auth_checks import UserNotFoundError

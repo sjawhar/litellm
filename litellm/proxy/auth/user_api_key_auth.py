@@ -788,20 +788,16 @@ async def fetch_global_spend_with_event_coordination(
 
     Reads the proxy budget aggregate user row, which accrues proxy-wide spend
     per request and is zeroed by ResetBudgetJob every ``litellm.budget_duration``.
-    While the database is unreachable, the spend it last returned answers.
+    While the database is unreachable, the spend it last returned answers. That answer is recalled by each request
+    after the shared load fails, never cached by the coordinator, so every request served from it records the recall
+    in its own ``last_good_auth_entries_scope``.
     """
 
     async def _load_global_spend() -> float | None:
-        try:
-            proxy_budget_row: Final = await bounded_db_lookup(
-                prisma_client.db.litellm_usertable.find_unique(where={"user_id": LITELLM_PROXY_BUDGET_NAME}),
-                name="proxy_budget",
-            )
-        except Exception as e:
-            served: Final = await recall_last_good_limits_after(e, user_api_key_cache, cache_key, _ProxyBudgetSpend)
-            if served is None:
-                raise
-            return served.spend
+        proxy_budget_row: Final = await bounded_db_lookup(
+            prisma_client.db.litellm_usertable.find_unique(where={"user_id": LITELLM_PROXY_BUDGET_NAME}),
+            name="proxy_budget",
+        )
         if proxy_budget_row is None:
             await forget_missing_last_good(user_api_key_cache, cache_key)
             return None
@@ -809,11 +805,17 @@ async def fetch_global_spend_with_event_coordination(
         await remember_last_good(user_api_key_cache, cache_key, _ProxyBudgetSpend(spend=spend))
         return spend
 
-    return await _global_spend_coordinator.get_or_load(
-        cache_key=cache_key,
-        cache=user_api_key_cache,  # pyright: ignore[reportArgumentType]
-        load_fn=_load_global_spend,
-    )
+    try:
+        return await _global_spend_coordinator.get_or_load(
+            cache_key=cache_key,
+            cache=user_api_key_cache,  # pyright: ignore[reportArgumentType]
+            load_fn=_load_global_spend,
+        )
+    except Exception as e:
+        served: Final = await recall_last_good_limits_after(e, user_api_key_cache, cache_key, _ProxyBudgetSpend)
+        if served is None:
+            raise
+        return served.spend
 
 
 _fetch_global_spend_with_event_coordination: Final = fetch_global_spend_with_event_coordination
