@@ -3,9 +3,10 @@ import logging
 import sys
 from itertools import chain
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
-from prometheus_client import REGISTRY, CollectorRegistry, multiprocess, values
+from prometheus_client import REGISTRY, CollectorRegistry, metrics, multiprocess, values
 
 import litellm
 from litellm.integrations.prometheus import PrometheusLogger
@@ -197,20 +198,24 @@ def test_saturation_gauge_drops_an_exited_workers_reading_in_multiprocess_mode(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
     monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
-    worker_pid = [1001]
+    worker_pid = [1002]
     monkeypatch.setattr(values, "ValueClass", values.MultiProcessValue(process_identifier=lambda: worker_pid[0]))
     _clear_prometheus_registry()
     prometheus_logger = PrometheusLogger()
     litellm_params = {"metadata": {"user_api_key_team_metadata": {"priority": "high"}}}
+    # the exited worker writes last, at a strictly later stamp, so only removing its file leaves 0.1
+    write_time = [1_000.0]
+    monkeypatch.setattr(metrics, "time", SimpleNamespace(time=lambda: write_time[0]))
 
+    prometheus_logger.set_model_group_saturation_ratio(
+        model_group="gpt-4o-mini", saturation=0.1, litellm_params=litellm_params
+    )
+    worker_pid[0] = 1001
+    write_time[0] += 1.0
     prometheus_logger.set_model_group_saturation_ratio(
         model_group="gpt-4o-mini", saturation=1.0, litellm_params=litellm_params
     )
     mark_worker_exit(1001)
-    worker_pid[0] = 1002
-    prometheus_logger.set_model_group_saturation_ratio(
-        model_group="gpt-4o-mini", saturation=0.1, litellm_params=litellm_params
-    )
 
     scrape_registry = CollectorRegistry()
     multiprocess.MultiProcessCollector(scrape_registry, path=str(tmp_path))
