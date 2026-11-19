@@ -9770,14 +9770,34 @@ async def test_mapping_row_is_refused_while_the_database_is_stopped_with_the_set
 
 
 @pytest.mark.asyncio
-async def test_issuer_without_a_row_is_served_the_last_good_global_row_while_the_database_is_stopped():
+async def test_while_the_database_is_stopped_the_global_row_serves_a_token_without_an_issuer_but_not_an_issuer_caller():
+    """Only the database can say an issuer has no row of its own, so an issuer's caller that resolved through the
+    global row is refused during the outage. A token that carries no issuer resolves in the global scope itself."""
+    from litellm.proxy.auth.user_api_key_auth import _resolve_jwt_to_virtual_key
+
     cache: Final = await _cache_holding_keys("hashed-global-key")
-    table: Final = await _stopped_after_one_read(cache, _svc_mapping("hashed-global-key", jwt_issuer=""))
+    table: Final = _JWTKeyMappingTable(_svc_mapping("hashed-global-key", jwt_issuer=""))
+    jwt_handler: Final = _per_issuer_virtual_key_jwt_handler(global_claim_field="sub")
+    issuer_claim: Final = {JWTHandler.LITELLM_JWT_ISSUER_CLAIM: ISSUER_TWO}
 
-    served: Final = await _resolve_svc(table, cache)
+    async def resolve(claims: dict[str, str]) -> object:
+        return await _resolve_jwt_to_virtual_key(
+            jwt_claims={**claims, "sub": "svc-7"},
+            jwt_handler=jwt_handler,
+            prisma_client=SimpleNamespace(db=SimpleNamespace(litellm_jwtkeymapping=table)),
+            user_api_key_cache=cache,
+            parent_otel_span=None,
+            proxy_logging_obj=MagicMock(),
+        )
 
-    assert isinstance(served, UserAPIKeyAuth)
-    assert served.token == "hashed-global-key"
+    while_answering: Final = (await resolve(issuer_claim), await resolve({}))
+    await _outlive_the_mapping_cache(cache)
+    table.stopped = True
+    served: Final = await resolve({})
+
+    assert [getattr(key, "token", None) for key in (*while_answering, served)] == ["hashed-global-key"] * 3
+    with pytest.raises(httpx.ConnectError):
+        await resolve(issuer_claim)
 
 
 @pytest.mark.asyncio

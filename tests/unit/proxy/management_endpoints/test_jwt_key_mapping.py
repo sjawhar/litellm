@@ -1942,26 +1942,48 @@ async def test_a_read_that_started_before_a_repoint_cannot_keep_the_old_key_afte
 
 
 @pytest.mark.asyncio
-async def test_a_read_that_started_before_an_issuer_row_was_created_cannot_keep_the_empty_target_after_it():
-    """The read found no row for the issuer and went on to the global row. Kept, its empty target would send the
-    issuer to the global key during an outage, past the row created for it."""
-    from litellm.proxy._types import CreateJWTKeyMappingRequest
+async def test_issuer_miss_paused_across_auto_registration_and_global_create_keeps_the_issuer_off_the_global_row():
+    """The paused read found no row for the issuer, then the issuer's row is auto-registered to a restricted key and a
+    broader global row is created. The resumed read goes on to the global row for its own request, but no outage may
+    send the issuer's caller there: the store keeps no answer for a scope that had no row."""
+    from litellm.proxy._types import CreateJWTKeyMappingRequest, hash_token
+    from litellm.proxy.auth.user_api_key_auth import _auto_register_jwt_mapping
 
-    table = _MappingTable(_mapping_row("mapping-1", _OLD_KEY))
+    minted = "minted-by-auto-registration"
+    restricted = hash_token(minted)
+    table = _MappingTable()
     user_api_key_cache = await _cache_holding_both_keys()
+    await user_api_key_cache.async_set_cache(key=restricted, value=UserAPIKeyAuth(token=restricted))
     release = table.pause_next_read()
     read = asyncio.create_task(_resolve(table, user_api_key_cache, _ISSUER))
     await table.read_held.wait()
 
+    jwt_handler = MagicMock()
+    jwt_handler.litellm_jwtauth = LiteLLM_JWTAuth(
+        virtual_key_claim_field="sub", unregistered_jwt_client_behavior="auto_register"
+    )
+    with patch(  # test-quality-ok: key creation is an inline import inside the helper, no injection seam
+        "litellm.proxy.management_endpoints.key_management_endpoints.generate_key_helper_fn",
+        new=AsyncMock(return_value={"token": minted}),
+    ):
+        registered = await _auto_register_jwt_mapping(
+            virtual_key_claim_field="sub",
+            claim_value="svc-7",
+            jwt_handler=jwt_handler,
+            prisma_client=SimpleNamespace(db=SimpleNamespace(litellm_jwtkeymapping=table)),
+            user_api_key_cache=user_api_key_cache,
+            parent_otel_span=None,
+            proxy_logging_obj=MagicMock(),
+            cache_key=jwt_key_mapping_cache_key("sub", "svc-7", _ISSUER),
+            jwt_issuer=_ISSUER,
+        )
     with _endpoints_on(table, user_api_key_cache):
         await create_jwt_key_mapping(
-            data=CreateJWTKeyMappingRequest(
-                jwt_claim_name="sub", jwt_claim_value="svc-7", token=_NEW_KEY, jwt_issuer=_ISSUER
-            ),
+            data=CreateJWTKeyMappingRequest(jwt_claim_name="sub", jwt_claim_value="svc-7", token=_OLD_KEY),
             user_api_key_dict=_make_admin_auth(),
         )
     release.set()
-    assert (await read).token == _OLD_KEY
+    assert (registered.token, (await read).token) == (restricted, _OLD_KEY)
     await _expire_and_stop(table, user_api_key_cache, _ISSUER)
 
     with pytest.raises(httpx.ConnectError):

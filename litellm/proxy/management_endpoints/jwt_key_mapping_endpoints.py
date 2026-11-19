@@ -175,10 +175,9 @@ async def create_jwt_key_mapping(
         if data.description is not None:
             create_data["description"] = data.description
 
-        cache_key: Final = jwt_key_mapping_cache_key(data.jwt_claim_name, data.jwt_claim_value, data.jwt_issuer)
-        await revoke_last_good(user_api_key_cache, (cache_key,))
         new_mapping: Final = await _mapping_table(prisma_client).create(data=create_data)
 
+        cache_key: Final = jwt_key_mapping_cache_key(data.jwt_claim_name, data.jwt_claim_value, data.jwt_issuer)
         await evict_and_broadcast(cache_keys=(cache_key,), user_api_key_cache=user_api_key_cache)
 
         return _to_response(new_mapping)
