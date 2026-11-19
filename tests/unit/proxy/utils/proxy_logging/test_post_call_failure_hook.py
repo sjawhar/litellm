@@ -4,6 +4,7 @@ and ``_handle_logging_proxy_only_error``."""
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from datetime import datetime
 from types import MappingProxyType, SimpleNamespace
@@ -1289,6 +1290,152 @@ async def test_failure_after_add_litellm_data_to_request_keeps_the_stamp_over_a_
     } == {
         "metadata": {**stamped, "user_api_key_team_id": authenticated.team_id},
         "payload_team_id": authenticated.team_id,
+    }
+
+
+def _record_failure_spend_rows(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    """Runs the failure spend logger in the callback loop and captures the rows it would write."""
+    from litellm.proxy.hooks.proxy_track_cost_callback import ProxyDBLogger
+
+    update_database: Final = AsyncMock()
+    monkeypatch.setattr("litellm.proxy.db.db_spend_update_writer.DBSpendUpdateWriter.update_database", update_database)
+    monkeypatch.setattr(litellm, "callbacks", [ProxyDBLogger()])
+    return update_database
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket", ("metadata", "litellm_metadata"))
+async def test_auth_gate_failure_spend_row_bills_no_guardrail_the_body_names(
+    proxy_logging, monkeypatch, bucket: str
+):
+    """An auth-gate rejection never reaches add_litellm_data_to_request, which strips a caller's guardrail record,
+    and no guardrail ran on it. The failure spend row bills the guardrail cost it finds in either bucket, so the
+    body could charge any amount to the key, user, team and proxy budget the row is filed under."""
+    from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+
+    update_database: Final = _record_failure_spend_rows(monkeypatch)
+    proxy_logging.alert_types = []
+    forged_record: Final = [
+        {"guardrail_name": "never-ran", "guardrail_status": "guardrail_intervened", "guardrail_cost": 25.0}
+    ]
+
+    await proxy_logging.post_call_failure_hook(
+        request_data={
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            bucket: {"standard_logging_guardrail_information": forged_record},
+        },
+        original_exception=HTTPException(status_code=401, detail="Invalid virtual key"),
+        user_api_key_dict=UserAPIKeyAuth(request_route="/chat/completions"),
+        error_type=ProxyErrorTypes.auth_error,
+        route="/chat/completions",
+    )
+
+    update_database.assert_awaited_once()
+    row: Final = update_database.call_args.kwargs
+    row_metadata: Final = row["kwargs"]["litellm_params"]["metadata"]
+    now: Final = datetime.now()
+    payload: Final = get_logging_payload(
+        kwargs={**row["kwargs"], "completion_start_time": now}, response_obj=None, start_time=now, end_time=now
+    )
+    assert {
+        "spend": row["response_cost"],
+        "record_in_row_metadata": "standard_logging_guardrail_information" in row_metadata,
+        "row_guardrail_information": json.loads(payload["metadata"]).get("guardrail_information"),
+    } == {"spend": 0.0, "record_in_row_metadata": False, "row_guardrail_information": None}
+
+
+@pytest.mark.asyncio
+async def test_guardrail_refusal_past_pre_call_keeps_the_guardrail_cost_on_the_spend_row(
+    proxy_logging, make_user_api_key_auth, monkeypatch
+):
+    """A guardrail that ran in the pre-call hooks wrote its record after add_litellm_data_to_request stripped the
+    caller's and stamped the request, so a refusal it raised still bills what it cost."""
+    update_database: Final = _record_failure_spend_rows(monkeypatch)
+    proxy_logging.alert_types = []
+    authenticated: Final = make_user_api_key_auth(request_route="/chat/completions")
+    request_data: Final[dict[str, object]] = {
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "litellm_call_id": "guardrail-refusal",
+        "metadata": {"user_api_key_auth": authenticated},
+    }
+    logging_obj, _ = litellm.utils.function_setup(
+        original_function="acompletion", rules_obj=litellm.utils.Rules(), start_time=datetime.now(), **request_data
+    )
+    request_data["metadata"]["standard_logging_guardrail_information"] = [
+        {"guardrail_name": "local-block", "guardrail_status": "guardrail_intervened", "guardrail_cost": 0.25}
+    ]
+
+    await proxy_logging.post_call_failure_hook(
+        request_data={**request_data, "litellm_logging_obj": logging_obj},
+        original_exception=GuardrailRaisedException(guardrail_name="local-block", message="blocked"),
+        user_api_key_dict=authenticated,
+        route="/chat/completions",
+    )
+
+    update_database.assert_awaited_once()
+    assert update_database.call_args.kwargs["response_cost"] == pytest.approx(0.25)
+
+
+@pytest.mark.asyncio
+async def test_auth_gate_failure_spend_row_takes_its_deployment_from_the_router_not_the_body(
+    proxy_logging, monkeypatch
+):
+    """Nobody is authenticated at the auth gate, so model_info, model_group and deployment in either bucket, at
+    the top level or under a body litellm_params, must not name the deployment its failure row is filed under."""
+    from litellm.proxy import proxy_server
+    from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+
+    monkeypatch.setattr(
+        proxy_server,
+        "llm_router",
+        litellm.Router(
+            model_list=[
+                {
+                    "model_name": "internal-model",
+                    "litellm_params": {"model": "openai/gpt-4.1", "api_key": "sk-test"},
+                    "model_info": {"id": "configured-deployment"},
+                }
+            ]
+        ),
+    )
+    update_database: Final = _record_failure_spend_rows(monkeypatch)
+    proxy_logging.alert_types = []
+    routing_claims: Final = {
+        "model_info": {"id": "victim-deployment"},
+        "model_group": "victim-group",
+        "deployment": "openai/victim-model",
+    }
+
+    await proxy_logging.post_call_failure_hook(
+        request_data={
+            "model": "internal-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": dict(routing_claims),
+            "litellm_metadata": dict(routing_claims),
+            "model_info": {"id": "victim-deployment"},
+            "litellm_params": {"api_base": "https://victim.invalid", "litellm_metadata": dict(routing_claims)},
+        },
+        original_exception=HTTPException(status_code=401, detail="Invalid virtual key"),
+        user_api_key_dict=UserAPIKeyAuth(request_route="/chat/completions"),
+        error_type=ProxyErrorTypes.auth_error,
+        route="/chat/completions",
+    )
+
+    update_database.assert_awaited_once()
+    now: Final = datetime.now()
+    payload: Final = get_logging_payload(
+        kwargs={**update_database.call_args.kwargs["kwargs"], "completion_start_time": now},
+        response_obj=None,
+        start_time=now,
+        end_time=now,
+    )
+    assert {key: payload[key] for key in ("model_id", "model_group", "model", "api_base")} == {
+        "model_id": "configured-deployment",
+        "model_group": "internal-model",
+        "model": "openai/gpt-4.1",
+        "api_base": "",
     }
 
 

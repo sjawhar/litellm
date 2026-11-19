@@ -237,7 +237,11 @@ from litellm.proxy.hooks.sensitive_data_routing import (  # noqa: F401, RUF100  
     PROXY_SensitiveDataRoutingHandler,
     _PROXY_SensitiveDataRoutingHandler,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
 )
-from litellm.proxy.litellm_pre_call_utils import LiteLLMProxyRequestSetup, add_guardrails_from_auth_metadata
+from litellm.proxy.litellm_pre_call_utils import (
+    LiteLLMProxyRequestSetup,
+    add_guardrails_from_auth_metadata,
+    strip_client_guardrail_information,
+)
 from litellm.proxy.management_helpers.key_settings_audit import with_settings_updated_at
 from litellm.proxy.policy_engine.pipeline_executor import PipelineExecutor
 from litellm.proxy.policy_engine.policy_registry import get_policy_registry
@@ -1233,6 +1237,11 @@ def _reached_deployment(litellm_logging_obj: Logging) -> bool:
 # it for ``cooldown_time``. On a request that reached no deployment the logging object can hold either only
 # because the proxy built it from the caller's body.
 _BODY_DEPLOYMENT_PARAMS: Final = frozenset(("model_info", "cooldown_time"))
+
+
+# The metadata names the failure spend row reads its deployment id, model group and model name from. The router
+# writes them once it picks a deployment; on an auth-gate rejection only the caller can have.
+_ROUTING_METADATA_FIELDS: Final = frozenset(("model_info", "model_group", "deployment"))
 
 
 def _stamp_deployment_attribution(
@@ -3820,6 +3829,21 @@ class ProxyLogging:
                     **_without_caller_identity_fields(request_data.get("metadata") or {}),
                     **authenticated_metadata,
                 }
+                # No guardrail of the proxy runs before the stamp (they run in pre_call_hook), so a guardrail record
+                # here is the caller's, and the failure spend row would bill its cost.
+                strip_client_guardrail_information(request_data)
+                if error_type == ProxyErrorTypes.auth_error:
+                    # Nobody is authenticated at the auth gate: the failure record takes its deployment and model
+                    # group from the router config alone, never from the body.
+                    request_data.pop("litellm_params", None)
+                    request_data.pop("model_info", None)
+                    request_data.update(
+                        {
+                            bucket: {k: v for k, v in caller_bucket.items() if k not in _ROUTING_METADATA_FIELDS}
+                            for bucket in ("metadata", "litellm_metadata")
+                            if isinstance(caller_bucket := request_data.get(bucket), dict)
+                        }
+                    )
             # The logging object starts from what the proxy wrote for this request, as a route's own logging
             # object does: each bucket it stamped, else the identity written above. The body adds the allowlist.
             proxy_written_metadata: Final = (
