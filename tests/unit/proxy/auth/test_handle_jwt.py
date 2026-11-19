@@ -742,7 +742,8 @@ async def test_sync_user_role_and_teams():
 
 @pytest.mark.asyncio
 async def test_sync_user_role_and_teams_cache_invalidation_on_role_change():
-    """Test that user cache is updated when role changes."""
+    """The user's cache entry is evicted when the role changes, not overwritten with the
+    object in hand, which may be the user's last good entry."""
     mock_cache = AsyncMock()
 
     jwt_handler = JWTHandler()
@@ -775,17 +776,15 @@ async def test_sync_user_role_and_teams_cache_invalidation_on_role_change():
         jwt_handler, token, user, prisma, user_api_key_cache=mock_cache
     )
 
-    mock_cache.async_set_cache.assert_called_once()
-    call_kwargs = mock_cache.async_set_cache.call_args
-    assert call_kwargs.kwargs["key"] == "u1"
-    assert isinstance(call_kwargs.kwargs["value"], LiteLLM_UserTable)
-    assert call_kwargs.kwargs["value"].user_role == LitellmUserRoles.PROXY_ADMIN.value
-    assert call_kwargs.kwargs["model_type"] == LiteLLM_UserTable
+    mock_cache.async_delete_cache.assert_awaited_once_with(key="u1")
+    mock_cache.async_set_cache.assert_not_called()
+    assert user.user_role == LitellmUserRoles.PROXY_ADMIN.value
 
 
 @pytest.mark.asyncio
-async def test_sync_user_role_and_teams_cache_invalidation_on_team_change():
-    """Test that user cache is updated when team memberships change."""
+async def test_sync_user_role_and_teams_does_not_cache_the_user_on_team_change():
+    """The membership writes evict the user themselves. The sync does not cache the
+    object in hand, which may be the user's last good entry."""
     mock_cache = AsyncMock()
 
     jwt_handler = JWTHandler()
@@ -822,12 +821,8 @@ async def test_sync_user_role_and_teams_cache_invalidation_on_team_change():
             jwt_handler, token, user, prisma, user_api_key_cache=mock_cache
         )
 
-    mock_cache.async_set_cache.assert_called_once()
-    call_kwargs = mock_cache.async_set_cache.call_args
-    assert call_kwargs.kwargs["key"] == "u1"
-    assert isinstance(call_kwargs.kwargs["value"], LiteLLM_UserTable)
-    assert set(call_kwargs.kwargs["value"].teams) == {"team1", "team2"}
-    assert call_kwargs.kwargs["model_type"] == LiteLLM_UserTable
+    mock_cache.async_set_cache.assert_not_called()
+    assert set(user.teams) == {"team1", "team2"}
 
 
 @pytest.mark.asyncio
@@ -865,6 +860,7 @@ async def test_sync_user_role_and_teams_no_cache_write_when_nothing_changes():
     )
 
     mock_cache.async_set_cache.assert_not_called()
+    mock_cache.async_delete_cache.assert_not_called()
 
 
 def test_get_all_jwt_team_ids_unions_singular_and_plural():
