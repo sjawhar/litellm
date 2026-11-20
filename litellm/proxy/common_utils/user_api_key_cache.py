@@ -909,11 +909,12 @@ async def revoke_last_good(cache: DualCache, cache_keys: Sequence[str]) -> None:
     """Tombstone and drop the last good entries a request is about to revoke, before it writes anything. Only these
     revocations are strict: a delete of a key, team, user, organization, project or customer, a block of a key, team,
     project or customer, the revocations of the restricted-customer registry, a key's regenerate or rotate (for its
-    old token), a key's ``expires`` moved to now or earlier, a team or organization membership removal, and a SCIM
-    deactivation or delete of a user. With ``serve_last_good_auth_entries`` on, a Redis that cannot record the
-    revocation refuses the request with 503: nothing has changed yet and the operator retries, rather than a revoked
-    credential staying, until its expiry, where a database outage serves it. Every other update evicts after its
-    write, best effort (``forget_last_good``).
+    old token), a key's ``expires`` moved to now or earlier, a team or organization membership removal, a SCIM
+    deactivation or delete of a user, and a JWT key mapping's delete or an update of its ``token``, ``jwt_issuer`` or
+    ``is_active``. With ``serve_last_good_auth_entries`` on, a Redis that cannot record the revocation refuses the
+    request with 503: nothing has changed yet and the operator retries, rather than a revoked credential staying,
+    until its expiry, where a database outage serves it. Every other update evicts after its write, best effort
+    (``forget_last_good``).
 
     It returns only when every key's tombstone stands for more than ``LAST_GOOD_LATE_STORE_MARGIN_SECONDS``, so the
     write the caller makes right after it runs while they all stand. A pass records the tombstones of every key not

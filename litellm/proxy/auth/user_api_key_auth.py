@@ -1187,7 +1187,8 @@ async def _auto_register_jwt_mapping(
 
 class _JWTKeyMappingTarget(BaseModel):
     """The virtual key a JWT claim mapped to in one issuer scope when the database last answered for that scope with a
-    row. A scope with no row keeps no entry: the store never expires, so it holds no negative answer."""
+    row. A scope with no row keeps no entry, so the store holds no negative answer: in an outage such a scope raises the
+    database error, as a scope never read does."""
 
     model_config = ConfigDict(frozen=True)
 
