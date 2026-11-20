@@ -402,23 +402,31 @@ _ALLOW_CLIENT_MESSAGE_REDACTION_OPT_OUT_METADATA_KEY: Final = "allow_client_mess
 _CLIENT_PRICING_CONTROL_FIELDS: Final = frozenset(CustomPricingLiteLLMParams.model_fields.keys()) | {"base_model"}
 # ``model_info`` carries the same pricing fields when read by
 # ``use_custom_pricing_for_model``; strip from metadata for the same reason.
-# ``standard_logging_guardrail_information`` is proxy-written telemetry summed
-# into response_cost and spend; a client seeding it forges (even negative)
-# guardrail cost.
-_CLIENT_PRICING_METADATA_FIELDS: Final = frozenset({"model_info", "standard_logging_guardrail_information"})
-# ``attempted_fallbacks`` and ``original_model_group`` are written by the router
+_CLIENT_PRICING_METADATA_FIELDS: Final = frozenset({"model_info"})
+# ``attempted_fallbacks``, ``original_model_group`` and ``deployment`` are written by the router
 # and read by spend logs as fact; a client value has no legitimate meaning and no
 # key or team setting keeps it, so the strip is never gated.
 _ROUTER_RESERVED_METADATA_FIELDS: Final = frozenset(
     {
         "attempted_fallbacks",
         "original_model_group",
+        "deployment",
         "previous_models",
         "request_retry_count",
         CLIENT_OUTPUT_CEILING_METADATA_KEY,
         ROUTER_USAGE_COUNTED_TOKENS_METADATA_KEY,
     }
 )
+# The router writes a dispatched call's ``model_info`` and takes ``cooldown_time`` from the deployment it picked;
+# its failure and usage callbacks count against the deployment ``model_info.id`` names and cool it for that time.
+# A client value only points them at a deployment the request never reached, or lengthens a real one's cooldown,
+# so the strip is never gated.
+ROUTER_OWNED_REQUEST_FIELDS: Final = frozenset({"model_info", "cooldown_time"})
+# The SDK spreads the request parameters it does not know over the ``litellm_params`` its failure and usage
+# callbacks read, so a body's root ``litellm_params`` replaces them: a provider error then counts against, and
+# cools, the deployment its ``model_info`` names. Nothing on the proxy reads a caller's copy, so the strip is never
+# gated.
+_CLIENT_LITELLM_PARAMS_FIELD: Final = "litellm_params"
 _ALLOW_CLIENT_PRICING_OVERRIDE_METADATA_KEY: Final = "allow_client_pricing_override"
 
 # Request fields whose value, when URL-valued, becomes the outbound destination
@@ -661,6 +669,19 @@ def _strip_client_pricing_overrides(data: dict[str, object]) -> None:
         )
 
 
+def strip_client_guardrail_information(data: dict[str, object]) -> None:
+    """Guardrail hooks write this field and its cost is billed, so no key or team setting keeps a caller's value."""
+    for metadata_key in ("metadata", "litellm_metadata"):
+        if (
+            isinstance(metadata := data.get(metadata_key), dict)
+            and "standard_logging_guardrail_information" in metadata
+        ):
+            metadata.pop("standard_logging_guardrail_information")
+            verbose_proxy_logger.debug(
+                "Stripped client-supplied guardrail information from request body: %s", metadata_key
+            )
+
+
 def _strip_router_reserved_metadata(
     data: dict[str, object],  # mutable-ok: strips in place on the request body the pre-call pipeline threads through
 ) -> None:
@@ -673,6 +694,76 @@ def _strip_router_reserved_metadata(
             verbose_proxy_logger.debug(
                 "Stripped router-reserved metadata field from request body: %s.%s", metadata_key, field
             )
+
+
+def _strip_router_owned_request_fields(
+    data: dict[str, object],  # mutable-ok: strips in place on the request body the pre-call pipeline threads through
+) -> None:
+    """Drop the router-owned deployment fields from the root of the client's request body."""
+    for field in ROUTER_OWNED_REQUEST_FIELDS & data.keys():
+        data.pop(field)
+        verbose_proxy_logger.debug("Stripped router-owned field from request body: %s", field)
+
+
+def _strip_client_litellm_params(
+    data: dict[str, object],  # mutable-ok: strips in place on the request body the pre-call pipeline threads through
+) -> None:
+    """Drop a root ``litellm_params`` from the client's request body."""
+    if _CLIENT_LITELLM_PARAMS_FIELD in data:
+        data.pop(_CLIENT_LITELLM_PARAMS_FIELD)
+        verbose_proxy_logger.debug("Stripped client-supplied field from request body: %s", _CLIENT_LITELLM_PARAMS_FIELD)
+
+
+# The router merges a dict fallback target into the call's parameters when it falls back to it (``kwargs.update`` in
+# ``run_async_fallback``), after this setup ran on the request root: the router-owned fields and a ``litellm_params``
+# would come back, and a metadata bucket would replace the request's own, identity stamp included. A target keeps
+# its other keys; a dict inside a list under one of them (a message, say) is stripped the same way.
+_FALLBACK_TARGET_CLIENT_FIELDS: Final = ROUTER_OWNED_REQUEST_FIELDS | {
+    _CLIENT_LITELLM_PARAMS_FIELD,
+    "metadata",
+    "litellm_metadata",
+}
+_CLIENT_FALLBACK_FIELDS: Final = ("fallbacks", "context_window_fallbacks", "content_policy_fallbacks")
+
+
+def _strip_fallback_target_overrides(
+    data: dict[str, object],  # mutable-ok: strips in place on the request body the pre-call pipeline threads through
+) -> None:
+    """Drop the fields a dict fallback target in the client's request body would merge over the call's own."""
+    for source in (data, data.get("router_settings_override")):
+        if isinstance(source, dict):
+            for field in _CLIENT_FALLBACK_FIELDS:
+                _strip_overrides_from_fallback_list(field, source.get(field), depth=0)
+
+
+def _strip_overrides_from_fallback_list(field: str, targets: object, depth: int) -> None:
+    """Strip every dict that is an element of ``targets``, or of a list reachable from it through nested lists and
+    the list values of those dicts, whatever its keys: the router resolves these shapes in more than one way but only
+    ever merges a list element. A dict held as a dict value is a target's own payload (a tool schema, say) and stays.
+    A model group named like one of the stripped fields can no longer key a group map in a request body: the strip
+    removes that key and does not try to tell such a group from the field."""
+    if not isinstance(targets, list):
+        return
+    # The same number is_request_body_safe allows for fallback nesting, but this counts every list level (a list in a
+    # list, a message's content), so it can refuse a body that check accepted.
+    if depth > 2 * litellm.ROUTER_MAX_FALLBACKS:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "invalid_request",
+                "param": field,
+                "message": "Rejected Request: fallback nesting exceeds the allowed validation depth.",
+            },
+        )
+    for item in targets:
+        if isinstance(item, dict):
+            for key in _FALLBACK_TARGET_CLIENT_FIELDS & item.keys():
+                item.pop(key)
+                verbose_proxy_logger.debug("Stripped client-supplied field from a fallback target: %s", key)
+            for value in item.values():
+                _strip_overrides_from_fallback_list(field, value, depth + 1)
+        else:
+            _strip_overrides_from_fallback_list(field, item, depth + 1)
 
 
 def get_metadata_variable_name(request: Request) -> str:
@@ -2364,7 +2455,11 @@ async def add_litellm_data_to_request(
     # would silently skip the field.
     if not _key_or_team_allows_client_pricing_override(user_api_key_dict):
         _strip_client_pricing_overrides(data)
+    strip_client_guardrail_information(data)
     _strip_router_reserved_metadata(data)
+    _strip_router_owned_request_fields(data)
+    _strip_client_litellm_params(data)
+    _strip_fallback_target_overrides(data)
 
     # Same reason as the strips above: runs after the metadata string-to-dict parse
     # so JSON-string metadata cannot smuggle callback credentials past the dict guard.

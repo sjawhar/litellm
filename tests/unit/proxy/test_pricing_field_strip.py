@@ -10,6 +10,8 @@ strips them at the boundary; an opt-in key/team flag preserves the override
 for operators who actually want it.
 """
 
+import asyncio
+import copy
 from unittest.mock import MagicMock
 
 import pytest
@@ -22,7 +24,9 @@ from litellm.proxy.litellm_pre_call_utils import (
     _CLIENT_PRICING_METADATA_FIELDS,
     _strip_client_pricing_overrides,
     add_litellm_data_to_request,
+    strip_client_guardrail_information,
 )
+from litellm.types.router import RouterRateLimitError
 from litellm.types.utils import CustomPricingLiteLLMParams
 
 
@@ -133,7 +137,7 @@ class TestStripClientPricingOverrides:
                 "standard_logging_guardrail_information": [{"guardrail_cost": 5.0}],
             },
         }
-        _strip_client_pricing_overrides(data)
+        strip_client_guardrail_information(data)
         assert data["metadata"] == {"user_session": "keep-me"}
         assert data["litellm_metadata"] == {}
 
@@ -164,7 +168,6 @@ class TestStripClientPricingOverrides:
 
     def test_metadata_field_set_contains_model_info(self):
         assert "model_info" in _CLIENT_PRICING_METADATA_FIELDS
-        assert "standard_logging_guardrail_information" in _CLIENT_PRICING_METADATA_FIELDS
 
     def test_strip_emits_debug_log_listing_dropped_fields(self, caplog):
         # Operators need a paper trail so they can diagnose why a previously
@@ -313,6 +316,681 @@ async def test_add_litellm_data_to_request_skips_strip_with_key_opt_in():
     assert updated["input_cost_per_token"] == 0.0001
     assert updated["metadata"]["model_info"] == {"output_cost_per_token": 0.0002}
     assert updated["base_model"] == "gpt-4o-mini"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("opt_in_field", ["metadata", "team_metadata"])
+async def test_add_litellm_data_to_request_strips_guardrail_information_despite_pricing_opt_in(opt_in_field):
+    data = {
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "hi"}],
+        "input_cost_per_token": 0.0001,
+        "metadata": {
+            "user_session": "keep-me",
+            "standard_logging_guardrail_information": [{"guardrail_name": "forged", "guardrail_cost": 5.0}],
+        },
+    }
+
+    updated = await add_litellm_data_to_request(
+        data=data,
+        request=_make_request_mock(),
+        user_api_key_dict=_user_api_key_auth(**{opt_in_field: {"allow_client_pricing_override": True}}),
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    assert updated["input_cost_per_token"] == 0.0001
+    assert updated["metadata"]["user_session"] == "keep-me"
+    assert "standard_logging_guardrail_information" not in updated["metadata"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("allow_client_pricing_override", [False, True])
+async def test_add_litellm_data_to_request_strips_root_model_info_and_cooldown_time(allow_client_pricing_override):
+    """The router writes a dispatched call's ``model_info`` and takes ``cooldown_time`` from the deployment, and its
+    failure callbacks count against and cool the deployment a logged ``model_info.id`` names. A body's root value of
+    either never reaches a logging object, whatever the pricing opt-in, which still decides ``metadata.model_info``."""
+    data = {
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "hi"}],
+        "model_info": {"id": "victim-deployment"},
+        "cooldown_time": 3600,
+        "metadata": {"model_info": {"output_cost_per_token": 0.0002}},
+    }
+
+    updated = await add_litellm_data_to_request(
+        data=data,
+        request=_make_request_mock(),
+        user_api_key_dict=_user_api_key_auth(metadata={"allow_client_pricing_override": allow_client_pricing_override}),
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    assert {
+        "root": {field: updated.get(field) for field in ("model_info", "cooldown_time")},
+        "metadata_model_info": updated["metadata"].get("model_info"),
+    } == {
+        "root": {"model_info": None, "cooldown_time": None},
+        "metadata_model_info": {"output_cost_per_token": 0.0002} if allow_client_pricing_override else None,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("allow_client_pricing_override", [False, True])
+@pytest.mark.parametrize("bucket", ["metadata", "litellm_metadata"])
+async def test_add_litellm_data_to_request_strips_a_body_litellm_params_and_metadata_deployment(
+    bucket, allow_client_pricing_override
+):
+    """The SDK spreads a body's root ``litellm_params`` over the parameters its callbacks read, and the router writes
+    ``deployment`` on dispatch, so the request setup removes both whatever the pricing opt-in. ``model_group`` stays:
+    A2A, the MCP REST tool call and search write their own before the setup. ``model_info`` still follows the opt-in."""
+    updated = await add_litellm_data_to_request(
+        data={
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "litellm_params": {"model_info": {"id": "victim-deployment"}, "cooldown_time": 86400},
+            bucket: {
+                "deployment": "openai/victim-model",
+                "model_group": "a2a_agent/route-written",
+                "model_info": {"output_cost_per_token": 0.0002},
+            },
+        },
+        request=_make_request_mock(),
+        user_api_key_dict=_user_api_key_auth(metadata={"allow_client_pricing_override": allow_client_pricing_override}),
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    assert {
+        "litellm_params": updated.get("litellm_params"),
+        "metadata": {field: updated["metadata"].get(field) for field in ("deployment", "model_group", "model_info")},
+    } == {
+        "litellm_params": None,
+        "metadata": {
+            "deployment": None,
+            "model_group": "a2a_agent/route-written",
+            "model_info": {"output_cost_per_token": 0.0002} if allow_client_pricing_override else None,
+        },
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("slot", "sampling_rate"), [("metadata", 0.25), ("litellm_params", None)])
+async def test_a_callback_param_is_read_from_metadata_and_no_longer_from_a_body_litellm_params(slot, sampling_rate):
+    """The SDK reads the callback parameters a caller may set (``langsmith_sampling_rate`` among them) from
+    ``metadata``, ``litellm_metadata`` and ``litellm_params.metadata``. The request setup removes a body's root
+    ``litellm_params``, so on a proxy request only the first two still take effect."""
+    from litellm.litellm_core_utils.initialize_dynamic_callback_params import (
+        initialize_standard_callback_dynamic_params,
+    )
+
+    claim = {"langsmith_sampling_rate": 0.25}
+    updated = await add_litellm_data_to_request(
+        data={
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            **({"metadata": claim} if slot == "metadata" else {"litellm_params": {"metadata": claim}}),
+        },
+        request=_make_request_mock(),
+        user_api_key_dict=_user_api_key_auth(),
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    assert initialize_standard_callback_dynamic_params(updated).get("langsmith_sampling_rate") == sampling_rate
+
+
+@pytest.mark.asyncio
+async def test_a_failure_after_dispatch_counts_and_cools_the_deployment_the_router_chose_not_the_one_the_body_names():
+    """The positive control for the strip above: a provider failure after dispatch still counts against, and cools
+    for the router's own ``cooldown_time``, the deployment the router chose, while the deployment and the time the
+    body names get nothing."""
+    from litellm.router_utils.router_callbacks.track_deployment_metrics import (
+        get_deployment_failures_for_current_minute,
+    )
+
+    deployment_ids = ("chosen-a", "chosen-b", "body-named")
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "gpt-4",
+                "litellm_params": {"model": "openai/gpt-4", "api_key": "sk-test"},
+                "model_info": {"id": "chosen-a"},
+            },
+            {
+                "model_name": "gpt-4",
+                "litellm_params": {"model": "openai/gpt-4o", "api_key": "sk-test"},
+                "model_info": {"id": "chosen-b"},
+            },
+            {
+                "model_name": "other-model",
+                "litellm_params": {"model": "openai/gpt-4.1", "api_key": "sk-test"},
+                "model_info": {"id": "body-named"},
+            },
+        ],
+        cooldown_time=13,
+        num_retries=0,
+    )
+    data = await add_litellm_data_to_request(
+        data={
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "model_info": {"id": "body-named"},
+            "cooldown_time": 86400,
+        },
+        request=_make_request_mock(),
+        user_api_key_dict=_user_api_key_auth(),
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    with pytest.raises(litellm.RateLimitError):
+        router.completion(**data, mock_response="litellm.RateLimitError")
+
+    failures = {
+        deployment_id: get_deployment_failures_for_current_minute(
+            litellm_router_instance=router, deployment_id=deployment_id
+        )
+        for deployment_id in deployment_ids
+    }
+    cooldowns = {
+        deployment_id: cooldown["cooldown_time"]
+        for deployment_id, cooldown in router.cooldown_cache.get_active_cooldowns(
+            model_ids=list(deployment_ids), parent_otel_span=None
+        )
+    }
+    chosen = [deployment_id for deployment_id, count in failures.items() if count]
+    assert chosen in (["chosen-a"], ["chosen-b"])
+    assert {"failures": failures, "cooldowns": cooldowns} == {
+        "failures": {deployment_id: int(deployment_id in chosen) for deployment_id in deployment_ids},
+        "cooldowns": {chosen[0]: 13},
+    }
+
+
+def _deployment_counters(router: litellm.Router, deployment_ids: tuple[str, ...]) -> dict[str, object]:
+    """What the router's failure callbacks wrote for each deployment: its failures this minute, its active cooldown,
+    and the deployments an RPM usage key names."""
+    from litellm.router_utils.router_callbacks.track_deployment_metrics import (
+        get_deployment_failures_for_current_minute,
+    )
+
+    return {
+        "failures": {
+            deployment_id: get_deployment_failures_for_current_minute(
+                litellm_router_instance=router, deployment_id=deployment_id
+            )
+            for deployment_id in deployment_ids
+        },
+        "cooldowns": {
+            deployment_id: cooldown["cooldown_time"]
+            for deployment_id, cooldown in router.cooldown_cache.get_active_cooldowns(
+                model_ids=list(deployment_ids), parent_otel_span=None
+            )
+        },
+        "rpm_usage": sorted(
+            {
+                key.split(":")[1]
+                for key in router.cache.in_memory_cache.cache_dict
+                if isinstance(key, str) and key.startswith("global_router:") and ":rpm:" in key
+            }
+            & set(deployment_ids)
+        ),
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_provider_error_counts_against_the_deployment_the_router_chose_not_one_a_body_litellm_params_names():
+    """On a provider that is not OpenAI the SDK copies the request parameters it does not know into the parameters
+    its failure callbacks read, so a body's root ``litellm_params`` replaced the ``litellm_params`` the router's
+    callbacks take the deployment and the cooldown from. The request setup removes it: a provider error counts
+    against, cools for the router's own ``cooldown_time`` and adds usage to the deployment the router chose, and the
+    deployment the body named gets no failure, no cooldown and no usage."""
+
+    deployment_ids = ("chosen-a", "chosen-b", "body-named")
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "claude",
+                "litellm_params": {"model": "anthropic/claude-sonnet-4-5", "api_key": "sk-test"},
+                "model_info": {"id": "chosen-a"},
+            },
+            {
+                "model_name": "claude",
+                "litellm_params": {"model": "anthropic/claude-3-5-haiku-20241022", "api_key": "sk-test"},
+                "model_info": {"id": "chosen-b"},
+            },
+            {
+                "model_name": "other-model",
+                "litellm_params": {"model": "anthropic/claude-3-opus-20240229", "api_key": "sk-test"},
+                "model_info": {"id": "body-named"},
+            },
+        ],
+        cooldown_time=13,
+        num_retries=0,
+    )
+    data = await add_litellm_data_to_request(
+        data={
+            "model": "claude",
+            "messages": [{"role": "user", "content": "hi"}],
+            "litellm_params": {
+                "model_info": {"id": "body-named"},
+                "cooldown_time": 86400,
+                "metadata": {"model_group": "other-model", "deployment": "anthropic/claude-3-opus-20240229"},
+            },
+        },
+        request=_make_request_mock(),
+        user_api_key_dict=_user_api_key_auth(),
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    with pytest.raises(litellm.RateLimitError):
+        await router.acompletion(**data, mock_response="litellm.RateLimitError")
+    pending = asyncio.all_tasks() - {asyncio.current_task()}
+    await asyncio.gather(*pending, return_exceptions=True)
+
+    counters = _deployment_counters(router, deployment_ids)
+    chosen = next(
+        (deployment_id for deployment_id in ("chosen-a", "chosen-b") if counters["failures"][deployment_id]), None
+    )
+    assert counters == {
+        "failures": {deployment_id: int(deployment_id == chosen) for deployment_id in deployment_ids},
+        "cooldowns": {chosen: 13},
+        "rpm_usage": [chosen],
+    }
+
+
+def _cooling_primary_router(backup_mock_response: str, cooldown_time: float | None = None) -> litellm.Router:
+    """A ``primary`` group whose only deployment is cooling, so a request for it reaches its fallback without any
+    provider call; a ``backup`` group of two Anthropic deployments answering ``backup_mock_response``; and another
+    group of two deployments a body may name."""
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "primary",
+                "litellm_params": {"model": "openai/gpt-4.1", "api_key": "sk-test"},
+                "model_info": {"id": "primary-a"},
+            },
+            {
+                "model_name": "backup",
+                "litellm_params": {
+                    "model": "anthropic/claude-sonnet-4-5",
+                    "api_key": "sk-test",
+                    "mock_response": backup_mock_response,
+                },
+                "model_info": {"id": "chosen-a"},
+            },
+            {
+                "model_name": "backup",
+                "litellm_params": {
+                    "model": "anthropic/claude-3-5-haiku-20241022",
+                    "api_key": "sk-test",
+                    "mock_response": backup_mock_response,
+                },
+                "model_info": {"id": "chosen-b"},
+            },
+            {
+                "model_name": "other",
+                "litellm_params": {"model": "anthropic/claude-3-opus-20240229", "api_key": "sk-test"},
+                "model_info": {"id": "body-named"},
+            },
+            {
+                "model_name": "other",
+                "litellm_params": {"model": "anthropic/claude-3-haiku-20240307", "api_key": "sk-test"},
+                "model_info": {"id": "body-named-sibling"},
+            },
+        ],
+        num_retries=0,
+        **({"cooldown_time": cooldown_time} if cooldown_time is not None else {}),
+    )
+    router.cooldown_cache.add_deployment_to_cooldown(
+        model_id="primary-a",
+        original_exception=litellm.RateLimitError("cooling", "openai", "gpt-4.1"),
+        exception_status=429,
+        cooldown_time=600.0,
+    )
+    return router
+
+
+@pytest.mark.asyncio
+async def test_a_dict_fallback_target_cannot_count_cool_or_add_usage_to_a_deployment_its_litellm_params_names():
+    """The router merges a dict fallback target into the call's parameters when it falls back to it, after the
+    request setup ran on the root. The primary reaches no provider, so the only provider call is the backup's: its
+    error counts against, cools for the router's own ``cooldown_time`` and adds usage to the backup deployment the
+    router chose, and the deployment the target's ``litellm_params`` names gets no failure, no cooldown and no usage."""
+    router = _cooling_primary_router(backup_mock_response="litellm.RateLimitError", cooldown_time=13)
+    data = await add_litellm_data_to_request(
+        data={
+            "model": "primary",
+            "messages": [{"role": "user", "content": "hi"}],
+            "fallbacks": [
+                {
+                    "model": "backup",
+                    "litellm_params": {
+                        "model_info": {"id": "body-named"},
+                        "cooldown_time": 86400,
+                        "metadata": {"model_group": "other", "deployment": "anthropic/claude-3-opus-20240229"},
+                    },
+                }
+            ],
+        },
+        request=_make_request_mock(),
+        user_api_key_dict=_user_api_key_auth(),
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    with pytest.raises((litellm.RateLimitError, RouterRateLimitError)):
+        await router.acompletion(**data)
+    pending = asyncio.all_tasks() - {asyncio.current_task()}
+    await asyncio.gather(*pending, return_exceptions=True)
+
+    deployment_ids = ("chosen-a", "chosen-b", "body-named", "body-named-sibling")
+    counters = _deployment_counters(router, deployment_ids)
+    chosen = next(
+        (deployment_id for deployment_id in ("chosen-a", "chosen-b") if counters["failures"][deployment_id]), None
+    )
+    assert counters == {
+        "failures": {deployment_id: int(deployment_id == chosen) for deployment_id in deployment_ids},
+        "cooldowns": {chosen: 13},
+        "rpm_usage": [chosen],
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_served_fallback_keeps_the_requests_own_identity_not_one_its_dict_target_names(monkeypatch):
+    """A dict fallback target's ``metadata`` replaced the request's own when the router merged the target into the
+    call, so a served fallback call carried the key, team and user the body named, and its success spend row is
+    filed under the identity it reads from that metadata. The request setup removes a target's metadata buckets: the
+    fallback hop keeps the identity the proxy stamped."""
+    router = _cooling_primary_router(backup_mock_response="served by the fallback")
+    identity_fields = ("user_api_key", "user_api_key_team_id", "user_api_key_user_id")
+    named_identity = dict(zip(identity_fields, ("victim-key-hash", "victim-team", "victim-user")))
+    data = await add_litellm_data_to_request(
+        data={
+            "model": "primary",
+            "messages": [{"role": "user", "content": "hi"}],
+            "fallbacks": [{"model": "backup", "metadata": named_identity}],
+        },
+        request=_make_request_mock(),
+        user_api_key_dict=_user_api_key_auth().model_copy(update={"team_id": "own-team", "user_id": "own-user"}),
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+    stamped = {field: data["metadata"].get(field) for field in identity_fields}
+    sdk_calls: list[dict[str, object]] = []
+    sdk_acompletion = litellm.acompletion
+
+    async def recording_acompletion(**kwargs):
+        sdk_calls.append(kwargs)
+        return await sdk_acompletion(**kwargs)
+
+    monkeypatch.setattr(litellm, "acompletion", recording_acompletion)
+
+    response = await router.acompletion(**data)
+
+    fallback_hop_metadata = sdk_calls[-1]["metadata"]
+    assert {
+        "content": response.choices[0].message.content,
+        "fallback_hop_identity": {field: fallback_hop_metadata.get(field) for field in identity_fields},
+    } == {
+        "content": "served by the fallback",
+        "fallback_hop_identity": {**stamped, "user_api_key_team_id": "own-team", "user_api_key_user_id": "own-user"},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fallback_field", "primary_error"),
+    [
+        ("context_window_fallbacks", litellm.ContextWindowExceededError),
+        ("content_policy_fallbacks", litellm.ContentPolicyViolationError),
+    ],
+    ids=["context-window", "content-policy"],
+)
+async def test_a_target_under_a_mixed_fallback_wrapper_cannot_count_cool_or_add_usage_to_a_deployment_it_names(
+    fallback_field, primary_error
+):
+    """The context-window and content-policy resolvers read a fallback dict by its first key, so a wrapper that also
+    has a ``model`` still hands the router the targets under that key. The primary fails its context-window check
+    before any provider call, or its provider refuses the content; the backup then answers a retryable error, which
+    counts against, cools and adds usage to the backup deployment the router chose, never to the deployment the
+    nested target's ``litellm_params`` names."""
+    context_window_case = fallback_field == "context_window_fallbacks"
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "primary",
+                "litellm_params": (
+                    {"model": "openai/gpt-4.1", "api_key": "sk-test"}
+                    if context_window_case
+                    else {
+                        "model": "azure/content-filtered-model",
+                        "api_key": "sk-test",
+                        "mock_response": "Exception: content_filter_policy",
+                    }
+                ),
+                "model_info": {"id": "primary-a", **({"max_input_tokens": 1} if context_window_case else {})},
+            },
+            *(
+                {
+                    "model_name": "backup",
+                    "litellm_params": {"model": model, "api_key": "sk-test", "mock_response": "litellm.RateLimitError"},
+                    "model_info": {"id": deployment_id},
+                }
+                for deployment_id, model in (
+                    ("chosen-a", "anthropic/claude-sonnet-4-5"),
+                    ("chosen-b", "anthropic/claude-3-5-haiku-20241022"),
+                )
+            ),
+            *(
+                {
+                    "model_name": "other",
+                    "litellm_params": {"model": model, "api_key": "sk-test"},
+                    "model_info": {"id": deployment_id},
+                }
+                for deployment_id, model in (
+                    ("body-named", "anthropic/claude-3-opus-20240229"),
+                    ("body-named-sibling", "anthropic/claude-3-haiku-20240307"),
+                )
+            ),
+        ],
+        enable_pre_call_checks=context_window_case,
+        cooldown_time=13,
+        num_retries=0,
+    )
+    data = await add_litellm_data_to_request(
+        data={
+            "model": "primary",
+            "messages": [{"role": "user", "content": "hello"}],
+            fallback_field: [
+                {
+                    "primary": [
+                        {
+                            "model": "backup",
+                            "litellm_params": {
+                                "model_info": {"id": "body-named"},
+                                "cooldown_time": 86400,
+                                "metadata": {"model_group": "other", "deployment": "anthropic/claude-3-opus-20240229"},
+                            },
+                        }
+                    ],
+                    "model": "ignored",
+                }
+            ],
+        },
+        request=_make_request_mock(),
+        user_api_key_dict=_user_api_key_auth(),
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    with pytest.raises(primary_error):
+        await router.acompletion(**data)
+    pending = asyncio.all_tasks() - {asyncio.current_task()}
+    await asyncio.gather(*pending, return_exceptions=True)
+
+    deployment_ids = ("chosen-a", "chosen-b", "body-named", "body-named-sibling")
+    counters = _deployment_counters(router, deployment_ids)
+    chosen = next(
+        (deployment_id for deployment_id in ("chosen-a", "chosen-b") if counters["failures"][deployment_id]), None
+    )
+    assert counters == {
+        "failures": {deployment_id: int(deployment_id == chosen) for deployment_id in deployment_ids},
+        "cooldowns": {chosen: 13},
+        "rpm_usage": [chosen],
+    }
+
+
+_CALLER_OVERRIDE_FIELDS = ("model_info", "cooldown_time", "litellm_params", "metadata", "litellm_metadata")
+
+
+def _target_with_caller_overrides() -> dict[str, object]:
+    return {
+        "model": "backup",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {"type": "object", "properties": {"metadata": {"type": "string"}}},
+                },
+            }
+        ],
+        "model_info": {"id": "victim"},
+        "cooldown_time": 86400,
+        "litellm_params": {"model_info": {"id": "victim"}},
+        "metadata": {"user_api_key_team_id": "victim-team", "deployment": "openai/victim"},
+        "litellm_metadata": {"user_api_key_team_id": "victim-team"},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "path"),
+    [
+        ({"fallbacks": ["backup-string", _target_with_caller_overrides()]}, ("fallbacks",)),
+        ({"fallbacks": [{"gpt-4": ["backup-string", _target_with_caller_overrides()]}]}, ("fallbacks", 0, "gpt-4")),
+        (
+            {"context_window_fallbacks": [{"gpt-4": ["backup-string", _target_with_caller_overrides()]}]},
+            ("context_window_fallbacks", 0, "gpt-4"),
+        ),
+        (
+            {"content_policy_fallbacks": [{"gpt-4": ["backup-string", _target_with_caller_overrides()]}]},
+            ("content_policy_fallbacks", 0, "gpt-4"),
+        ),
+        (
+            {
+                "router_settings_override": {
+                    "fallbacks": [{"gpt-4": ["backup-string", _target_with_caller_overrides()]}]
+                }
+            },
+            ("router_settings_override", "fallbacks", 0, "gpt-4"),
+        ),
+        (
+            {"fallbacks": [{"model": "outer", "fallbacks": ["backup-string", _target_with_caller_overrides()]}]},
+            ("fallbacks", 0, "fallbacks"),
+        ),
+        (
+            {
+                "context_window_fallbacks": [
+                    {"gpt-4": ["backup-string", _target_with_caller_overrides()], "model": "ignored"}
+                ]
+            },
+            ("context_window_fallbacks", 0, "gpt-4"),
+        ),
+        (
+            {
+                "fallbacks": [
+                    {
+                        "gpt-4": [
+                            {
+                                "model": "outer",
+                                "content_policy_fallbacks": [
+                                    {
+                                        "outer": [
+                                            {
+                                                "model": "inner",
+                                                "fallbacks": ["backup-string", _target_with_caller_overrides()],
+                                            }
+                                        ],
+                                        "model": "ignored",
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                ]
+            },
+            ("fallbacks", 0, "gpt-4", 0, "content_policy_fallbacks", 0, "outer", 0, "fallbacks"),
+        ),
+    ],
+    ids=[
+        "target-list",
+        "group-map",
+        "context-window",
+        "content-policy",
+        "router-settings-override",
+        "nested",
+        "mixed-wrapper",
+        "three-levels",
+    ],
+)
+async def test_add_litellm_data_to_request_strips_caller_overrides_from_every_dict_fallback_target(body, path):
+    """Every dict a body supplies under a fallback field, in each shape the router reads and at any nesting, loses
+    the router-owned fields, a ``litellm_params`` and both metadata buckets. Its other keys, a dict held as one of
+    their values (a tool schema here) and every string target stay as sent."""
+    updated = await add_litellm_data_to_request(
+        data={"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}], **copy.deepcopy(body)},
+        request=_make_request_mock(),
+        user_api_key_dict=_user_api_key_auth(),
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    targets: object = updated
+    for step in path:
+        targets = targets[step]
+    assert targets == [
+        "backup-string",
+        {
+            key: value
+            for key, value in _target_with_caller_overrides().items()
+            if key not in _CALLER_OVERRIDE_FIELDS
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_refuses_fallbacks_nested_past_the_body_check_bound():
+    """The strip descends no deeper than the nesting the body check allows, so a body cannot drive it deep."""
+    from fastapi import HTTPException
+
+    nested: object = ["backup"]
+    for _ in range(2 * litellm.ROUTER_MAX_FALLBACKS + 1):
+        nested = [nested]
+
+    with pytest.raises(HTTPException) as refused:
+        await add_litellm_data_to_request(
+            data={"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}], "fallbacks": nested},
+            request=_make_request_mock(),
+            user_api_key_dict=_user_api_key_auth(),
+            proxy_config=MagicMock(),
+            general_settings={},
+            version="test-version",
+        )
+    assert refused.value.status_code == 400
 
 
 @pytest.mark.asyncio
