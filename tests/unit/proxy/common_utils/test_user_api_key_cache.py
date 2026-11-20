@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import math
+from collections.abc import Sequence
 from typing import Any, Final, Literal
 
 import pytest
@@ -31,6 +32,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     last_good_reads_started_at,
     recall_last_good,
     remember_last_good,
+    revoke_and_delete_read_rows,
     revoke_last_good,
     revoke_last_good_then,
     start_last_good_reads,
@@ -1400,3 +1402,74 @@ class TestLastGoodEntries:
 
         assert refused.value.status_code == 503
         assert (kept, bare, written) == ("revoked before", "no keys", ["revoked before", "no keys"])
+
+    @pytest.mark.asyncio
+    async def test_an_exact_delete_revokes_and_deletes_a_row_added_after_its_read_in_a_next_round(self):
+        """The first read finds a, the second b, the third nothing: a is deleted alone, then b, each right after its own
+        revocation, so b, added after the first read, is never deleted unrevoked."""
+        redis: Final = fake_redis_cache()
+        cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=_Clock())
+        answers: Final = [("a",), ("b",)]  # mutable-ok: each read takes the next answer
+        deletes: Final[list[tuple[tuple[str, ...], bool]]] = []  # mutable-ok: each delete and its tombstones
+
+        async def read() -> tuple[str, ...]:
+            return answers.pop(0) if answers else ()
+
+        async def delete(rows: Sequence[str]) -> None:
+            stood: Final = all([await redis.cache.async_get_cache(f"last_good_tombstone:{row}") for row in rows])
+            deletes.append((tuple(rows), stood))
+
+        deleted: Final = await revoke_and_delete_read_rows(cache, read, tuple, delete)
+
+        assert deleted == ("a", "b")
+        assert deletes == [(("a",), True), (("b",), True)]
+
+    @pytest.mark.asyncio
+    async def test_an_exact_delete_whose_late_row_cannot_be_revoked_answers_503_and_leaves_it(self):
+        """With ``first`` the caller's read is used, and revoked again by the pairing; Redis is lost before the row
+        added since can be revoked, so the 503 leaves it undeleted."""
+        from fastapi import HTTPException
+
+        redis: Final = fake_redis_cache()
+        cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=_Clock())
+        deletes: Final[list[tuple[str, ...]]] = []  # mutable-ok: records each delete in order
+
+        async def read() -> tuple[str, ...]:
+            return ("late",)
+
+        async def delete(rows: Sequence[str]) -> None:
+            deletes.append(tuple(rows))
+            redis.server.connected = False
+
+        with pytest.raises(HTTPException) as refused:
+            await revoke_and_delete_read_rows(cache, read, tuple, delete, first=("read before",))
+
+        assert refused.value.status_code == 503
+        assert deletes == [("read before",)]
+
+    @pytest.mark.asyncio
+    async def test_rows_that_keep_appearing_refuse_with_409_after_the_last_round_and_stay(self):
+        """Every read finds a new row: after LAST_GOOD_EXACT_DELETE_ROUNDS deletes the request answers 409 and the row
+        of the last read is neither revoked nor deleted."""
+        from fastapi import HTTPException
+
+        from litellm.proxy.common_utils.user_api_key_cache import LAST_GOOD_EXACT_DELETE_ROUNDS
+
+        cache: Final = UserApiKeyCache(serve_last_good_entries=True, last_good_clock=_Clock())
+        reads: Final = [0]  # mutable-ok: counts the reads
+        deletes: Final[list[tuple[str, ...]]] = []  # mutable-ok: records each delete in order
+
+        async def read() -> tuple[str, ...]:
+            reads[0] += 1
+            return (f"row-{reads[0]}",)
+
+        async def delete(rows: Sequence[str]) -> None:
+            deletes.append(tuple(rows))
+
+        with pytest.raises(HTTPException) as refused:
+            await revoke_and_delete_read_rows(cache, read, tuple, delete)
+
+        last_read: Final = f"row-{LAST_GOOD_EXACT_DELETE_ROUNDS + 1}"
+        assert refused.value.status_code == 409
+        assert deletes == [(f"row-{n}",) for n in range(1, LAST_GOOD_EXACT_DELETE_ROUNDS + 1)]
+        assert cache.last_good_memory.tombstoned(last_read) is False

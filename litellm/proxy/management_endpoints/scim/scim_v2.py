@@ -58,6 +58,7 @@ from litellm.proxy.common_utils.http_parsing_utils import (  # noqa: F401  # leg
     safe_get_request_headers,
 )
 from litellm.proxy.common_utils.user_api_key_cache import (
+    revoke_and_delete_read_rows,
     revoke_last_good,
     revoke_last_good_then,
     serves_last_good_entries,
@@ -92,6 +93,7 @@ from litellm.types.llms.base import LiteLLMBaseModel
 from litellm.types.proxy.management_endpoints.scim_v2 import *
 
 if TYPE_CHECKING:
+    from prisma.models import LiteLLM_TeamMembership as PrismaTeamMembership
     from prisma.models import LiteLLM_VerificationToken as PrismaVerificationToken
 
 
@@ -145,6 +147,10 @@ class _UserReferencingTableClient(Protocol):
     async def delete_many(self, where: Mapping[str, object]) -> int: ...
 
 
+class _TeamMembershipTableClient(_UserReferencingTableClient, Protocol):
+    async def find_many(self, where: Mapping[str, object]) -> "Sequence[PrismaTeamMembership]": ...
+
+
 @overload
 def _table(repository: UserRepository) -> _UserTableClient: ...
 
@@ -158,9 +164,11 @@ def _table(repository: VerificationTokenRepository) -> _VerificationTokenTableCl
 
 
 @overload
-def _table(
-    repository: InvitationLinkRepository | OrganizationMembershipRepository | TeamMembershipRepository,
-) -> _UserReferencingTableClient: ...
+def _table(repository: TeamMembershipRepository) -> _TeamMembershipTableClient: ...
+
+
+@overload
+def _table(repository: InvitationLinkRepository | OrganizationMembershipRepository) -> _UserReferencingTableClient: ...
 
 
 def _table(
@@ -1149,8 +1157,10 @@ async def _delete_rows_referencing_user(prisma_client: PrismaClient, *, user_id:
     ``LiteLLM_InvitationLink_user_id_fkey``).
 
     While last good entries are served, each delete that ends an access revokes the entries holding it immediately
-    before it: the user's own entry carries its organization memberships, and each team membership has its own.
-    Invitations are held by no last good entry.
+    before it: the user's own entry carries its organization memberships, so its revocation covers every one of them,
+    and each team membership has its own entry, so only the team memberships read and revoked are deleted, round by
+    round until a read finds none (``revoke_and_delete_read_rows``). Invitations are held by no last good entry. A
+    team membership left by a refused round stays with the user, whose delete is then not reached.
     """
     from litellm.proxy.proxy_server import user_api_key_cache
 
@@ -1169,16 +1179,16 @@ async def _delete_rows_referencing_user(prisma_client: PrismaClient, *, user_id:
         partial(_table(OrganizationMembershipRepository(prisma_client)).delete_many, where={"user_id": user_id}),
     )
     team_memberships: Final = _table(TeamMembershipRepository(prisma_client))
-    # The rows' teams name the entries the delete ends; read only while those entries are kept
-    held_team_ids: Final = (
-        tuple(row.team_id for row in await team_memberships.find_many(where={"user_id": user_id}))
-        if serves_last_good_entries(user_api_key_cache)
-        else ()
-    )
-    await revoke_last_good_then(
+    if not serves_last_good_entries(user_api_key_cache):
+        await team_memberships.delete_many(where={"user_id": user_id})
+        return
+    await revoke_and_delete_read_rows(
         user_api_key_cache,
-        tuple(team_membership_auth_cache_key(team_id=team_id, user_id=user_id) for team_id in held_team_ids),
-        partial(team_memberships.delete_many, where={"user_id": user_id}),
+        partial(team_memberships.find_many, where={"user_id": user_id}),
+        lambda rows: tuple(team_membership_auth_cache_key(team_id=row.team_id, user_id=user_id) for row in rows),
+        lambda rows: team_memberships.delete_many(
+            where={"user_id": user_id, "team_id": {"in": [row.team_id for row in rows]}}
+        ),
     )
 
 

@@ -27,6 +27,7 @@ from litellm.proxy._types import (
     LiteLLM_TeamTable,
     LiteLLM_TeamTableCachedObj,
     LiteLLM_UserTable,
+    LiteLLM_VerificationToken,
     LitellmTableNames,
     LitellmUserRoles,
     Member,
@@ -81,6 +82,7 @@ from litellm.types.proxy.management_endpoints.team_endpoints import (
 )
 from litellm.types.utils import StandardAuditLogPayload
 from tests._master_key import MASTER_KEY
+from tests.unit.caching.fake_redis_cache import FakeRedisCache
 from tests.unit.proxy.management_endpoints.jwt_key_mapping_doubles import (
     CascadingJWTMappingTable,
     JWTMappingRow,
@@ -17180,3 +17182,207 @@ async def test_team_member_removal_answers_503_and_writes_nothing_when_redis_can
     assert refused.value.status_code == 503
     for write in writes:
         write.assert_not_awaited()
+
+
+def _member_key(token: str) -> LiteLLM_VerificationToken:
+    return LiteLLM_VerificationToken(token=token, user_id="member-1", team_id="team-1")
+
+
+def _key_row_matches(row: LiteLLM_VerificationToken, where: dict[str, object]) -> bool:
+    """Prisma's ``where`` on key columns: each column equals its value, or is in its filter's ``in`` list."""
+    return all(
+        getattr(row, column) in condition["in"] if isinstance(condition, dict) else getattr(row, column) == condition
+        for column, condition in where.items()
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _KeyDelete:
+    """One ``delete_many`` on the key table: its where, the tokens it deleted, and those of them whose tombstone stood
+    in Redis as it ran."""
+
+    where: dict[str, object]
+    deleted: tuple[str | None, ...]
+    tombstoned: tuple[str | None, ...]
+
+
+class _MemberKeyRows:
+    """The key table a member removal's transaction reads and deletes, filtering like prisma's ``where``. The keys of
+    ``created_after_read[n]`` are created for member-1 in team-1 right after read ``n`` (from 1) answered, so that read
+    misses them; Redis is lost right after read ``redis_lost_after_read``."""
+
+    def __init__(
+        self,
+        redis: FakeRedisCache,
+        rows: Sequence[LiteLLM_VerificationToken],
+        *,
+        created_after_read: dict[int, tuple[LiteLLM_VerificationToken, ...]],
+        redis_lost_after_read: int | None = None,
+    ) -> None:
+        self.redis = redis
+        self.rows = list(rows)
+        self.created_after_read = created_after_read
+        self.redis_lost_after_read = redis_lost_after_read
+        self.reads = 0
+        self.deletes: list[_KeyDelete] = []
+
+    async def find_many(self, where: dict[str, object]) -> list[LiteLLM_VerificationToken]:
+        self.reads += 1
+        found: Final = [row for row in self.rows if _key_row_matches(row, where)]
+        self.rows.extend(self.created_after_read.get(self.reads, ()))
+        if self.reads == self.redis_lost_after_read:
+            self.redis.server.connected = False
+        return found
+
+    async def delete_many(self, where: dict[str, object]) -> None:
+        deleted: Final = tuple(row.token for row in self.rows if _key_row_matches(row, where))
+        client: Final = self.redis.cache.init_async_client()
+        tombstoned: Final = tuple(
+            [
+                token
+                for token in deleted
+                if self.redis.server.connected and await client.exists(f"last_good_tombstone:{token}") == 1
+            ]
+        )
+        self.rows = [row for row in self.rows if row.token not in deleted]
+        self.deletes.append(_KeyDelete(where=where, deleted=deleted, tombstoned=tombstoned))
+
+
+@dataclass(frozen=True, slots=True)
+class _MemberKeyRemoval:
+    """What a member removal holding keys is wired to: its client, and the deleted keys' archive and audit hooks."""
+
+    prisma: MagicMock
+    archive: AsyncMock
+    audit: MagicMock
+
+
+def _wire_member_key_removal(monkeypatch, cache, key_rows: _MemberKeyRows) -> _MemberKeyRemoval:
+    """``_wire_member_removal`` with member-1's keys in team-1 held by ``key_rows``, none mapped to a JWT claim, and
+    the deleted keys' archive and audit hooks recorded."""
+    prisma: Final = _wire_member_removal(monkeypatch, cache)
+    prisma.db.litellm_verificationtoken = key_rows
+    prisma.db.litellm_jwtkeymapping = CascadingJWTMappingTable([])
+    archive: Final = AsyncMock()
+    audit: Final = MagicMock()
+    monkeypatch.setattr(  # test-quality-ok: the removal imports the archive writer as it runs; no seam to inject it
+        "litellm.proxy.management_endpoints.key_management_endpoints.persist_deleted_verification_tokens", archive
+    )
+    monkeypatch.setattr(  # test-quality-ok: the removal calls the static audit hook directly; no seam to inject it
+        "litellm.proxy.hooks.key_management_event_hooks.KeyManagementEventHooks.create_key_deleted_audit_logs", audit
+    )
+    return _MemberKeyRemoval(prisma=prisma, archive=archive, audit=audit)
+
+
+def _archived_tokens(archive: AsyncMock) -> list[list[str | None]]:
+    """The tokens of each archive write, in order."""
+    return [[key.token for key in archived.kwargs["keys"]] for archived in archive.await_args_list]
+
+
+@pytest.mark.asyncio
+async def test_team_member_removal_revokes_and_deletes_a_key_created_after_its_read_in_a_next_round(monkeypatch):
+    """A key created for the member in the team after the removal's transaction read the member's keys is not deleted
+    unrevoked by a delete wider than that read: a next round reads it, tombstones it in Redis, archives it and deletes
+    it by token, and its cached entry and its audit record go as the first key's do."""
+    from litellm.proxy._types import TeamMemberDeleteRequest
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis: Final = fake_redis_cache()
+    cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+    first_token: Final = "hashed-member-key-read-first"
+    late_token: Final = "hashed-member-key-created-after-the-read"
+    key_rows: Final = _MemberKeyRows(
+        redis, [_member_key(first_token)], created_after_read={1: (_member_key(late_token),)}
+    )
+    removal: Final = _wire_member_key_removal(monkeypatch, cache, key_rows)
+    for token in (first_token, late_token):
+        cache.set_cache(key=token, value={"retained": True}, local_only=True)
+
+    await team_member_delete(
+        data=TeamMemberDeleteRequest(team_id="team-1", user_id="member-1"),
+        user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN, user_id="admin-user"),
+    )
+
+    assert key_rows.deletes == [
+        _KeyDelete(where={"token": {"in": [first_token]}}, deleted=(first_token,), tombstoned=(first_token,)),
+        _KeyDelete(where={"token": {"in": [late_token]}}, deleted=(late_token,), tombstoned=(late_token,)),
+    ]
+    assert key_rows.rows == []
+    assert _archived_tokens(removal.archive) == [[first_token], [late_token]]
+    removal.audit.assert_called_once()
+    assert [key.token for key in removal.audit.call_args.kwargs["keys_being_deleted"]] == [first_token, late_token]
+    assert [cache.get_cache(key=token, local_only=True) for token in (first_token, late_token)] == [None, None]
+
+
+@pytest.mark.asyncio
+async def test_team_member_removal_answers_503_and_keeps_a_late_key_when_redis_is_lost_before_its_round(monkeypatch):
+    """Redis is lost once the first round deleted the key the removal read, before the key created since is revoked:
+    the request answers 503 and neither archives nor deletes that key, and the refusal leaves through the
+    transaction, which a real database rolls back with the writes before it."""
+    from litellm.proxy._types import TeamMemberDeleteRequest
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis: Final = fake_redis_cache()
+    first_token: Final = "hashed-member-key-read-first"
+    late_key: Final = _member_key("hashed-member-key-created-after-the-read")
+    key_rows: Final = _MemberKeyRows(
+        redis, [_member_key(first_token)], created_after_read={1: (late_key,)}, redis_lost_after_read=2
+    )
+    removal: Final = _wire_member_key_removal(
+        monkeypatch, UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True), key_rows
+    )
+
+    with pytest.raises(HTTPException) as refused:
+        await team_member_delete(
+            data=TeamMemberDeleteRequest(team_id="team-1", user_id="member-1"),
+            user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN, user_id="admin-user"),
+        )
+
+    assert refused.value.status_code == 503
+    assert key_rows.deletes == [
+        _KeyDelete(where={"token": {"in": [first_token]}}, deleted=(first_token,), tombstoned=(first_token,))
+    ]
+    assert key_rows.rows == [late_key]
+    assert _archived_tokens(removal.archive) == [[first_token]]
+    removal.audit.assert_not_called()
+    # The fake keeps the first round's writes; the refusal leaving through the transaction is what rolls them back
+    assert removal.prisma.tx.return_value.__aexit__.await_args.args[0] is HTTPException
+
+
+@pytest.mark.asyncio
+async def test_team_member_removal_answers_409_and_keeps_the_last_read_key_when_keys_keep_appearing(monkeypatch):
+    """A key is created for the member in the team after every read: each of the LAST_GOOD_EXACT_DELETE_ROUNDS rounds
+    revokes and deletes the key it read, then the request answers 409 from inside the transaction, so the whole
+    removal rolls back, and the key of the last read is neither revoked nor deleted."""
+    from litellm.proxy._types import TeamMemberDeleteRequest
+    from litellm.proxy.common_utils.user_api_key_cache import LAST_GOOD_EXACT_DELETE_ROUNDS, UserApiKeyCache
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis: Final = fake_redis_cache()
+    tokens: Final = tuple(f"hashed-member-key-{n}" for n in range(1, LAST_GOOD_EXACT_DELETE_ROUNDS + 2))
+    key_rows: Final = _MemberKeyRows(
+        redis,
+        [_member_key(tokens[0])],
+        created_after_read={n: (_member_key(tokens[n]),) for n in range(1, LAST_GOOD_EXACT_DELETE_ROUNDS + 1)},
+    )
+    removal: Final = _wire_member_key_removal(
+        monkeypatch, UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True), key_rows
+    )
+
+    with pytest.raises(HTTPException) as refused:
+        await team_member_delete(
+            data=TeamMemberDeleteRequest(team_id="team-1", user_id="member-1"),
+            user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN, user_id="admin-user"),
+        )
+
+    assert refused.value.status_code == 409
+    assert key_rows.reads == LAST_GOOD_EXACT_DELETE_ROUNDS + 1
+    assert key_rows.deletes == [
+        _KeyDelete(where={"token": {"in": [token]}}, deleted=(token,), tombstoned=(token,)) for token in tokens[:-1]
+    ]
+    assert [row.token for row in key_rows.rows] == [tokens[-1]]
+    assert await redis.cache.init_async_client().exists(f"last_good_tombstone:{tokens[-1]}") == 0
+    removal.audit.assert_not_called()
+    assert removal.prisma.tx.return_value.__aexit__.await_args.args[0] is HTTPException
