@@ -142,7 +142,8 @@ def _outlive_the_cache() -> None:
 
 def _outlive_the_last_good_entries(read_by: float) -> None:
     """Sleep until every last good entry a database read stored before ``read_by`` has expired. The entry's Redis
-    expiry is whole seconds, rounded up, hence the extra seconds; the ordinary cache lapses long before."""
+    expiry is a whole Unix second, rounded down, on the Redis server's clock, which may trail this host's a little,
+    hence the extra seconds; the ordinary cache lapses long before."""
     time.sleep(max(CACHE_TTL_SECONDS + 1, read_by + LAST_GOOD_SECONDS + 2 - time.monotonic()))
 
 

@@ -6,6 +6,7 @@ import math
 from typing import Any, Final, Literal
 
 import pytest
+from fakeredis import FakeServer
 
 from litellm.caching.dual_cache import DualCache
 from litellm.caching.in_memory_cache import InMemoryCache
@@ -34,7 +35,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     start_last_good_reads,
 )
 from litellm.proxy.proxy_server import UserAPIKeyCacheTTLEnum
-from tests.unit.caching.fake_redis_cache import fake_redis_cache
+from tests.unit.caching.fake_redis_cache import drive_fake_redis_time, fake_redis_cache
 
 HASHED_TOKEN = hashlib.sha256(b"sk-lit7563-hot-key").hexdigest()
 
@@ -61,10 +62,12 @@ class _DeleteLandsDuringWrite(RedisCache):
     async def async_get_cache_or_raise(self, key: str) -> object:
         return await self._redis.async_get_cache_or_raise(key)
 
-    async def async_set_cache_or_raise(self, key: str, value: object, ttl: int | None = None) -> None:
+    async def async_set_cache_or_raise(
+        self, key: str, value: object, ttl: int | None = None, *, expire_at: int | None = None
+    ) -> None:
         if key.startswith("last_good:"):
             await forget_last_good(self._deleting_pod, key.removeprefix("last_good:"), tombstone=True)
-        await self._redis.async_set_cache_or_raise(key, value, ttl=ttl)
+        await self._redis.async_set_cache_or_raise(key, value, ttl=ttl, expire_at=expire_at)
 
     async def async_delete_cache(self, key: str) -> None:
         await self._redis.async_delete_cache(key)
@@ -91,8 +94,10 @@ class _FailsAfterTheWrite(RedisCache):
             raise ConnectionError("Redis went away after the write")
         return await self._redis.async_get_cache_or_raise(key)
 
-    async def async_set_cache_or_raise(self, key: str, value: object, ttl: int | None = None) -> None:
-        await self._redis.async_set_cache_or_raise(key, value, ttl=ttl)
+    async def async_set_cache_or_raise(
+        self, key: str, value: object, ttl: int | None = None, *, expire_at: int | None = None
+    ) -> None:
+        await self._redis.async_set_cache_or_raise(key, value, ttl=ttl, expire_at=expire_at)
         self.wrote = True  # rebind-ok: records that the write reached Redis
         if self._failing == "write":
             raise TimeoutError("the write reached Redis but its answer was lost")
@@ -101,14 +106,26 @@ class _FailsAfterTheWrite(RedisCache):
         await self._redis.async_delete_cache(key)
 
 
+# How far the wall clock a test drives runs ahead of _Clock: a quarter second into a Unix second, so that a store's
+# rounding of the end down to a whole second shows
+_WALL_CLOCK_AHEAD_SECONDS: Final = 1_700_000_000.25
+
+
 class _Clock:
-    """The last good entries' clock, which a test moves instead of sleeping."""
+    """The last good entries' clock, which a test moves instead of sleeping. ``wall`` is the wall clock that moves with
+    it, for ``last_good_wall_clock`` and for fake Redis (``drive_fake_redis_time``)."""
 
     def __init__(self, now: float = 1000.0) -> None:
         self.now = now
 
     def __call__(self) -> float:
         return self.now
+
+    def wall(self) -> float:
+        return self.now + _WALL_CLOCK_AHEAD_SECONDS
+
+    def move_to_wall(self, wall: float) -> None:
+        self.now = wall - _WALL_CLOCK_AHEAD_SECONDS
 
 
 class _SlowTombstoneCheck(RedisCache):
@@ -125,8 +142,10 @@ class _SlowTombstoneCheck(RedisCache):
         self._seconds = 0.0  # rebind-ok: only the first read is slow
         return answer
 
-    async def async_set_cache_or_raise(self, key: str, value: object, ttl: int | None = None) -> None:
-        await self._redis.async_set_cache_or_raise(key, value, ttl=ttl)
+    async def async_set_cache_or_raise(
+        self, key: str, value: object, ttl: int | None = None, *, expire_at: int | None = None
+    ) -> None:
+        await self._redis.async_set_cache_or_raise(key, value, ttl=ttl, expire_at=expire_at)
 
     async def async_delete_cache(self, key: str) -> None:
         await self._redis.async_delete_cache(key)
@@ -157,13 +176,46 @@ class _SlowWrite(RedisCache):
     async def async_get_cache_or_raise(self, key: str) -> object:
         return await self._redis.async_get_cache_or_raise(key)
 
-    async def async_set_cache_or_raise(self, key: str, value: object, ttl: int | None = None) -> None:
+    async def async_set_cache_or_raise(
+        self, key: str, value: object, ttl: int | None = None, *, expire_at: int | None = None
+    ) -> None:
         self._clock.now += self.seconds
         self.set_keys.append(key)
-        await self._redis.async_set_cache_or_raise(key, value, ttl=ttl)
+        await self._redis.async_set_cache_or_raise(key, value, ttl=ttl, expire_at=expire_at)
 
     async def async_delete_cache(self, key: str) -> None:
         await self._redis.async_delete_cache(key)
+
+
+class _LostRightAfterASlowWrite(_SlowWrite):
+    """As ``_SlowWrite``, and the Redis server is lost right after each SET lands, until the test restores it: the
+    tombstone check after the entry's write and the undo both fail."""
+
+    def __init__(self, redis: RedisCache, server: FakeServer, clock: _Clock, seconds: float) -> None:
+        super().__init__(redis, clock, seconds)
+        self._server = server
+
+    async def async_set_cache_or_raise(
+        self, key: str, value: object, ttl: int | None = None, *, expire_at: int | None = None
+    ) -> None:
+        await super().async_set_cache_or_raise(key, value, ttl, expire_at=expire_at)
+        self._server.connected = False
+
+
+async def _held_in(redis: RedisCache, cache: UserApiKeyCache, cache_key: str) -> tuple[bool, bool]:
+    """Whether the Redis server and this pod's memory each hold the last good entry for ``cache_key``."""
+    return (
+        await redis.init_async_client().get(f"last_good:{cache_key}") is not None,
+        cache.last_good_memory.get(cache_key) is not None,
+    )
+
+
+def _cache_on_driven_clocks(monkeypatch: pytest.MonkeyPatch, clock: _Clock, redis: RedisCache) -> UserApiKeyCache:
+    """A cache serving last good entries whose stores, and every fake Redis server, run on ``clock`` and its wall."""
+    drive_fake_redis_time(monkeypatch, clock.wall)
+    return UserApiKeyCache(
+        redis_cache=redis, serve_last_good_entries=True, last_good_clock=clock, last_good_wall_clock=clock.wall
+    )
 
 
 class FakeRedisCache(RedisCache):
@@ -630,29 +682,25 @@ class TestLastGoodEntries:
         return LiteLLM_TeamTableCachedObj(team_id=team_id, team_alias=alias, models=["claude-opus-5-5"])
 
     @pytest.mark.asyncio
-    async def test_the_redis_entry_ends_with_the_memory_line(self):
-        """The end is taken from the moment the read began: the time the tombstone check before the write took comes
-        off the Redis TTL, rounded up to whole seconds, so Redis ends with the memory line or less than a second after
-        it, and the memory line never outlives Redis."""
-        clock = _Clock()
-        redis = fake_redis_cache()
-        cache = UserApiKeyCache(
-            redis_cache=_SlowTombstoneCheck(redis.cache, clock, seconds=30.5),
-            serve_last_good_entries=True,
-            last_good_clock=clock,
+    async def test_the_redis_entry_ends_with_the_memory_line(self, monkeypatch: pytest.MonkeyPatch):
+        """The end is taken as the store begins, from the moment the read began, rounded down to a whole Unix second:
+        Redis gets it as an absolute expiry, so the 30.5 s the tombstone check before the write takes do not move it,
+        and the memory line ends at that same instant."""
+        clock: Final = _Clock()
+        redis: Final = fake_redis_cache()
+        cache: Final = _cache_on_driven_clocks(
+            monkeypatch, clock, _SlowTombstoneCheck(redis.cache, clock, seconds=30.5)
         )
-        stored_at: Final = clock.now
+        expire_at: Final = math.floor(clock.wall() + LAST_GOOD_ENTRY_TTL_SECONDS)
 
         with last_good_reads_started_at(clock()):
             await remember_last_good(cache, "team_id:t1", self._team("t1"))
 
-        # The write came 30.5 s after the read, so Redis got the rest of the entry's life, rounded up
-        expected_ttl: Final = math.ceil(LAST_GOOD_ENTRY_TTL_SECONDS - 30.5)
-        assert await redis.cache.init_async_client().ttl("last_good:team_id:t1") == expected_ttl
+        assert await redis.cache.init_async_client().expiretime("last_good:team_id:t1") == expire_at
         redis.server.connected = False
-        clock.now = stored_at + LAST_GOOD_ENTRY_TTL_SECONDS - 0.001
+        clock.move_to_wall(expire_at - 0.001)
         assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) == self._team("t1")
-        clock.now = stored_at + LAST_GOOD_ENTRY_TTL_SECONDS
+        clock.move_to_wall(expire_at)
         assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
 
     @pytest.mark.asyncio
@@ -696,11 +744,13 @@ class TestLastGoodEntries:
         )
         clock = _Clock()
         redis = fake_redis_cache()
-        cache = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=clock)
+        cache = _cache_on_driven_clocks(monkeypatch, clock, redis.cache)
         with last_good_reads_started_at(clock()):
             await remember_last_good(cache, "team_id:t1", self._team("t1"))
 
-        assert await redis.cache.init_async_client().ttl("last_good:team_id:t1") == thirty_days
+        assert await redis.cache.init_async_client().expiretime("last_good:team_id:t1") == math.floor(
+            clock.wall() + thirty_days
+        )
         redis.server.connected = False
         clock.now += thirty_days - 1
         assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) == self._team("t1")
@@ -708,18 +758,22 @@ class TestLastGoodEntries:
         assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
 
     @pytest.mark.asyncio
-    async def test_an_entry_ends_its_expiry_after_its_read_began_not_after_its_store(self):
+    async def test_an_entry_ends_its_expiry_after_its_read_began_not_after_its_store(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
         """The read began at 0 and its store completed at 100: the entry ends at the expiry after 0, in memory and in
         Redis, not 100 s later."""
         clock: Final = _Clock(0.0)
         redis: Final = fake_redis_cache()
-        cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=clock)
+        cache: Final = _cache_on_driven_clocks(monkeypatch, clock, redis.cache)
+        read_began_on_the_wall: Final = clock.wall()
         with last_good_reads_started_at(0.0):
             clock.now = 100.0
             await remember_last_good(cache, "team_id:t1", self._team("t1"))
 
-        redis_ttl: Final = await redis.cache.init_async_client().ttl("last_good:team_id:t1")
-        assert LAST_GOOD_ENTRY_TTL_SECONDS - 101 <= redis_ttl <= LAST_GOOD_ENTRY_TTL_SECONDS - 100
+        assert await redis.cache.init_async_client().expiretime("last_good:team_id:t1") == math.floor(
+            read_began_on_the_wall + LAST_GOOD_ENTRY_TTL_SECONDS
+        )
         redis.server.connected = False
         clock.now = LAST_GOOD_ENTRY_TTL_SECONDS - 1
         assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) == self._team("t1")
@@ -825,31 +879,91 @@ class TestLastGoodEntries:
         assert reading_pod.last_good_memory.get("team_id:t1") is None
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("write_seconds", "kept"),
-        [(LAST_GOOD_LATE_STORE_MARGIN_SECONDS + 1, False), (LAST_GOOD_LATE_STORE_MARGIN_SECONDS - 1, True)],
-        ids=["slower_than_the_margin", "faster_than_the_margin"],
-    )
-    async def test_a_redis_write_slower_than_the_margin_is_undone_far_inside_the_tombstone_time(
-        self, write_seconds: int, kept: bool
+    async def test_a_set_redis_runs_100_s_late_is_kept_and_both_copies_end_at_the_reads_deadline(
+        self, monkeypatch: pytest.MonkeyPatch
     ):
-        """The SET carries an expiry computed before it is sent, and Redis counts it from when it runs the SET, so a
-        slow write could keep the entry in Redis that much past its end. A write and check slower than the margin are
-        undone, in Redis and in memory, although the store is far from late; a faster one is kept, and Redis then ends
-        at most the margin plus the rounding after the memory line."""
+        """The SET carries the end the store took before sending it, as an absolute expiry, so a SET that Redis runs
+        100 s later, far inside the time a tombstone stands, is kept: Redis still drops the entry at the read's
+        deadline, the instant the memory line ends, and not 100 s past it."""
         clock: Final = _Clock()
         redis: Final = fake_redis_cache()
-        cache: Final = UserApiKeyCache(
-            redis_cache=_SlowWrite(redis.cache, clock, seconds=write_seconds),
-            serve_last_good_entries=True,
-            last_good_clock=clock,
-        )
+        cache: Final = _cache_on_driven_clocks(monkeypatch, clock, _SlowWrite(redis.cache, clock, seconds=100))
+        expire_at: Final = math.floor(clock.wall() + LAST_GOOD_ENTRY_TTL_SECONDS)
 
         with last_good_reads_started_at(clock()):
             await remember_last_good(cache, "team_id:t1", self._team("t1"))
 
-        in_redis: Final = await redis.cache.init_async_client().get("last_good:team_id:t1")
-        assert (in_redis is not None, cache.last_good_memory.get("team_id:t1") is not None) == (kept, kept)
+        assert await redis.cache.init_async_client().expiretime("last_good:team_id:t1") == expire_at
+        clock.move_to_wall(expire_at - 0.01)
+        assert await _held_in(redis.cache, cache, "team_id:t1") == (True, True)
+        clock.move_to_wall(expire_at + 0.01)
+        assert await _held_in(redis.cache, cache, "team_id:t1") == (False, False)
+
+    @pytest.mark.asyncio
+    async def test_a_late_set_whose_check_and_undo_both_fail_leaves_an_entry_that_ends_at_the_reads_deadline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Redis runs the SET 100 s late and is lost right after it, so the tombstone check after the write and the
+        undo both fail, and Redis comes back later: the entry left in Redis ends at the read's deadline, as its
+        absolute expiry says, not 100 s past it, and this pod keeps no memory line."""
+        clock: Final = _Clock()
+        redis: Final = fake_redis_cache()
+        cache: Final = _cache_on_driven_clocks(
+            monkeypatch, clock, _LostRightAfterASlowWrite(redis.cache, redis.server, clock, seconds=100)
+        )
+        expire_at: Final = math.floor(clock.wall() + LAST_GOOD_ENTRY_TTL_SECONDS)
+
+        with last_good_reads_started_at(clock()):
+            await remember_last_good(cache, "team_id:t1", self._team("t1"))
+        redis.server.connected = True
+
+        clock.move_to_wall(expire_at - 0.01)
+        assert await _held_in(redis.cache, cache, "team_id:t1") == (True, False)
+        clock.move_to_wall(expire_at + 0.01)
+        assert await _held_in(redis.cache, cache, "team_id:t1") == (False, False)
+
+    @pytest.mark.asyncio
+    async def test_a_store_whose_end_passed_before_it_began_sends_no_set_and_keeps_the_earlier_entry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A 10 s expiry, and a read that began 9.5 s ago a quarter second into a Unix second: rounded down to a whole
+        second, its end has passed when the store begins. No SET is sent and nothing goes into memory, so the entry an
+        earlier read kept stays in Redis and in memory until its own expiry."""
+        monkeypatch.setattr(  # test-quality-ok: the store reads the entry's expiry from this module's constant
+            "litellm.proxy.common_utils.user_api_key_cache.LAST_GOOD_ENTRY_TTL_SECONDS", 10
+        )
+        clock: Final = _Clock()
+        redis: Final = _SlowWrite(fake_redis_cache().cache, clock, seconds=0.0)
+        cache: Final = _cache_on_driven_clocks(monkeypatch, clock, redis)
+        before: Final = self._team("t1", alias="before")
+        with last_good_reads_started_at(clock()):
+            await remember_last_good(cache, "team_id:t1", before)
+        redis.set_keys.clear()
+
+        with last_good_reads_started_at(clock() - 9.5):
+            await remember_last_good(cache, "team_id:t1", self._team("t1", alias="after"))
+
+        assert redis.set_keys == []
+        assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) == before
+        assert cache.last_good_memory.get("team_id:t1") == CacheCodec.serialize(before)
+
+    @pytest.mark.asyncio
+    async def test_the_memory_line_and_the_redis_entry_end_at_the_same_instant(self, monkeypatch: pytest.MonkeyPatch):
+        """The wall clock is a quarter second into a Unix second, so the end, rounded down to a whole second, comes a
+        quarter second before the read's full expiry: both copies are there just before that instant and both are gone
+        just after it."""
+        clock: Final = _Clock()
+        redis: Final = fake_redis_cache()
+        cache: Final = _cache_on_driven_clocks(monkeypatch, clock, redis.cache)
+        expire_at: Final = math.floor(clock.wall() + LAST_GOOD_ENTRY_TTL_SECONDS)
+
+        with last_good_reads_started_at(clock()):
+            await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        clock.move_to_wall(expire_at - 0.01)
+        assert await _held_in(redis.cache, cache, "team_id:t1") == (True, True)
+        clock.move_to_wall(expire_at + 0.01)
+        assert await _held_in(redis.cache, cache, "team_id:t1") == (False, False)
 
     @pytest.mark.asyncio
     async def test_memory_line_answers_while_redis_is_away(self):

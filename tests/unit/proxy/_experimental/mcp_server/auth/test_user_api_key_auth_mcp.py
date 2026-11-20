@@ -10901,11 +10901,12 @@ def test_guardrail_bearer_respects_custom_admission_header(monkeypatch: pytest.M
 @pytest.mark.parametrize(
     "path", ["/mcp", "/.well-known/oauth-protected-resource"], ids=["through_user_api_key_auth", "public_route"]
 )
-async def test_each_mcp_request_starts_its_own_auth_reads(path: str) -> None:
+async def test_each_mcp_request_starts_its_own_auth_reads(path: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """The MCP SDK runs a stateful session's message handler in a copy of the context of the HTTP request that posted
     the message, so that request's auth sets the start the handler's reads count from. It sets a new one even when its
     context holds a start 600 s old, both on the branch that reaches user_api_key_auth (mocked here, so it records no
     start itself) and on the public route that never does: the store after it is kept for the whole expiry."""
+    import math
     import time
 
     from litellm.constants import LAST_GOOD_ENTRY_TTL_SECONDS
@@ -10915,10 +10916,14 @@ async def test_each_mcp_request_starts_its_own_auth_reads(path: str) -> None:
         last_good_reads_started_at,
         remember_last_good,
     )
-    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+    from tests.unit.caching.fake_redis_cache import drive_fake_redis_time, fake_redis_cache
 
+    wall: Final = 1_700_000_000.25
+    drive_fake_redis_time(monkeypatch, lambda: wall)
     redis: Final = fake_redis_cache()
-    cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+    cache: Final = UserApiKeyCache(
+        redis_cache=redis.cache, serve_last_good_entries=True, last_good_wall_clock=lambda: wall
+    )
     scope: Final = {"type": "http", "method": "POST", "path": path, "headers": [(b"x-litellm-api-key", b"sk-1234")]}
 
     with (
@@ -10931,4 +10936,8 @@ async def test_each_mcp_request_starts_its_own_auth_reads(path: str) -> None:
         await MCPRequestHandler.process_mcp_request(scope)
         await remember_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj(team_id="t1"))
 
-    assert await redis.cache.init_async_client().ttl("last_good:team_id:t1") == LAST_GOOD_ENTRY_TTL_SECONDS
+    # The whole expiry after the request's start, rounded down to a whole second: the real time from that start to
+    # the store, under a second, may take one more second off
+    whole_expiry: Final = math.floor(wall + LAST_GOOD_ENTRY_TTL_SECONDS)
+    expire_at: Final = await redis.cache.init_async_client().expiretime("last_good:team_id:t1")
+    assert expire_at in (whole_expiry - 1, whole_expiry)

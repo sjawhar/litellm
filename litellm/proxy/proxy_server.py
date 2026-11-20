@@ -5201,6 +5201,54 @@ def _attach_redis_usage_cache(redis_cache: RedisCache, enable_redis_auth_cache: 
     litellm_config_cache.redis_cache = redis_cache
 
 
+# SET EXAT, by which a last good auth entry's Redis copy ends at its deadline, came in Redis 6.2
+_LAST_GOOD_MIN_REDIS_VERSION: Final = (6, 2)
+_REDIS_VERSION_MAJOR_MINOR: Final = re.compile(r"(\d+)\.(\d+)")
+
+
+def _redis_major_minor(version: str) -> tuple[int, int]:
+    """``(7, 2)`` for ``7.2.4``, ``7.2`` or ``7.2.4-rc1``; raises ``ValueError`` when ``version`` does not start with
+    major.minor."""
+    parsed: Final = _REDIS_VERSION_MAJOR_MINOR.match(version)
+    if parsed is None:
+        raise ValueError(f"redis_version {version!r} does not start with major.minor")
+    return int(parsed.group(1)), int(parsed.group(2))
+
+
+async def _check_last_good_redis_version(cache: UserApiKeyCache) -> None:
+    """
+    Turns ``serve_last_good_entries`` off, with an error naming both versions, when the auth cache's Redis is older
+    than 6.2: a last good entry's Redis copy ends at its deadline by SET EXAT, which an older server rejects. Reads
+    nothing when the setting is off or the auth cache has no Redis.
+
+    A version that cannot be read leaves the setting on with a warning, since that is safe: a store against a server
+    that rejects EXAT fails, keeps nothing in Redis or in memory, and logs a warning.
+    """
+    redis: Final = cache.redis_cache
+    if not cache.serve_last_good_entries or redis is None:
+        return
+    try:
+        version: Final = await redis.async_server_version()
+        found: Final = _redis_major_minor(version)
+    except Exception as e:  # noqa: BLE001  # an unread version must not stop start-up; a failed EXAT SET keeps nothing
+        verbose_proxy_logger.warning(
+            "general_settings.serve_last_good_auth_entries stays on, but the Redis version could not be read from "
+            "INFO (%s): last good auth entries need Redis %s.%s or later for SET EXAT, and on an older Redis each "
+            "store fails with a warning and keeps nothing",
+            e,
+            *_LAST_GOOD_MIN_REDIS_VERSION,
+        )
+        return
+    if found < _LAST_GOOD_MIN_REDIS_VERSION:
+        verbose_proxy_logger.error(
+            "general_settings.serve_last_good_auth_entries is turned off: Redis %s does not support SET EXAT, which "
+            "last good auth entries need to end at their deadline; it needs Redis %s.%s or later",
+            version,
+            *_LAST_GOOD_MIN_REDIS_VERSION,
+        )
+        cache.serve_last_good_entries = False
+
+
 def resolve_routing_plugins(
     plugin_paths: list,
     config_file_path: str | None,
@@ -6999,6 +7047,8 @@ class ProxyConfig:
                     LAST_GOOD_LATE_STORE_MARGIN_SECONDS,
                 )
                 user_api_key_cache.serve_last_good_entries = False
+            # A last good entry's Redis copy ends at its deadline by SET EXAT, which Redis before 6.2 rejects
+            await _check_last_good_redis_version(user_api_key_cache)
             cached_object_ttl: Final = get_management_object_ttl(user_api_key_cache)
             if user_api_key_cache.serve_last_good_entries and LAST_GOOD_ENTRY_TTL_SECONDS < cached_object_ttl:
                 verbose_proxy_logger.warning(
@@ -10649,6 +10699,9 @@ class ProxyStartupEvent:
             coordination_redis_cache,
             enable_redis_auth_cache=litellm_settings.get("enable_redis_auth_cache", False) is True,
         )
+        # load_config checked the Redis the auth cache had then; a Redis attached to it only now needs the same check
+        if user_api_key_cache.redis_cache is coordination_redis_cache:
+            await _check_last_good_redis_version(user_api_key_cache)
         if llm_router is not None and llm_router.cache.redis_cache is None:
             llm_router.update_redis_cache(cache=coordination_redis_cache)
         verbose_proxy_logger.info(

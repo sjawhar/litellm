@@ -2296,11 +2296,12 @@ async def test_a_second_auth_run_600_s_after_the_first_in_one_context_keeps_its_
         moved[0] += 600
         await auth_run_then_store("second")
 
-    moved[0] += LAST_GOOD_ENTRY_TTL_SECONDS - 1
+    # The store rounds the end down to a whole second of the real wall clock, so it may come up to a second early
+    moved[0] += LAST_GOOD_ENTRY_TTL_SECONDS - 2
     assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) == LiteLLM_TeamTableCachedObj(
         team_id="t1", team_alias="second"
     )
-    moved[0] += 1
+    moved[0] += 2
     assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
 
 

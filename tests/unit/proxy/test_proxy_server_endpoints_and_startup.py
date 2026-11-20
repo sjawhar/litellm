@@ -15269,6 +15269,149 @@ async def test_load_config_turns_last_good_entries_off_when_no_store_could_compl
         assert "LAST_GOOD_LATE_STORE_MARGIN_SECONDS=5" in refusals[0]
 
 
+_REDIS_6_0_16_TURNS_LAST_GOOD_OFF: Final = (
+    "general_settings.serve_last_good_auth_entries is turned off: Redis 6.0.16 does not support SET EXAT, which last "
+    "good auth entries need to end at their deadline; it needs Redis 6.2 or later"
+)
+
+
+def _redis_version_unread_warning(reason: str) -> str:
+    return (
+        "general_settings.serve_last_good_auth_entries stays on, but the Redis version could not be read from INFO "
+        f"({reason}): last good auth entries need Redis 6.2 or later for SET EXAT, and on an older Redis each store "
+        "fails with a warning and keeps nothing"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("answer", "kept", "notice"),
+    [
+        ("6.0.16", False, ("ERROR", _REDIS_6_0_16_TURNS_LAST_GOOD_OFF)),
+        ("6.2.0", True, None),
+        ("7.4.1", True, None),
+        ("6.2", True, None),
+        ("7.2.4-rc1", True, None),
+        (ConnectionError("Connection refused"), True, ("WARNING", _redis_version_unread_warning("Connection refused"))),
+        (
+            "unknown",
+            True,
+            ("WARNING", _redis_version_unread_warning("redis_version 'unknown' does not start with major.minor")),
+        ),
+    ],
+    ids=["6.0.16", "6.2.0", "7.4.1", "6.2", "release_candidate", "unreachable", "unparseable"],
+)
+async def test_load_config_checks_the_redis_version_last_good_entries_need(
+    tmp_path, monkeypatch, caplog, answer: str | Exception, kept: bool, notice: tuple[str, str] | None
+):
+    """A last good entry's Redis copy ends at its deadline by SET EXAT, which Redis before 6.2 rejects: an older server
+    turns the setting off with an error naming the version found and the one needed, and 6.2 or later, read as numbers
+    whatever follows major.minor, stays on without a word. A version that cannot be read keeps the setting on with a
+    warning, since a store the server rejects keeps nothing."""
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from litellm.proxy.proxy_server import ProxyConfig
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis: Final = fake_redis_cache()
+    # fakeredis has no INFO, so the RedisCache the auth cache holds gives the server's answer
+    server_version: Final = AsyncMock(side_effect=[answer])
+    monkeypatch.setattr(redis.cache, "async_server_version", server_version)
+    config_file: Final = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump({"general_settings": {"serve_last_good_auth_entries": True}}))
+    cache: Final = UserApiKeyCache(redis_cache=redis.cache)
+    monkeypatch.setattr(
+        proxy_server_module, "user_api_key_cache", cache
+    )  # test-quality-ok: load_config reads this module global; no injection seam
+    monkeypatch.setattr(
+        proxy_server_module, "general_settings", {}, raising=False
+    )  # test-quality-ok: load_config writes this module global; each test starts from an empty one
+    caplog.set_level(logging.WARNING, logger="LiteLLM Proxy")
+
+    await ProxyConfig().load_config(router=None, config_file_path=str(config_file))
+
+    notices: Final = [(r.levelname, r.getMessage()) for r in caplog.records if "SET EXAT" in r.getMessage()]
+    assert (cache.serve_last_good_entries, server_version.await_count) == (kept, 1)
+    assert notices == ([] if notice is None else [notice])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("serve_last_good", "with_redis"), [(True, False), (False, True)], ids=["no_redis_on_the_auth_cache", "setting_off"]
+)
+async def test_load_config_reads_no_redis_version_without_last_good_entries_in_redis(
+    tmp_path, monkeypatch, caplog, serve_last_good: bool, with_redis: bool
+):
+    """Only a last good entry's Redis copy needs SET EXAT: with the setting off, or no Redis on the auth cache,
+    start-up sends no INFO and logs no version line."""
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from litellm.proxy.proxy_server import ProxyConfig
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    server_version: Final = AsyncMock(return_value="6.0.16")
+    monkeypatch.setattr(
+        RedisCache, "async_server_version", server_version
+    )  # test-quality-ok: records an INFO read on any RedisCache, including when the auth cache holds none
+    config_file: Final = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump({"general_settings": {"serve_last_good_auth_entries": serve_last_good}}))
+    cache: Final = UserApiKeyCache(redis_cache=fake_redis_cache().cache if with_redis else None)
+    monkeypatch.setattr(
+        proxy_server_module, "user_api_key_cache", cache
+    )  # test-quality-ok: load_config reads this module global; no injection seam
+    monkeypatch.setattr(
+        proxy_server_module, "general_settings", {}, raising=False
+    )  # test-quality-ok: load_config writes this module global; each test starts from an empty one
+    caplog.set_level(logging.WARNING, logger="LiteLLM Proxy")
+
+    await ProxyConfig().load_config(router=None, config_file_path=str(config_file))
+
+    assert (cache.serve_last_good_entries, server_version.await_count) == (serve_last_good, 0)
+    assert [r.getMessage() for r in caplog.records if "SET EXAT" in r.getMessage()] == []
+
+
+class _Redis6016Cache(_EnvBuiltRedisCache):
+    """The coordination Redis stand-in, answering INFO as Redis 6.0.16, which has no SET EXAT."""
+
+    async def async_server_version(self) -> str:
+        return "6.0.16"
+
+
+@pytest.mark.asyncio
+async def test_startup_checks_the_redis_version_of_the_database_coordination_redis_it_attaches_to_the_auth_cache(
+    caplog,
+):
+    """The coordination Redis saved in the database reaches the auth cache only after load_config checked it, so its
+    version is checked as it is attached: Redis 6.0.16 turns last good entries off with the same error."""
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    caplog.set_level(logging.WARNING, logger="LiteLLM Proxy")
+    with (
+        _patched_coordination_redis_module_state(
+            spend_cache=DualCache(),
+            config_cache=types.SimpleNamespace(redis_cache=None),
+            redis_cache_class=_Redis6016Cache,
+        ),
+        patch.object(
+            proxy_server_module, "user_api_key_cache", cache
+        ),  # test-quality-ok: the attach writes this module global; no injection seam
+        patch.object(
+            proxy_server_module,
+            "get_persisted_coordination_redis_settings",
+            AsyncMock(return_value={"host": "db-host", "port": 6381}),
+        ),  # test-quality-ok: the row the admin UI saves; no database in this unit test
+    ):
+        result: Final = await proxy_server_module.ProxyStartupEvent.init_coordination_redis_from_db(
+            litellm_settings={"enable_redis_auth_cache": True},
+            llm_router=None,
+        )
+
+    assert isinstance(result, _Redis6016Cache)
+    assert (cache.redis_cache is result, cache.serve_last_good_entries) == (True, False)
+    assert [r.getMessage() for r in caplog.records if "SET EXAT" in r.getMessage()] == [
+        _REDIS_6_0_16_TURNS_LAST_GOOD_OFF
+    ]
+
+
 def test_docs_redoc_openapi_are_reachable_by_default():
     """
     LIT-6745: the interactive/machine-readable docs surfaces are on by

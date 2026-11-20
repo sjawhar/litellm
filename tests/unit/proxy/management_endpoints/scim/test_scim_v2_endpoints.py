@@ -1,7 +1,7 @@
 import json
 import logging
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from itertools import chain
 from types import MappingProxyType
 from typing import Final
@@ -12,6 +12,7 @@ from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
 from pytest_mock import MockerFixture
 
+from litellm.constants import LAST_GOOD_TOMBSTONE_TTL_SECONDS
 from litellm.proxy._types import (
     LiteLLM_TeamTable,
     LiteLLM_UserTable,
@@ -23,6 +24,7 @@ from litellm.proxy._types import (
     ProxyException,
     UserAPIKeyAuth,
 )
+from litellm.proxy.common_utils.user_api_key_cache import LAST_GOOD_LATE_STORE_MARGIN_SECONDS
 from litellm.proxy.management_endpoints.scim.scim_v2 import (
     SCIMRosterSyncError,
     UserProvisionerHelpers,
@@ -6413,11 +6415,26 @@ def _unreachable_redis() -> FakeRedisCache:
     return redis
 
 
+class _DrivenClock:
+    """The last good entries' clock, which a test moves instead of waiting."""
+
+    def __init__(self) -> None:
+        self.now: float = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
 def _scim_user_with_a_key(
-    mocker: MockerFixture, *, serves_last_good: bool, redis: FakeRedisCache | None = None
+    mocker: MockerFixture,
+    *,
+    serves_last_good: bool,
+    redis: FakeRedisCache | None = None,
+    last_good_clock: Callable[[], float] = time.monotonic,
 ) -> MagicMock:
     """An active SCIM user on team-1's roster holding one unblocked key, behind ``redis`` (an unreachable one when
-    none is given) with last good entries served or not. Every write is a mock the test can check."""
+    none is given) with last good entries served or not, on ``last_good_clock``. Every write is a mock the test can
+    check."""
     from litellm.proxy._types import LiteLLM_VerificationToken
     from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 
@@ -6441,6 +6458,7 @@ def _scim_user_with_a_key(
         UserApiKeyCache(
             redis_cache=(redis if redis is not None else _unreachable_redis()).cache,
             serve_last_good_entries=serves_last_good,
+            last_good_clock=last_good_clock,
         ),
     )
     mocker.patch(  # test-quality-ok: endpoint collaborators are module-level, not injectable
@@ -6784,3 +6802,144 @@ async def test_scim_user_delete_blocks_only_the_keys_it_revoked_when_redis_is_lo
     _assert_only_the_key_read_first_was_blocked_and_revoked(prisma, created_key_hash)
     referencing_rows.assert_awaited_once()
     prisma.db.litellm_usertable.delete.assert_awaited_once()
+
+
+# Past this since a revocation, the request's record no longer skips Redis for the key: its tombstone may lapse first
+_PAST_THE_RECORD: Final = LAST_GOOD_TOMBSTONE_TTL_SECONDS - LAST_GOOD_LATE_STORE_MARGIN_SECONDS + 1
+
+
+def _outlasts_the_tombstones(
+    redis: FakeRedisCache, clock: _DrivenClock, *, loses_redis: bool
+) -> Callable[..., Awaitable[object]]:
+    """A write mock's side effect: the write takes past the time the request's record of its revocations allows, the
+    tombstones in Redis lapse meanwhile, and Redis is lost once it lands when ``loses_redis``. The write answers as
+    configured."""
+
+    async def outlast(*_args: object, **_kwargs: object) -> object:
+        clock.now += _PAST_THE_RECORD
+        client: Final = redis.cache.init_async_client()
+        lapsed: Final = await client.keys("last_good_tombstone:*")
+        if lapsed:
+            await client.delete(*lapsed)
+        if loses_redis:
+            redis.server.connected = False
+        return DEFAULT
+
+    return outlast
+
+
+def _deactivate(method: str) -> Awaitable[SCIMUser]:
+    return (
+        update_user(user_id=_SCIM_USER_ID, user=_scim_put(active=False))
+        if method == "PUT"
+        else patch_user(user_id=_SCIM_USER_ID, patch_ops=_deactivation_patch())
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["PUT", "PATCH"])
+async def test_scim_deactivation_revokes_its_key_again_when_the_user_row_update_outlasts_the_tombstones(mocker, method):
+    """The preflight revokes the user and its key, then the user row update waits past the time the request's record
+    of that revocation allows and the key's tombstone lapses meanwhile, so another pod may store the key's entry
+    again. The block revokes the key again right before it writes: the key's tombstone stands again in Redis when the
+    key's row is blocked."""
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    prisma: Final = _scim_user_with_a_key(mocker, serves_last_good=True, redis=redis, last_good_clock=clock)
+    prisma.db.litellm_usertable.update.side_effect = _outlasts_the_tombstones(redis, clock, loses_redis=False)
+    tombstone_stood: Final[list[bool]] = []  # mutable-ok: one entry for each key row write
+
+    async def block_key(*_args: object, **_kwargs: object) -> object:
+        tombstone: Final = f"last_good_tombstone:{_SCIM_KEY_HASH}"
+        tombstone_stood.append(await redis.cache.init_async_client().exists(tombstone) == 1)
+        return DEFAULT
+
+    prisma.db.litellm_verificationtoken.update.side_effect = block_key
+
+    scim_user: Final = await _deactivate(method)
+
+    assert scim_user.id == _SCIM_USER_ID
+    assert tombstone_stood == [True]
+    prisma.db.litellm_verificationtoken.update.assert_awaited_once_with(
+        where={"token": _SCIM_KEY_HASH}, data={"blocked": True, "metadata": json.dumps({"scim_blocked": True})}
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["PUT", "PATCH"])
+async def test_scim_deactivation_answers_503_and_blocks_no_key_when_redis_is_lost_after_the_tombstones_lapsed(
+    mocker, method
+):
+    """The same slow user row update, with Redis lost once it lands: the key's revocation has to reach Redis again and
+    cannot, so the request answers 503 and the key is not blocked."""
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    prisma: Final = _scim_user_with_a_key(mocker, serves_last_good=True, redis=redis, last_good_clock=clock)
+    prisma.db.litellm_usertable.update.side_effect = _outlasts_the_tombstones(redis, clock, loses_redis=True)
+
+    with pytest.raises(ProxyException) as refused:
+        await _deactivate(method)
+
+    assert str(refused.value.code) == "503"
+    prisma.db.litellm_usertable.update.assert_awaited_once()
+    prisma.db.litellm_verificationtoken.update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_scim_put_deactivation_answers_503_before_the_user_row_update_when_a_team_removal_outlasts_the_tombstones(
+    mocker,
+):
+    """A PUT deactivates the user and moves it from team-1 to team-2. The removal from team-1 takes past the time the
+    request's record allows and Redis is lost once it lands: the user row update revokes the user again right before
+    it and cannot, so the PUT answers 503 with the user row not updated and no key blocked."""
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    prisma: Final = _scim_user_with_a_key(mocker, serves_last_good=True, redis=redis, last_good_clock=clock)
+    mocker.patch(  # test-quality-ok: the roster writes are module-level, not injectable
+        f"{_SCIM_MODULE}.team_member_add", AsyncMock()
+    )
+    member_delete: Final = mocker.patch(  # test-quality-ok: the roster writes are module-level, not injectable
+        f"{_SCIM_MODULE}.team_member_delete",
+        AsyncMock(side_effect=_outlasts_the_tombstones(redis, clock, loses_redis=True)),
+    )
+
+    with pytest.raises(ProxyException) as refused:
+        await update_user(user_id=_SCIM_USER_ID, user=_scim_put(active=False, groups=["team-2"]))
+
+    assert str(refused.value.code) == "503"
+    member_delete.assert_awaited_once()
+    prisma.db.litellm_usertable.update.assert_not_awaited()
+    prisma.db.litellm_verificationtoken.update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("holds_a_key", [True, False], ids=["holding-a-key", "holding-no-key"])
+async def test_scim_user_delete_answers_503_with_the_user_kept_when_its_first_write_outlasts_the_tombstones(
+    mocker, holds_a_key
+):
+    """The DELETE's first write, the team's legacy roster, takes past the time the request's record allows and Redis
+    is lost once it lands. The next write that ends an access revokes it again right before it and cannot: the key's
+    block when the user holds a key, else the deletes of the user's memberships and row. The DELETE answers 503 with
+    the user row not deleted."""
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    prisma: Final = _scim_user_with_a_key(mocker, serves_last_good=True, redis=redis, last_good_clock=clock)
+    if not holds_a_key:
+        prisma.db.litellm_verificationtoken.find_many = AsyncMock(return_value=[])
+    prisma.db.litellm_teamtable.update.side_effect = _outlasts_the_tombstones(redis, clock, loses_redis=True)
+    # Stands in for /team/member_delete without the revocation it runs, so the refusal is the DELETE's own
+    mocker.patch(  # test-quality-ok: the roster writes are module-level, not injectable
+        f"{_SCIM_MODULE}.team_member_delete", AsyncMock()
+    )
+    referencing_rows: Final = mocker.patch(  # test-quality-ok: the row cleanup is module-level, not injectable
+        f"{_SCIM_MODULE}._delete_rows_referencing_user", AsyncMock()
+    )
+
+    with pytest.raises(ProxyException) as refused:
+        await delete_user(user_id=_SCIM_USER_ID)
+
+    assert str(refused.value.code) == "503"
+    prisma.db.litellm_teamtable.update.assert_awaited_once()
+    prisma.db.litellm_verificationtoken.update.assert_not_awaited()
+    referencing_rows.assert_not_awaited()
+    prisma.db.litellm_usertable.delete.assert_not_awaited()
