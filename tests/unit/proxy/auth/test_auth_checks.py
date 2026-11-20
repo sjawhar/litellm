@@ -1733,8 +1733,8 @@ class _HeldTeamRows(_TeamRows):
 
 
 class TestLastGoodEntryWhileTheDatabaseIsUnreachable:
-    """R69: a team or key the database last answered for is served while the database is unreachable,
-    whatever the age of its cached entry; an unknown or missing one is refused."""
+    """A team or key the database last answered for is served while the database is unreachable, once its cached
+    object is gone, until its last good entry expires; an unknown or missing one is refused."""
 
     @staticmethod
     async def _expire(cache: UserApiKeyCache, *keys: str) -> None:

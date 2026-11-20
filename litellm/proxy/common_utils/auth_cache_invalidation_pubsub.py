@@ -134,9 +134,10 @@ async def evict_and_broadcast(cache_keys: Sequence[str], user_api_key_cache: "Us
 
     Every endpoint that mutates a cached object must call this: auth serves those objects
     cache-first with no freshness check, so a mutation that leaves the entry in place keeps the
-    stale object enforced until its TTL expires (LIT-3803), and a last good entry, which never
-    expires, would serve it during every later database outage. Best-effort: the DB write has
-    already committed, so a cache backend error must not fail the endpoint.
+    stale object enforced until its TTL expires (LIT-3803), and a last good entry, which lasts until
+    LAST_GOOD_ENTRY_TTL_SECONDS after the database read that stored it, would serve it during any
+    database outage until then. Best-effort: the DB write has already committed, so a cache backend
+    error must not fail the endpoint.
     """
     for cache_key in cache_keys:
         try:

@@ -838,9 +838,9 @@ async def forget_last_good(cache: DualCache, cache_key: str, *, tombstone: bool 
     entry as it was before the update stays until its expiry, ``LAST_GOOD_ENTRY_TTL_SECONDS`` after the database
     read that stored it, and a database outage until then can serve it.
 
-    ``tombstone`` is for a delete or a block: for ``LAST_GOOD_TOMBSTONE_TTL_SECONDS``, longer than any database
-    read takes, no read may store the entry again, so a read that was in flight when the row changed cannot bring
-    the old entry back."""
+    ``tombstone`` is for a delete or a block: for ``LAST_GOOD_TOMBSTONE_TTL_SECONDS`` no read may store the entry
+    again, and a store that completes that time less ``LAST_GOOD_LATE_STORE_MARGIN_SECONDS`` or more after its read
+    began keeps nothing, so a read that was in flight when the row changed cannot bring the old entry back."""
     store: Final = _last_good_store(cache)
     if store is None:
         return
@@ -907,13 +907,13 @@ def _refused_revocation(cache_keys: Sequence[str], why: str, retry: str) -> HTTP
 
 async def revoke_last_good(cache: DualCache, cache_keys: Sequence[str]) -> None:
     """Tombstone and drop the last good entries a request is about to revoke, before it writes anything. Only these
-    revocations are strict: a delete or a block of a key, team, user, organization, project or customer, the
-    revocations of the restricted-customer registry, a key's regenerate or rotate (for its old token), a key's
-    ``expires`` moved to now or earlier, a team or organization membership removal, and a SCIM deactivation or delete
-    of a user. With ``serve_last_good_auth_entries`` on, a Redis that cannot record the revocation refuses the request
-    with 503: nothing has changed yet and the operator retries, rather than a revoked credential staying, until its
-    expiry, where a database outage serves it. Every other update evicts after its write, best effort
-    (``forget_last_good``).
+    revocations are strict: a delete of a key, team, user, organization, project or customer, a block of a key, team,
+    project or customer, the revocations of the restricted-customer registry, a key's regenerate or rotate (for its
+    old token), a key's ``expires`` moved to now or earlier, a team or organization membership removal, and a SCIM
+    deactivation or delete of a user. With ``serve_last_good_auth_entries`` on, a Redis that cannot record the
+    revocation refuses the request with 503: nothing has changed yet and the operator retries, rather than a revoked
+    credential staying, until its expiry, where a database outage serves it. Every other update evicts after its
+    write, best effort (``forget_last_good``).
 
     It returns only when every key's tombstone stands for more than ``LAST_GOOD_LATE_STORE_MARGIN_SECONDS``, so the
     write the caller makes right after it runs while they all stand. A pass records the tombstones of every key not
