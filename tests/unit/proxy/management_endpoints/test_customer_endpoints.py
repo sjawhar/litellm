@@ -1085,8 +1085,8 @@ def test_customer_new_invalidates_end_user_and_registry_caches(mock_prisma_clien
         )
 
     assert response.status_code == 200, response.text
-    assert recording_cache.deleted == ["end_user_id:c1", "end_user_restricted_registry"]
-    assert _published_keys(mock_publish) == ["end_user_id:c1", "end_user_restricted_registry"]
+    assert recording_cache.deleted == ["end_user_id:c1", "end_user_validation:c1", "end_user_restricted_registry"]
+    assert _published_keys(mock_publish) == ["end_user_id:c1", "end_user_validation:c1", "end_user_restricted_registry"]
 
 
 def test_customer_update_invalidates_end_user_and_registry_caches(mock_prisma_client, mock_user_api_key_auth):
@@ -1104,8 +1104,8 @@ def test_customer_update_invalidates_end_user_and_registry_caches(mock_prisma_cl
         )
 
     assert response.status_code == 200, response.text
-    assert recording_cache.deleted == ["end_user_id:c1", "end_user_restricted_registry"]
-    assert _published_keys(mock_publish) == ["end_user_id:c1", "end_user_restricted_registry"]
+    assert recording_cache.deleted == ["end_user_id:c1", "end_user_validation:c1", "end_user_restricted_registry"]
+    assert _published_keys(mock_publish) == ["end_user_id:c1", "end_user_validation:c1", "end_user_restricted_registry"]
 
 
 def test_customer_block_invalidates_end_user_and_registry_caches(mock_prisma_client, mock_user_api_key_auth):
@@ -1124,12 +1124,16 @@ def test_customer_block_invalidates_end_user_and_registry_caches(mock_prisma_cli
     assert response.status_code == 200, response.text
     assert recording_cache.deleted == [
         "end_user_id:c1",
+        "end_user_validation:c1",
         "end_user_id:c2",
+        "end_user_validation:c2",
         "end_user_restricted_registry",
     ]
     assert _published_keys(mock_publish) == [
         "end_user_id:c1",
+        "end_user_validation:c1",
         "end_user_id:c2",
+        "end_user_validation:c2",
         "end_user_restricted_registry",
     ]
 
@@ -1154,12 +1158,16 @@ def test_customer_delete_invalidates_end_user_and_registry_caches(mock_prisma_cl
     assert response.status_code == 200, response.text
     assert recording_cache.deleted == [
         "end_user_id:c1",
+        "end_user_validation:c1",
         "end_user_id:c2",
+        "end_user_validation:c2",
         "end_user_restricted_registry",
     ]
     assert _published_keys(mock_publish) == [
         "end_user_id:c1",
+        "end_user_validation:c1",
         "end_user_id:c2",
+        "end_user_validation:c2",
         "end_user_restricted_registry",
     ]
 
@@ -1231,6 +1239,13 @@ class _BudgetRows:
         row = self.rows[where["budget_id"]].model_copy(update=data)
         self.rows[where["budget_id"]] = row
         return row
+
+
+class _EmptyTable:
+    """A table with no row for any lookup: the user table, which end-user id validation also reads."""
+
+    async def find_unique(self, where: object = None, include: object = None) -> None:
+        return None
 
 
 def _serve_end_user_rows(
@@ -1508,3 +1523,31 @@ async def test_a_customer_budget_lowered_while_redis_is_down_drops_the_entry_thi
 
     with pytest.raises(LastGoodEntryMissing):
         await customer()
+
+
+@pytest.mark.asyncio
+async def test_a_customer_created_after_a_request_found_its_id_invalid_is_kept_by_the_next_request(monkeypatch):
+    """With end-user ids validated and no default budget, a request naming an id no row holds caches the verdict
+    "invalid" and drops the id. Creating that customer with a model restriction evicts the verdict, so the next request
+    keeps the id and the restriction applies, rather than the id being dropped until the verdict lapses."""
+    from litellm.proxy.auth.auth_checks import resolve_and_validate_end_user_id
+    from litellm.proxy.management_endpoints.customer_endpoints import new_end_user
+
+    monkeypatch.setattr("litellm.validate_end_user_id_in_db", True)
+    monkeypatch.setattr("litellm.max_end_user_budget_id", None)
+    rows: Final = _EndUserRows()
+    cache: Final = UserApiKeyCache()
+    _serve_end_user_rows(monkeypatch, rows, cache)
+    database: Final = SimpleNamespace(db=SimpleNamespace(litellm_endusertable=rows, litellm_usertable=_EmptyTable()))
+
+    async def resolve() -> str | None:
+        return await resolve_and_validate_end_user_id(
+            raw_end_user_id="c1",
+            prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+            user_api_key_cache=cache,
+        )
+
+    assert (await resolve(), await cache.async_get_cache("end_user_validation:c1")) == (None, "invalid")
+    await new_end_user(data=NewCustomerRequest(user_id="c1", models=["m1"]), user_api_key_dict=_ADMIN)
+
+    assert await resolve() == "c1"

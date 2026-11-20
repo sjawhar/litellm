@@ -114,6 +114,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     default_end_user_budget_cache_key,
     end_user_cache_key,
     end_user_restricted_registry_cache_key,
+    end_user_validation_cache_key,
     forget_last_good,
     forget_missing_last_good,
     get_management_object_ttl,
@@ -2223,7 +2224,7 @@ async def resolve_and_validate_end_user_id(
         return raw_end_user_id
 
     has_default_budget: Final = bool(litellm.max_end_user_budget_id) or key_end_user_budget_id is not None
-    cache_key: Final = f"end_user_validation:{raw_end_user_id}"
+    cache_key: Final = end_user_validation_cache_key(raw_end_user_id)
     cached: Final = await _raw_cache(user_api_key_cache).async_get_cache(key=cache_key)
     if cached == _END_USER_VALID_FROM_LAST_GOOD:
         record_last_good_served(_END_USER_VALID_FROM_LAST_GOOD)

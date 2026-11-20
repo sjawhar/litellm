@@ -35,6 +35,7 @@ from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.user_api_key_cache import (
     end_user_cache_key,
     end_user_restricted_registry_cache_key,
+    end_user_validation_cache_key,
     revoke_last_good,
 )
 from litellm.proxy.management_endpoints.common_daily_activity import get_daily_activity
@@ -136,8 +137,12 @@ async def _evict_end_user_cache_keys(cache_keys: Sequence[str]) -> None:
 
 
 def _end_user_cache_keys(user_ids: Sequence[str]) -> tuple[str, ...]:
-    """The per-id entries plus the registry, which any restriction change can move ids in or out of."""
-    return (*(end_user_cache_key(user_id) for user_id in user_ids), end_user_restricted_registry_cache_key())
+    """The per-id entries, the per-id validation verdicts, whose cached "invalid" would drop a customer just created,
+    and the registry, which any restriction change can move ids in or out of."""
+    return (
+        *(key for user_id in user_ids for key in (end_user_cache_key(user_id), end_user_validation_cache_key(user_id))),
+        end_user_restricted_registry_cache_key(),
+    )
 
 
 def _to_customer_response(record: BaseModel) -> CustomerResponse:
