@@ -1304,9 +1304,9 @@ def _deployment_attribution_for_model_group(model_group: object, team_id: str | 
     """Provider fields the router would have stamped had it reached a deployment:
     ``custom_llm_provider`` when every deployment in the group resolves to the same
     provider, plus ``model_info`` and ``deployment`` when the group has exactly one, and ``model_group``
-    whenever the router routes the name: the requested name itself, alias or wildcard match included, which is
-    what the router files a served call under. ``team_id`` picks the key's team deployments over a global group
-    of the same public name."""
+    whenever the router routes the name: the requested name itself (a group, an alias, a wildcard match, a team's
+    public name, a deployment id or a deployment's model name), which is what the router files a served call under.
+    ``team_id`` picks the key's team deployments over a global group of the same public name."""
     if not isinstance(model_group, str):
         return _EMPTY_LIFT
 
@@ -1316,7 +1316,12 @@ def _deployment_attribution_for_model_group(model_group: object, team_id: str | 
         return _EMPTY_LIFT
     deployments: Final = llm_router.get_model_list(model_name=model_group, team_id=team_id)
     if not deployments:
-        return _EMPTY_LIFT
+        # A deployment id or a deployment's own model name routes too, outside any group lookup.
+        return (
+            MappingProxyType({"model_group": model_group})
+            if llm_router.has_model_id(model_group) or model_group in llm_router.deployment_names
+            else _EMPTY_LIFT
+        )
 
     def _provider_for_deployment(deployment: Mapping[str, object]) -> str | None:
         litellm_params: Final = cast(  # cast-ok: router deployment parameters are mapping-shaped
@@ -3936,6 +3941,20 @@ class ProxyLogging:
                 litellm_logging_obj.litellm_params = {
                     key: value for key, value in existing.items() if key not in _BODY_DEPLOYMENT_PARAMS
                 }
+                if litellm_logging_obj.call_type != CallTypes.pass_through.value:
+                    # A group in a metadata bucket that names another model than the one requested came from the body:
+                    # the routes that write their own group before the setup (A2A, the MCP REST tool call, search) write
+                    # the requested model's name. It leaves the request's buckets, which the failure callbacks read, and
+                    # the logging object's; the group the router would file the requested name under is stamped below.
+                    requested: Final = request_data.get("model")
+                    for holder, held_before in ((request_data, _EMPTY_LIFT), (litellm_params, existing)):
+                        holder.update(
+                            {
+                                bucket: {k: v for k, v in held.items() if k != "model_group" or v == requested}
+                                for bucket in ("metadata", "litellm_metadata")
+                                if isinstance(held := holder.get(bucket, held_before.get(bucket)), Mapping)
+                            }
+                        )
             attribution: Final = _stamp_deployment_attribution(
                 litellm_params,
                 request_data.get("model"),
