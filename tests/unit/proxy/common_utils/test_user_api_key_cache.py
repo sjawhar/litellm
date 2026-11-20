@@ -32,6 +32,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     recall_last_good,
     remember_last_good,
     revoke_last_good,
+    revoke_last_good_then,
     start_last_good_reads,
 )
 from litellm.proxy.proxy_server import UserAPIKeyCacheTTLEnum
@@ -1373,3 +1374,29 @@ class TestLastGoodEntries:
             await revoke_last_good(cache, (token,))
 
         assert refused.value.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_a_write_paired_with_its_revocation_runs_only_once_the_revocation_is_recorded(self):
+        """``revoke_last_good_then`` revokes, then writes: with Redis away and the key not revoked by this task, the 503
+        leaves the write unmade; a key this task revoked moments ago needs no Redis, so its write runs; no keys, just
+        the write."""
+        from fastapi import HTTPException
+
+        written: Final[list[str]] = []  # mutable-ok: records each write that ran
+
+        async def write(name: str) -> str:
+            written.append(name)
+            return name
+
+        redis: Final = fake_redis_cache()
+        cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=_Clock())
+        await revoke_last_good(cache, ("hashed-revoked",))
+        redis.server.connected = False
+
+        with pytest.raises(HTTPException) as refused:
+            await revoke_last_good_then(cache, ("hashed-never-revoked",), lambda: write("refused"))
+        kept: Final = await revoke_last_good_then(cache, ("hashed-revoked",), lambda: write("revoked before"))
+        bare: Final = await revoke_last_good_then(cache, (), lambda: write("no keys"))
+
+        assert refused.value.status_code == 503
+        assert (kept, bare, written) == ("revoked before", "no keys", ["revoked before", "no keys"])

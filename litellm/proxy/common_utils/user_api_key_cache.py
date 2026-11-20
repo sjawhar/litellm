@@ -5,7 +5,7 @@ import math
 import re
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from types import TracebackType
@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from litellm.caching.redis_batch import BatchResult
 
 T = TypeVar("T", bound=BaseModel)
+_Written = TypeVar("_Written")
 
 AUTH_OBJECTS_TARGET: Final = "auth_objects"
 
@@ -933,3 +934,14 @@ async def revoke_last_good(cache: DualCache, cache_keys: Sequence[str]) -> None:
             ) from e
     for cache_key in cache_keys:
         store.last_good_memory.tombstone(cache_key, LAST_GOOD_TOMBSTONE_TTL_SECONDS)
+
+
+async def revoke_last_good_then(
+    cache: DualCache, cache_keys: Sequence[str], write: Callable[[], Awaitable[_Written]]
+) -> _Written:
+    """``revoke_last_good`` of ``cache_keys``, then ``write``, with nothing awaited in between: a write that ends what
+    those entries hold. A request that already revoked them, while their tombstones stand, needs no Redis here; once
+    a slow step may have outlasted them, they are revoked again, or the 503 leaves ``write`` unmade. No keys: just the
+    write."""
+    await revoke_last_good(cache, cache_keys)
+    return await write()
