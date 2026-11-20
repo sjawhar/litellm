@@ -11,7 +11,7 @@ import pytest
 import litellm
 from litellm._service_logger import ServiceLogging
 from litellm.caching.redis_cache import RedisCache, RedisCircuitBreakerOpenError
-from tests.unit.caching.fake_redis_cache import fake_redis_cache
+from tests.unit.caching.fake_redis_cache import drive_fake_redis_time, fake_redis_cache
 
 
 @pytest.fixture
@@ -1651,6 +1651,49 @@ async def test_set_cache_or_raise_without_a_ttl_stores_a_key_redis_never_expires
     assert await client.ttl("gateway:last_good:team_id:t1") == -1
     assert 0 < await client.ttl("gateway:last_good_tombstone:team_id:t1") <= 600
     assert await redis.cache.async_get_cache_or_raise("last_good:team_id:t1") == {"team_id": "t1"}
+
+
+@pytest.mark.asyncio
+async def test_set_cache_or_raise_with_expire_at_ends_the_key_at_that_unix_second(monkeypatch: pytest.MonkeyPatch):
+    """``expire_at`` goes to Redis as SET EXAT, so the key ends at that second on the server's clock and Redis reports
+    that absolute expiry; a ``ttl`` given with it is refused before anything is sent."""
+    now: Final = [1_700_000_000.25]  # mutable-ok: the test moves the fake server's clock
+    drive_fake_redis_time(monkeypatch, lambda: now[0])
+    redis: Final = fake_redis_cache(namespace="gateway")
+    expire_at: Final = 1_700_000_600
+
+    await redis.cache.async_set_cache_or_raise("last_good:team_id:t1", {"team_id": "t1"}, expire_at=expire_at)
+    with pytest.raises(ValueError, match="not both"):
+        await redis.cache.async_set_cache_or_raise(
+            "last_good:team_id:t2", {"team_id": "t2"}, ttl=600, expire_at=expire_at
+        )
+
+    client: Final = redis.cache.init_async_client()
+    assert await client.expiretime("gateway:last_good:team_id:t1") == expire_at
+    assert await client.exists("gateway:last_good:team_id:t2") == 0
+    now[0] = expire_at - 0.01
+    assert await redis.cache.async_get_cache_or_raise("last_good:team_id:t1") == {"team_id": "t1"}
+    now[0] = expire_at + 0.01
+    assert await redis.cache.async_get_cache_or_raise("last_good:team_id:t1") is None
+
+
+@pytest.mark.asyncio
+async def test_server_version_is_the_redis_version_from_info_and_raises_without_one():
+    """fakeredis has no INFO command, so its client's ``info`` is patched; with the server away, the call raises."""
+    from redis.exceptions import ConnectionError as RedisConnectionError
+
+    redis: Final = fake_redis_cache()
+    client: Final = redis.cache.init_async_client()
+
+    with patch.object(client, "info", AsyncMock(return_value={"redis_version": "7.2.4"})) as info:
+        assert await redis.cache.async_server_version() == "7.2.4"
+    info.assert_awaited_once_with("server")
+    with patch.object(client, "info", AsyncMock(return_value={"redis_mode": "standalone"})):
+        with pytest.raises(ValueError, match="without redis_version"):
+            await redis.cache.async_server_version()
+    redis.server.connected = False
+    with pytest.raises(RedisConnectionError):
+        await redis.cache.async_server_version()
 
 
 @pytest.mark.asyncio

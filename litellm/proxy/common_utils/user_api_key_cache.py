@@ -145,6 +145,7 @@ class UserApiKeyCache(DualCache):
         key_object_in_memory_cache: InMemoryCache | None = None,
         serve_last_good_entries: bool = False,
         last_good_clock: Callable[[], float] = time.monotonic,
+        last_good_wall_clock: Callable[[], float] = time.time,
     ) -> None:
         super().__init__(
             in_memory_cache=in_memory_cache,
@@ -160,6 +161,8 @@ class UserApiKeyCache(DualCache):
         )
         # One clock for the memory line's ends and tombstones and for the end each store takes, so a test drives all
         self.last_good_clock: Final = last_good_clock
+        # Read together with last_good_clock once per store, to turn the entry's end into the Redis EXAT deadline
+        self.last_good_wall_clock: Final = last_good_wall_clock
         self.last_good_memory: Final = LastGoodMemory(
             max_entries=LAST_GOOD_AUTH_ENTRIES_IN_MEMORY, clock=last_good_clock
         )
@@ -535,8 +538,8 @@ def serves_last_good_entries(cache: DualCache) -> bool:
 #: context creates
 _auth_reads_started_at: Final[ContextVar[float | None]] = ContextVar("last_good_auth_reads_started_at", default=None)
 
-# Covers a drift or step between the Redis server's clock, on which tombstones and entries expire, and the pod's, on
-# which these checks run; and bounds how long a store's Redis write and check may take before the write is undone
+# Covers a drift or step between the Redis server's clock, on which tombstones expire, and the pod's, on which these
+# checks run
 LAST_GOOD_LATE_STORE_MARGIN_SECONDS: Final = 5
 
 
@@ -594,63 +597,48 @@ async def _store_in_redis_unless_tombstoned(
     payload: object,
     *,
     read_started_at: float,
-    ends_at: float,
+    expire_at: int,
     clock: Callable[[], float],
 ) -> Literal["kept", "late", "refused"]:
-    """``kept`` when Redis keeps the entry until ``ends_at``, or at most ``LAST_GOOD_LATE_STORE_MARGIN_SECONDS`` plus
-    the rounding to whole seconds after it; ``late`` when the store turned late (``_store_is_late``) before its write,
-    so it wrote and deleted nothing; ``refused`` when a tombstone refused it or its write was undone. Raises only when
-    Redis cannot answer before the write, which leaves nothing in Redis.
+    """``kept`` when Redis keeps the entry until ``expire_at``, whole Unix seconds on the Redis server's clock (SET
+    EXAT); ``late`` when the store turned late (``_store_is_late``) before its write, so it wrote and deleted nothing;
+    ``refused`` when a tombstone refused it or its write was undone. Raises only when Redis cannot answer before the
+    write, which leaves nothing in Redis.
 
     The tombstone is read again after the write, and the write is undone if one appeared or if the store turned late
     in between. A revocation writes its tombstone before it deletes the entry, so one recorded after the read began
     still has its tombstone when that last check runs: the check sees it, or the revocation's delete comes after this
     write. A write or a second read that fails is undone too, since the write may have landed after a tombstone this
-    store could not see. The SET carries a relative expiry computed before it is sent, so Redis counts it from when it
-    runs the SET: a SET and check that take longer than the margin are undone too, which bounds how long Redis can
-    keep the entry past ``ends_at``. An undone write had replaced the entry an earlier read kept, so nothing of that
-    is left.
+    store could not see. The expiry is absolute, so however late Redis runs the SET, and whether or not an undo then
+    reaches it, the entry ends at ``expire_at``. An undone write had replaced the entry an earlier read kept, so
+    nothing of that is left.
     """
     entry: Final = _last_good_redis_key(cache_key)
     tombstone: Final = _last_good_tombstone_key(cache_key)
     if await redis.async_get_cache_or_raise(tombstone) is not None:
         return "refused"
-    # Taken where the expiry is computed, so the time the SET and its check take is measured from here
-    set_at: Final = clock()
-    if set_at - read_started_at >= _late_store_seconds():
+    if _store_is_late(read_started_at, clock):
         return "late"
-    # Rounded up to whole seconds: Redis may outlast the memory line by the rounding plus at most the margin below
-    ttl_seconds: Final = math.ceil(ends_at - set_at)
     try:
-        await redis.async_set_cache_or_raise(entry, payload, ttl=ttl_seconds)
+        await redis.async_set_cache_or_raise(entry, payload, expire_at=expire_at)
         if await redis.async_get_cache_or_raise(tombstone) is None:
-            took: Final = clock() - set_at
-            if took > LAST_GOOD_LATE_STORE_MARGIN_SECONDS:
-                verbose_proxy_logger.warning(
-                    "Dropping the last good auth entry %s: its Redis write and the tombstone check after it took %.1f "
-                    "s, more than LAST_GOOD_LATE_STORE_MARGIN_SECONDS=%s, so Redis could keep it past its expiry",
-                    cache_key,
-                    took,
-                    LAST_GOOD_LATE_STORE_MARGIN_SECONDS,
-                )
-            elif not _store_is_late(read_started_at, clock):
+            if not _store_is_late(read_started_at, clock):
                 return "kept"
-            else:
-                _log_late_store(cache_key, undone=True)
+            _log_late_store(cache_key, undone=True)
     except Exception as e:  # noqa: BLE001  # the write may have landed after a tombstone, so it is undone below
         verbose_proxy_logger.warning(
             "Dropping the last good auth entry %s: Redis failed during its write or the tombstone check after it: %s",
             cache_key,
             e,
         )
-    # Best effort: when this delete fails too, the entry's expiry is the backstop
+    # Best effort: when this delete fails too, the entry's absolute expiry is the backstop
     try:
         _ = await redis.async_delete_cache(entry)
     except Exception as e:  # noqa: BLE001  # the entry ends at its expiry, and the read must not fail on Redis
         verbose_proxy_logger.warning(
-            "Could not drop the last good auth entry %s from Redis, so it stays until it expires within %s s: %s",
+            "Could not drop the last good auth entry %s from Redis, so it stays until its expiry at %s: %s",
             cache_key,
-            ttl_seconds,
+            expire_at,
             e,
         )
     return "refused"
@@ -659,21 +647,21 @@ async def _store_in_redis_unless_tombstoned(
 async def remember_last_good(cache: DualCache, cache_key: str, value: BaseModel) -> None:
     """Keep ``value``, which the database just returned, as the last good entry for ``cache_key`` until
     ``LAST_GOOD_ENTRY_TTL_SECONDS`` after this context's auth reads began (``mark_last_good_read_start``): in Redis, so
-    every pod can serve it, and in this pod's memory for when Redis cannot answer. The memory line ends at that moment;
-    the Redis entry can outlast it by at most ``LAST_GOOD_LATE_STORE_MARGIN_SECONDS`` plus the rounding to whole
-    seconds, since a store whose Redis write and tombstone check take longer than that margin is undone. Only a
-    database read calls this, so only a read sets or restores an entry's time: serving the entry in an outage never
-    extends it.
+    every pod can serve it, and in this pod's memory for when Redis cannot answer. The end is taken once per store, as
+    whole Unix seconds rounded down, and both copies end at that instant: the memory line on the pod's clock, the Redis
+    entry by an absolute expiry (SET EXAT, Redis 6.2 or later) on the server's clock, so the entry can live past its
+    end only by as much as the server's clock is behind the pod's. An end already past stores nothing and sends no
+    SET. Only a database read calls this, so only a read sets or restores an entry's time: serving the entry in an
+    outage never extends it.
 
     A store that comes ``LAST_GOOD_TOMBSTONE_TTL_SECONDS`` less ``LAST_GOOD_LATE_STORE_MARGIN_SECONDS`` or more after
     its read began, or after the entry's expiry, is late: a revocation recorded after the read began may no longer have
     its tombstone. A store with no recorded start, or one that is late before its write, writes nothing and deletes
     nothing, in Redis or in this pod's memory: neither says the object was revoked, and an entry an earlier read kept
     ends at its own expiry. A tombstone refuses the entry, and a store whose Redis write fails, whose tombstone check
-    after that write fails or finds one, that turned late between the write and that check, or whose write and check
-    took longer than the margin, undoes the write. Those refused stores also drop this pod's memory line, since another
-    pod may have revoked the object; only a Redis that fails before the write leaves the entry to the memory line. Best
-    effort: a failed write must not fail the read."""
+    after that write fails or finds one, or that turned late between the write and that check, undoes the write. Those
+    refused stores also drop this pod's memory line, since another pod may have revoked the object; only a Redis that
+    fails before the write leaves the entry to the memory line. Best effort: a failed write must not fail the read."""
     store: Final = _last_good_store(cache)
     if store is None or not store.serve_last_good_entries or store.last_good_memory.tombstoned(cache_key):
         return
@@ -688,7 +676,19 @@ async def remember_last_good(cache: DualCache, cache_key: str, value: BaseModel)
     if _store_is_late(read_started_at, store.last_good_clock):
         _log_late_store(cache_key, undone=False)
         return
-    ends_at: Final = read_started_at + LAST_GOOD_ENTRY_TTL_SECONDS
+    # One reading of each clock, taken together, gives the one end both copies take
+    now: Final = store.last_good_clock()
+    wall_now: Final = store.last_good_wall_clock()
+    # Rounded down, so the Redis entry never outlives the read's deadline; the memory line takes the same instant
+    expire_at: Final = math.floor(wall_now + read_started_at + LAST_GOOD_ENTRY_TTL_SECONDS - now)
+    if expire_at <= wall_now:
+        verbose_proxy_logger.warning(
+            "Did not keep the last good auth entry %s: its expiry passed before its store; the entry kept before stays "
+            "until its own expiry",
+            cache_key,
+        )
+        return
+    ends_at: Final = now + (expire_at - wall_now)
     payload: Final = CacheCodec.serialize(value)
     if store.redis_cache is not None:
         try:
@@ -697,7 +697,7 @@ async def remember_last_good(cache: DualCache, cache_key: str, value: BaseModel)
                 cache_key,
                 payload,
                 read_started_at=read_started_at,
-                ends_at=ends_at,
+                expire_at=expire_at,
                 clock=store.last_good_clock,
             )
         except Exception as e:  # noqa: BLE001  # Redis failed before the write: only the memory line can keep the entry

@@ -18,7 +18,7 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import timedelta
@@ -83,7 +83,9 @@ class _AsyncRedisCommands(Protocol):
 
     def get(self, name: str) -> Awaitable[bytes | str | None]: ...
 
-    def set(self, name: str, value: str, ex: int | None = None) -> Awaitable[object]: ...
+    def set(self, name: str, value: str, ex: int | None = None, exat: int | None = None) -> Awaitable[object]: ...
+
+    def info(self, section: str | None = None) -> Awaitable[Mapping[str, object]]: ...
 
     def ttl(self, name: str) -> Awaitable[int]: ...
 
@@ -2006,10 +2008,27 @@ class RedisCache(BaseCache):
         return self._get_cache_logic(cached_response=raw)
 
     @_redis_circuit_breaker_guard
-    async def async_set_cache_or_raise(self, key: str, value: object, ttl: int | None = None) -> None:
+    async def async_set_cache_or_raise(
+        self, key: str, value: object, ttl: int | None = None, *, expire_at: int | None = None
+    ) -> None:
         """SET that raises when Redis cannot take the write. ``ttl=None`` means the key never expires, where
-        ``async_set_cache`` would apply the default TTL."""
-        _ = await self._async_commands().set(self.check_and_fix_namespace(key=key), json.dumps(value), ex=ttl)
+        ``async_set_cache`` would apply the default TTL. ``expire_at`` ends the key at that Unix second on the
+        server's clock (SET EXAT, Redis 6.2 or later) instead; the two are exclusive."""
+        if ttl is not None and expire_at is not None:
+            raise ValueError("async_set_cache_or_raise takes ttl or expire_at, not both")
+        _ = await self._async_commands().set(
+            self.check_and_fix_namespace(key=key), json.dumps(value), ex=ttl, exat=expire_at
+        )
+
+    @_redis_circuit_breaker_guard
+    async def async_server_version(self) -> str:
+        """The ``redis_version`` the server reports in INFO; raises when Redis cannot answer or reports none. A cluster
+        client asks one node (redis-py sends INFO to its default node)."""
+        info: Final = await self._async_commands().info("server")
+        version: Final = info.get("redis_version")
+        if version is None:
+            raise ValueError("Redis answered INFO without redis_version")
+        return str(version)
 
     def delete_cache(self, key):
         key = self.check_and_fix_namespace(key=key)
