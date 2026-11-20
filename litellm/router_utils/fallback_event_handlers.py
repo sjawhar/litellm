@@ -12,7 +12,11 @@ from typing_extensions import TypeIs  # noqa: TID251  # TypeIs reaches typing on
 import litellm
 from litellm._logging import verbose_router_logger
 from litellm.integrations.custom_logger import CustomLogger
-from litellm.litellm_core_utils.core_helpers import get_metadata_variable_name_from_kwargs, safe_deep_copy
+from litellm.litellm_core_utils.core_helpers import (
+    fallback_target_params_over_call,
+    get_metadata_variable_name_from_kwargs,
+    safe_deep_copy,
+)
 from litellm.litellm_core_utils.get_llm_provider_logic import inferred_provider
 from litellm.litellm_core_utils.sensitive_data_masker import mask_sensitive_structure
 from litellm.llms.anthropic.common_utils import OBJECT_LIST_ADAPTER, anthropic_owns_fallbacks
@@ -420,47 +424,90 @@ def fallback_target_model_name(target: object) -> str | None:
     return None
 
 
+class FallbackReading(Enum):
+    """Whose list each ``fallbacks`` field of a request and of its targets is, on every hop the request can take"""
+
+    LITELLM = "litellm"
+    ANTHROPIC = "anthropic"
+    # A hop can carry the beta or lose it, by the header fields an earlier target left in the call: read both ways
+    BOTH = "both"
+
+
 @dataclass(frozen=True, slots=True)
 class FallbackCall:
     """
-    The call a fallback entry is read for: the model a target without its own keeps, and whose list the call's own
-    ``fallbacks`` is, which the Router decides with provider_owns_fallbacks_field on the header carriers in its kwargs.
-    A hop merges a target into the call, so the carriers the target holds replace the call's. ``carriers`` None marks a
-    call whose carriers the reader does not know, whose ``fallbacks`` may then be Anthropic's.
+    The call a fallback entry is read for: the model a target lands on, and whose list every ``fallbacks`` field of
+    the request and of its targets is. The Router keeps an earlier target's params in the call on later hops, so a
+    mapping without its own ``model`` lands on whichever model an earlier hop left there, and is read for none.
     """
 
     model: str
-    anthropic_messages_call: bool
-    carriers: Mapping[str, object] | None
+    reading: FallbackReading
 
     @classmethod
     def of_kwargs(
-        cls, kwargs: Mapping[str, object] | None, *, anthropic_messages_call: bool = False
+        cls,
+        kwargs: Mapping[str, object] | None,
+        *,
+        fallbacks: object,
+        field: str,
+        anthropic_messages_call: bool = False,
     ) -> "FallbackCall":
+        """The call a Router entry check reads ``fallbacks`` for, the list ``field`` holds in these kwargs"""
         if kwargs is None:
-            return cls(model="", anthropic_messages_call=anthropic_messages_call, carriers=None)
+            return cls(model="", reading=FallbackReading.BOTH)
         model: Final = kwargs.get("model")
         function_name: Final[object] = getattr(kwargs.get("original_generic_function"), "__name__", None)
         return cls(
             model=model if isinstance(model, str) else "",
-            anthropic_messages_call=anthropic_messages_call or function_name == "anthropic_messages",
-            carriers={key: kwargs[key] for key in HEADER_CARRIER_KWARGS if key in kwargs},
+            reading=fallback_reading(
+                {**kwargs, field: fallbacks},
+                carriers=kwargs,
+                anthropic_messages_call=anthropic_messages_call or function_name == "anthropic_messages",
+            ),
         )
 
     def with_target(self, target: Mapping[str, object]) -> "FallbackCall":
-        """The call once a hop merges ``target`` into it, as the Router's kwargs.update does"""
-        carried: Final = {key: target[key] for key in HEADER_CARRIER_KWARGS if key in target}
-        return FallbackCall(
-            model=fallback_target_model_name(target) or self.model,
-            anthropic_messages_call=self.anthropic_messages_call,
-            carriers=None if self.carriers is None else {**self.carriers, **carried},
-        )
+        """The call once a hop merges ``target`` into it"""
+        return FallbackCall(model=fallback_target_model_name(target) or "", reading=self.reading)
 
-    def anthropic_reads_fallbacks(self) -> bool:
-        """Whether the call's own ``fallbacks`` goes to Anthropic; a call with unknown carriers may send it there"""
-        return self.carriers is None or provider_owns_fallbacks_field(
-            self.carriers, anthropic_messages_call=self.anthropic_messages_call
+
+def fallback_reading(
+    body: Mapping[str, object], *, carriers: Mapping[str, object], anthropic_messages_call: bool
+) -> FallbackReading:
+    """
+    One pass over every fallback list a request carries, before any check reads one: whose list each ``fallbacks``
+    field is on every hop. ``carriers`` holds the request's header fields, which the Router's
+    provider_owns_fallbacks_field reads for the beta. A target that carries a header field replaces the call's on its
+    hop and the Router keeps it on later hops, so when any target carries one and any hop can carry the beta, the order
+    of hops decides and every ``fallbacks`` field is read both ways.
+    """
+    if not anthropic_messages_call:
+        return FallbackReading.LITELLM
+    request_beta: Final = provider_owns_fallbacks_field(carriers, anthropic_messages_call=True)
+    probe: Final = FallbackCall(model="", reading=FallbackReading.BOTH)
+    try:
+        carrying: Final = tuple(
+            entry.target
+            for entry in iter_body_fallback_entries(body, probe)
+            if not isinstance(entry.target, str) and any(key in entry.target for key in HEADER_CARRIER_KWARGS)
         )
+    except FallbackListShapeError:
+        # The checks refuse the list; nothing is known of its hops until then
+        return FallbackReading.BOTH
+    if not carrying:
+        return FallbackReading.ANTHROPIC if request_beta else FallbackReading.LITELLM
+    target_beta: Final = any(provider_owns_fallbacks_field(target, anthropic_messages_call=True) for target in carrying)
+    return FallbackReading.BOTH if request_beta or target_beta else FallbackReading.LITELLM
+
+
+def _list_readings(call: FallbackCall, *, own_fallbacks: bool, widest_reading: bool) -> tuple[bool, ...]:
+    """For each reading of a list, whether it is Anthropic's, read in the widest way"""
+    if widest_reading:
+        return (True,)
+    if not own_fallbacks or call.reading is FallbackReading.LITELLM:
+        return (False,)
+    return (True,) if call.reading is FallbackReading.ANTHROPIC else (False, True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -603,9 +650,7 @@ def iter_body_fallback_entries(
     """
     The entries of every fallback list a request body carries, the request's own or a target's merged into ``call``:
     its fallback fields, those of its router_settings_override, and the models its context_window_fallback_dict swaps
-    in. Its own ``fallbacks`` is Anthropic's, read in the widest way, when ``call``'s header carriers opt into
-    Anthropic's server-side fallback on an anthropic_messages call, and LiteLLM's otherwise. An error field that is not
-    a list is refused: the Router would refuse it only once the call it rides on fails.
+    in. Its own ``fallbacks`` is read as ``call.reading`` says: Anthropic's, read in the widest way, LiteLLM's, or both.
     """
     override: Final = body.get(ROUTER_SETTINGS_OVERRIDE_KWARG)
     for source in (body, override):
@@ -613,15 +658,11 @@ def iter_body_fallback_entries(
             continue
         for field in FALLBACK_LIST_FIELDS:
             value = source.get(field)
-            if field in ERROR_FALLBACK_FIELDS and value is not None and not isinstance(value, list):
-                if not widest_reading:
-                    raise FallbackListShapeError(f"Rejected Request: {field} must be a list of model groups.", field)
-            anthropic_list = widest_reading or (
-                source is body and field == "fallbacks" and call.anthropic_reads_fallbacks()
-            )
-            yield from iter_fallback_entries(
-                value, field, call, checks=checks, depth=depth, widest_reading=anthropic_list, group=group
-            )
+            own_fallbacks = source is body and field == "fallbacks"
+            for anthropic_list in _list_readings(call, own_fallbacks=own_fallbacks, widest_reading=widest_reading):
+                yield from iter_fallback_entries(
+                    value, field, call, checks=checks, depth=depth, widest_reading=anthropic_list, group=group
+                )
     context_window_swaps: Final = body.get(CONTEXT_WINDOW_FALLBACK_DICT_FIELD)
     if _is_mapping(context_window_swaps):
         # Each value is the model the client wrapper swaps in, so the values are a list of targets
@@ -678,7 +719,9 @@ def reject_non_list_litellm_fallbacks(
         if fallbacks is not None and not isinstance(fallbacks, list):
             _reject_router_unreadable_list(fallbacks, field, model=model)
         return
-    call: Final = FallbackCall.of_kwargs(call_kwargs, anthropic_messages_call=anthropic_messages_call)
+    call: Final = FallbackCall.of_kwargs(
+        call_kwargs, fallbacks=fallbacks, field=field, anthropic_messages_call=anthropic_messages_call
+    )
     checks: Final = FallbackChecks(
         litellm_list=lambda value, value_field: _reject_router_unreadable_list(value, value_field, model=model)
     )
@@ -1004,36 +1047,6 @@ PROVIDER_SCOPED_RESOURCE_FUNCTION_NAMES: Final = frozenset(
 )
 PROVIDER_SCOPED_CREATION_FUNCTION_NAMES: Final = frozenset({"_acreate_file"})
 
-# The proxy stamps the caller's identity into a call's metadata under this prefix, and strips it from a request's own
-_IDENTITY_METADATA_KEY_PREFIX: Final = "user_api_key_"
-
-
-def _target_params_over_call(call_kwargs: Mapping[str, object], target: Mapping[str, object]) -> dict[str, object]:
-    """
-    The params a dict target lays over the call. Its ``metadata`` and ``litellm_metadata`` only add keys to the call's:
-    a key the call holds keeps the call's value, and no ``user_api_key_*`` identity key comes from the target, so every
-    reader of the hop's metadata, whichever bucket it reads first, finds the identity the call was stamped with.
-    """
-    params: Final = dict(target)
-    for bucket in _ROUTER_METADATA_BUCKETS:
-        if bucket not in target:
-            continue
-        held: Final = call_kwargs.get(bucket)
-        if held is not None and not isinstance(held, Mapping):
-            del params[bucket]
-            continue
-        added: Final = target[bucket]
-        params[bucket] = {
-            **{
-                key: value
-                for key, value in (added.items() if isinstance(added, Mapping) else ())
-                if not (isinstance(key, str) and key.startswith(_IDENTITY_METADATA_KEY_PREFIX))
-            },
-            **(held or {}),
-        }
-    return params
-
-
 
 def _get_fallback_target_model_group(fallback_entry: str | Mapping[str, object]) -> str | None:
     if isinstance(fallback_entry, str):
@@ -1226,7 +1239,7 @@ async def run_async_fallback(
             if isinstance(mg, str):
                 kwargs["model"] = mg
             elif isinstance(mg, dict):
-                kwargs.update(_target_params_over_call(kwargs, mg))
+                kwargs.update(fallback_target_params_over_call(kwargs, mg))
             fallback_depth = fallback_depth + 1
             _hop_metadata = dict(kwargs.get(metadata_variable_name) or {})
             _original_model_group_stamp = _hop_metadata.pop("original_model_group", original_model_group)

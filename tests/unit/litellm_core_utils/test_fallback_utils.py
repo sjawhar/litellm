@@ -110,6 +110,37 @@ async def test_async_completion_with_fallbacks_header_is_zero_when_primary_succe
     assert response.choices[0].message.content == "primary-resp"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket", ["metadata", "litellm_metadata"])
+async def test_a_targets_metadata_keeps_the_calls_keys_and_adds_no_identity(monkeypatch, bucket: str):
+    """
+    litellm.acompletion's own fallback loop merges a target as the Router's hop does: the call's metadata keys win,
+    the target adds its own, and an identity key never comes from the target
+    """
+    received: list[dict] = []
+
+    async def _fake_acompletion(*, model: str, **kwargs):
+        received.append({"model": model, **kwargs})
+        if model == "primary-model":
+            raise Exception("primary failed")
+        return {"model": model}
+
+    monkeypatch.setattr(litellm, "acompletion", _fake_acompletion)
+    target_metadata = {"added": "by-target", "tags": ["target-tag"], "user_api_key_hash": "forged"}
+
+    await async_completion_with_fallbacks(
+        model="primary-model",
+        **{bucket: {"user_api_key_hash": "caller-hash", "tags": ["call-tag"]}},
+        kwargs={"fallbacks": [{"model": "fallback-model", bucket: target_metadata}]},
+    )
+
+    hop_metadata = received[-1][bucket]
+    assert received[-1]["model"] == "fallback-model"
+    assert hop_metadata["user_api_key_hash"] == "caller-hash"
+    assert hop_metadata["tags"] == ["call-tag"]
+    assert hop_metadata["added"] == "by-target"
+
+
 def test_process_response_headers_preserves_x_litellm_headers_when_internal():
     """
     `process_response_headers` must not add the `llm_provider-` prefix to

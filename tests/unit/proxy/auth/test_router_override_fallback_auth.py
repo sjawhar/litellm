@@ -39,7 +39,7 @@ from litellm.proxy._types import (
 from litellm.proxy.agent_endpoints.auth.agent_access_groups import AgentAccessGroupCeiling, CeilingResolver
 from litellm.proxy.auth.auth_utils import key_fallback_model_names
 from litellm.proxy.auth.user_api_key_auth import enforce_key_and_fallback_model_access
-from litellm.router_utils.fallback_event_handlers import FallbackCall, iter_body_fallback_entries
+from litellm.router_utils.fallback_event_handlers import FallbackCall, FallbackReading, iter_body_fallback_entries
 from litellm.types.agents import AgentCaller, AgentResponse
 
 
@@ -99,7 +99,7 @@ def test_fallback_model_names_target_and_group_named_model_shapes():
 def test_fallback_model_names_read_a_parameter_only_entry_as_a_target():
     """The Router merges every mapping of a list of targets into the call, so its list values name no model."""
     stop: Final = {"stop": ["END"]}
-    call: Final = FallbackCall(model="", anthropic_messages_call=False, carriers={})
+    call: Final = FallbackCall(model="", reading=FallbackReading.LITELLM)
     entries: Final = iter_body_fallback_entries({"fallbacks": [{"model": "gpt-4"}, stop]}, call)
     assert [entry.target for entry in entries] == [{"model": "gpt-4"}, stop]
     assert _fallback_model_names([{"model": "gpt-4"}, stop]) == ["gpt-4"]
@@ -640,6 +640,9 @@ class _Gateway:
         enforce_fallback_model_access: bool = False,
         # general_settings.allow_client_side_credentials, the proxy-wide opt-in the body's checks read
         client_side_credentials: bool = False,
+        # The key's own config, a legacy per-key setting the key's owner can write
+        key_config: Mapping[str, object] | None = None,
+        route: str = "/v1/messages",
     ) -> "_GatewayResult":
         import httpx
         import respx
@@ -690,6 +693,7 @@ class _Gateway:
                 list(token_team_models) if token_team_models is not None else list(team_models) if team_id else []
             ),
             router_settings=key_router_settings,
+            config=dict(key_config or {}),
             aliases=dict(key_aliases or {}),
             team_model_aliases=dict(team_aliases) if team_aliases is not None else None,
         )
@@ -753,7 +757,7 @@ class _Gateway:
                 ),
             }
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://proxy.test") as client:
-                response = await client.post("/v1/messages", json=payload, headers=headers)
+                response = await client.post(route, json=payload, headers=headers)
         return _GatewayResult(
             response=response,
             calls={name: route.call_count for name, route in routes.items()},
@@ -1018,26 +1022,34 @@ async def test_a_fallback_field_the_proxy_renames_after_auth_still_stops_at_the_
     assert result.deployment_key_reached_the_attacker() is leaks
 
 
-def _has_non_list_error_fallback(send_kwargs: Mapping[str, object]) -> bool:
-    sources = (
-        send_kwargs.get("body_fields"),
-        send_kwargs.get("key_router_settings"),
-        send_kwargs.get("team_router_settings"),
+def _has_unreadable_litellm_list(send_kwargs: Mapping[str, object]) -> bool:
+    """
+    Whether a LiteLLM fallback field holds a value that is not a list, which every LiteLLM reader iterates as one: any
+    field of a body, of its router_settings_override and of saved settings, except a body's own `fallbacks` under the
+    beta, which is Anthropic's
+    """
+    body: Final = send_kwargs.get("body_fields")
+    override: Final = body.get("router_settings_override") if isinstance(body, Mapping) else None
+    sources: Final = (
+        (body, send_kwargs.get("beta") is True),
+        (override, False),
+        (send_kwargs.get("key_router_settings"), False),
+        (send_kwargs.get("team_router_settings"), False),
     )
-    for source in sources:
-        if not isinstance(source, Mapping):
-            continue
-        for field in ("context_window_fallbacks", "content_policy_fallbacks"):
-            if field in source and not isinstance(source[field], list):
-                return True
-    return False
+    return any(
+        field in source and not isinstance(source[field], list)
+        for source, anthropic_owns_fallbacks in sources
+        if isinstance(source, Mapping)
+        for field in _list_fields()
+        if not (anthropic_owns_fallbacks and field == "fallbacks")
+    )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("send_kwargs", _FORBIDDEN_ROWS)
 async def test_every_fallback_target_must_be_a_model_the_key_may_call(gateway: _Gateway, send_kwargs):
     result = await gateway.send(**send_kwargs)
-    rejects_non_list_value = _has_non_list_error_fallback(send_kwargs)
+    rejects_non_list_value = _has_unreadable_litellm_list(send_kwargs)
     # A malformed list is refused with one status from every source
     expected_statuses = (400,) if rejects_non_list_value else (401, 403)
 
@@ -1086,8 +1098,15 @@ async def test_every_name_in_anthropics_fallbacks_is_checked_in_any_shape(
 async def test_a_fallback_the_upstream_error_triggers_never_reaches_a_model_the_key_may_not_call(
     monkeypatch: pytest.MonkeyPatch, field: str, requested_error: tuple[int, str, str], shape: str
 ):
-    result = await _Gateway(monkeypatch, requested_error).send({field: _FORBIDDEN_SHAPES[shape]})
+    value: Final = _FORBIDDEN_SHAPES[shape]
+    result = await _Gateway(monkeypatch, requested_error).send({field: value})
 
+    if not isinstance(value, list):
+        # The Router refuses an error field that is not a list, and no other reader reads one
+        assert result.response.status_code == 400, result.response.text
+        assert f"{field} must be a list" in result.response.text
+        assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+        return
     assert result.response.status_code in (401, 403), result.response.text
     assert result.calls["forbidden"] == 0
 
@@ -1374,8 +1393,8 @@ _READ_BOTH_WAYS_NOTE: Final = (
     [
         # /v1/messages stamps the caller in litellm_metadata, which an empty one replaced
         pytest.param({"litellm_metadata": {}}, id="empty-litellm-metadata"),
-        # The access check reads metadata first, where an identity under the other name stood in for the caller's
-        pytest.param({"metadata": {"user_api_key_auth": {}}}, id="identity-in-metadata"),
+        # An identity key in a target's metadata is refused before any call, a STRIPPED row of the table below; the
+        # Router's own drop of one at the merge is covered in tests/unit/router_utils/test_fallback_event_handlers.py
     ],
 )
 async def test_a_targets_metadata_keeps_the_callers_identity_for_a_later_hops_access_check(
@@ -1499,7 +1518,8 @@ async def test_a_saved_targets_own_fallbacks_under_the_beta_get_the_refusals_of_
 ) -> None:
     """
     Saved key and team router settings go through the body's checks: under the beta a hop sends a saved target's own
-    `fallbacks` to Anthropic, so a name there that has an alias is refused
+    `fallbacks` to Anthropic, so a name there that has an alias is refused. The refusal comes after authentication, so
+    /v1/messages answers it in Anthropic's error shape.
     """
     target: Final = {"model": "other", "fallbacks": [{"model": _ALIASED_PROVIDER_FALLBACK}]}
     settings: Final = {"context_window_fallbacks": [{"requested": [target]}]}
@@ -1512,8 +1532,55 @@ async def test_a_saved_targets_own_fallbacks_under_the_beta_get_the_refusals_of_
     )
 
     assert result.response.status_code == 403, result.response.text
-    assert "key_model_access_denied" in result.response.text
+    assert f"The requested model '{_ALIASED_PROVIDER_FALLBACK}' is not available" in result.response.text
     assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+
+
+def _error_of(response: "httpx.Response") -> tuple[int, object, object]:
+    body: Final = response.json()
+    error: Final = body.get("error") if isinstance(body, dict) else None
+    return (
+        response.status_code,
+        error.get("type") if isinstance(error, dict) else None,
+        error.get("param") if isinstance(error, dict) else None,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["key", "team"])
+async def test_a_saved_target_is_refused_on_a_chat_route_as_the_bodys_with_the_same_type_and_param(
+    monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    """On a chat route the error envelope keeps `type` and `param`, so a saved target's refusal matches the body's"""
+    settings: Final = {"fallbacks": [{"requested": ["forbidden"]}]}
+    from_body: Final = await _Gateway(monkeypatch).send(dict(settings), route="/v1/chat/completions")
+    from_saved: Final = await _Gateway(monkeypatch).send(
+        {},
+        key_router_settings=settings if source == "key" else None,
+        team_router_settings=settings if source == "team" else None,
+        route="/v1/chat/completions",
+    )
+
+    assert from_body.response.status_code in (401, 403), from_body.response.text
+    assert _error_of(from_saved.response) == _error_of(from_body.response), from_saved.response.text
+    assert from_saved.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["body", "key"])
+async def test_a_keys_own_config_does_not_turn_off_the_fallback_checks(
+    monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    """A key's owner writes its config, so a config on the key never lets a fallback reach a model the key may not"""
+    settings: Final = {"fallbacks": [{"requested": ["forbidden"]}]}
+    result: Final = await _Gateway(monkeypatch).send(
+        dict(settings) if source == "body" else {},
+        key_router_settings=settings if source == "key" else None,
+        key_config={"max_parallel_requests": 5},
+    )
+
+    assert result.response.status_code in (401, 403), result.response.text
+    assert result.calls["forbidden"] == 0
 
 
 @pytest.mark.asyncio
@@ -1588,6 +1655,47 @@ async def test_a_deployment_id_label_in_metadata_is_still_served(
     assert result.calls == calls
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("first_brings_the_beta", "served"), [(True, False), (False, True)], ids=["beta", "no-beta"])
+async def test_a_later_targets_own_fallbacks_are_read_both_ways_when_an_earlier_target_brings_the_beta(
+    monkeypatch: pytest.MonkeyPatch, first_brings_the_beta: bool, served: bool
+) -> None:
+    """
+    The Router keeps a target's header fields in the call on later hops, so the second target's own `fallbacks` goes to
+    Anthropic once the first brought the beta: a name there with an alias is refused before any call
+    """
+    first: Final = {"model": "other", "extra_headers": {"anthropic-beta": _SERVER_SIDE_FALLBACK_BETA}}
+    second: Final = {"model": "other", "max_tokens": 5, "fallbacks": [{"model": _ALIASED_PROVIDER_FALLBACK}]}
+    result: Final = await _Gateway(monkeypatch).send(
+        {"fallbacks": [first if first_brings_the_beta else {"model": "other"}, second]},
+        client_side_credentials=True,
+        credentials_allowed=True,
+        router_aliases={_ALIASED_PROVIDER_FALLBACK: "other"},
+    )
+
+    if served:
+        assert result.response.status_code == 200, result.response.text
+        assert result.calls == {"requested": 1, "other": 1, "forbidden": 0, "attacker": 0}
+        return
+    assert result.response.status_code == 403, result.response.text
+    assert "key_model_access_denied" in result.response.text
+    assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket", ["metadata", "litellm_metadata"])
+@pytest.mark.parametrize("value", [7, ["tags"], "not json"], ids=["number", "list", "string"])
+async def test_a_metadata_bucket_that_is_not_an_object_is_refused_in_a_body_and_in_a_target(
+    monkeypatch: pytest.MonkeyPatch, bucket: str, value: object
+) -> None:
+    """The request setup's own type check of a body's metadata runs on a target's, with the same 400"""
+    for body_fields in ({bucket: value}, {"fallbacks": [{"model": "other", bucket: value}]}):
+        result = await _Gateway(monkeypatch).send(copy.deepcopy(body_fields))
+        assert result.response.status_code == 400, (body_fields, result.response.text)
+        assert f"Invalid type for '{bucket}'" in result.response.text
+        assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+
+
 # ── A fallback target is never validated less than a request body ────────────
 #
 # Each row is a key, and the outcome of a /v1/messages body that carries it at its root against the outcome of one
@@ -1609,7 +1717,8 @@ class _Row:
     key: str
     value: object
     rule: _Rule
-    # For a SAME row: whether a body that carries the key is refused, and so a target that carries it
+    # For a SAME row: whether a body that carries the key is refused, and so a target that carries it. For a CLAIM or
+    # STRIPPED row: whether a body's root is refused for it after authentication (the mock testing params are)
     refused: bool = True
 
 
@@ -1643,32 +1752,35 @@ _TARGET_TABLE: Final = (
     _Row("prompt_version", 2, _Rule.SAME, refused=False),
     _Row("_excluded_deployment_ids", ["absent-deployment"], _Rule.SAME, refused=False),
     _Row("_retry_skipped_deployment_ids", ["absent-deployment"], _Rule.SAME, refused=False),
-    _Row("router_fallbacks", ["other"], _Rule.STRIPPED),
-    _Row("_target_order", [0], _Rule.STRIPPED),
-    _Row("fallback_depth", 0, _Rule.STRIPPED),
-    _Row("fallback_model_group", ["other"], _Rule.STRIPPED),
-    _Row("callbacks", ["langfuse"], _Rule.STRIPPED),
-    _Row("client_side_timeout", True, _Rule.STRIPPED),
-    _Row("base_model", "anthropic/other", _Rule.STRIPPED),
-    _Row("specific_deployment", True, _Rule.CLAIM),
-    _Row("custom_llm_provider", "openai", _Rule.CLAIM),
-    _Row("model_info", {"id": "forbidden-deployment"}, _Rule.CLAIM),
-    _Row("model_file_id_mapping", {"file-1": {"forbidden-deployment": "file-2"}}, _Rule.CLAIM),
-    _Row("endpoint", "/v1/other", _Rule.CLAIM),
-    _Row("azure", True, _Rule.CLAIM),
-    _Row("use_litellm_proxy", True, _Rule.CLAIM),
-    _Row("passthrough_on_no_deployment", True, _Rule.CLAIM),
-    _Row("ssl_verify", False, _Rule.CLAIM),
-    _Row("api_key", _CALLER_SUPPLIED_KEY, _Rule.CLAIM),
-    _Row("api_version", "2024-10-21", _Rule.CLAIM),
-    _Row("organization", "org-other", _Rule.CLAIM),
-    _Row("litellm_credential_name", "stored-credential", _Rule.CLAIM),
-    _Row("headers", _PARAM_VALUES["headers"], _Rule.CLAIM),
-    _Row("extra_headers", _PARAM_VALUES["headers"], _Rule.CLAIM),
-    _Row("provider_specific_header", _PARAM_VALUES["provider_specific_header"], _Rule.CLAIM),
-    _Row("extra_body", {"top_k": 1}, _Rule.CLAIM),
-    _Row("mock_response", "served by a mock", _Rule.CLAIM),
-    _Row("mock_tool_calls", [{"function": {"name": "f", "arguments": "{}"}}], _Rule.CLAIM),
+    _Row("router_fallbacks", ["other"], _Rule.STRIPPED, refused=False),
+    _Row("_target_order", [0], _Rule.STRIPPED, refused=False),
+    _Row("fallback_depth", 0, _Rule.STRIPPED, refused=False),
+    _Row("fallback_model_group", ["other"], _Rule.STRIPPED, refused=False),
+    _Row("callbacks", ["langfuse"], _Rule.STRIPPED, refused=False),
+    _Row("client_side_timeout", True, _Rule.STRIPPED, refused=False),
+    _Row("base_model", "anthropic/other", _Rule.STRIPPED, refused=False),
+    _Row("metadata", {"user_api_key_user_id": "someone-else"}, _Rule.STRIPPED, refused=False),
+    _Row("litellm_metadata", {"user_api_key_team_id": "another-team"}, _Rule.STRIPPED, refused=False),
+    _Row("specific_deployment", True, _Rule.CLAIM, refused=False),
+    _Row("custom_llm_provider", "openai", _Rule.CLAIM, refused=False),
+    _Row("model_info", {"id": "forbidden-deployment"}, _Rule.CLAIM, refused=False),
+    _Row("model_file_id_mapping", {"file-1": {"forbidden-deployment": "file-2"}}, _Rule.CLAIM, refused=False),
+    _Row("endpoint", "/v1/other", _Rule.CLAIM, refused=False),
+    _Row("azure", True, _Rule.CLAIM, refused=False),
+    _Row("use_litellm_proxy", True, _Rule.CLAIM, refused=False),
+    _Row("passthrough_on_no_deployment", True, _Rule.CLAIM, refused=False),
+    _Row("ssl_verify", False, _Rule.CLAIM, refused=False),
+    _Row("api_key", _CALLER_SUPPLIED_KEY, _Rule.CLAIM, refused=False),
+    _Row("api_version", "2024-10-21", _Rule.CLAIM, refused=False),
+    _Row("organization", "org-other", _Rule.CLAIM, refused=False),
+    _Row("litellm_credential_name", "stored-credential", _Rule.CLAIM, refused=False),
+    _Row("headers", _PARAM_VALUES["headers"], _Rule.CLAIM, refused=False),
+    _Row("extra_headers", _PARAM_VALUES["headers"], _Rule.CLAIM, refused=False),
+    _Row("provider_specific_header", _PARAM_VALUES["provider_specific_header"], _Rule.CLAIM, refused=False),
+    _Row("extra_body", {"top_k": 1}, _Rule.CLAIM, refused=False),
+    _Row("mock_response", "served by a mock", _Rule.CLAIM, refused=False),
+    _Row("mock_tool_calls", [{"function": {"name": "f", "arguments": "{}"}}], _Rule.CLAIM, refused=False),
+    # A body's root is refused for these by the mock testing gate, unless an admin opted in
     *(_Row(name, True, _Rule.CLAIM) for name in _MOCK_TESTING_PARAMS),
     _Row("mock_delay", 1, _Rule.CLAIM),
 )
@@ -1688,6 +1800,11 @@ def _error_param(response: "httpx.Response") -> object:
     return error.get("param") if isinstance(error, dict) else None
 
 
+def _not_refused_by_authentication(result: _GatewayResult) -> bool:
+    """What reading shows of a body whose outcome after authentication depends on the provider: no auth refusal"""
+    return result.response.status_code not in (400, 401, 403) or any(result.calls.values())
+
+
 def _target_placements(row: _Row) -> tuple[tuple[str, list[object]], ...]:
     """The `fallbacks` lists whose target carries the row's key, by where the target stands"""
     target: Final = {"model": "other", row.key: row.value}
@@ -1704,8 +1821,11 @@ async def test_a_fallback_target_is_never_validated_less_than_a_request_body(
     monkeypatch: pytest.MonkeyPatch, row: _Row
 ) -> None:
     in_body: Final = await _Gateway(monkeypatch).send({row.key: copy.deepcopy(row.value)})
-    if row.rule is _Rule.SAME:
+    if row.rule is _Rule.SAME or row.refused:
         assert _refused(in_body) is row.refused, in_body.response.text
+    else:
+        # Accepted or dropped at a body's root, so a target's refusal is the claim's, not one the body shares
+        assert _not_refused_by_authentication(in_body), in_body.response.text
     for placement, fallbacks in _target_placements(row):
         in_target = await _Gateway(monkeypatch).send({"fallbacks": fallbacks})
         seen = f"{placement}: {in_target.response.status_code} {in_target.response.text}"
@@ -1718,6 +1838,40 @@ async def test_a_fallback_target_is_never_validated_less_than_a_request_body(
         if row.refused:
             assert in_target.response.status_code // 100 == in_body.response.status_code // 100, seen
             assert _error_param(in_target.response) == _error_param(in_body.response), seen
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("row", _TARGET_TABLE, ids=lambda row: row.key)
+async def test_a_mapping_read_both_ways_is_never_validated_less_than_a_request_body(
+    monkeypatch: pytest.MonkeyPatch, row: _Row
+) -> None:
+    """
+    `["other", {key: value}]` is a `fallbacks` list in the Router's group format, so the mapping without a `model` is a
+    model group map to the Router and a parameter override to litellm's own fallback loop, and is checked both ways:
+    it is refused wherever the body is, and may be refused where the body is not (a list value is a model name there)
+    """
+    result: Final = await _Gateway(monkeypatch).send({"fallbacks": ["other", {row.key: copy.deepcopy(row.value)}]})
+
+    if row.rule is not _Rule.SAME or row.refused:
+        assert _refused(result), result.response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("row", [row for row in _TARGET_TABLE if row.rule is not _Rule.SAME or row.refused], ids=str)
+async def test_a_target_litellms_own_fallback_loop_merges_is_refused_as_on_the_routers_hop(
+    monkeypatch: pytest.MonkeyPatch, row: _Row
+) -> None:
+    """
+    Where no Router serves the request, litellm.acompletion's own fallback loop merges the target, with no merge-point
+    guard of the Router's: the entry check alone refuses it, before any call
+    """
+    target: Final = {"model": "openai/other", row.key: copy.deepcopy(row.value)}
+    response, called = await _chat_served_by_litellm(
+        monkeypatch, [target], router=True, key_models=("openai/requested", "openai/other")
+    )
+
+    assert response.status_code in (400, 401, 403), response.text
+    assert called == ()
 
 
 async def _chat_served_by_litellm(

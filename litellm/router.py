@@ -686,7 +686,7 @@ def _request_fallback_list(
     kwargs: Mapping[str, object], key: str, router_default: "list[object] | None"
 ) -> "list[object] | None":  # mutable-ok: should_retry_this_error's own parameter type
     fallbacks: Final = kwargs.get(key, router_default)
-    reject_non_list_litellm_fallbacks(fallbacks, kwargs.get("model"), field=key)
+    reject_non_list_litellm_fallbacks(fallbacks, kwargs.get("model"), field=key, call_kwargs=kwargs)
     return cast("list[object] | None", fallbacks)  # cast-ok: checked a list or None above
 
 
@@ -7657,11 +7657,13 @@ class Router:
             cast(object, context_window_fallbacks),  # cast-ok: public Router kwargs are untyped
             model_group,
             field="context_window_fallbacks",
+            call_kwargs=kwargs,
         )
         reject_non_list_litellm_fallbacks(
             cast(object, content_policy_fallbacks),  # cast-ok: public Router kwargs are untyped
             model_group,
             field="content_policy_fallbacks",
+            call_kwargs=kwargs,
         )
 
         if verbose_router_logger.isEnabledFor(logging.DEBUG):
@@ -8072,11 +8074,13 @@ class Router:
             cast(object, context_window_fallbacks),  # cast-ok: public Router kwargs are untyped
             cast(object, model_group),  # cast-ok: public Router kwargs are untyped
             field="context_window_fallbacks",
+            call_kwargs=kwargs,
         )
         reject_non_list_litellm_fallbacks(
             cast(object, content_policy_fallbacks),  # cast-ok: public Router kwargs are untyped
             cast(object, model_group),  # cast-ok: public Router kwargs are untyped
             field="content_policy_fallbacks",
+            call_kwargs=kwargs,
         )
         # Support per-request model_group_retry_policy override (from key/team settings)
         model_group_retry_policy: Final = kwargs.pop("model_group_retry_policy", self.model_group_retry_policy)

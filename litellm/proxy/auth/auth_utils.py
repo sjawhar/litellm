@@ -22,6 +22,7 @@ from litellm.constants import (
     MINIMUM_CUSTOM_KEY_LENGTH,
     STANDARD_CUSTOMER_ID_HEADERS,
 )
+from litellm.litellm_core_utils.core_helpers import IDENTITY_METADATA_KEY_PREFIX
 from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
 from litellm.litellm_core_utils.safe_json_loads import safe_json_loads
 from litellm.litellm_core_utils.url_utils import (
@@ -43,6 +44,8 @@ from litellm.router_utils.fallback_event_handlers import (
     FallbackCall,
     FallbackChecks,
     FallbackEntry,
+    FallbackListShapeError,
+    fallback_reading,
     fallback_target_model_name,
     iter_body_fallback_entries,
 )
@@ -558,8 +561,15 @@ def request_fallback_call(route: str, request: Request | None, request_body: Map
         carriers["provider_specific_header"] = {"extra_headers": sent}
     model: Final = request_body.get("model")
     return FallbackCall(
-        model=model if isinstance(model, str) else "", anthropic_messages_call=messages_call, carriers=carriers
+        model=model if isinstance(model, str) else "",
+        reading=fallback_reading(request_body, carriers=carriers, anthropic_messages_call=messages_call),
     )
+
+
+def _reject_unreadable_litellm_list(value: object, field: str) -> None:
+    """Every LiteLLM reader of a fallback field iterates a list, so a value that is not one is called by none"""
+    if value is not None and not isinstance(value, list):
+        raise FallbackListShapeError(f"Rejected Request: {field} must be a list of model groups.", field)
 
 
 @dataclass(frozen=True, slots=True)
@@ -693,7 +703,7 @@ def _setup_stripped_fields() -> tuple[frozenset[str], frozenset[str]]:
 def _reject_setup_stripped_fields(target: Mapping[str, object]) -> None:
     """
     The request setup drops these keys from a body's root and from its metadata before the call, so a target merged
-    into the call on a hop may not bring one back. A ``user_api_key_*`` metadata key is dropped at the merge instead.
+    into the call on a hop may not bring one back: litellm.acompletion's own fallback loop merges a target as it is.
     """
     root_fields, metadata_fields = _setup_stripped_fields()
     stripped: Final = [
@@ -702,7 +712,7 @@ def _reject_setup_stripped_fields(target: Mapping[str, object]) -> None:
             f"{bucket}.{field}"
             for bucket in _NESTED_METADATA_KEYS
             for field in _coerce_metadata_to_dict(target.get(bucket)) or {}
-            if field in metadata_fields
+            if field in metadata_fields or (isinstance(field, str) and field.startswith(IDENTITY_METADATA_KEY_PREFIX))
         ),
     ]
     if stripped:
@@ -710,6 +720,18 @@ def _reject_setup_stripped_fields(target: Mapping[str, object]) -> None:
             f"Rejected Request: a fallback target may not carry {', '.join(sorted(stripped))}, "
             "which the proxy drops from a request body."
         )
+
+
+def _reject_unreadable_metadata(target: Mapping[str, object]) -> None:
+    """A target's metadata gets the request setup's own type check of a body's, with its 400"""
+    from litellm.proxy.litellm_pre_call_utils import (  # the setup module imports this one
+        _normalized_metadata_object,  # pyright: ignore[reportPrivateUsage]  # the setup's own check
+    )
+
+    for bucket in _NESTED_METADATA_KEYS:
+        value = target.get(bucket)
+        if value is not None:
+            _normalized_metadata_object(bucket, value)
 
 
 def _reject_url_valued_fallback_target(value: str) -> None:
@@ -742,6 +764,7 @@ def _check_fallback_entry(settings: _BodyCheckSettings, entry: FallbackEntry) ->
     """
     target: Final = entry.target
     if not isinstance(target, str):
+        _reject_unreadable_metadata(target)
         try:
             _check_banned_params_in_body(
                 target,
@@ -814,7 +837,8 @@ def is_request_body_safe(
         request_body, general_settings, llm_router, model, manages_deployments=manages_deployments
     )
     checks: Final = FallbackChecks(
-        entry=partial(_check_fallback_entry, _BodyCheckSettings(general_settings, llm_router, manages_deployments))
+        entry=partial(_check_fallback_entry, _BodyCheckSettings(general_settings, llm_router, manages_deployments)),
+        litellm_list=_reject_unreadable_litellm_list,
     )
     for _entry in iter_body_fallback_entries(
         request_body, request_fallback_call(route or "", request, request_body), checks=checks
