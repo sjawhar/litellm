@@ -844,7 +844,12 @@ def get_provider_response_headers_from_hidden_params(response: object) -> Mappin
 
 # The proxy stamps the caller's identity into a call's metadata under this prefix, and strips it from a request's own
 IDENTITY_METADATA_KEY_PREFIX: Final = "user_api_key_"
-_CALL_METADATA_BUCKETS: Final = ("metadata", "litellm_metadata")
+# The call params the proxy fills with its own keys beside the caller's: the metadata buckets, and stream_options, where
+# it sets include_usage to track the stream's spend
+_CALL_MERGED_PARAMS: Final = ("metadata", "litellm_metadata", "stream_options")
+# The timeouts a call may set for itself; the proxy marks a request that sets one client_side_timeout, so the Router's
+# cooldown reads a 408 under it as the caller's timeout, not the deployment's health
+_CALLER_TIMEOUT_PARAMS: Final = ("timeout", "request_timeout", "stream_timeout")
 
 
 def fallback_target_params_over_call(
@@ -852,20 +857,22 @@ def fallback_target_params_over_call(
 ) -> dict[str, object]:
     """
     The params a fallback target lays over the call, for every reader that merges one: the Router's hop and
-    litellm.acompletion's own fallback loop. Its ``metadata`` and ``litellm_metadata`` only add keys to the call's: a
-    key the call holds keeps the call's value, and no ``user_api_key_*`` identity key comes from the target, so every
-    reader of the hop's metadata, whichever bucket it reads first, finds the identity the call was stamped with.
+    litellm.acompletion's own fallback loop. Its ``metadata``, ``litellm_metadata`` and ``stream_options`` only add keys
+    to the call's: a key the call holds keeps the call's value, and no ``user_api_key_*`` identity key comes from the
+    target, so every reader of the hop's metadata, whichever bucket it reads first, finds the identity the call was
+    stamped with, and the hop's stream reports the usage the proxy asked for. A target that sets its own timeout marks
+    the hop ``client_side_timeout``, as the proxy marks a request that sets one.
     """
     params: Final = dict(target)
-    for bucket in _CALL_METADATA_BUCKETS:
-        if bucket not in target:
+    for name in _CALL_MERGED_PARAMS:
+        if name not in target:
             continue
-        held: Final = call_kwargs.get(bucket)
+        held: Final = call_kwargs.get(name)
         if held is not None and not isinstance(held, Mapping):
-            del params[bucket]
+            del params[name]
             continue
-        added: Final = target[bucket]
-        params[bucket] = {
+        added: Final = target[name]
+        params[name] = {
             **{
                 key: value
                 for key, value in (added.items() if isinstance(added, Mapping) else ())
@@ -873,4 +880,6 @@ def fallback_target_params_over_call(
             },
             **(held or {}),
         }
+    if any(target.get(name) is not None for name in _CALLER_TIMEOUT_PARAMS):
+        params["client_side_timeout"] = True
     return params

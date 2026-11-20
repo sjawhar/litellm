@@ -1703,13 +1703,15 @@ async def test_a_metadata_bucket_that_is_not_an_object_is_refused_in_a_body_and_
 # mapping. Whatever a body's root refuses, checks or strips, a target refuses: no key is accepted in a target that a
 # body is refused for. SAME rows get the body's outcome; CLAIM rows are what this pull request's claim refuses in a
 # target (credential, endpoint, routing and mock-response parameters), which a body's root may carry; STRIPPED rows are
-# keys the request setup drops from a body's root, which a target merged into the call on a hop may not bring back.
+# keys the request setup drops from a body's root, which a target merged into the call on a hop may not bring back;
+# STAMPED rows are keys the setup writes over a body's own value, which a target on a hop would replace.
 
 
 class _Rule(Enum):
     SAME = "the body's outcome"
     CLAIM = "refused in a target by the claim"
     STRIPPED = "dropped from a body, refused in a target"
+    STAMPED = "written by the setup at a body's root, refused in a target"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1717,8 +1719,8 @@ class _Row:
     key: str
     value: object
     rule: _Rule
-    # For a SAME row: whether a body that carries the key is refused, and so a target that carries it. For a CLAIM or
-    # STRIPPED row: whether a body's root is refused for it after authentication (the mock testing params are)
+    # For a SAME row: whether a body that carries the key is refused, and so a target that carries it. For any other
+    # row: whether a body's root is refused for it after authentication (the mock testing params are)
     refused: bool = True
 
 
@@ -1736,7 +1738,7 @@ _TARGET_TABLE: Final = (
     _Row("content_policy_fallbacks", [{"requested": ["forbidden"]}], _Rule.SAME),
     _Row("default_fallbacks", ["forbidden"], _Rule.SAME),
     _Row("context_window_fallback_dict", {"anthropic/requested": "forbidden"}, _Rule.SAME),
-    _Row("router_settings_override", {"fallbacks": ["forbidden"]}, _Rule.SAME),
+    _Row("router_settings_override", {"num_retries": 0}, _Rule.STAMPED, refused=False),
     _Row("model_list", [{"model_name": "forbidden", "litellm_params": {"model": "anthropic/forbidden"}}], _Rule.SAME),
     _Row("user_config", {"model_list": []}, _Rule.SAME),
     _Row("api_base", _ATTACKER_HOST, _Rule.SAME),
@@ -1761,6 +1763,27 @@ _TARGET_TABLE: Final = (
     _Row("base_model", "anthropic/other", _Rule.STRIPPED, refused=False),
     _Row("metadata", {"user_api_key_user_id": "someone-else"}, _Rule.STRIPPED, refused=False),
     _Row("litellm_metadata", {"user_api_key_team_id": "another-team"}, _Rule.STRIPPED, refused=False),
+    _Row("guardrails", [], _Rule.STRIPPED, refused=False),
+    _Row("policies", [], _Rule.STRIPPED, refused=False),
+    _Row("include_fallback_errors", True, _Rule.STRIPPED, refused=False),
+    # A per-request callback param, refused at a body's root with the observability params
+    _Row("turn_off_message_logging", False, _Rule.SAME),
+    _Row("allowed_model_region", "eu", _Rule.STAMPED, refused=False),
+    _Row("litellm_call_id", "caller-call-id", _Rule.STAMPED, refused=False),
+    # The setup copies these from the caller's own headers: the caller's parameters, in a target as in a body
+    _Row("litellm_trace_id", "caller-trace-id", _Rule.SAME, refused=False),
+    _Row("litellm_session_id", "caller-session-id", _Rule.SAME, refused=False),
+    _Row("timeout", 30, _Rule.SAME, refused=False),
+    _Row("stream_timeout", 30, _Rule.SAME, refused=False),
+    _Row("num_retries", 0, _Rule.SAME, refused=False),
+    _Row("keepalive_seconds", 5, _Rule.SAME, refused=False),
+    _Row("ttl", 60, _Rule.SAME, refused=False),
+    # Written over a body's only by a proxy started with --request_timeout
+    _Row("request_timeout", 30, _Rule.SAME, refused=False),
+    _Row("cache", {"no-cache": True}, _Rule.STAMPED, refused=False),
+    _Row("disable_fallbacks", False, _Rule.STAMPED, refused=False),
+    _Row("success_callback", [], _Rule.STAMPED, refused=False),
+    _Row("failure_callback", [], _Rule.STAMPED, refused=False),
     _Row("specific_deployment", True, _Rule.CLAIM, refused=False),
     _Row("custom_llm_provider", "openai", _Rule.CLAIM, refused=False),
     _Row("model_info", {"id": "forbidden-deployment"}, _Rule.CLAIM, refused=False),
@@ -1840,20 +1863,39 @@ async def test_a_fallback_target_is_never_validated_less_than_a_request_body(
             assert _error_param(in_target.response) == _error_param(in_body.response), seen
 
 
+# The rows whose refusal in a target is a model name's, which both readings of a mapping name alike
+_NAME_ROWS: Final = frozenset(
+    {
+        "model",
+        "fallbacks",
+        "context_window_fallbacks",
+        "content_policy_fallbacks",
+        "default_fallbacks",
+        "context_window_fallback_dict",
+    }
+)
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("row", _TARGET_TABLE, ids=lambda row: row.key)
-async def test_a_mapping_read_both_ways_is_never_validated_less_than_a_request_body(
+@pytest.mark.parametrize(
+    "row",
+    [row for row in _TARGET_TABLE if (row.rule is not _Rule.SAME or row.refused) and row.key not in _NAME_ROWS],
+    ids=lambda row: row.key,
+)
+async def test_a_mapping_read_both_ways_is_refused_as_the_parameter_override_it_is_to_litellms_own_loop(
     monkeypatch: pytest.MonkeyPatch, row: _Row
 ) -> None:
     """
     `["other", {key: value}]` is a `fallbacks` list in the Router's group format, so the mapping without a `model` is a
-    model group map to the Router and a parameter override to litellm's own fallback loop, and is checked both ways:
-    it is refused wherever the body is, and may be refused where the body is not (a list value is a model name there)
+    model group map to the Router and a parameter override to litellm's own fallback loop. A key a target is refused
+    for is a parameter's, so the override reading refuses the mapping, and the refusal says it was read both ways. Rows
+    a body accepts, and rows refused for a model name both readings name, prove nothing here and are left out.
     """
     result: Final = await _Gateway(monkeypatch).send({"fallbacks": ["other", {row.key: copy.deepcopy(row.value)}]})
 
-    if row.rule is not _Rule.SAME or row.refused:
-        assert _refused(result), result.response.text
+    assert _refused(result), result.response.text
+    assert row.key in result.response.text
+    assert _READ_BOTH_WAYS_NOTE.format(entry=repr(row.key)) in result.response.text
 
 
 @pytest.mark.asyncio
@@ -1872,6 +1914,68 @@ async def test_a_target_litellms_own_fallback_loop_merges_is_refused_as_on_the_r
 
     assert response.status_code in (400, 401, 403), response.text
     assert called == ()
+
+
+# The reader's backup group: one deployment, outside the region an end user may be restricted to
+_BACKUP_IN_US: Final = MappingProxyType(
+    {
+        "model_name": "backup",
+        "litellm_params": {
+            "model": "anthropic/backup",
+            "api_key": _DEPLOYMENT_KEY,
+            "api_base": _OTHER_HOST,
+            "region_name": "us",
+        },
+    }
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("target", "served"),
+    [
+        pytest.param({"model": "backup", "allowed_model_region": None}, False, id="clears-the-region"),
+        pytest.param({"model": "backup"}, True, id="control"),
+    ],
+)
+async def test_a_target_may_not_replace_the_region_the_proxy_stamps(
+    monkeypatch: pytest.MonkeyPatch, target: Mapping[str, object], served: bool
+) -> None:
+    """
+    The request setup writes the key's or end user's region over a body's own, and the Router's region check reads it
+    to keep the call in that region; a target merged on a hop would replace it with its own, null included.
+
+    What this proves: a target that carries `allowed_model_region` is refused at the entry check, before any call, so
+    the hop to the `us` deployment is never made. What it does not: the Router's region path itself. The harness has no
+    end user restricted to a region and runs no pre-call checks, so the control is served whatever its region.
+    """
+    result: Final = await _Gateway(monkeypatch).send(
+        {"fallbacks": [dict(target)]},
+        key_models=("requested", "backup"),
+        extra_deployments=[_BACKUP_IN_US],
+    )
+
+    if served:
+        assert result.response.status_code == 200, result.response.text
+        assert result.calls == {"requested": 1, "other": 1, "forbidden": 0, "attacker": 0}
+        return
+    assert result.response.status_code == 401, result.response.text
+    assert "allowed_model_region" in result.response.text
+    assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+
+
+@pytest.mark.asyncio
+async def test_a_targets_own_timeout_and_retries_are_the_callers_parameters(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    The setup copies the caller's own timeout and retry headers over its body's values, which applies no one else's
+    limit, so a target may set its own, as a body may
+    """
+    result: Final = await _Gateway(monkeypatch).send(
+        {"fallbacks": [{"model": "other", "timeout": 30, "num_retries": 0}]}
+    )
+
+    assert result.response.status_code == 200, result.response.text
+    assert result.calls == {"requested": 1, "other": 1, "forbidden": 0, "attacker": 0}
 
 
 async def _chat_served_by_litellm(
@@ -2855,6 +2959,210 @@ def test_fallback_key_scan_covers_renamed_router_inputs(tmp_path: Path, monkeypa
     assert _proxy_renamed_fallback_input_fields((proxy_source,), read | frozenset({"fallbacks"})) == frozenset(
         {"backup_fallbacks"}
     )
+
+
+# What the request setup writes at a body's root and leaves the caller's own: it fills the key in only when the body
+# lacks it, or merges the body's value with its own. A key here may ride on a fallback target.
+_SETUP_DEFAULTS: Final = MappingProxyType(
+    {
+        "model": "the body's own model, resolved by alias; a target's own model gets the model checks",
+        "drop_params": "set only when the body has none (should_auto_drop_params_for_agentic_cli)",
+        "stream_options": "merged: include_usage is added; fallback_target_params_over_call keeps the call's keys",
+        "metadata": "merged: fallback_target_params_over_call keeps every key the call holds",
+        "litellm_metadata": "merged: fallback_target_params_over_call keeps every key the call holds",
+    }
+)
+# What the setup copies from the caller's own request headers over its body's values: no one else's limit applies to
+# the write, so a target may set its own, as a body may. Each with why.
+_SETUP_CALLERS_OWN: Final = MappingProxyType(
+    {
+        "timeout": "the caller's x-litellm-timeout header, no limit; the merge marks a target's client_side_timeout",
+        "stream_timeout": "the caller's x-litellm-stream-timeout header, no limit; marked as timeout is",
+        "num_retries": "the caller's x-litellm-num-retries header, no limit",
+        "keepalive_seconds": "the caller's keepalive header; the deployment's opt-in gates the root's value when read",
+        "ttl": "the s-maxage of the caller's Cache-Control header, no limit",
+        "litellm_trace_id": "the caller's trace headers, or one the setup adds when the body has none",
+        "litellm_session_id": "the caller's session header or metadata; the session policy only adds a missing one",
+    }
+)
+# Written over a body's own only under an administrator's setting, so refused in a target then: each key, with the
+# module and global that switch it on (the command line's values, and the key hash as `user`)
+_SETUP_PINS: Final = MappingProxyType(
+    {
+        "temperature": ("litellm.proxy.proxy_server", "user_temperature"),
+        "max_tokens": ("litellm.proxy.proxy_server", "user_max_tokens"),
+        "api_base": ("litellm.proxy.proxy_server", "user_api_base"),
+        "request_timeout": ("litellm.proxy.proxy_server", "user_request_timeout"),
+        "user": ("litellm", "overwrite_user_with_key_hash"),
+    }
+)
+# The setup's keys a proxy-wide allow_client_side_credentials admits on a target, by the claim's own rule
+_ADMITTED_BY_THE_CREDENTIAL_OPT_IN: Final = frozenset(
+    {"api_key", "api_base", "api_version", "organization", "headers", "extra_headers", "provider_specific_header"}
+)
+
+
+def _computed_setup_keys() -> Mapping[str, frozenset[str]]:
+    """The keys behind each name the setup computes a root key from, resolved by reading its line"""
+    from litellm.proxy import litellm_pre_call_utils as setup
+    from litellm.types.utils import StandardCallbackDynamicParams
+
+    buckets: Final = frozenset({"metadata", "litellm_metadata"})
+    return MappingProxyType(
+        {
+            "_metadata_variable_name": buckets,
+            "metadata_variable_name": buckets,
+            "_metadata_field": buckets,
+            "_internal_key": frozenset(setup._UNTRUSTED_ROOT_CONTROL_FIELDS),  # pyright: ignore[reportPrivateUsage]
+            "field": frozenset(setup._CLIENT_PRICING_CONTROL_FIELDS),  # pyright: ignore[reportPrivateUsage]
+            "k": frozenset(StandardCallbackDynamicParams.__annotations__),  # the team's callback vars
+            "key": frozenset({"api_base", "api_key", "api_version"}),  # a model's credential config, when absent
+        }
+    )
+
+
+def _request_setup_root_keys() -> tuple[frozenset[str], frozenset[str]]:
+    """
+    The root keys the request setup writes, sets by default or drops, read from its source: litellm_pre_call_utils, and
+    the pre-call logic of common_request_processing. Returns the keys it names and the names it computes.
+    """
+    import litellm
+
+    root: Final = Path(litellm.__file__).parent / "proxy"
+    sources: Final = (
+        ("litellm.proxy.litellm_pre_call_utils", root / "litellm_pre_call_utils.py", None),
+        (
+            "litellm.proxy.common_request_processing",
+            root / "common_request_processing.py",
+            frozenset({"common_processing_pre_call_logic"}),
+        ),
+    )
+    named: set[str] = set()
+    computed: set[str] = set()
+    for module_name, path, functions in sources:
+        tree = ast.parse(path.read_text())
+        module = importlib.import_module(module_name)
+        defs = {
+            node.name: node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+
+        def record(node: ast.expr, module: ModuleType = module) -> None:
+            value = node.value if isinstance(node, ast.Constant) else None
+            if isinstance(node, ast.Name):
+                value = getattr(module, node.id, None)
+                if not isinstance(value, str):
+                    computed.add(node.id)
+                    return
+            if isinstance(value, str):
+                named.add(value)
+            else:
+                computed.add(ast.unparse(node))
+
+        def is_data(node: ast.expr) -> bool:
+            return (isinstance(node, ast.Name) and node.id in ("data", "request_data")) or (
+                isinstance(node, ast.Attribute)
+                and node.attr == "data"
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "self"
+            )
+
+        def scan(function: ast.AST, seen: set[str], defs: Mapping[str, ast.AST] = defs) -> None:
+            for node in ast.walk(function):
+                targets = (
+                    node.targets
+                    if isinstance(node, ast.Assign)
+                    else (node.target,)
+                    if isinstance(node, (ast.AnnAssign, ast.AugAssign))
+                    else ()
+                )
+                for target in targets:
+                    if isinstance(target, ast.Subscript) and is_data(target.value):
+                        record(target.slice)
+                if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.args):
+                    continue
+                if not is_data(node.func.value):
+                    continue
+                if node.func.attr in ("setdefault", "pop"):
+                    record(node.args[0])
+                if node.func.attr == "update":
+                    # The keys of the dict a helper returns into the request data
+                    called = node.args[0]
+                    callee = (
+                        called.func.attr
+                        if isinstance(called, ast.Call) and isinstance(called.func, ast.Attribute)
+                        else called.func.id
+                        if isinstance(called, ast.Call) and isinstance(called.func, ast.Name)
+                        else None
+                    )
+                    helper = defs.get(callee) if callee is not None else None
+                    if helper is None:
+                        computed.add(ast.unparse(called))
+                        continue
+                    if callee not in seen:
+                        seen.add(callee)
+                        scan(helper, seen)
+                    for returned in ast.walk(helper):
+                        if isinstance(returned, ast.Return) and isinstance(returned.value, ast.Dict):
+                            for key in returned.value.keys:
+                                if key is not None:
+                                    record(key)
+
+        for name, function in defs.items():
+            if functions is None or name in functions:
+                scan(function, set())
+    return frozenset(named), frozenset(computed)
+
+
+def test_every_root_key_the_request_setup_writes_or_drops_is_refused_in_a_target_or_the_callers_own(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """
+    A key the request setup writes over a body's own with a value that is not the caller's (the key's, team's or end
+    user's settings, the proxy's own), or drops from it, would be replaced or brought back by a target merged on a hop,
+    so the entry check refuses it in a target, naming it; a key the setup copies from the caller's own headers, only
+    defaults or merges stays the caller's own. A new key the setup writes fails this test until it is classified.
+    """
+    from litellm.proxy.auth.auth_utils import (
+        _proxy_pinned_call_params,  # pyright: ignore[reportPrivateUsage]
+        is_request_body_safe,
+    )
+
+    named, computed = _request_setup_root_keys()
+    resolved: Final = _computed_setup_keys()
+    assert computed <= frozenset(resolved), computed - frozenset(resolved)
+    keys: Final = named.union(*(resolved[name] for name in computed))
+    router: Final = _router_without_fallback_group()
+
+    def refusal(key: str, general_settings: dict) -> str:
+        target = {"model": "primary", key: {}}  # a mapping, so no key is refused for its value's shape
+        try:
+            is_request_body_safe({"model": "primary", "fallbacks": [target]}, general_settings, router, "primary")
+        except (ValueError, ProxyException) as error:
+            return str(getattr(error, "message", error))
+        return ""
+
+    callers_own: Final = frozenset(_SETUP_CALLERS_OWN)
+    pins: Final = frozenset(_SETUP_PINS)
+    refused_keys: Final = keys - frozenset(_SETUP_DEFAULTS) - callers_own - pins
+    assert {"allowed_model_region", "router_settings_override", "cache", "litellm_call_id"} <= refused_keys
+    assert [key for key in sorted(refused_keys) if key not in refusal(key, {})] == []
+    with_opt_in: Final = {"allow_client_side_credentials": True}
+    assert [
+        key for key in sorted(refused_keys - _ADMITTED_BY_THE_CREDENTIAL_OPT_IN) if key not in refusal(key, with_opt_in)
+    ] == []
+
+    assert callers_own <= keys
+    assert [key for key in sorted(callers_own) if refusal(key, {})] == []
+
+    # api_base is the claim's without the credential opt-in, whatever the command line says
+    switched: Final = sorted(pins - _ADMITTED_BY_THE_CREDENTIAL_OPT_IN)
+    assert pins <= keys
+    assert _proxy_pinned_call_params() == frozenset()
+    assert [key for key in switched if refusal(key, {})] == []
+    for module_name, global_name in _SETUP_PINS.values():
+        monkeypatch.setattr(importlib.import_module(module_name), global_name, True)
+    assert _proxy_pinned_call_params() == pins
+    assert [key for key in switched if key not in refusal(key, {})] == []
 
 
 def test_the_router_reads_no_fallback_kwarg_that_auth_does_not_check():
