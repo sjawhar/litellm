@@ -8,6 +8,7 @@ from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
+from functools import partial
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple, TypeVar, cast, overload
 
@@ -34,6 +35,7 @@ if TYPE_CHECKING:
 
 T = TypeVar("T", bound=BaseModel)
 _Written = TypeVar("_Written")
+_Row = TypeVar("_Row")
 
 AUTH_OBJECTS_TARGET: Final = "auth_objects"
 
@@ -945,3 +947,39 @@ async def revoke_last_good_then(
     write."""
     await revoke_last_good(cache, cache_keys)
     return await write()
+
+
+# Rows that keep appearing between a read and its delete for this many rounds are left, and the request refused
+LAST_GOOD_EXACT_DELETE_ROUNDS: Final = 3
+
+
+async def revoke_and_delete_read_rows(
+    cache: DualCache,
+    read: Callable[[], Awaitable[Sequence[_Row]]],
+    cache_keys_of: Callable[[Sequence[_Row]], Sequence[str]],
+    delete: Callable[[Sequence[_Row]], Awaitable[object]],
+    *,
+    first: Sequence[_Row] | None = None,
+) -> tuple[_Row, ...]:
+    """Delete the rows ``read`` finds and only those, each round paired with the revocation of their entries
+    (``revoke_last_good_then``), then read again, until a read finds none. A row added between a read and its delete
+    is not deleted unrevoked: the next round reads, revokes and deletes it. ``first`` is a read the caller already made.
+    When the rows of ``LAST_GOOD_EXACT_DELETE_ROUNDS`` deletes are each followed by more, answers 409 with the rows of
+    the last read kept, their entries not revoked by this call. Returns every row it deleted."""
+    deleted: Final[list[_Row]] = []  # mutable-ok: grows by the rows of each round
+    rows = first if first is not None else await read()
+    for _ in range(LAST_GOOD_EXACT_DELETE_ROUNDS):
+        if not rows:
+            return tuple(deleted)
+        await revoke_last_good_then(cache, cache_keys_of(rows), partial(delete, rows))
+        deleted.extend(rows)
+        rows = await read()  # rebind-ok: rows added since the last read
+    if not rows:
+        return tuple(deleted)
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "error": f"Rows kept being added while they were deleted, {LAST_GOOD_EXACT_DELETE_ROUNDS} times, so the "
+            "request stopped before deleting the last ones it found. Retry it."
+        },
+    )

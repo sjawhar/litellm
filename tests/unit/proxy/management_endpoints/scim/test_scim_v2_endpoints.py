@@ -4,7 +4,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from itertools import chain
 from types import MappingProxyType
-from typing import Final
+from typing import Final, NamedTuple
 from unittest.mock import DEFAULT, AsyncMock, MagicMock, call
 
 import pytest
@@ -14,6 +14,7 @@ from pytest_mock import MockerFixture
 
 from litellm.constants import LAST_GOOD_TOMBSTONE_TTL_SECONDS
 from litellm.proxy._types import (
+    LiteLLM_TeamMembership,
     LiteLLM_TeamTable,
     LiteLLM_UserTable,
     LitellmUserRoles,
@@ -6839,26 +6840,93 @@ def _deactivate(method: str) -> Awaitable[SCIMUser]:
     )
 
 
-def _membership_tables(prisma: MagicMock, *, team_ids: Sequence[str]) -> None:
-    """The tables the user's row cleanup writes: its invitations, its organization memberships, and its team
-    memberships, one row for each of ``team_ids``."""
-    from litellm.proxy._types import LiteLLM_TeamMembership
+class _TeamMembershipTable:
+    """The user's team memberships, by team, as its row cleanup reads and deletes them: ``added_after_reads`` holds,
+    for each read in turn, the teams of the rows another request adds right after it, before the delete that follows.
+    Each delete records the teams it deleted and those whose membership had a tombstone in ``redis`` as it ran (none
+    while Redis is lost)."""
 
+    def __init__(
+        self,
+        team_ids: Sequence[str],
+        *,
+        added_after_reads: Sequence[Sequence[str]] = (),
+        redis: FakeRedisCache | None = None,
+    ) -> None:
+        self.team_ids: Final[list[str]] = list(team_ids)  # mutable-ok: rows are added and deleted as the request runs
+        self.deletes: Final[list[tuple[tuple[str, ...], tuple[str, ...]]]] = []  # mutable-ok: one entry per delete
+        self._added_after_reads: Final = tuple(tuple(added) for added in added_after_reads)
+        self._redis: Final = redis
+        self._reads = 0
+
+    async def find_many(self, where: Mapping[str, object]) -> list[LiteLLM_TeamMembership]:
+        found: Final = [
+            LiteLLM_TeamMembership(user_id=_SCIM_USER_ID, team_id=team_id)
+            for team_id in self.team_ids
+            if where.get("user_id") == _SCIM_USER_ID
+        ]
+        if self._reads < len(self._added_after_reads):
+            self.team_ids.extend(self._added_after_reads[self._reads])
+        self._reads += 1  # rebind-ok: counts the reads
+        return found
+
+    async def delete_many(self, where: Mapping[str, object]) -> int:
+        named: Final = where.get("team_id")
+        deleted: Final = tuple(
+            team_id
+            for team_id in self.team_ids
+            if where.get("user_id") == _SCIM_USER_ID and (not isinstance(named, dict) or team_id in named["in"])
+        )
+        self.deletes.append((deleted, await self._tombstoned(deleted)))
+        for team_id in deleted:
+            self.team_ids.remove(team_id)
+        return len(deleted)
+
+    async def _tombstoned(self, team_ids: Sequence[str]) -> tuple[str, ...]:
+        if self._redis is None or not self._redis.server.connected:
+            return ()
+        client: Final = self._redis.cache.init_async_client()
+        return tuple(
+            [
+                team_id
+                for team_id in team_ids
+                if await client.exists(
+                    f"last_good_tombstone:{team_membership_auth_cache_key(team_id=team_id, user_id=_SCIM_USER_ID)}"
+                )
+                == 1
+            ]
+        )
+
+
+def _membership_tables(
+    prisma: MagicMock,
+    *,
+    team_ids: Sequence[str],
+    added_after_reads: Sequence[Sequence[str]] = (),
+    redis: FakeRedisCache | None = None,
+) -> _TeamMembershipTable:
+    """The tables the user's row cleanup writes: its invitations, its organization memberships, and its team
+    memberships, a ``_TeamMembershipTable`` whose reads and deletes stay mocks the test can check."""
+    memberships: Final = _TeamMembershipTable(team_ids, added_after_reads=added_after_reads, redis=redis)
     prisma.db.litellm_invitationlink.delete_many = AsyncMock()
     prisma.db.litellm_organizationmembership.delete_many = AsyncMock()
-    prisma.db.litellm_teammembership.find_many = AsyncMock(
-        return_value=[LiteLLM_TeamMembership(user_id=_SCIM_USER_ID, team_id=team_id) for team_id in team_ids]
-    )
-    prisma.db.litellm_teammembership.delete_many = AsyncMock()
+    prisma.db.litellm_teammembership.find_many = AsyncMock(side_effect=memberships.find_many)
+    prisma.db.litellm_teammembership.delete_many = AsyncMock(side_effect=memberships.delete_many)
+    return memberships
 
 
 def _tombstones_standing_at(
-    redis: FakeRedisCache, write: str, cache_keys: Sequence[str], standing: list[tuple[str, tuple[str, ...]]]
+    redis: FakeRedisCache,
+    write: str,
+    cache_keys: Sequence[str],
+    standing: list[tuple[str, tuple[str, ...]]],
+    *,
+    then: Callable[..., Awaitable[object]] | None = None,
 ) -> Callable[..., Awaitable[object]]:
     """A write mock's side effect: records under ``write`` which of ``cache_keys`` have a tombstone in Redis when the
-    write runs, none while Redis is lost. The write answers as configured."""
+    write runs, none while Redis is lost. The write then runs ``then`` when given, else answers as configured."""
 
-    async def record(*_args: object, **_kwargs: object) -> object:
+    async def record(*args: object, **kwargs: object) -> object:
         client: Final = redis.cache.init_async_client()
         standing.append(
             (
@@ -6872,7 +6940,7 @@ def _tombstones_standing_at(
                 ),
             )
         )
-        return DEFAULT
+        return DEFAULT if then is None else await then(*args, **kwargs)
 
     return record
 
@@ -7078,12 +7146,23 @@ async def test_scim_user_end_answers_503_with_the_second_key_unwritten_when_redi
 _HELD_TEAM_IDS: Final = ("team-1", "team-2")
 
 
-def _user_with_no_key_or_team_whose_invitations_delete_outlasts_the_tombstones(
-    mocker: MockerFixture, *, loses_redis: bool
-) -> tuple[MagicMock, FakeRedisCache]:
-    """A SCIM user on no team and holding no key, yet with team memberships in ``_HELD_TEAM_IDS``, whose DELETE runs
-    the real row cleanup. Its first write, the invitations delete, takes past the time the request's record allows,
-    the tombstones lapsing meanwhile and Redis lost once it lands when ``loses_redis``."""
+class _UserWithMemberships(NamedTuple):
+    """A SCIM user on no team and holding no key, yet with team memberships, whose DELETE runs the real row cleanup on
+    ``clock`` behind ``redis``."""
+
+    prisma: MagicMock
+    redis: FakeRedisCache
+    clock: _DrivenClock
+    memberships: _TeamMembershipTable
+
+
+def _user_with_memberships_but_no_key_or_team(
+    mocker: MockerFixture,
+    *,
+    team_ids: Sequence[str] = _HELD_TEAM_IDS,
+    added_after_reads: Sequence[Sequence[str]] = (),
+) -> _UserWithMemberships:
+    """The user, with a membership in each of ``team_ids`` and the memberships ``added_after_reads`` adds."""
     clock: Final = _DrivenClock()
     redis: Final = fake_redis_cache()
     prisma: Final = _scim_user_with_a_key(mocker, serves_last_good=True, redis=redis, last_good_clock=clock)
@@ -7092,11 +7171,21 @@ def _user_with_no_key_or_team_whose_invitations_delete_outlasts_the_tombstones(
         AsyncMock(return_value=LiteLLM_UserTable(user_id=_SCIM_USER_ID, teams=[], metadata={"scim_active": True})),
     )
     prisma.db.litellm_verificationtoken.find_many = AsyncMock(return_value=[])
-    _membership_tables(prisma, team_ids=_HELD_TEAM_IDS)
-    prisma.db.litellm_invitationlink.delete_many.side_effect = _outlasts_the_tombstones(
-        redis, clock, loses_redis=loses_redis
+    memberships: Final = _membership_tables(prisma, team_ids=team_ids, added_after_reads=added_after_reads, redis=redis)
+    return _UserWithMemberships(prisma=prisma, redis=redis, clock=clock, memberships=memberships)
+
+
+def _user_with_no_key_or_team_whose_invitations_delete_outlasts_the_tombstones(
+    mocker: MockerFixture, *, loses_redis: bool
+) -> _UserWithMemberships:
+    """``_user_with_memberships_but_no_key_or_team`` with memberships in ``_HELD_TEAM_IDS``. Its first write, the
+    invitations delete, takes past the time the request's record allows, the tombstones lapsing meanwhile and Redis
+    lost once it lands when ``loses_redis``."""
+    user: Final = _user_with_memberships_but_no_key_or_team(mocker)
+    user.prisma.db.litellm_invitationlink.delete_many.side_effect = _outlasts_the_tombstones(
+        user.redis, user.clock, loses_redis=loses_redis
     )
-    return prisma, redis
+    return user
 
 
 @pytest.mark.asyncio
@@ -7104,7 +7193,7 @@ async def test_scim_user_delete_revokes_again_before_each_membership_and_user_de
     """The invitations delete outlasts the tombstone the preflight wrote for the user. The organization memberships
     delete revokes the user again immediately before it, the team memberships delete revokes the membership of each
     row it finds, and the user delete the user: each tombstone stands in Redis when its delete runs."""
-    prisma, redis = _user_with_no_key_or_team_whose_invitations_delete_outlasts_the_tombstones(
+    prisma, redis, _clock, held = _user_with_no_key_or_team_whose_invitations_delete_outlasts_the_tombstones(
         mocker, loses_redis=False
     )
     memberships: Final = tuple(
@@ -7115,7 +7204,7 @@ async def test_scim_user_delete_revokes_again_before_each_membership_and_user_de
         redis, "organization memberships", (_SCIM_USER_ID,), standing
     )
     prisma.db.litellm_teammembership.delete_many.side_effect = _tombstones_standing_at(
-        redis, "team memberships", memberships, standing
+        redis, "team memberships", memberships, standing, then=held.delete_many
     )
     prisma.db.litellm_usertable.delete.side_effect = _tombstones_standing_at(redis, "user", (_SCIM_USER_ID,), standing)
 
@@ -7128,6 +7217,7 @@ async def test_scim_user_delete_revokes_again_before_each_membership_and_user_de
         ("team memberships", memberships),
         ("user", (_SCIM_USER_ID,)),
     ]
+    assert held.team_ids == []
 
 
 @pytest.mark.asyncio
@@ -7136,7 +7226,7 @@ async def test_scim_user_delete_answers_503_with_every_membership_kept_when_redi
 ):
     """The same slow invitations delete, with Redis lost once it lands: the organization memberships delete has to
     revoke the user in Redis again and cannot, so the DELETE answers 503 with the memberships and the user kept."""
-    prisma, _redis = _user_with_no_key_or_team_whose_invitations_delete_outlasts_the_tombstones(
+    prisma, _redis, _clock, held = _user_with_no_key_or_team_whose_invitations_delete_outlasts_the_tombstones(
         mocker, loses_redis=True
     )
 
@@ -7148,6 +7238,7 @@ async def test_scim_user_delete_answers_503_with_every_membership_kept_when_redi
     prisma.db.litellm_organizationmembership.delete_many.assert_not_awaited()
     prisma.db.litellm_teammembership.delete_many.assert_not_awaited()
     prisma.db.litellm_usertable.delete.assert_not_awaited()
+    assert held.team_ids == list(_HELD_TEAM_IDS)
 
 
 @pytest.mark.asyncio
@@ -7174,3 +7265,131 @@ async def test_scim_put_leaving_a_team_answers_503_before_the_user_row_update_wh
     assert str(refused.value.code) == "503"
     member_delete.assert_awaited_once()
     prisma.db.litellm_usertable.update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_scim_user_delete_revokes_and_deletes_a_team_membership_added_after_the_cleanup_read_the_memberships(
+    mocker,
+):
+    """A team membership is added for the user between the cleanup's read of its memberships and the delete after it.
+    Only the memberships read are deleted, each with its membership's tombstone standing in Redis, so the one added is
+    read, revoked and deleted in a next round, and the user is deleted."""
+    prisma, _redis, _clock, held = _user_with_memberships_but_no_key_or_team(
+        mocker, team_ids=("team-1",), added_after_reads=(("team-2",),)
+    )
+
+    response: Final = await delete_user(user_id=_SCIM_USER_ID)
+
+    assert response.status_code == 204
+    assert prisma.db.litellm_teammembership.delete_many.await_args_list == [
+        call(where={"user_id": _SCIM_USER_ID, "team_id": {"in": [team_id]}}) for team_id in ("team-1", "team-2")
+    ]
+    assert held.deletes == [(("team-1",), ("team-1",)), (("team-2",), ("team-2",))]
+    assert held.team_ids == []
+    prisma.db.litellm_usertable.delete.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_scim_user_delete_answers_503_with_the_added_team_membership_kept_when_redis_is_lost_after_a_delete(
+    mocker,
+):
+    """The same added membership, with Redis lost once the delete of the memberships read lands: the added one has to
+    be revoked in Redis before its own delete and cannot, so the DELETE answers 503 with it and the user kept."""
+    prisma, redis, _clock, held = _user_with_memberships_but_no_key_or_team(
+        mocker, team_ids=("team-1",), added_after_reads=(("team-2",),)
+    )
+
+    async def delete_then_lose_redis(*, where: Mapping[str, object]) -> int:
+        deleted: Final = await held.delete_many(where=where)
+        redis.server.connected = False
+        return deleted
+
+    prisma.db.litellm_teammembership.delete_many.side_effect = delete_then_lose_redis
+
+    with pytest.raises(ProxyException) as refused:
+        await delete_user(user_id=_SCIM_USER_ID)
+
+    assert str(refused.value.code) == "503"
+    prisma.db.litellm_teammembership.delete_many.assert_awaited_once_with(
+        where={"user_id": _SCIM_USER_ID, "team_id": {"in": ["team-1"]}}
+    )
+    assert held.team_ids == ["team-2"]
+    prisma.db.litellm_usertable.delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_scim_user_delete_answers_409_with_the_user_kept_when_team_memberships_keep_being_added(mocker):
+    """A team membership is added for the user after every read of its memberships. The cleanup deletes what each of
+    its three rounds read, then refuses with 409: the membership the fourth read found is neither deleted nor revoked,
+    and the user is not deleted."""
+    prisma, redis, _clock, held = _user_with_memberships_but_no_key_or_team(
+        mocker, team_ids=("team-1",), added_after_reads=(("team-2",), ("team-3",), ("team-4",))
+    )
+
+    with pytest.raises(ProxyException) as refused:
+        await delete_user(user_id=_SCIM_USER_ID)
+
+    assert str(refused.value.code) == "409"
+    assert prisma.db.litellm_teammembership.delete_many.await_args_list == [
+        call(where={"user_id": _SCIM_USER_ID, "team_id": {"in": [team_id]}})
+        for team_id in ("team-1", "team-2", "team-3")
+    ]
+    assert held.team_ids == ["team-4"]
+    unrevoked: Final = team_membership_auth_cache_key(team_id="team-4", user_id=_SCIM_USER_ID)
+    assert await redis.cache.init_async_client().exists(f"last_good_tombstone:{unrevoked}") == 0
+    prisma.db.litellm_usertable.delete.assert_not_awaited()
+
+
+def _user_whose_team_memberships_delete_outlasts_the_tombstones(
+    mocker: MockerFixture, *, loses_redis: bool
+) -> _UserWithMemberships:
+    """``_user_with_memberships_but_no_key_or_team`` with memberships in ``_HELD_TEAM_IDS``. The cleanup's last write,
+    the team memberships delete, takes past the time the request's record allows, every tombstone lapsing meanwhile,
+    the user's too, and Redis lost once it lands when ``loses_redis``: only a revocation after it stands again."""
+    user: Final = _user_with_memberships_but_no_key_or_team(mocker)
+    outlast: Final = _outlasts_the_tombstones(user.redis, user.clock, loses_redis=loses_redis)
+
+    async def slow_delete(*, where: Mapping[str, object]) -> int:
+        deleted: Final = await user.memberships.delete_many(where=where)
+        _ = await outlast()
+        return deleted
+
+    user.prisma.db.litellm_teammembership.delete_many.side_effect = slow_delete
+    return user
+
+
+@pytest.mark.asyncio
+async def test_scim_user_delete_revokes_the_user_again_before_its_row_delete_after_a_slow_team_memberships_delete(
+    mocker,
+):
+    """The team memberships delete outlasts every tombstone, the one the organization memberships delete renewed for
+    the user included. The user delete revokes the user again immediately before it, so the user's tombstone stands in
+    Redis when the user row is deleted."""
+    prisma, redis, _clock, held = _user_whose_team_memberships_delete_outlasts_the_tombstones(mocker, loses_redis=False)
+    standing: Final[list[tuple[str, tuple[str, ...]]]] = []  # mutable-ok: one entry for the user delete
+    prisma.db.litellm_usertable.delete.side_effect = _tombstones_standing_at(redis, "user", (_SCIM_USER_ID,), standing)
+
+    response: Final = await delete_user(user_id=_SCIM_USER_ID)
+
+    assert response.status_code == 204
+    assert held.deletes == [(_HELD_TEAM_IDS, _HELD_TEAM_IDS)]
+    assert standing == [("user", (_SCIM_USER_ID,))]
+
+
+@pytest.mark.asyncio
+async def test_scim_user_delete_answers_503_with_the_user_kept_when_redis_is_lost_during_the_team_memberships_delete(
+    mocker,
+):
+    """The same slow team memberships delete, with Redis lost once it lands: the user delete has to revoke the user in
+    Redis again and cannot, so the DELETE answers 503 with the memberships deleted and the user kept."""
+    prisma, _redis, _clock, held = _user_whose_team_memberships_delete_outlasts_the_tombstones(
+        mocker, loses_redis=True
+    )
+
+    with pytest.raises(ProxyException) as refused:
+        await delete_user(user_id=_SCIM_USER_ID)
+
+    assert str(refused.value.code) == "503"
+    prisma.db.litellm_teammembership.delete_many.assert_awaited_once()
+    assert held.team_ids == []
+    prisma.db.litellm_usertable.delete.assert_not_awaited()
