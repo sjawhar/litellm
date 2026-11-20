@@ -1855,6 +1855,11 @@ class _MappingTable:
         self.rows.append(row)
         return SimpleNamespace(**row)
 
+    async def delete(self, where: dict[str, object]) -> SimpleNamespace:
+        row = next(row for row in self.rows if row["id"] == where["id"])
+        self.rows.remove(row)
+        return SimpleNamespace(**row)
+
 
 async def _cache_holding_both_keys(**cache_kwargs: object) -> UserApiKeyCache:
     user_api_key_cache = UserApiKeyCache(serve_last_good_entries=True, **cache_kwargs)
@@ -2011,3 +2016,62 @@ async def test_a_repoint_answers_503_and_changes_nothing_when_redis_cannot_recor
         await _repoint(table, user_api_key_cache)
 
     assert (refused.value.status_code, table.rows[0]["token"]) == (503, _OLD_KEY)
+
+
+async def _mapping_on_a_down_redis() -> tuple[_MappingTable, UserApiKeyCache]:
+    redis = fake_redis_cache()
+    table = _MappingTable(_mapping_row("mapping-1", _OLD_KEY))
+    user_api_key_cache = await _cache_holding_both_keys(redis_cache=redis.cache)
+    redis.server.connected = False
+    return table, user_api_key_cache
+
+
+@pytest.mark.asyncio
+async def test_a_mapping_delete_answers_503_and_keeps_the_row_when_redis_cannot_record_the_revocation():
+    """A mapping delete is a strict revocation: the scope's entry is tombstoned before the row goes, or none goes."""
+    from litellm.proxy._types import DeleteJWTKeyMappingRequest
+
+    table, user_api_key_cache = await _mapping_on_a_down_redis()
+
+    with _endpoints_on(table, user_api_key_cache), pytest.raises(HTTPException) as refused:
+        await delete_jwt_key_mapping(
+            data=DeleteJWTKeyMappingRequest(id="mapping-1"), user_api_key_dict=_make_admin_auth()
+        )
+
+    assert (refused.value.status_code, [row["id"] for row in table.rows]) == (503, ["mapping-1"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change", [{"jwt_issuer": "https://issuer.example"}, {"is_active": False}], ids=["issuer", "deactivate"]
+)
+async def test_a_mapping_update_that_changes_what_it_resolves_answers_503_and_changes_nothing_when_redis_is_down(
+    change: dict[str, object],
+):
+    """Moving a mapping to another issuer or deactivating it is a repoint of its scope, as a new token is."""
+    from litellm.proxy._types import UpdateJWTKeyMappingRequest
+
+    table, user_api_key_cache = await _mapping_on_a_down_redis()
+    before = dict(table.rows[0])
+
+    with _endpoints_on(table, user_api_key_cache), pytest.raises(HTTPException) as refused:
+        await update_jwt_key_mapping(
+            data=UpdateJWTKeyMappingRequest(id="mapping-1", **change), user_api_key_dict=_make_admin_auth()
+        )
+
+    assert (refused.value.status_code, table.rows[0]) == (503, before)
+
+
+@pytest.mark.asyncio
+async def test_a_mapping_description_update_writes_while_redis_is_down():
+    """A description resolves nothing, so it revokes nothing and needs no Redis."""
+    from litellm.proxy._types import UpdateJWTKeyMappingRequest
+
+    table, user_api_key_cache = await _mapping_on_a_down_redis()
+
+    with _endpoints_on(table, user_api_key_cache):
+        await update_jwt_key_mapping(
+            data=UpdateJWTKeyMappingRequest(id="mapping-1", description="renamed"), user_api_key_dict=_make_admin_auth()
+        )
+
+    assert (table.rows[0]["description"], table.rows[0]["token"]) == ("renamed", _OLD_KEY)
