@@ -3,12 +3,13 @@
 import copy
 import logging
 import re
-from collections.abc import Collection, Iterable, Iterator, Mapping
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, cast, runtime_checkable
 
 import httpx
 from pydantic import TypeAdapter, ValidationError
+from typing_extensions import TypeIs  # noqa: TID251  # TypeIs reaches typing only on 3.13
 
 from litellm._logging import verbose_logger
 from litellm.litellm_core_utils.llm_response_utils.get_headers import get_provider_request_id
@@ -853,9 +854,35 @@ _CALL_MERGED_PARAMS: Final = ("metadata", "litellm_metadata", "stream_options")
 _CALLER_TIMEOUT_PARAMS: Final = ("timeout", "request_timeout", "stream_timeout")
 
 
+def is_object_mapping(value: object) -> TypeIs[Mapping[object, object]]:  # guard-ok: isinstance cannot type the keys
+    return isinstance(value, Mapping)
+
+
+def is_object_dict(
+    value: object,
+) -> TypeIs[dict[object, object]]:  # guard-ok: isinstance cannot type the keys  # mutable-ok: a body's own dict
+    return isinstance(value, dict)
+
+
+def is_object_tuple(value: object) -> TypeIs[tuple[object, ...]]:  # guard-ok: isinstance cannot type the items
+    return isinstance(value, tuple)
+
+
+def is_object_list(
+    value: object,
+) -> TypeIs[list[object]]:  # guard-ok: isinstance cannot type the items  # mutable-ok: the caller's own list
+    return isinstance(value, list)
+
+
+def is_object_sequence(
+    value: object,
+) -> TypeIs[Sequence[object]]:  # guard-ok: a list or a tuple, the sequences a JSON value or a call's kwargs hold
+    return isinstance(value, (list, tuple))
+
+
 def fallback_target_params_over_call(
     call_kwargs: Mapping[str, object], target: Mapping[str, object]
-) -> dict[str, object]:
+) -> Mapping[str, object]:
     """
     The params a fallback target lays over the call, for every reader that merges one: the Router's hop and
     litellm.acompletion's own fallback loop. Its ``metadata``, ``litellm_metadata`` and ``stream_options`` only add keys
@@ -864,27 +891,30 @@ def fallback_target_params_over_call(
     stamped with, and the hop's stream reports the usage the proxy asked for. A target that sets a timeout of its own,
     null included, decides the hop's ``client_side_timeout`` (_caller_timeouts_in_effect).
     """
-    params: Final = dict(target)
-    for name in _CALL_MERGED_PARAMS:
-        if name not in target:
-            continue
-        held: Final = call_kwargs.get(name)
-        if held is not None and not isinstance(held, Mapping):
-            del params[name]
-            continue
-        added: Final = target[name]
-        params[name] = {
-            **{
-                key: value
-                for key, value in (added.items() if isinstance(added, Mapping) else ())
-                if not (isinstance(key, str) and key.startswith(IDENTITY_METADATA_KEY_PREFIX))
-            },
-            **(held or {}),
-        }
+    merged: Final = {
+        name: _merged_bucket(call_kwargs.get(name), target[name]) for name in _CALL_MERGED_PARAMS if name in target
+    }
     touched: Final = tuple(name for name in _CALLER_TIMEOUT_PARAMS if name in target)
-    if touched:
-        params["client_side_timeout"] = _caller_timeouts_in_effect(call_kwargs, target, touched)
-    return params
+    return {
+        **{name: value for name, value in target.items() if name not in merged},
+        # A bucket the call holds as something other than a mapping stays the call's
+        **{name: bucket for name, bucket in merged.items() if bucket is not None},
+        **({"client_side_timeout": _caller_timeouts_in_effect(call_kwargs, target, touched)} if touched else {}),
+    }
+
+
+def _merged_bucket(held: object, added: object) -> Mapping[object, object] | None:
+    """A target's bucket under the call's: the call's keys win, and no identity key comes from the target"""
+    if held is not None and not is_object_mapping(held):
+        return None
+    return {
+        **{
+            key: value
+            for key, value in (added.items() if is_object_mapping(added) else ())
+            if not (isinstance(key, str) and key.startswith(IDENTITY_METADATA_KEY_PREFIX))
+        },
+        **(held or {}),
+    }
 
 
 def _caller_timeouts_in_effect(
@@ -899,7 +929,14 @@ def _caller_timeouts_in_effect(
     marked: Final = call_kwargs.get("client_side_timeout")
     kept: Final = tuple(
         name
-        for name in (marked if isinstance(marked, tuple) else ())
-        if name not in touched and call_kwargs.get(name) is not None
+        for name in (marked if is_object_tuple(marked) else ())
+        if isinstance(name, str) and name not in touched and call_kwargs.get(name) is not None
     )
     return (*kept, *(name for name in touched if target[name] is not None))
+
+
+def caller_timeouts_left(marked: object, replaced: str) -> tuple[str, ...]:
+    """The caller's timeouts a request's mark names, once a timeout the administrator set replaced ``replaced``"""
+    return tuple(
+        name for name in (marked if is_object_tuple(marked) else ()) if isinstance(name, str) and name != replaced
+    )

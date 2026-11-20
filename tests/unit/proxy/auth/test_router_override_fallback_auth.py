@@ -40,7 +40,6 @@ from litellm.proxy._types import (
 from litellm.proxy.agent_endpoints.auth.agent_access_groups import AgentAccessGroupCeiling, CeilingResolver
 from litellm.proxy.auth.auth_utils import key_fallback_model_names
 from litellm.proxy.auth.user_api_key_auth import enforce_key_and_fallback_model_access
-from litellm.router_utils.fallback_event_handlers import FallbackCall, FallbackReading, iter_body_fallback_entries
 from litellm.types.agents import AgentCaller, AgentResponse
 
 
@@ -99,10 +98,13 @@ def test_fallback_model_names_target_and_group_named_model_shapes():
 
 def test_fallback_model_names_read_a_parameter_only_entry_as_a_target():
     """The Router merges every mapping of a list of targets into the call, so its list values name no model."""
+    from litellm.router_utils.fallback_event_handlers import walk_fallback_lists
+
     stop: Final = {"stop": ["END"]}
-    call: Final = FallbackCall(model="", reading=FallbackReading.LITELLM)
-    entries: Final = iter_body_fallback_entries({"fallbacks": [{"model": "gpt-4"}, stop]}, call)
-    assert [entry.target for entry in entries] == [{"model": "gpt-4"}, stop]
+    walk: Final = walk_fallback_lists(
+        {"fallbacks": [{"model": "gpt-4"}, stop]}, carriers={}, anthropic_messages_call=False
+    )
+    assert [entry.target for entry in walk.entries] == [{"model": "gpt-4"}, stop]
     assert _fallback_model_names([{"model": "gpt-4"}, stop]) == ["gpt-4"]
     assert _fallback_model_names([{"gpt-3.5-turbo": ["gpt-4", stop]}]) == ["gpt-4"]
 
@@ -644,6 +646,8 @@ class _Gateway:
         # The key's own config, a legacy per-key setting the key's owner can write
         key_config: Mapping[str, object] | None = None,
         route: str = "/v1/messages",
+        # False sends the request with no API key, as a caller before authentication
+        credentials: bool = True,
     ) -> "_GatewayResult":
         import httpx
         import respx
@@ -731,7 +735,7 @@ class _Gateway:
             **body_fields,
         }
         headers = {
-            "Authorization": f"Bearer {_CALLER_KEY}",
+            **({"Authorization": f"Bearer {_CALLER_KEY}"} if credentials else {}),
             **({"anthropic-beta": _SERVER_SIDE_FALLBACK_BETA} if beta else {}),
         }
 
@@ -1512,6 +1516,150 @@ async def test_a_nested_list_as_a_fallback_entry_is_refused_before_any_call(
     assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
 
 
+# -- A walk of fallback lists is linear in their entries, and refuses lists past the entry budget -----------------
+
+# Ten mappings, the deepest nesting the walk reads (2 * ROUTER_MAX_FALLBACKS), as in the body of the review
+_NESTING: Final = 10
+
+
+def _nested_fallbacks(names: int) -> list[object]:
+    """
+    ``[{"fallbacks": [{"fallbacks": [ ... {"fallbacks": ["n0", "n1", ...]} ... ]}]}]``, ten mappings around ``names``
+    model names: its lists hold ``names + 10`` entries, so 990 names fill the budget of 1,000.
+    """
+    nested: list[object] = [f"n{index}" for index in range(names)]
+    for _ in range(_NESTING):
+        nested = [{"fallbacks": nested}]
+    return nested
+
+
+def _walk_visits(names: int, *, both_ways: bool) -> int:
+    """
+    The entries one walk visits in that body, from the walk's rules, which read each list once per way of reading it.
+    Reading the lists as LiteLLM's, it visits each mapping as a group map, the nine below the first again as targets
+    of a group's list, and the names twice, as the last mapping's own ``fallbacks`` and as its group's list:
+    2 * names + 19. A /v1/messages walk reads the body's ``fallbacks`` both ways, and Anthropic's reading, which reads
+    every mapping as a group map, visits the names three more times: as the last mapping's own list, as the list its
+    group maps to under the group key, and from the body's own list, under no group key: 5 * names + 19.
+    """
+    return (5 if both_ways else 2) * names + 2 * _NESTING - 1
+
+
+def _count_visits(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """The entries every fallback walk visits from now on, in order: each visit builds one FallbackEntry"""
+    from litellm.router_utils import fallback_event_handlers
+
+    visits: Final[list[object]] = []
+
+    class _CountedEntry(fallback_event_handlers.FallbackEntry):
+        __slots__ = ()
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)  # pyright: ignore[reportArgumentType]  # FallbackEntry's own fields
+            visits.append(self.target)
+
+    monkeypatch.setattr(fallback_event_handlers, "FallbackEntry", _CountedEntry)
+    return visits
+
+
+_BODY_CHECK_ROUTES: Final = (
+    pytest.param("/v1/chat/completions", None, False, id="litellms-route"),
+    pytest.param("/v1/messages", "context-management-2025-06-27", True, id="messages-without-the-beta"),
+    pytest.param("/v1/messages", _SERVER_SIDE_FALLBACK_BETA, True, id="messages-with-the-beta"),
+)
+
+
+@pytest.mark.parametrize(("route", "anthropic_beta", "both_ways"), _BODY_CHECK_ROUTES)
+def test_the_body_check_visits_nested_fallbacks_a_fixed_number_of_times_each(
+    monkeypatch: pytest.MonkeyPatch, route: str, anthropic_beta: str | None, both_ways: bool
+) -> None:
+    """
+    The shape of the review's body at the budget, ten nested mappings around 990 names: the body check visits each
+    entry a fixed number of times, not once per path through the mappings above it
+    """
+    from litellm.proxy.auth.auth_utils import is_request_body_safe
+
+    visits: Final = _count_visits(monkeypatch)
+    body: Final = {"model": "requested", "fallbacks": _nested_fallbacks(990)}
+    request: Final = _messages_request(anthropic_beta) if anthropic_beta is not None else None
+
+    assert is_request_body_safe(body, {}, _router_without_fallback_group(), "requested", route=route, request=request)
+    assert len(visits) == _walk_visits(990, both_ways=both_ways)
+
+
+@pytest.mark.parametrize("names", [1000, 20000], ids=["the-8-kb-body", "the-189-kb-body"])
+@pytest.mark.parametrize(("route", "anthropic_beta", "both_ways"), _BODY_CHECK_ROUTES)
+def test_nested_fallbacks_past_the_budget_are_refused_before_their_names_are_read(
+    monkeypatch: pytest.MonkeyPatch, names: int, route: str, anthropic_beta: str | None, both_ways: bool
+) -> None:
+    """
+    The review's two bodies hold 1,010 and 20,010 entries, past the budget of 1,000. The walk counts a list's entries
+    when it reaches the list, so it refuses the list of names before reading it, after the ten mappings above it.
+    """
+    from litellm.proxy.auth.auth_utils import is_request_body_safe
+    from litellm.router_utils.fallback_event_handlers import FallbackBudgetError
+
+    visits: Final = _count_visits(monkeypatch)
+    body: Final = {"model": "requested", "fallbacks": _nested_fallbacks(names)}
+    request: Final = _messages_request(anthropic_beta) if anthropic_beta is not None else None
+
+    with pytest.raises(FallbackBudgetError, match="hold more than 1000 entries in all") as refusal:
+        is_request_body_safe(body, {}, _router_without_fallback_group(), "requested", route=route, request=request)
+    assert refusal.value.param == "fallbacks"
+    assert len(visits) == _NESTING
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("beta", [False, True], ids=["without-the-beta", "with-the-beta"])
+@pytest.mark.parametrize(
+    ("names", "status", "walk_visits"),
+    [
+        pytest.param(990, 401, _walk_visits(990, both_ways=True), id="at-the-budget"),
+        pytest.param(1000, 400, _NESTING, id="the-8-kb-body"),
+        pytest.param(20000, 400, _NESTING, id="the-189-kb-body"),
+    ],
+)
+async def test_nested_fallbacks_sent_without_credentials_are_answered_after_two_bounded_walks(
+    monkeypatch: pytest.MonkeyPatch, beta: bool, names: int, status: int, walk_visits: int
+) -> None:
+    """
+    Before it reads any key, the proxy walks the body's fallback lists in its body check, and once more as it answers
+    the refusal, to see whether a model in Anthropic's list rules out the database-outage identity. The review's
+    bodies are refused at the budget with 400; one at the budget passes the body check and is refused for its missing
+    key with 401.
+    """
+    visits: Final = _count_visits(monkeypatch)
+    result: Final = await _Gateway(monkeypatch).send(
+        {"fallbacks": _nested_fallbacks(names)}, beta=beta, credentials=False
+    )
+
+    assert result.response.status_code == status, result.response.text
+    assert ("hold more than 1000 entries in all" in result.response.text) is (status == 400)
+    assert len(visits) == 2 * walk_visits
+    assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+
+
+@pytest.mark.asyncio
+async def test_a_fallback_hop_walks_no_list_its_request_walked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A hop's lists are its request's own, or the own lists of a target merged into the call, which authentication and
+    the Router's first call walked: a request that falls back twice visits as many entries as one that falls back once
+    """
+    visits: Final = _count_visits(monkeypatch)
+    body: Final = {"fallbacks": ["other", "forbidden"]}
+    key_models: Final = ("requested", "other", "forbidden")
+
+    one_hop: Final = await _Gateway(monkeypatch).send(body, key_models=key_models)
+    one_hop_visits: Final = len(visits)
+    two_hops: Final = await _Gateway(monkeypatch, other_error=(500, "api_error", "x")).send(body, key_models=key_models)
+
+    assert one_hop.response.status_code == 200, one_hop.response.text
+    assert two_hops.response.status_code == 200, two_hops.response.text
+    assert one_hop.calls == {"requested": 1, "other": 1, "forbidden": 0, "attacker": 0}
+    assert two_hops.calls == {"requested": 1, "other": 1, "forbidden": 1, "attacker": 0}
+    assert len(visits) - one_hop_visits == one_hop_visits
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("source", ["key", "team"])
 async def test_a_saved_targets_own_fallbacks_under_the_beta_get_the_refusals_of_anthropics_list(
@@ -1882,7 +2030,7 @@ def test_the_entry_check_runs_the_shared_sanitizer_on_a_target(monkeypatch: pyte
     target: Final = {"model": "primary", "metadata": metadata}
     body: Final = {"model": "primary", "fallbacks": [copy.deepcopy(target)]}
 
-    with pytest.raises(ValueError, match="metadata.headers.litellm-disable-message-redaction"):
+    with pytest.raises(ValueError, match=re.escape("metadata.headers.litellm-disable-message-redaction")):
         is_request_body_safe(body, {}, _router_without_fallback_group(), "primary", route="/v1/messages")
     # Only the target's metadata buckets reach the sanitizer, as they stand in the target
     assert sanitized == [{"metadata": metadata}]
@@ -1906,7 +2054,7 @@ def test_a_target_bucket_nested_past_the_recursion_limit_is_checked_without_a_cr
     if not refused:
         assert is_request_body_safe(body, {}, router, "primary", route="/v1/messages") is True
         return
-    with pytest.raises(ValueError, match="metadata.headers.litellm-disable-message-redaction"):
+    with pytest.raises(ValueError, match=re.escape("metadata.headers.litellm-disable-message-redaction")):
         is_request_body_safe(body, {}, router, "primary", route="/v1/messages")
 
 
@@ -1973,6 +2121,8 @@ _TARGET_TABLE: Final = (
     _Row("_retry_skipped_deployment_ids", ["absent-deployment"], _Rule.SAME, refused=False),
     _Row("router_fallbacks", ["other"], _Rule.STRIPPED, refused=False),
     _Row("_target_order", [0], _Rule.STRIPPED, refused=False),
+    # The Router's mark of a hop, whose lists its request's first call walked
+    _Row("attempted_targets", ["other"], _Rule.STRIPPED, refused=False),
     _Row("fallback_depth", 0, _Rule.STRIPPED, refused=False),
     _Row("fallback_model_group", ["other"], _Rule.STRIPPED, refused=False),
     _Row("callbacks", ["langfuse"], _Rule.STRIPPED, refused=False),

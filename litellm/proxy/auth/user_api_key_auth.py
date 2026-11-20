@@ -95,13 +95,13 @@ from litellm.proxy.auth.auth_object_prefetch import (
 from litellm.proxy.auth.auth_utils import (
     FallbackModelNames,
     abbreviate_api_key,
+    check_request_body,
     explained_fallback_name_refusal,
     get_end_user_id_from_request_body,
     get_model_from_request,
     get_request_route,
     get_request_route_template,
     is_invalid_virtual_key_error,
-    is_request_body_safe,
     key_fallback_model_names,
     log_model_access_denial,
     normalize_request_route,
@@ -3808,7 +3808,7 @@ async def enforce_key_and_fallback_model_access(
     request_data: dict,
     route: str,
     request: Request | None,
-    llm_model_list: Sequence[object] | None,
+    llm_model_list: list | None,
     llm_router: litellm.Router | None,
 ) -> None:
     """
@@ -3846,7 +3846,7 @@ async def enforce_key_and_fallback_model_access(
     await enforce_fallback_target_access(
         valid_token=valid_token,
         names=key_fallback_model_names(request_data, route=route, request=request),
-        llm_model_list=llm_model_list,
+        llm_model_list=llm_model_list,  # pyright: ignore[reportUnknownArgumentType]  # the proxy's untyped model list
         llm_router=llm_router,
     )
 
@@ -3897,7 +3897,7 @@ async def enforce_router_settings_fallback_access(
     *,
     request_data: Mapping[str, object],
     valid_token: UserAPIKeyAuth,
-    general_settings: dict,
+    general_settings: Mapping[str, object],
     llm_router: litellm.Router | None,
     request: Request,
 ) -> None:
@@ -3921,7 +3921,7 @@ async def enforce_router_settings_fallback_access(
         if key in request_data
     }
     try:
-        is_request_body_safe(
+        names: Final = check_request_body(
             settings_request,
             general_settings,
             llm_router,
@@ -3936,7 +3936,6 @@ async def enforce_router_settings_fallback_access(
             param="router_settings",
             code=status.HTTP_400_BAD_REQUEST,
         ) from e
-    names: Final = key_fallback_model_names(settings_request, route=route, request=request)
     if not (names.litellm or names.anthropic):
         return
     await enforce_fallback_target_access(

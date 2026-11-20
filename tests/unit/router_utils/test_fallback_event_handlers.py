@@ -1514,9 +1514,8 @@ def test_reject_non_list_litellm_fallbacks_refuses_a_group_mapped_to_a_non_list(
 @pytest.mark.parametrize("field", ["fallbacks", "context_window_fallbacks", "content_policy_fallbacks"])
 def test_reject_non_list_litellm_fallbacks_keeps_group_maps_of_lists(field: str):
     """A string and a group mapped to a list (`model` and `*` included) pass in every field"""
-    reject_non_list_litellm_fallbacks(
-        ["other", {"requested": ["other"]}, {"*": [{"model": "other"}]}, {"model": ["other"]}], "requested", field=field
-    )
+    fallbacks: Final = ["other", {"requested": ["other"]}, {"*": [{"model": "other"}]}, {"model": ["other"]}]
+    assert reject_non_list_litellm_fallbacks(fallbacks, "requested", field=field) is None
 
 
 @pytest.mark.parametrize("field", ["context_window_fallbacks", "content_policy_fallbacks"])
@@ -1529,7 +1528,7 @@ def test_reject_non_list_litellm_fallbacks_refuses_a_target_in_an_error_field(fi
 
 def test_reject_non_list_litellm_fallbacks_keeps_a_target_beside_a_string_in_fallbacks():
     """The Router skips it there, as it skips every target in a `fallbacks` list it resolves by group"""
-    reject_non_list_litellm_fallbacks(["other", {"model": "other", "n": 1}], "requested")
+    assert reject_non_list_litellm_fallbacks(["other", {"model": "other", "n": 1}], "requested") is None
 
 
 @pytest.mark.parametrize("field", ["fallbacks", "context_window_fallbacks", "content_policy_fallbacks"])
@@ -1559,7 +1558,64 @@ def test_reject_non_list_litellm_fallbacks_refuses_a_nested_list(field: str, fal
 
 def test_reject_non_list_litellm_fallbacks_reads_no_group_map_in_a_list_of_targets():
     """The Router calls a `fallbacks` list of targets as is, so an entry there without a model is an override"""
-    reject_non_list_litellm_fallbacks([{"model": "other"}, {"timeout": 5}, {"stop": ["END"]}, {}], "requested")
+    targets: Final = [{"model": "other"}, {"timeout": 5}, {"stop": ["END"]}, {}]
+    assert reject_non_list_litellm_fallbacks(targets, "requested") is None
+
+
+_NESTED_LIST_REFUSAL: Final = "LiteLLM fallbacks must hold model names and mappings, got list"
+
+
+def _target_with_a_nested_list() -> dict[str, object]:
+    """A target whose own `fallbacks` no reader can call, which a hop would merge into the call"""
+    return {"model": "other", "fallbacks": [["bad"]]}
+
+
+@pytest.mark.parametrize(
+    "mark",
+    [None, {"keys": ["requested"]}, ["requested"]],
+    ids=["no-mark", "a-mapping-a-body-can-send", "a-list-a-body-can-send"],
+)
+def test_a_call_without_its_requests_attempted_targets_gets_the_routers_list_check(mark: object):
+    """
+    Only a hop skips the Router's list check: a call carrying its request's AttemptedFallbackTargets, which
+    run_async_fallback creates. A request body can send `attempted_targets` only as data, which the setup drops and
+    which marks nothing here either.
+    """
+    kwargs: Final = {"model": "requested"} if mark is None else {"model": "requested", "attempted_targets": mark}
+    with pytest.raises(litellm.BadRequestError, match=_NESTED_LIST_REFUSAL):
+        reject_non_list_litellm_fallbacks([_target_with_a_nested_list()], "requested", call_kwargs=kwargs)
+
+
+def test_a_hop_reads_no_list_its_requests_first_call_checked():
+    """A hop's lists are its request's own, or a merged target's own, which its request's first call walked"""
+    kwargs: Final = {"model": "other", "attempted_targets": AttemptedFallbackTargets(frozenset({"requested"}))}
+    assert reject_non_list_litellm_fallbacks([_target_with_a_nested_list()], "other", call_kwargs=kwargs) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["the-call", "the-routers-configuration"])
+async def test_the_routers_first_call_checks_a_targets_own_list_without_the_proxy(source: str):
+    """
+    A call that reaches the Router without the proxy is walked by the Router's own first call, which its hops rely on:
+    a target's own list no reader can call is refused there before any deployment answers, whether the call sends the
+    list or the Router's configuration holds it
+    """
+    deployment_key: Final = "-".join(("fake", "deployment", "key"))
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": name,
+                "litellm_params": {"model": f"openai/{name}", "api_key": deployment_key, "mock_response": "served"},
+            }
+            for name in ("requested", "other")
+        ],
+        fallbacks=[{"requested": [_target_with_a_nested_list()]}] if source == "the-routers-configuration" else None,
+        num_retries=0,
+    )
+    sent: Final = {"fallbacks": [_target_with_a_nested_list()]} if source == "the-call" else {}
+
+    with pytest.raises(litellm.BadRequestError, match=_NESTED_LIST_REFUSAL):
+        await router.acompletion(model="requested", messages=[{"role": "user", "content": "hi"}], **sent)
 
 
 @pytest.mark.parametrize(

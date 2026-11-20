@@ -15,6 +15,8 @@ from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.core_helpers import (
     fallback_target_params_over_call,
     get_metadata_variable_name_from_kwargs,
+    is_object_dict,
+    is_object_list,
     safe_deep_copy,
 )
 from litellm.litellm_core_utils.get_llm_provider_logic import inferred_provider
@@ -364,7 +366,7 @@ def _unsupported_group_map_entry(fallbacks: Sequence[object], field: str) -> str
     for entry in fallbacks:
         if isinstance(entry, str):
             continue
-        if not isinstance(entry, dict):
+        if not is_object_dict(entry):
             return f"must hold model names and mappings, got {type(entry).__name__}"
         if not entry:
             return "must not hold an empty mapping"
@@ -373,7 +375,7 @@ def _unsupported_group_map_entry(fallbacks: Sequence[object], field: str) -> str
                 continue
             return f"maps model groups to their fallbacks, so it cannot hold a target naming model {entry['model']!r}"
         for group, chain in entry.items():
-            if not isinstance(chain, list):
+            if not is_object_list(chain):
                 return f"must map model group {group!r} to a list of model groups, got {type(chain).__name__}"
             unsupported = tuple(type(item).__name__ for item in chain if not isinstance(item, (str, dict)))
             if unsupported:
@@ -413,6 +415,12 @@ def _is_mapping(value: object) -> TypeIs[Mapping[object, object]]:  # guard-ok: 
     return isinstance(value, Mapping)
 
 
+def _is_entry_mapping(
+    value: object,
+) -> TypeIs[Mapping[str, object]]:  # guard-ok: an entry comes from a JSON body or a call's kwargs, keyed by strings
+    return isinstance(value, Mapping)
+
+
 def fallback_target_model_name(target: object) -> str | None:
     """The model a fallback entry names: a string entry, or a mapping's string ``model``"""
     if isinstance(target, str):
@@ -433,105 +441,54 @@ class FallbackReading(Enum):
     BOTH = "both"
 
 
-@dataclass(frozen=True, slots=True)
-class FallbackCall:
+class FallbackBudgetError(FallbackListShapeError):
     """
-    The call a fallback entry is read for: the model a target lands on, and whose list every ``fallbacks`` field of
-    the request and of its targets is. The Router keeps an earlier target's params in the call on later hops, so a
-    mapping without its own ``model`` lands on whichever model an earlier hop left there, and is read for none.
+    Fallback lists that hold more entries in all than their budget, refused when the walk reaches the list that passes
+    it, before it reads that list's entries
     """
-
-    model: str
-    reading: FallbackReading
-
-    @classmethod
-    def of_kwargs(
-        cls,
-        kwargs: Mapping[str, object] | None,
-        *,
-        fallbacks: object,
-        field: str,
-        anthropic_messages_call: bool = False,
-    ) -> "FallbackCall":
-        """The call a Router entry check reads ``fallbacks`` for, the list ``field`` holds in these kwargs"""
-        if kwargs is None:
-            return cls(model="", reading=FallbackReading.BOTH)
-        model: Final = kwargs.get("model")
-        function_name: Final[object] = getattr(kwargs.get("original_generic_function"), "__name__", None)
-        return cls(
-            model=model if isinstance(model, str) else "",
-            reading=fallback_reading(
-                {**kwargs, field: fallbacks},
-                carriers=kwargs,
-                anthropic_messages_call=anthropic_messages_call or function_name == "anthropic_messages",
-            ),
-        )
-
-    def with_target(self, target: Mapping[str, object]) -> "FallbackCall":
-        """The call once a hop merges ``target`` into it"""
-        return FallbackCall(model=fallback_target_model_name(target) or "", reading=self.reading)
-
-
-def fallback_reading(
-    body: Mapping[str, object], *, carriers: Mapping[str, object], anthropic_messages_call: bool
-) -> FallbackReading:
-    """
-    One pass over every fallback list a request carries, before any check reads one: whose list each ``fallbacks``
-    field is on every hop. ``carriers`` holds the request's header fields, which the Router's
-    provider_owns_fallbacks_field reads for the beta. A target that carries a header field replaces the call's on its
-    hop and the Router keeps it on later hops, so when any target carries one and any hop can carry the beta, the order
-    of hops decides and every ``fallbacks`` field is read both ways.
-    """
-    if not anthropic_messages_call:
-        return FallbackReading.LITELLM
-    request_beta: Final = provider_owns_fallbacks_field(carriers, anthropic_messages_call=True)
-    probe: Final = FallbackCall(model="", reading=FallbackReading.BOTH)
-    try:
-        carrying: Final = tuple(
-            entry.target
-            for entry in iter_body_fallback_entries(body, probe)
-            if not isinstance(entry.target, str) and any(key in entry.target for key in HEADER_CARRIER_KWARGS)
-        )
-    except FallbackListShapeError:
-        # The checks refuse the list; nothing is known of its hops until then
-        return FallbackReading.BOTH
-    if not carrying:
-        return FallbackReading.ANTHROPIC if request_beta else FallbackReading.LITELLM
-    target_beta: Final = any(provider_owns_fallbacks_field(target, anthropic_messages_call=True) for target in carrying)
-    return FallbackReading.BOTH if request_beta or target_beta else FallbackReading.LITELLM
-
-
-def _list_readings(call: FallbackCall, *, own_fallbacks: bool, widest_reading: bool) -> tuple[bool, ...]:
-    """For each reading of a list, whether it is Anthropic's, read in the widest way"""
-    if widest_reading:
-        return (True,)
-    if not own_fallbacks or call.reading is FallbackReading.LITELLM:
-        return (False,)
-    return (True,) if call.reading is FallbackReading.ANTHROPIC else (False, True)
 
 
 @dataclass(frozen=True, slots=True)
 class FallbackEntry:
     """
-    One entry of a fallback list: a model name, or a mapping a reader merges into ``call``. ``group`` is the key of the
+    One entry of a fallback list: a model name, or a mapping a reader merges into the call. ``group`` is the key of the
     model group map the entry is or stands under in a ``fallbacks`` list in the Router's group format, a map the Router
     reads as that group's fallbacks while litellm.acompletion's own fallback loop, which serves a request no Router
     serves, merges it into the call as a parameter override; ``is_group_map`` marks the map itself. ``anthropic`` marks
-    an entry of a list Anthropic reads.
+    an entry of a list Anthropic reads. ``via_litellm_fallbacks`` marks an entry reached through a ``fallbacks`` field
+    read as LiteLLM's by a walk that reads it both ways.
     """
 
     target: str | Mapping[str, object]
-    call: FallbackCall
     group: str | None = None
     is_group_map: bool = False
     anthropic: bool = False
+    via_litellm_fallbacks: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class FallbackListRead:
+    """A value a LiteLLM reader iterates as the fallback list ``field`` holds"""
+
+    value: object
+    field: str
+    via_litellm_fallbacks: bool = False
+
+
+def _in_reading(event: FallbackEntry | FallbackListRead, reading: FallbackReading) -> bool:
+    """Whether a walk that reads every ``fallbacks`` field both ways reaches ``event`` under ``reading`` too"""
+    if reading is FallbackReading.LITELLM:
+        return isinstance(event, FallbackListRead) or not event.anthropic
+    if reading is FallbackReading.ANTHROPIC:
+        return not event.via_litellm_fallbacks
+    return True
 
 
 @dataclass(frozen=True, slots=True)
 class FallbackChecks:
     """
-    What a reader checks as the walk reaches it: ``entry`` sees every entry, a target before the lists it carries are
-    read, and ``litellm_list`` sees every list LiteLLM reads, with the field it is the value of.
+    What a reader checks of what a walk reached: ``entry`` sees every entry, a target before the lists it carries, and
+    ``litellm_list`` sees every list LiteLLM reads, with the field it is the value of.
     """
 
     entry: Callable[[FallbackEntry], None] | None = None
@@ -541,53 +498,224 @@ class FallbackChecks:
 _NO_FALLBACK_CHECKS: Final = FallbackChecks()
 
 
-def _checked(entry: FallbackEntry, checks: FallbackChecks) -> FallbackEntry:
-    if checks.entry is not None:
-        checks.entry(entry)
-    return entry
+@dataclass(frozen=True, slots=True)
+class FallbackWalk:
+    """
+    One walk of fallback lists: whose list each ``fallbacks`` field is, what its readers reach in walk order (every
+    entry, and every list LiteLLM iterates), and the shape error the walk stopped at
+    """
+
+    reading: FallbackReading
+    events: tuple[FallbackEntry | FallbackListRead, ...]
+    error: FallbackListShapeError | None = None
+
+    @property
+    def entries(self) -> tuple[FallbackEntry, ...]:
+        return tuple(event for event in self.events if isinstance(event, FallbackEntry))
+
+    def check(self, checks: FallbackChecks = _NO_FALLBACK_CHECKS) -> tuple[FallbackEntry, ...]:
+        """
+        Runs ``checks`` on what the walk reached, in its order, then raises the shape error it stopped at, so a check
+        refuses an entry before the walk's refusal of a later one. Returns the entries.
+        """
+        for event in self.events:
+            if isinstance(event, FallbackListRead):
+                if checks.litellm_list is not None:
+                    checks.litellm_list(event.value, event.field)
+            elif checks.entry is not None:
+                checks.entry(event)
+        if self.error is not None:
+            raise self.error
+        return self.entries
+
+
+@dataclass(slots=True)
+class _FallbackRead:
+    """
+    The state of one walk. It reads each list, and each mapping merged into the call, once per way of reading it: the
+    field it is read as, its depth, whose list it is, the group key above it, and whether a both-ways ``fallbacks``
+    read lies above it. A walk is so linear in the entries. ``budget`` caps the entries of all the lists, each counted
+    once however many ways it is read; None leaves them uncounted.
+    """
+
+    reading: FallbackReading
+    budget: int | None
+    read: set[tuple[object, ...]]  # mutable-ok: one walk's own record of what it read, never handed out
+    counted: set[int]  # mutable-ok: one walk's own record of the lists it counted, never handed out
+    entries: int = 0
+
+    def first_read(self, way: tuple[object, ...]) -> bool:
+        if way in self.read:
+            return False
+        self.read.add(way)
+        return True
+
+    def count(self, container: object, entries: int, field: str | None) -> None:
+        if id(container) in self.counted:
+            return
+        self.counted.add(id(container))
+        self.entries += entries
+        if self.budget is not None and self.entries > self.budget:
+            raise FallbackBudgetError(
+                f"Rejected Request: the fallback lists hold more than {self.budget} entries in all.", field
+            )
+
+
+def _until_shape_error(
+    events: Iterator[FallbackEntry | FallbackListRead],
+) -> Iterator[FallbackEntry | FallbackListRead | FallbackListShapeError]:
+    """What a walk reached, then the shape error it stopped at; a list past the budget is refused at once"""
+    try:
+        yield from events
+    except FallbackListShapeError as shape_error:
+        if isinstance(shape_error, FallbackBudgetError):
+            raise
+        yield shape_error
+
+
+def _recorded(events: Iterator[FallbackEntry | FallbackListRead], reading: FallbackReading) -> FallbackWalk:
+    """What a walk reached and the shape error it stopped at, for the checks to read in the walk's order"""
+    reached: Final = tuple(_until_shape_error(events))
+    stopped: Final = reached[-1] if reached and isinstance(reached[-1], FallbackListShapeError) else None
+    return FallbackWalk(
+        reading, tuple(event for event in reached if not isinstance(event, FallbackListShapeError)), stopped
+    )
+
+
+def walk_fallback_lists(
+    body: Mapping[str, object],
+    *,
+    carriers: Mapping[str, object],
+    anthropic_messages_call: bool,
+    budget: int | None = None,
+) -> FallbackWalk:
+    """
+    One walk of every fallback list a request body carries, with whose list each ``fallbacks`` field is on every hop.
+    ``carriers`` holds the request's header fields, which the Router's provider_owns_fallbacks_field reads for the
+    beta. A target that carries a header field replaces the call's on its hop and the Router keeps it on later hops, so
+    when any target carries one and any hop can carry the beta, the order of hops decides and every ``fallbacks`` field
+    is read both ways. An anthropic_messages call's walk reads both ways from the start, decides the reading from the
+    targets it reached, and keeps what that reading reaches: one walk serves the reading and every check. ``budget``
+    caps the entries of all the lists.
+    """
+    if not anthropic_messages_call:
+        return _recorded(
+            iter_body_fallback_entries(body, _FallbackRead(FallbackReading.LITELLM, budget, set(), set())),
+            FallbackReading.LITELLM,
+        )
+    both_ways: Final = _recorded(
+        iter_body_fallback_entries(body, _FallbackRead(FallbackReading.BOTH, budget, set(), set())),
+        FallbackReading.BOTH,
+    )
+    if both_ways.error is not None:
+        # The checks refuse the lists; nothing is known of their hops until then
+        return both_ways
+    request_beta: Final = provider_owns_fallbacks_field(carriers, anthropic_messages_call=True)
+    carrying: Final = tuple(
+        entry.target
+        for entry in both_ways.entries
+        if not isinstance(entry.target, str) and any(key in entry.target for key in HEADER_CARRIER_KWARGS)
+    )
+    target_beta: Final = any(provider_owns_fallbacks_field(target, anthropic_messages_call=True) for target in carrying)
+    reading: Final = (
+        (FallbackReading.ANTHROPIC if request_beta else FallbackReading.LITELLM)
+        if not carrying
+        else (FallbackReading.BOTH if request_beta or target_beta else FallbackReading.LITELLM)
+    )
+    return FallbackWalk(reading, tuple(event for event in both_ways.events if _in_reading(event, reading)))
+
+
+def walk_fallback_list(value: object, field: str, reading: FallbackReading) -> FallbackWalk:
+    """One walk of the fallback list ``field`` holds, its targets' own ``fallbacks`` read as ``reading`` says"""
+    return _recorded(iter_fallback_entries(value, field, _FallbackRead(reading, None, set(), set())), reading)
+
+
+def _list_readings(
+    reading: FallbackReading, *, own_fallbacks: bool, widest_reading: bool, via_litellm_fallbacks: bool
+) -> tuple[tuple[bool, bool], ...]:
+    """
+    For each reading of a list: whether it is Anthropic's, read in the widest way, and whether a both-ways
+    ``fallbacks`` field read as LiteLLM's lies above what it reaches
+    """
+    if widest_reading:
+        return ((True, via_litellm_fallbacks),)
+    if not own_fallbacks or reading is FallbackReading.LITELLM:
+        return ((False, via_litellm_fallbacks),)
+    if reading is FallbackReading.ANTHROPIC:
+        return ((True, via_litellm_fallbacks),)
+    return ((False, True), (True, via_litellm_fallbacks))
 
 
 def iter_fallback_entries(
     value: object,
     field: str | None,
-    call: FallbackCall,
+    walk: _FallbackRead,
     *,
-    checks: FallbackChecks = _NO_FALLBACK_CHECKS,
     depth: int = 0,
     widest_reading: bool = False,
     group: str | None = None,
-) -> Iterator[FallbackEntry]:
+    via_litellm_fallbacks: bool = False,
+) -> Iterator[FallbackEntry | FallbackListRead]:
     """
     The entries of one fallback list, read as its reader reads it: ``field`` is the fallback field whose value the list
     is, and None marks a list of targets, such as the one a model group is mapped to. Every mapping merged into the
-    call gets the reader's checks and has its fallback lists read as a request body's are, by iter_merged_target. A
-    ``fallbacks`` list in the group format is read both ways: a model group map there is also merged as a parameter
-    override, and its names are tagged with its key, which ``group`` carries down. ``widest_reading`` reads every
-    mapping without a string ``model`` as a group map, at every level, for a list Anthropic reads, whose names no
-    LiteLLM reader calls, so a name in any shape gets the checks.
+    call has its fallback lists read as a request body's are, by iter_merged_target. A ``fallbacks`` list in the group
+    format is read both ways: a model group map there is also merged as a parameter override, and its names are tagged
+    with its key, which ``group`` carries down. ``widest_reading`` reads every mapping without a string ``model`` as a
+    group map, at every level, for a list Anthropic reads, whose names no LiteLLM reader calls, so a name in any shape
+    gets the checks. A list the walk read before in the same way yields nothing again.
     """
     if depth > 2 * litellm.ROUTER_MAX_FALLBACKS:
         raise FallbackListShapeError("Rejected Request: fallback nesting exceeds the allowed validation depth.", field)
-    if field is not None and not widest_reading and checks.litellm_list is not None:
-        checks.litellm_list(value, field)
+    if not walk.first_read(("list", id(value), field, depth, widest_reading, group, via_litellm_fallbacks)):
+        return
+    if field is not None and not widest_reading:
+        yield FallbackListRead(value, field, via_litellm_fallbacks)
     if _is_mapping(value):
+        walk.count(value, len(value), field)
         # The Router iterates a fallback list, and iterating a mapping walks its keys, so each key is a target
         for key in value:
             if isinstance(key, str):
-                yield _checked(FallbackEntry(key, call, group, anthropic=widest_reading), checks)
+                yield FallbackEntry(key, group, anthropic=widest_reading, via_litellm_fallbacks=via_litellm_fallbacks)
         for target_list in value.values():
             yield from iter_fallback_entries(
-                target_list, None, call, checks=checks, depth=depth + 1, widest_reading=widest_reading, group=group
+                target_list,
+                None,
+                walk,
+                depth=depth + 1,
+                widest_reading=widest_reading,
+                group=group,
+                via_litellm_fallbacks=via_litellm_fallbacks,
             )
-        return
-    if not isinstance(value, list):
-        return
-    entries_are_targets: Final = not widest_reading and (field is None or fallback_entries_are_targets(value, field))
+    elif is_object_list(value):
+        walk.count(value, len(value), field)
+        yield from _iter_list_entries(
+            value,
+            field,
+            walk,
+            depth=depth,
+            widest_reading=widest_reading,
+            group=group,
+            via_litellm_fallbacks=via_litellm_fallbacks,
+        )
+
+
+def _iter_list_entries(
+    items: Sequence[object],
+    field: str | None,
+    walk: _FallbackRead,
+    *,
+    depth: int,
+    widest_reading: bool,
+    group: str | None,
+    via_litellm_fallbacks: bool,
+) -> Iterator[FallbackEntry | FallbackListRead]:
+    entries_are_targets: Final = not widest_reading and (field is None or fallback_entries_are_targets(items, field))
     read_both_ways: Final = field == "fallbacks" and not widest_reading and not entries_are_targets
-    for item in value:
+    for item in items:
         if isinstance(item, str):
-            yield _checked(FallbackEntry(item, call, group, anthropic=widest_reading), checks)
-        elif not isinstance(item, Mapping):
+            yield FallbackEntry(item, group, anthropic=widest_reading, via_litellm_fallbacks=via_litellm_fallbacks)
+        elif not _is_entry_mapping(item):
             # Every reader takes an entry for a model name or a mapping, so a nested list is called as neither
             raise FallbackListShapeError(
                 "Rejected Request: a fallback list entry must be a model name or a mapping, "
@@ -596,7 +724,12 @@ def iter_fallback_entries(
             )
         elif entries_are_targets or fallback_entry_is_target(item):
             yield from iter_merged_target(
-                item, call, checks=checks, depth=depth + 1, widest_reading=widest_reading, group=group
+                item,
+                walk,
+                depth=depth + 1,
+                widest_reading=widest_reading,
+                group=group,
+                via_litellm_fallbacks=via_litellm_fallbacks,
             )
         else:
             # A model group mapped to the targets the Router calls once that group fails. In `fallbacks`,
@@ -604,56 +737,68 @@ def iter_fallback_entries(
             item_group = ", ".join(str(key) for key in item) if read_both_ways and group is None else group
             if read_both_ways:
                 yield from iter_merged_target(
-                    item, call, checks=checks, depth=depth + 1, group=item_group, is_group_map=True
+                    item,
+                    walk,
+                    depth=depth + 1,
+                    group=item_group,
+                    is_group_map=True,
+                    via_litellm_fallbacks=via_litellm_fallbacks,
                 )
             for target_list in item.values():
                 yield from iter_fallback_entries(
                     target_list,
                     None,
-                    call,
-                    checks=checks,
+                    walk,
                     depth=depth + 1,
                     widest_reading=widest_reading,
                     group=item_group,
+                    via_litellm_fallbacks=via_litellm_fallbacks,
                 )
 
 
 def iter_merged_target(
     target: Mapping[str, object],
-    call: FallbackCall,
+    walk: _FallbackRead,
     *,
-    checks: FallbackChecks = _NO_FALLBACK_CHECKS,
     depth: int,
     widest_reading: bool = False,
     group: str | None = None,
     is_group_map: bool = False,
-) -> Iterator[FallbackEntry]:
+    via_litellm_fallbacks: bool = False,
+) -> Iterator[FallbackEntry | FallbackListRead]:
     """
-    One mapping a reader merges into ``call``, its fallback lists read as a request body's are: the reader's checks
-    see the mapping, then iter_body_fallback_entries reads every list through which the call it lands in picks another
-    model, in the call the merge leaves, so the mapping's own ``fallbacks`` is Anthropic's or LiteLLM's by the carriers
-    the merge leaves.
+    One mapping a reader merges into the call, its fallback lists read as a request body's are: the mapping itself,
+    then iter_body_fallback_entries reads every list through which the call it lands in picks another model, the
+    mapping's own ``fallbacks`` as Anthropic's or LiteLLM's by the walk's reading.
     """
-    yield _checked(FallbackEntry(target, call, group, is_group_map, widest_reading), checks)
+    yield FallbackEntry(target, group, is_group_map, widest_reading, via_litellm_fallbacks)
     yield from iter_body_fallback_entries(
-        target, call.with_target(target), checks=checks, depth=depth, widest_reading=widest_reading, group=group
+        target,
+        walk,
+        depth=depth,
+        widest_reading=widest_reading,
+        group=group,
+        via_litellm_fallbacks=via_litellm_fallbacks,
     )
 
 
 def iter_body_fallback_entries(
     body: Mapping[str, object],
-    call: FallbackCall,
+    walk: _FallbackRead,
     *,
-    checks: FallbackChecks = _NO_FALLBACK_CHECKS,
     depth: int = 0,
     widest_reading: bool = False,
     group: str | None = None,
-) -> Iterator[FallbackEntry]:
+    via_litellm_fallbacks: bool = False,
+) -> Iterator[FallbackEntry | FallbackListRead]:
     """
-    The entries of every fallback list a request body carries, the request's own or a target's merged into ``call``:
+    The entries of every fallback list a request body carries, the request's own or a target's merged into the call:
     its fallback fields, those of its router_settings_override, and the models its context_window_fallback_dict swaps
-    in. Its own ``fallbacks`` is read as ``call.reading`` says: Anthropic's, read in the widest way, LiteLLM's, or both.
+    in. Its own ``fallbacks`` is read as the walk's reading says: Anthropic's, read in the widest way, LiteLLM's, or
+    both. A body the walk read before in the same way yields nothing again.
     """
+    if not walk.first_read(("body", id(body), depth, widest_reading, group, via_litellm_fallbacks)):
+        return
     override: Final = body.get(ROUTER_SETTINGS_OVERRIDE_KWARG)
     for source in (body, override):
         if not _is_mapping(source):
@@ -661,21 +806,33 @@ def iter_body_fallback_entries(
         for field in FALLBACK_LIST_FIELDS:
             value = source.get(field)
             own_fallbacks = source is body and field == "fallbacks"
-            for anthropic_list in _list_readings(call, own_fallbacks=own_fallbacks, widest_reading=widest_reading):
+            for anthropic_list, via in _list_readings(
+                walk.reading,
+                own_fallbacks=own_fallbacks,
+                widest_reading=widest_reading,
+                via_litellm_fallbacks=via_litellm_fallbacks,
+            ):
                 yield from iter_fallback_entries(
-                    value, field, call, checks=checks, depth=depth, widest_reading=anthropic_list, group=group
+                    value,
+                    field,
+                    walk,
+                    depth=depth,
+                    widest_reading=anthropic_list,
+                    group=group,
+                    via_litellm_fallbacks=via,
                 )
     context_window_swaps: Final = body.get(CONTEXT_WINDOW_FALLBACK_DICT_FIELD)
     if _is_mapping(context_window_swaps):
         # Each value is the model the client wrapper swaps in, so the values are a list of targets
-        yield from iter_fallback_entries(
-            list(context_window_swaps.values()),
+        walk.count(context_window_swaps, len(context_window_swaps), CONTEXT_WINDOW_FALLBACK_DICT_FIELD)
+        yield from _iter_list_entries(
+            tuple(context_window_swaps.values()),
             None,
-            call,
-            checks=checks,
+            walk,
             depth=depth,
             widest_reading=widest_reading,
             group=group,
+            via_litellm_fallbacks=via_litellm_fallbacks,
         )
 
 
@@ -715,21 +872,23 @@ def reject_non_list_litellm_fallbacks(
     lists with, before the first call. ``call_kwargs`` are the kwargs of the call, whose header carriers decide whether
     a target's own ``fallbacks`` is Anthropic's; without them no LiteLLM rule is applied to it. ``list_of_targets``
     marks a list whose reader calls every entry as a target, as the direct completion fallback does, so only its type
-    is checked.
+    is checked. A hop, a call that carries its request's AttemptedFallbackTargets, is not read again: each list in its
+    kwargs is one its request's first call checked, or the own list of a target merged into the call, which that check
+    walked.
     """
     if list_of_targets:
         if fallbacks is not None and not isinstance(fallbacks, list):
             _reject_router_unreadable_list(fallbacks, field, model=model)
         return
-    call: Final = FallbackCall.of_kwargs(
-        call_kwargs, fallbacks=fallbacks, field=field, anthropic_messages_call=anthropic_messages_call
-    )
+    if call_kwargs is not None and isinstance(call_kwargs.get("attempted_targets"), AttemptedFallbackTargets):
+        return
     checks: Final = FallbackChecks(
         litellm_list=lambda value, value_field: _reject_router_unreadable_list(value, value_field, model=model)
     )
     try:
-        for _entry in iter_fallback_entries(fallbacks, field, call, checks=checks):
-            pass
+        walk_fallback_list(
+            fallbacks, field, _router_reading(call_kwargs, fallbacks, field, anthropic_messages_call)
+        ).check(checks)
     except FallbackListShapeError as shape_error:
         raise litellm.BadRequestError(
             message=str(shape_error),
@@ -738,9 +897,23 @@ def reject_non_list_litellm_fallbacks(
         ) from shape_error
 
 
+def _router_reading(
+    kwargs: Mapping[str, object] | None, fallbacks: object, field: str, anthropic_messages_call: bool
+) -> FallbackReading:
+    """Whose list each ``fallbacks`` field is, for a Router check of ``fallbacks``, the list ``field`` holds"""
+    if kwargs is None:
+        return FallbackReading.BOTH
+    function_name: Final[object] = getattr(kwargs.get("original_generic_function"), "__name__", None)
+    return walk_fallback_lists(
+        {**kwargs, field: fallbacks},
+        carriers=kwargs,
+        anthropic_messages_call=anthropic_messages_call or function_name == "anthropic_messages",
+    ).reading
+
+
 def request_fallbacks(
     kwargs: Mapping[str, object], router_fallbacks: Sequence[object] | None, *, anthropic_messages_call: bool = False
-) -> list[object] | None:
+) -> list[object] | None:  # mutable-ok: the Router hands it on to its fallback functions' `list | None` parameter
     """The Router's fallback list for this request: the per-request override, else the Router's own"""
     fallbacks: Final = kwargs.get(_router_fallbacks_key(kwargs, anthropic_messages_call), router_fallbacks)
     reject_non_list_litellm_fallbacks(
@@ -752,7 +925,7 @@ def request_fallbacks(
 def pop_request_fallbacks(
     kwargs: dict[str, object],  # mutable-ok: async_function_with_retries pops its controls before the attempt runs
     router_fallbacks: Sequence[object] | None,
-) -> list[object] | None:
+) -> list[object] | None:  # mutable-ok: the Router hands it on to its fallback functions' `list | None` parameter
     fallbacks: Final = kwargs.pop(_router_fallbacks_key(kwargs, False), router_fallbacks)
     reject_non_list_litellm_fallbacks(fallbacks, kwargs.get("model"), call_kwargs=kwargs)
     return None if fallbacks is None else OBJECT_LIST_ADAPTER.validate_python(fallbacks)
@@ -980,7 +1153,7 @@ def get_fallback_model_group_for_lookup_groups(
     return next((result for result in results if result[0] is not None), (None, None))
 
 
-def fallback_entry_is_target(entry: Mapping[str, object]) -> bool:
+def fallback_entry_is_target(entry: object) -> bool:
     """
     A fallback entry that names a string ``model`` is one target, whatever the order of its keys, never a model group
     mapped to the fallbacks under it. The Router's fallback resolution and the proxy's fallback checks both read an

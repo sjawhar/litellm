@@ -56,6 +56,7 @@ from litellm.litellm_core_utils.bug_report import (
     strip_bug_report_notice,
 )
 from litellm.litellm_core_utils.core_helpers import (
+    caller_timeouts_left,
     get_or_create_metadata_bucket,
     independent_snapshot,
     is_expected_client_error,
@@ -2181,12 +2182,14 @@ class ProxyBaseLLMRequestProcessing:
         if user_request_timeout:
             self.data["request_timeout"] = user_request_timeout
             # The administrator's request_timeout replaced the caller's, so the timeout mark no longer names it
-            marked: Final = self.data.pop("client_side_timeout", None)
-            caller_timeouts: Final = tuple(
-                name for name in (marked if isinstance(marked, tuple) else ()) if name != "request_timeout"
+            marked: Final[object] = self.data.pop(  # pyright: ignore[reportUnknownMemberType]  # untyped request body
+                "client_side_timeout", None
             )
+            caller_timeouts: Final = caller_timeouts_left(marked, "request_timeout")
             if caller_timeouts:
-                self.data["client_side_timeout"] = caller_timeouts
+                self.data["client_side_timeout"] = (  # pyright: ignore[reportUnknownMemberType]  # untyped body
+                    caller_timeouts
+                )
         if user_max_tokens:
             self.data["max_tokens"] = user_max_tokens
         if user_api_base:
@@ -2214,6 +2217,7 @@ class ProxyBaseLLMRequestProcessing:
         # group -- model-level guardrails, per-model budgets and rate limits,
         # the logging object -- sees the group that will actually serve.
         if llm_router is not None and proxy_config is not None:
+            from litellm.proxy.auth.auth_utils import GENERAL_SETTINGS_VIEW
             from litellm.proxy.auth.user_api_key_auth import enforce_router_settings_fallback_access
             from litellm.proxy.proxy_server import prisma_client
 
@@ -2229,9 +2233,11 @@ class ProxyBaseLLMRequestProcessing:
             if router_settings is not None:
                 self.data["router_settings_override"] = router_settings
                 await enforce_router_settings_fallback_access(
-                    request_data=self.data,
+                    request_data=(
+                        self.data  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # untyped body
+                    ),
                     valid_token=user_api_key_dict,
-                    general_settings=general_settings,
+                    general_settings=GENERAL_SETTINGS_VIEW.validate_python(general_settings),
                     llm_router=llm_router,
                     request=request,
                 )
@@ -2250,12 +2256,16 @@ class ProxyBaseLLMRequestProcessing:
                 )
                 if alias_target is not None:
                     self.data["model"] = alias_target
-            elif route_type == "anthropic_messages" and anthropic_owns_fallbacks(self.data):
+            elif route_type == "anthropic_messages" and anthropic_owns_fallbacks(
+                self.data  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # untyped request body
+            ):
                 # Under the beta a client sends no LiteLLM fallback list of its own: its body `fallbacks` goes to
                 # Anthropic, so its own router_settings_override may not carry one to the Router either.
-                client_override: Final = self.data.get("router_settings_override")
+                client_override: Final[object] = self.data.get(  # pyright: ignore[reportUnknownMemberType]  # untyped
+                    "router_settings_override"
+                )
                 if isinstance(client_override, dict):
-                    client_override.pop("fallbacks", None)
+                    client_override.pop("fallbacks", None)  # pyright: ignore[reportUnknownMemberType]  # a client dict
 
         self.data["litellm_call_id"] = resolve_litellm_call_id(request.headers.get("x-litellm-call-id"))
         DDSpanTagger.tag_call_id(self.data.get("litellm_call_id"))
@@ -2483,7 +2493,7 @@ class ProxyBaseLLMRequestProcessing:
         return fallbacks if isinstance(fallbacks, list) and fallbacks else None
 
     @staticmethod
-    def _resolve_fallback_models(model: str, fallbacks: list) -> list[str] | None:
+    def _resolve_fallback_models(model: str, fallbacks: list) -> Sequence[object] | None:
         from litellm.router_utils.fallback_event_handlers import get_fallback_model_group
 
         fallback_model_group, generic_fallback_idx = get_fallback_model_group(
@@ -3067,7 +3077,11 @@ class ProxyBaseLLMRequestProcessing:
                 log_context=f"litellm_call_id={logging_obj.litellm_call_id}",
                 return_raw_model_name=should_return_raw_model_name(self.data),
                 routed_model=(
-                    _server_side_fallback_routed_model(self.data) if route_type == "anthropic_messages" else None
+                    _server_side_fallback_routed_model(
+                        self.data  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # untyped body
+                    )
+                    if route_type == "anthropic_messages"
+                    else None
                 ),
             )
 
@@ -4186,7 +4200,12 @@ class ProxyBaseLLMRequestProcessing:
         response reports.
         """
         restamper: Final = (
-            AnthropicStreamModelRestamper(restamp_model, routed_model=_server_side_fallback_routed_model(request_data))
+            AnthropicStreamModelRestamper(
+                restamp_model,
+                routed_model=_server_side_fallback_routed_model(
+                    request_data  # pyright: ignore[reportUnknownArgumentType]  # this method's untyped request dict
+                ),
+            )
             if restamp_model
             else None
         )

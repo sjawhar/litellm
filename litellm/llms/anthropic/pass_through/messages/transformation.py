@@ -597,7 +597,7 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
                 status_code=400,
             )
         caller_pins_thinking: Final = anthropic_request_errors_on_thinking_binding_mismatch(
-            anthropic_messages_optional_request_params
+            anthropic_messages_optional_request_params  # pyright: ignore[reportUnknownArgumentType]  # an untyped dict
         )
 
         self._translate_reasoning_effort_to_anthropic(
@@ -666,7 +666,7 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
             messages = strip_advisor_blocks_from_messages(messages)
 
         anthropic_messages_request: Final[AnthropicMessagesRequest] = AnthropicMessagesRequest(
-            messages=messages
+            messages=messages  # pyright: ignore[reportUnknownArgumentType]  # this method's untyped list of messages
             if caller_pins_thinking
             else strip_encrypted_reasoning_blocks_from_anthropic_messages(messages),
             max_tokens=max_tokens,
