@@ -756,7 +756,13 @@ def _sanitize_client_metadata(
 
 
 def _changed_paths(before: object, after: object, path: tuple[str, ...]) -> tuple[str, ...]:
-    """The dotted paths at which ``after`` drops, adds or changes a value of ``before``, mapping by mapping"""
+    """
+    The dotted paths at which ``after`` drops, adds or changes a value of ``before``, mapping by mapping. A value
+    ``after`` holds as the very object ``before`` holds is unchanged and is not read, so the comparison goes no deeper
+    than the copy it is given made new objects.
+    """
+    if before is after:
+        return ()
     if not (isinstance(before, Mapping) and isinstance(after, Mapping)):
         return () if before == after else (".".join(path),)
     return tuple(
@@ -770,23 +776,32 @@ def _changed_paths(before: object, after: object, path: tuple[str, ...]) -> tupl
     )
 
 
+def _bucket_copy(bucket: Mapping[str, object]) -> dict[str, object]:
+    """A bucket copied as deep as the strips change one, its own keys and those of its ``headers``, and no deeper"""
+    return {
+        key: dict(value) if key == "headers" and isinstance(value, dict) else value for key, value in bucket.items()
+    }
+
+
 def client_metadata_the_setup_would_change(
     target: Mapping[str, object], metadata_variable_name: str
 ) -> tuple[str, ...]:
     """
-    The paths of a fallback target that the request setup would drop or change in a request body. The target, its
-    metadata buckets parsed as a body's are, goes through the setup's own strips on a copy: the session marker's and
+    The paths of a fallback target's metadata buckets that the request setup would drop or change in a request body.
+    Each bucket, parsed as a body's is, goes through the setup's own strips on a copy: the session marker's and
     _sanitize_client_metadata's. The key's and team's opt-ins are taken as off, since a target is checked before the
-    key is read; the proxy-wide settings are as they are. On a route whose metadata is `metadata`, the setup merges a
-    body's `litellm_metadata` into it and drops the bucket, so a target may not bring that bucket there.
+    key is read; the proxy-wide settings are as they are. Only the two buckets are read, and only as deep as the
+    strips change them, so a target nested deeper than the fallback walker reads is refused by the walker; the root
+    fields the same strips drop from a body are in the entry check's own list of root fields. On a route whose
+    metadata is `metadata`, the setup merges a body's `litellm_metadata` into it and drops the bucket, so a target may
+    not bring that bucket there.
     """
     before: Final = {
-        key: (
-            _normalized_metadata_object(key, value) if key in _CLIENT_METADATA_BUCKETS and value is not None else value
-        )
-        for key, value in target.items()
+        name: _normalized_metadata_object(name, value)
+        for name in _CLIENT_METADATA_BUCKETS
+        if (value := target.get(name)) is not None
     }
-    after: Final = copy.deepcopy(before)
+    after: Final[dict[str, object]] = {name: _bucket_copy(bucket) for name, bucket in before.items()}
     _strip_session_id_omitted_marker(after)
     _sanitize_client_metadata(after, allow_client_message_redaction_opt_out=False, allow_client_pricing_override=False)
     dropped_bucket: Final = (
@@ -1669,15 +1684,19 @@ class LiteLLMProxyRequestSetup:
         # A deliberately tiny value can force a 408 on every deployment in a fallback chain,
         # so this marker (never trusted verbatim from the client; stripped above) must cover
         # every source cooldown_handlers._trigger_cooldown_for_failed_deployment needs to
-        # distinguish from a real deployment health signal.
-        if (
-            header_timeout is not None
-            or header_stream_timeout is not None
-            or request_data.get("timeout") is not None
-            or request_data.get("request_timeout") is not None
-            or request_data.get("stream_timeout") is not None
-        ):
-            data["client_side_timeout"] = True
+        # distinguish from a real deployment health signal. It names the caller's own timeouts, so a fallback hop that
+        # clears one can tell whether a timeout of the caller's is still in the call (fallback_target_params_over_call).
+        caller_timeouts: Final = tuple(
+            name
+            for name, header_value in (
+                ("timeout", header_timeout),
+                ("request_timeout", None),
+                ("stream_timeout", header_stream_timeout),
+            )
+            if header_value is not None or request_data.get(name) is not None
+        )
+        if caller_timeouts:
+            data["client_side_timeout"] = caller_timeouts
 
         num_retries: Final = LiteLLMProxyRequestSetup._get_num_retries_from_request(headers)
         if num_retries is not None:

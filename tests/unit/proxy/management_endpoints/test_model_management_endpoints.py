@@ -2,8 +2,8 @@ import inspect
 import asyncio
 import contextlib
 import json
-from collections.abc import Iterator, Mapping
-from types import SimpleNamespace
+from collections.abc import Callable, Iterator, Mapping
+from types import MappingProxyType, SimpleNamespace
 from typing import Dict, Final, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -888,6 +888,105 @@ class TestEveryMappingInADeploymentsParamsGetsTheWriteRules:
             prisma_client=MagicMock(),
             existing_litellm_params=stored,
         )
+
+    # The reader's sequence: an administrator stored an inert mapping with a stored credential under the deployment's
+    # metadata, and a team administrator writes an equal copy into the fallback list, where the fallback loop merges it
+    _SAVED_BACKUP: Final = MappingProxyType({"model": "openai/backup", "litellm_credential_name": "shared-credential"})
+
+    @pytest.mark.asyncio
+    async def test_update_model_checks_a_stored_mapping_moved_into_the_fallback_list(self):
+        from litellm.proxy._types import ProxyException
+        from litellm.proxy.management_endpoints.model_management_endpoints import update_model
+
+        model_id: Final = "moved-mapping-put-test"
+        existing: Final = Deployment(
+            model_name="team-model",
+            litellm_params=LiteLLM_Params(model="openai/gpt-4o", metadata={"saved_backup": dict(self._SAVED_BACKUP)}),
+            model_info={"id": model_id, "team_id": "test_team"},
+        )
+        existing_row: Final = MagicMock()
+        existing_row.model_dump.return_value = existing.model_dump()
+        mock_prisma: Final = MagicMock()
+        mock_prisma.db.litellm_proxymodeltable.find_unique = AsyncMock(return_value=existing_row)
+        mock_prisma.db.litellm_proxymodeltable.update = AsyncMock()
+        with _write_route(mock_prisma, llm_router=None), pytest.raises(ProxyException) as exc_info:
+            await update_model(
+                model_params=updateDeployment(
+                    litellm_params=updateLiteLLMParams(fallbacks=[dict(self._SAVED_BACKUP)]),
+                    model_info=ModelInfo(id=model_id),
+                ),
+                user_api_key_dict=self.team_admin_user,
+            )
+        assert exc_info.value.code == "403"
+        assert exc_info.value.param == "litellm_credential_name"
+        mock_prisma.db.litellm_proxymodeltable.update.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_patch_model_checks_a_stored_mapping_moved_into_the_fallback_list(self):
+        from litellm.proxy._types import ProxyException
+        from litellm.proxy.management_endpoints.model_management_endpoints import patch_model
+
+        model_id: Final = "moved-mapping-patch-test"
+        db_model: Final = Deployment(
+            model_name="team-model",
+            litellm_params=LiteLLM_Params(model="openai/gpt-4o", metadata={"saved_backup": dict(self._SAVED_BACKUP)}),
+            model_info={"id": model_id, "team_id": "test_team"},
+        )
+        with (
+            _write_route(MagicMock(), llm_router=MagicMock()),
+            patch(f"{_ENDPOINTS}.get_db_model", new=AsyncMock(return_value=db_model)),  # test-quality-ok: row stub
+            patch(  # test-quality-ok: asserts the DB write is never reached on rejection
+                f"{_ENDPOINTS}._update_team_model_in_db", new=AsyncMock()
+            ) as mock_update,
+            pytest.raises(ProxyException) as exc_info,
+        ):
+            await patch_model(
+                model_id=model_id,
+                patch_data=updateDeployment(litellm_params=updateLiteLLMParams(fallbacks=[dict(self._SAVED_BACKUP)])),
+                user_api_key_dict=self.team_admin_user,
+            )
+        assert exc_info.value.code == "403"
+        assert exc_info.value.param == "litellm_credential_name"
+        mock_update.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("written_fallbacks", "refused"),
+        [
+            # The stored entry stays at index 0 while the write appends after it: unchanged where it is
+            pytest.param(lambda saved, plain: [saved, plain], False, id="appended-after"),
+            # An entry written before it moves it to index 1: a moved entry is a changed one, and is checked
+            pytest.param(lambda saved, plain: [plain, saved], True, id="moved-to-another-index"),
+        ],
+    )
+    async def test_a_stored_fallback_entry_passes_only_at_its_own_index(
+        self, written_fallbacks: Callable[[dict, dict], list[dict]], refused: bool
+    ):
+        """
+        A PATCH that sends the fallback list back passes the administrator's entry where it was stored, and checks it
+        anywhere else: for a list, the same position is the same index
+        """
+        from litellm.proxy._types import ProxyException
+
+        plain: Final = {"model": "openai/other"}
+        stored: Final = LiteLLM_Params(model="openai/gpt-4o", fallbacks=[dict(self._SAVED_BACKUP)])
+        check: Final = ModelManagementAuthChecks.reject_what_a_non_admin_may_not_set(
+            model_params=Deployment(
+                model_name="team-model", litellm_params=stored, model_info={"id": "team-model", "team_id": "test_team"}
+            ),
+            litellm_params=updateLiteLLMParams(fallbacks=written_fallbacks(dict(self._SAVED_BACKUP), plain), tpm=10),
+            user_api_key_dict=self.team_admin_user,
+            prisma_client=MagicMock(),
+            existing_litellm_params=stored,
+            null_detaches=True,
+        )
+        if not refused:
+            assert await check
+            return
+        with pytest.raises(ProxyException) as exc_info:
+            await check
+        assert exc_info.value.code == "403"
+        assert exc_info.value.param == "litellm_credential_name"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(("params_key", "refused"), [("complexity_router_config", False), ("routing_notes", True)])

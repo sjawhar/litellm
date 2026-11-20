@@ -2180,6 +2180,13 @@ class ProxyBaseLLMRequestProcessing:
             self.data["temperature"] = user_temperature
         if user_request_timeout:
             self.data["request_timeout"] = user_request_timeout
+            # The administrator's request_timeout replaced the caller's, so the timeout mark no longer names it
+            marked: Final = self.data.pop("client_side_timeout", None)
+            caller_timeouts: Final = tuple(
+                name for name in (marked if isinstance(marked, tuple) else ()) if name != "request_timeout"
+            )
+            if caller_timeouts:
+                self.data["client_side_timeout"] = caller_timeouts
         if user_max_tokens:
             self.data["max_tokens"] = user_max_tokens
         if user_api_base:

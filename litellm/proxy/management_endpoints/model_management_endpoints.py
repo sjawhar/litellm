@@ -497,18 +497,21 @@ _CLASSIFIER_CONNECTION_PATHS: Final = frozenset(
 )
 
 
-def _nested_param_mappings(stored: Mapping[str, object] | None) -> tuple[dict[str, object], ...]:
+def _nested_param_mappings(
+    stored: Mapping[str, object] | None,
+) -> tuple[tuple[tuple[str | int, ...], dict[str, object]], ...]:
     """
-    Every mapping reachable inside a deployment's params, under any key and inside any list, at every depth, read from
-    the dict the write routes store (_stored_params), never from a validated copy. Readers merge some into a call: an
-    entry of `fallbacks`, the `litellm_params` of a `model_list` entry. The rest no reader merges, and a writer who is
-    not a proxy admin has no reason to put an admin-only field in any of them. The classifier connection is left out
+    Every mapping reachable inside a deployment's params, under any key and inside any list, at every depth, with its
+    path from the root of the params (a key for a mapping, an index for a list), read from the dict the write routes
+    store (_stored_params), never from a validated copy. Readers merge some into a call: an entry of `fallbacks`, the
+    `litellm_params` of a `model_list` entry. The rest no reader merges, and a writer who is not a proxy admin has no
+    reason to put an admin-only field in any of them. The classifier connection is left out
     (_CLASSIFIER_CONNECTION_PATHS).
     """
     if stored is None:
         return ()
-    found: Final[list[dict[str, object]]] = []
-    pending: Final[list[tuple[object, tuple[str, ...]]]] = [(value, (key,)) for key, value in stored.items()]
+    found: Final[list[tuple[tuple[str | int, ...], dict[str, object]]]] = []
+    pending: Final[list[tuple[object, tuple[str | int, ...]]]] = [(value, (key,)) for key, value in stored.items()]
     while pending:
         value, path = pending.pop()
         if len(path) > DEFAULT_MAX_RECURSE_DEPTH:
@@ -521,11 +524,10 @@ def _nested_param_mappings(stored: Mapping[str, object] | None) -> tuple[dict[st
         if path in _CLASSIFIER_CONNECTION_PATHS:
             continue
         if isinstance(value, Mapping):
-            found.append({key: item for key, item in value.items() if isinstance(key, str)})
+            found.append((path, {key: item for key, item in value.items() if isinstance(key, str)}))
             pending.extend((item, (*path, str(key))) for key, item in value.items())
         elif isinstance(value, (list, tuple)):
-            # A list adds a level to the path but no key, so a path names where an item sits, not its index
-            pending.extend((item, (*path, "")) for item in value)
+            pending.extend((item, (*path, index)) for index, item in enumerate(value))
     return tuple(found)
 
 
@@ -2283,9 +2285,11 @@ class ModelManagementAuthChecks:
         federated deployment's destination (_reject_non_admin_wif_write, which can_user_make_model_call already ran on
         the params). Every rule reads mappings, never a model built from one: the keys this write sets
         (submitted_litellm_params) against the stored deployment's, and each nested mapping as it is stored, so a key
-        such as `_fields_set` is one more key of the mapping, not an argument of a constructor. One the stored
-        deployment already carries unchanged passes, as an unchanged field does. ``model_params`` is the deployment
-        the write lands on, the stored one on an update.
+        such as `_fields_set` is one more key of the mapping, not an argument of a constructor. A nested mapping the
+        write leaves unchanged where it is passes, as an unchanged field does: the stored deployment holds an equal
+        mapping at the same path, the same keys from the root of the params and the same index in every list. An equal
+        mapping anywhere else counts for nothing, so one moved, into a fallback list or to another index, is checked.
+        ``model_params`` is the deployment the write lands on, the stored one on an update.
         """
         written: Final = submitted_litellm_params(litellm_params)
         stored: Final = _stored_params(existing_litellm_params)
@@ -2302,9 +2306,9 @@ class ModelManagementAuthChecks:
         )
         if user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN:
             return True
-        stored_mappings: Final = _nested_param_mappings(stored)
-        for mapping in _nested_param_mappings(_stored_params(litellm_params)):
-            if mapping in stored_mappings:
+        stored_mappings: Final = dict(_nested_param_mappings(stored))
+        for path, mapping in _nested_param_mappings(_stored_params(litellm_params)):
+            if stored_mappings.get(path) == mapping:
                 continue
             ModelManagementAuthChecks.can_user_attach_credential(
                 litellm_params=mapping, user_api_key_dict=user_api_key_dict

@@ -472,6 +472,50 @@ class TestProxyBaseLLMRequestProcessing:
         assert data_passed["litellm_call_id"] == returned_data["litellm_call_id"]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("caller_timeouts", "marked"),
+        [
+            pytest.param({"request_timeout": 1, "stream_timeout": 5}, ("stream_timeout",), id="caller-stream-timeout"),
+            pytest.param({"request_timeout": 1}, None, id="only-the-pinned-one"),
+        ],
+    )
+    async def test_the_command_line_request_timeout_is_not_named_in_the_callers_timeout_mark(
+        self, monkeypatch, caller_timeouts: dict[str, int], marked: tuple[str, ...] | None
+    ):
+        """
+        The request setup names the caller's own timeouts in client_side_timeout; the command line's request_timeout
+        then replaces the caller's, so the mark no longer names it, and a mark left with no name is dropped
+        """
+        processing_obj: Final = ProxyBaseLLMRequestProcessing(data=dict(caller_timeouts))
+        mock_request: Final = MagicMock(spec=Request)
+        mock_request.headers = {}
+
+        async def setup_naming_the_callers_timeouts(*args, data: dict, **kwargs) -> dict:
+            return {**data, "client_side_timeout": tuple(caller_timeouts)}
+
+        async def pre_call_hook(user_api_key_dict, data, call_type, skip_guardrails=False):
+            return copy.deepcopy(data)
+
+        proxy_logging_obj: Final = MagicMock(spec=ProxyLogging)
+        proxy_logging_obj.pre_call_hook = AsyncMock(side_effect=pre_call_hook)
+        monkeypatch.setattr(
+            litellm.proxy.common_request_processing, "add_litellm_data_to_request", setup_naming_the_callers_timeouts
+        )
+
+        returned_data, _ = await processing_obj.common_processing_pre_call_logic(
+            request=mock_request,
+            general_settings={},
+            user_api_key_dict=MagicMock(spec=UserAPIKeyAuth),
+            proxy_logging_obj=proxy_logging_obj,
+            proxy_config=MagicMock(spec=ProxyConfig),
+            route_type="acompletion",
+            user_request_timeout=30,
+        )
+
+        assert returned_data["request_timeout"] == 30
+        assert returned_data.get("client_side_timeout") == marked
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("requested_model", [{"bad": "value"}, ["gpt-5.2"], 1])
     async def test_common_processing_pre_call_logic_rejects_a_non_string_model_with_400(
         self, monkeypatch, requested_model: dict[str, str] | list[str] | int
