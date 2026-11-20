@@ -2864,12 +2864,9 @@ class TestLastGoodLimitsWhileTheDatabaseIsUnreachable:
         assert await request() == (99.0, ("_ProxyBudgetSpend",))
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("read_back_from", ["memory", "redis"])
-    async def test_a_request_that_reads_back_a_registry_its_last_good_entry_answered_reads_last_good(
-        self, read_back_from: str
-    ):
-        """The registry the last good entry answered is cached for the error TTL. A request inside that window rests on
-        it as much as the request that recalled it, so both record it, whether memory or Redis hands it back."""
+    async def test_a_request_that_reads_back_a_registry_its_last_good_entry_answered_reads_last_good(self):
+        """The registry the last good entry answered is kept in this pod's memory for a short time. A request inside
+        that window rests on it as much as the request that recalled it, so both record it."""
         from litellm.proxy._types import LiteLLM_EndUserTable
         from litellm.proxy.common_utils.user_api_key_cache import last_good_auth_entries_scope
 
@@ -2886,10 +2883,71 @@ class TestLastGoodLimitsWhileTheDatabaseIsUnreachable:
             return customer, scope.served
 
         recalled: Final = await request()
-        if read_back_from == "redis":
-            cache.in_memory_cache.delete_cache("end_user_restricted_registry")
 
         assert (recalled, await request()) == ((None, ("_RegistryIds",)), (None, ("_RegistryIds",)))
+
+    @pytest.mark.asyncio
+    async def test_the_registry_and_verdict_copies_of_last_good_entries_live_30_seconds_in_memory_and_none_in_redis(
+        self, monkeypatch
+    ):
+        """A registry and an end-user verdict a last good entry answered are cached in this pod's memory for
+        LAST_GOOD_SERVED_COPY_TTL_SECONDS and not in Redis, which memory would read back with a fresh time, so neither
+        copy can outlive the entry it rests on by more than that."""
+        from litellm.caching.in_memory_cache import InMemoryCache
+        from litellm.constants import LAST_GOOD_SERVED_COPY_TTL_SECONDS
+        from litellm.proxy._types import LiteLLM_EndUserTable
+        from litellm.proxy.auth.auth_checks import _load_end_user_restricted_registry, resolve_and_validate_end_user_id
+        from litellm.proxy.common_utils.user_api_key_cache import (
+            end_user_cache_key,
+            end_user_restricted_registry_cache_key,
+            end_user_validation_cache_key,
+        )
+
+        monkeypatch.setattr(litellm, "validate_end_user_id_in_db", True)
+        monkeypatch.setattr(litellm, "max_end_user_budget_id", None)
+        database: Final = _LimitsDatabase()
+        database.customers.rows["c-known"] = LiteLLM_EndUserTable(user_id="c-known", blocked=False)
+        database.customers.rows["c-restricted"] = LiteLLM_EndUserTable(user_id="c-restricted", blocked=True)
+        now: Final = [1_000.0]
+        memory: Final = InMemoryCache(clock=lambda: now[0])
+        redis: Final = fake_redis_cache()
+        cache: Final = _serving_cache(in_memory_cache=memory, redis_cache=redis.cache)
+        registry_key: Final = end_user_restricted_registry_cache_key()
+        verdict_key: Final = end_user_validation_cache_key("c-known")
+
+        async def registry() -> frozenset[str] | None:
+            return await _load_end_user_restricted_registry(
+                prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+                user_api_key_cache=cache,
+            )
+
+        assert await registry() == frozenset({"c-restricted"})
+        assert await self._customer(database, cache, "c-known") is not None
+        await self._expire(cache, registry_key, end_user_cache_key("c-known"))
+        database.stopped_with = _STOPPED
+        assert await registry() == frozenset({"c-restricted"})
+        assert (
+            await resolve_and_validate_end_user_id(
+                raw_end_user_id="c-known",
+                prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+                user_api_key_cache=cache,
+            )
+            == "c-known"
+        )
+
+        def copies() -> tuple[object, object]:
+            return memory.get_cache(key=registry_key), memory.get_cache(key=verdict_key)
+
+        held: Final = ({"ids": ["c-restricted"]}, "valid_from_last_good")
+        assert copies() == held
+        assert (await redis.cache.async_get_cache(registry_key), await redis.cache.async_get_cache(verdict_key)) == (
+            None,
+            None,
+        )
+        now[0] += LAST_GOOD_SERVED_COPY_TTL_SECONDS
+        assert copies() == held
+        now[0] += 1
+        assert copies() == (None, None)
 
     @pytest.mark.asyncio
     async def test_each_request_waiting_on_a_membership_load_records_the_last_good_membership(self):

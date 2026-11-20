@@ -311,6 +311,7 @@ from litellm.constants import (
     DEFAULT_MODEL_CREATED_AT_TIME,
     GLOBAL_PROXY_SPEND_CACHE_KEY,
     LAST_GOOD_ENTRY_TTL_SECONDS,
+    LAST_GOOD_TOMBSTONE_TTL_SECONDS,
     LITELLM_PROXY_ADMIN_NAME,
     LITELLM_PROXY_BUDGET_NAME,
     MONTHLY_SPEND_REPORT_JOB_ID,
@@ -520,6 +521,7 @@ from litellm.proxy.common_utils.timezone_utils import (
     get_budget_reset_time,
 )
 from litellm.proxy.common_utils.user_api_key_cache import (
+    LAST_GOOD_LATE_STORE_MARGIN_SECONDS,
     UserApiKeyCache,
     end_user_cache_key,
     get_management_object_ttl,
@@ -6983,6 +6985,18 @@ class ProxyConfig:
                     "seconds a last good auth entry may be served after the database read that produced it, must be "
                     "above 0",
                     LAST_GOOD_ENTRY_TTL_SECONDS,
+                )
+                user_api_key_cache.serve_last_good_entries = False
+            # A store must complete within the tombstone time less the margin of its read, or it keeps nothing at all
+            if (
+                user_api_key_cache.serve_last_good_entries
+                and LAST_GOOD_TOMBSTONE_TTL_SECONDS <= LAST_GOOD_LATE_STORE_MARGIN_SECONDS
+            ):
+                verbose_proxy_logger.error(
+                    "general_settings.serve_last_good_auth_entries is turned off: LAST_GOOD_TOMBSTONE_TTL_SECONDS=%s "
+                    "must be above LAST_GOOD_LATE_STORE_MARGIN_SECONDS=%s, or every last good auth entry is refused",
+                    LAST_GOOD_TOMBSTONE_TTL_SECONDS,
+                    LAST_GOOD_LATE_STORE_MARGIN_SECONDS,
                 )
                 user_api_key_cache.serve_last_good_entries = False
             cached_object_ttl: Final = get_management_object_ttl(user_api_key_cache)

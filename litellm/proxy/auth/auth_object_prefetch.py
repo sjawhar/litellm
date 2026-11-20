@@ -27,6 +27,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     AUTH_OBJECTS_TARGET,
     UserApiKeyCache,
     get_management_object_ttl,
+    mark_last_good_read_start,
     remember_last_good,
     team_membership_auth_cache_key,
     team_membership_reservation_cache_key,
@@ -266,6 +267,8 @@ def _validate_row(
 async def _fetch_rows(
     refs: AuthObjectRefs, kinds: frozenset[_RowKind], prisma_client: PrismaClient
 ) -> Mapping[str, object]:
+    # Not deadline-bounded, so it records its own start for a call outside a request
+    mark_last_good_read_start()
     async with db_span("prefetch_auth_objects", AUTH_OBJECTS_TARGET):
         row: Final[object] = await prisma_client.db.query_first(  # pyright: ignore[reportAny]  # prisma types query_first as Any
             _SQL,

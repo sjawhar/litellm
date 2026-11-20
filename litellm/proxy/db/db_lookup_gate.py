@@ -7,6 +7,7 @@ from litellm.constants import (
     PROXY_DB_LOOKUP_DEADLINE_SECONDS,
     PROXY_DB_LOOKUP_MAX_CONCURRENCY,
 )
+from litellm.proxy.common_utils.user_api_key_cache import mark_last_good_read_start
 
 LookupT = TypeVar("LookupT")
 
@@ -70,6 +71,8 @@ async def bounded_db_lookup(
     tracker: DBLookupStallTracker = db_lookup_stall_tracker,
 ) -> LookupT:
     timeout: Final = PROXY_DB_LOOKUP_DEADLINE_SECONDS if deadline_seconds is None else deadline_seconds
+    # In the caller's context, before the read's task exists: the caller's store after the read counts from before it
+    mark_last_good_read_start()
     task: Final = asyncio.ensure_future(lookup)
     try:
         done, _ = await asyncio.wait({task}, timeout=timeout)

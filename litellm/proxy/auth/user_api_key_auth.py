@@ -153,9 +153,11 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     end_user_restricted_registry_cache_key,
     forget_missing_last_good,
     last_good_auth_entries_scope,
+    mark_last_good_read_start,
     model_access_group_registry_cache_key,
     remember_last_good,
     serves_last_good_entries,
+    start_last_good_reads,
     team_membership_auth_cache_key,
 )
 from litellm.proxy.db.db_lookup_gate import bounded_db_lookup
@@ -3566,6 +3568,8 @@ async def _read_team_membership(
     cached: Final = await user_api_key_cache.async_get_cache(key=cache_key, model_type=LiteLLM_TeamMembership)
     if cached is not None:
         return cached
+    # Not deadline-bounded, so it records its own start for a call outside a request
+    mark_last_good_read_start()
     try:
         db_member: Final = await TeamMembershipRepository(prisma_client).table.find_first(
             where={"user_id": user_id, "team_id": team_id},
@@ -3651,6 +3655,10 @@ async def user_api_key_auth(
     """
     Parent function to authenticate user api key / jwt token.
     """
+
+    # Every auth read and last good store of this request, and of every task it creates, counts from here; set anew even
+    # when the context holds a start, so an earlier request's start never reaches these reads
+    start_last_good_reads()
 
     # Create the SERVER span and stash it on request.state BEFORE reading the
     # body. _read_request_body can raise ProxyException for malformed JSON;

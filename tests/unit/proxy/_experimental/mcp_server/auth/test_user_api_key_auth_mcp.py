@@ -10707,6 +10707,45 @@ async def test_fresh_mcp_user_permission_link_ignores_cached_and_replica_grants(
 
 
 @pytest.mark.asyncio
+async def test_a_permission_link_from_a_last_good_user_lives_30_seconds_in_memory_and_none_in_redis(monkeypatch):
+    """While the database is unreachable the user's last good entry gives the permission link. The link is cached in
+    this pod's memory for LAST_GOOD_SERVED_COPY_TTL_SECONDS and not in Redis, which memory would read back with a
+    fresh time, so the link cannot outlive the user's entry by more than that."""
+    import httpx
+
+    from litellm.caching.in_memory_cache import InMemoryCache
+    from litellm.constants import LAST_GOOD_SERVED_COPY_TTL_SECONDS
+    from litellm.proxy import proxy_server
+    from litellm.proxy._types import LiteLLM_UserTable
+    from litellm.proxy.common_utils.user_api_key_cache import (
+        UserApiKeyCache,
+        remember_last_good,
+        user_object_permission_id_cache_key,
+    )
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    user_id: Final = "u-link-from-last-good"
+    now: Final = [1_000.0]
+    memory: Final = InMemoryCache(clock=lambda: now[0])
+    redis: Final = fake_redis_cache()
+    cache: Final = UserApiKeyCache(in_memory_cache=memory, redis_cache=redis.cache, serve_last_good_entries=True)
+    await remember_last_good(cache, user_id, LiteLLM_UserTable(user_id=user_id, object_permission_id="op-kept"))
+    database: Final = MagicMock()
+    database.db.litellm_usertable.find_unique = AsyncMock(
+        side_effect=httpx.ConnectError("All connection attempts failed")
+    )
+    monkeypatch.setattr(proxy_server, "user_api_key_cache", cache)
+    link_key: Final = user_object_permission_id_cache_key(user_id)
+
+    assert await MCPRequestHandler._user_object_permission_id(user_id, database) == "op-kept"
+    assert (memory.get_cache(key=link_key), await redis.cache.async_get_cache(link_key)) == ("op-kept", None)
+    now[0] += LAST_GOOD_SERVED_COPY_TTL_SECONDS
+    assert memory.get_cache(key=link_key) == "op-kept"
+    now[0] += 1
+    assert memory.get_cache(key=link_key) is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["servers", "tools"])
 async def test_managed_agent_permission_resolution_outage_is_not_an_unrestricted_grant(monkeypatch, operation):
     from litellm.proxy._experimental.mcp_server import mcp_server_manager
@@ -10851,3 +10890,40 @@ def test_guardrail_bearer_respects_custom_admission_header(monkeypatch: pytest.M
         UserAPIKeyAuth(api_key="litellm_proxy_master_key"),
     )
     assert token is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path", ["/mcp", "/.well-known/oauth-protected-resource"], ids=["through_user_api_key_auth", "public_route"]
+)
+async def test_each_mcp_request_starts_its_own_auth_reads(path: str) -> None:
+    """The MCP SDK runs a stateful session's message handler in a copy of the context of the HTTP request that posted
+    the message, so that request's auth sets the start the handler's reads count from. It sets a new one even when its
+    context holds a start 600 s old, both on the branch that reaches user_api_key_auth (mocked here, so it records no
+    start itself) and on the public route that never does: the store after it is kept for the whole expiry."""
+    import time
+
+    from litellm.constants import LAST_GOOD_ENTRY_TTL_SECONDS
+    from litellm.models.team import LiteLLM_TeamTableCachedObj
+    from litellm.proxy.common_utils.user_api_key_cache import (
+        UserApiKeyCache,
+        last_good_reads_started_at,
+        remember_last_good,
+    )
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis: Final = fake_redis_cache()
+    cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+    scope: Final = {"type": "http", "method": "POST", "path": path, "headers": [(b"x-litellm-api-key", b"sk-1234")]}
+
+    with (
+        last_good_reads_started_at(time.monotonic() - 600),
+        patch(
+            "litellm.proxy._experimental.mcp_server.auth.user_api_key_auth_mcp.user_api_key_auth",
+            AsyncMock(return_value=UserAPIKeyAuth(api_key="sk-1234", user_id="u1")),
+        ),
+    ):
+        await MCPRequestHandler.process_mcp_request(scope)
+        await remember_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj(team_id="t1"))
+
+    assert await redis.cache.init_async_client().ttl("last_good:team_id:t1") == LAST_GOOD_ENTRY_TTL_SECONDS

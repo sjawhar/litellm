@@ -1019,18 +1019,35 @@ def _unblocked_keys_filter(user_id: str) -> Mapping[str, object]:
     return {"user_id": user_id, "OR": [{"blocked": False}, {"blocked": None}]}
 
 
-async def _revoke_scim_user(prisma_client: PrismaClient, user_id: str, cache_keys: Sequence[str] = ()) -> None:
-    """Revoke, before the request's first write, the entries a deactivation or a delete of the user changes: its own,
-    from which auth refuses an inactive user, those of the keys SCIM blocks, and ``cache_keys``. The keys are read
-    only while last good entries are served."""
+async def _revoke_scim_user(
+    prisma_client: PrismaClient, user_id: str, *, ends_user: bool, left_team_ids: Iterable[str]
+) -> None:
+    """Revoke, before the request's first write, every entry a later revocation of the request names, so Redis cannot
+    refuse it once a write landed: a deactivation's or a delete's (the user's own, from which auth refuses an inactive
+    user, and the keys ``_set_user_keys_blocked`` blocks) and what ``team_member_delete`` revokes for each team left.
+    The rows are read only while last good entries are served."""
     from litellm.proxy.proxy_server import user_api_key_cache
 
-    keys: Final = (
-        await _table(VerificationTokenRepository(prisma_client)).find_many(where=_unblocked_keys_filter(user_id))
-        if serves_last_good_entries(user_api_key_cache)
-        else ()
+    left: Final = sorted(set(left_team_ids))
+    if not (ends_user or left) or not serves_last_good_entries(user_api_key_cache):
+        return
+    found: Final = [
+        await _table(TeamRepository(prisma_client)).find_unique(where={"team_id": team_id}) for team_id in left
+    ]
+    teams: Final = tuple(LiteLLM_TeamTable.model_validate(team.model_dump()) for team in found if team)
+    keys: Final = _table(VerificationTokenRepository(prisma_client))
+    blocked: Final = await keys.find_many(where=_unblocked_keys_filter(user_id)) if ends_user else ()
+    in_left_teams: Final = await keys.find_many(where={"user_id": user_id, "team_id": {"in": left}}) if left else ()
+    rosters_naming_user: Final = (
+        team_cache_keys(team.team_id, team.team_alias)
+        for team in teams
+        if user_id in team.members or any(member.user_id == user_id for member in team.members_with_roles)
     )
-    await revoke_last_good(user_api_key_cache, (user_id, *(key_row.token for key_row in keys), *cache_keys))
+    memberships: Final = (team_membership_auth_cache_key(team_id=team_id, user_id=user_id) for team_id in left)
+    tokens: Final = (key_row.token for key_row in (*blocked, *in_left_teams))
+    await revoke_last_good(
+        user_api_key_cache, (user_id, *chain.from_iterable(rosters_naming_user), *memberships, *tokens)
+    )
 
 
 async def _set_user_keys_blocked(user_id: str, blocked: bool) -> int:
@@ -1812,14 +1829,17 @@ async def update_user(
             roles=user_data["roles"],
         )
 
-        # A deactivation blocks the user's keys and auth refuses an inactive user from its entry, so both are revoked
-        # before the first write
-        if client_set_active and _scim_active_value(metadata) is False and prev_active is not False:
-            await _revoke_scim_user(prisma_client, user_id)
-
         # SCIM User.groups is readOnly (RFC 7643 4.1.2): IdPs sync membership via /Groups and send
         # no groups or `groups: []` on profile PUTs, so empty means unspecified, not "remove from every team"
         target_teams: Final = user_data["teams"] or existing_user.teams
+        # A deactivation blocks the user's keys and auth refuses an inactive user from its entry, and leaving a team
+        # revokes the member's entries: all of them are revoked before the first write
+        await _revoke_scim_user(
+            prisma_client,
+            user_id,
+            ends_user=client_set_active and _scim_active_value(metadata) is False and prev_active is not False,
+            left_team_ids=set(existing_user.teams) - set(target_teams),
+        )
         await _handle_team_membership_changes(
             user_id=user_id,
             existing_teams=existing_user.teams,
@@ -1887,21 +1907,8 @@ async def delete_user(
         )
         teams: Final = tuple(team for team in found_teams if team)
         team_rows: Final = tuple(LiteLLM_TeamTable.model_validate(team.model_dump()) for team in teams)
-        # The user's entry, its keys', the entries of the teams whose roster names it and its memberships are revoked
-        # before the first write
-        await _revoke_scim_user(
-            prisma_client,
-            user_id,
-            (
-                *chain.from_iterable(
-                    team_cache_keys(team_row.team_id, team_row.team_alias)
-                    for team_row in team_rows
-                    if user_id in team_row.members
-                    or any(member.user_id == user_id for member in team_row.members_with_roles)
-                ),
-                *(team_membership_auth_cache_key(team_id=team_row.team_id, user_id=user_id) for team_row in team_rows),
-            ),
-        )
+        # Revoked before the first write: the user's entry, its keys' and all that removing it from its teams revokes
+        await _revoke_scim_user(prisma_client, user_id, ends_user=True, left_team_ids=existing_user.teams or [])
 
         # Remove user from all teams
         for team, team_row in zip(teams, team_rows, strict=True):
@@ -2410,10 +2417,14 @@ async def patch_user(
         patched_metadata: Final = update_data.get("metadata")
         new_active: Final = _scim_active_value(patched_metadata if isinstance(patched_metadata, Mapping) else None)
 
-        # A deactivation blocks the user's keys and auth refuses an inactive user from its entry, so both are revoked
-        # before the first write
-        if new_active is False and prev_active is not False:
-            await _revoke_scim_user(prisma_client, user_id)
+        # A deactivation blocks the user's keys and auth refuses an inactive user from its entry, and leaving a team
+        # revokes the member's entries: all of them are revoked before the first write
+        await _revoke_scim_user(
+            prisma_client,
+            user_id,
+            ends_user=new_active is False and prev_active is not False,
+            left_team_ids=set(existing_user.teams or []) - final_team_set,
+        )
 
         # Handle team membership changes
         await _handle_team_membership_changes(

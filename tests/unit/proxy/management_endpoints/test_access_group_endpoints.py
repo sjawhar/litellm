@@ -1393,7 +1393,12 @@ async def test_update_access_group_does_not_restart_the_expiry_of_a_patched_team
     the eviction after the write is lost, the entry still expires on time instead of living on with the patch."""
     from litellm.constants import LAST_GOOD_ENTRY_TTL_SECONDS
     from litellm.proxy._types import LiteLLM_TeamTableCachedObj
-    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, recall_last_good, remember_last_good
+    from litellm.proxy.common_utils.user_api_key_cache import (
+        UserApiKeyCache,
+        last_good_reads_started_at,
+        recall_last_good,
+        remember_last_good,
+    )
     from litellm.proxy.management_endpoints import access_group_endpoints
 
     client, mock_prisma, mock_access_group_table, *_ = client_and_mocks
@@ -1409,9 +1414,10 @@ async def test_update_access_group_does_not_restart_the_expiry_of_a_patched_team
         "team_id:team-add": LiteLLM_TeamTableCachedObj(team_id="team-add", access_group_ids=[]),
         "team_id:team-remove": LiteLLM_TeamTableCachedObj(team_id="team-remove", access_group_ids=["ag-update"]),
     }
-    for cache_key, team in read_rows.items():
-        await cache.async_set_cache(cache_key, team, model_type=LiteLLM_TeamTableCachedObj)
-        await remember_last_good(cache, cache_key, team)
+    with last_good_reads_started_at(now[0]):
+        for cache_key, team in read_rows.items():
+            await cache.async_set_cache(cache_key, team, model_type=LiteLLM_TeamTableCachedObj)
+            await remember_last_good(cache, cache_key, team)
     monkeypatch.setattr(ps, "user_api_key_cache", cache)
 
     async def eviction_lost(cache_keys: Sequence[str], user_api_key_cache: UserApiKeyCache) -> None:

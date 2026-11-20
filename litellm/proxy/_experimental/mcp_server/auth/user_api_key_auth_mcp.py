@@ -73,6 +73,9 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     AUTH_OBJECTS_TARGET,
     USER_NO_MCP_PERMISSION_SENTINEL,
     get_management_object_ttl,
+    keep_last_good_served_copy,
+    last_good_auth_entries_scope,
+    start_last_good_reads,
     user_object_permission_id_cache_key,
 )
 from litellm.proxy.db.exception_handler import LastGoodEntryMissing
@@ -467,6 +470,9 @@ class MCPRequestHandler:
         Raises:
             HTTPException: If headers are invalid or missing required headers
         """
+        # Each MCP message's auth reads, and the handler the MCP SDK runs in a copy of this context, count from here;
+        # some branches below never reach user_api_key_auth
+        start_last_good_reads()
         async with global_manager().catalog.operation():
             headers: Final = MCPRequestHandler.safe_get_headers_from_scope(scope)
 
@@ -3291,20 +3297,24 @@ class MCPRequestHandler:
                 return None
             if isinstance(cached, str) and cached:
                 return cached
-            user_row: Final = await get_user_object(
-                user_id=user_id,
-                prisma_client=prisma_client,
-                user_api_key_cache=user_api_key_cache,
-                user_id_upsert=False,
-                check_db_only=check_db_only,
-            )
+            with last_good_auth_entries_scope() as user_scope:
+                user_row: Final = await get_user_object(
+                    user_id=user_id,
+                    prisma_client=prisma_client,
+                    user_api_key_cache=user_api_key_cache,
+                    user_id_upsert=False,
+                    check_db_only=check_db_only,
+                )
             linked: Final[object] = getattr(user_row, "object_permission_id", None) if user_row is not None else None
             object_permission_id: Final = linked if isinstance(linked, str) and linked else None
-            await user_api_key_cache.async_set_cache(
-                key=cache_key,
-                value=object_permission_id or USER_NO_MCP_PERMISSION_SENTINEL,
-                ttl=get_management_object_ttl(user_api_key_cache),
-            )
+            link: Final = object_permission_id or USER_NO_MCP_PERMISSION_SENTINEL
+            if user_scope.served:
+                # Not in Redis: memory refills from Redis with a fresh time, so the link could outlive the user's entry
+                keep_last_good_served_copy(user_api_key_cache, cache_key, link)
+            else:
+                await user_api_key_cache.async_set_cache(
+                    key=cache_key, value=link, ttl=get_management_object_ttl(user_api_key_cache)
+                )
             return object_permission_id
         except UserNotFoundError:
             return None

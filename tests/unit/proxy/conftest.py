@@ -5,6 +5,7 @@ import copy
 import inspect
 import os
 import tempfile
+import time
 import warnings
 from collections.abc import Awaitable, Callable, Iterator
 from typing import Dict, Final, Optional
@@ -20,6 +21,7 @@ import litellm.proxy.proxy_server
 from litellm._service_logger import ServiceTypes
 from litellm.integrations.otel.model.payloads import ServiceSpanData
 from litellm.integrations.otel.model.spans import service_span_name
+from litellm.proxy.common_utils.user_api_key_cache import last_good_reads_started_at
 from tests.unit.litellm_core_utils.fake_secret_vault import FakeSecretVault
 from tests._master_key import MASTER_KEY
 
@@ -253,6 +255,13 @@ def _reset_graceful_shutdown_state():
     GracefulShutdownManager.reset()
     yield
     GracefulShutdownManager.reset()
+
+
+@pytest.fixture(autouse=True)
+def _last_good_reads_start() -> Iterator[None]:
+    # Production records it where a request's auth begins; a test's own last good stores need one too
+    with last_good_reads_started_at(time.monotonic()):
+        yield
 
 
 def build_cache_config(enable_cache: bool = True) -> Optional[Dict]:

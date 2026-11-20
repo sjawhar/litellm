@@ -36,6 +36,7 @@ from litellm.constants import (
     DEFAULT_MAX_RECURSE_DEPTH,
     EMAIL_BUDGET_ALERT_MAX_SPEND_ALERT_PERCENTAGE,
     END_USER_RESTRICTED_REGISTRY_MAX_SIZE,
+    LAST_GOOD_SERVED_COPY_TTL_SECONDS,
     LITELLM_PROXY_MASTER_KEY_ALIAS,
     MODEL_ACCESS_GROUP_REGISTRY_MAX_SIZE,
     REGISTRY_ERROR_NEGATIVE_CACHE_TTL,
@@ -118,6 +119,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     forget_last_good,
     forget_missing_last_good,
     get_management_object_ttl,
+    keep_last_good_served_copy,
     last_good_auth_entries_scope,
     model_access_group_cache_key,
     model_access_group_registry_cache_key,
@@ -1878,7 +1880,7 @@ async def _cached_registry(
 @with_service_target(AUTH_OBJECTS_TARGET)
 async def _cache_registry_answer(
     cache_key: str,
-    value: tuple[str, ...] | str | _RegistryIds,
+    value: tuple[str, ...] | str,
     ttl: float,
     user_api_key_cache: UserApiKeyCache,
 ) -> None:
@@ -1912,16 +1914,20 @@ async def _fetch_and_cache_registry(
             "per-id lookups will run and the registry query is suppressed"
             if kept is None
             else "its last good entry answers",
-            REGISTRY_ERROR_NEGATIVE_CACHE_TTL,
+            REGISTRY_ERROR_NEGATIVE_CACHE_TTL if kept is None else LAST_GOOD_SERVED_COPY_TTL_SECONDS,
             e,
         )
-        await _cache_registry_answer(
-            cache_key=cache_key,
-            value=overflow_sentinel if kept is None else kept,
-            ttl=REGISTRY_ERROR_NEGATIVE_CACHE_TTL,
-            user_api_key_cache=user_api_key_cache,
-        )
-        return None if kept is None else frozenset(kept.ids)
+        if kept is None:
+            await _cache_registry_answer(
+                cache_key=cache_key,
+                value=overflow_sentinel,
+                ttl=REGISTRY_ERROR_NEGATIVE_CACHE_TTL,
+                user_api_key_cache=user_api_key_cache,
+            )
+            return None
+        # Not in Redis: memory refills from Redis with a fresh time, so the copy could outlive the entry
+        keep_last_good_served_copy(user_api_key_cache, cache_key, kept)
+        return frozenset(kept.ids)
 
     if len(registry_ids) > max_size:
         if keep_last_good:
@@ -2247,11 +2253,15 @@ async def resolve_and_validate_end_user_id(
     verdict: Final = (
         "invalid" if not is_valid else _END_USER_VALID_FROM_LAST_GOOD if validation_scope.served else "valid"
     )
-    await user_api_key_cache.async_set_cache(
-        key=cache_key,
-        value=verdict,
-        ttl=(_END_USER_VALIDATION_POSITIVE_TTL if is_valid else _END_USER_VALIDATION_NEGATIVE_TTL),
-    )
+    if validation_scope.served:
+        # Not in Redis: memory refills from Redis with a fresh time, so the verdict could outlive the entry it rests on
+        keep_last_good_served_copy(user_api_key_cache, cache_key, verdict)
+    else:
+        await user_api_key_cache.async_set_cache(
+            key=cache_key,
+            value=verdict,
+            ttl=(_END_USER_VALIDATION_POSITIVE_TTL if is_valid else _END_USER_VALIDATION_NEGATIVE_TTL),
+        )
 
     return raw_end_user_id if is_valid or has_default_budget else None
 

@@ -1575,3 +1575,47 @@ async def test_a_customer_created_after_a_request_found_its_id_invalid_is_kept_b
     await new_end_user(data=NewCustomerRequest(user_id="c1", models=["m1"]), user_api_key_dict=_ADMIN)
 
     assert await resolve() == "c1"
+
+
+@pytest.mark.asyncio
+async def test_a_customer_block_drops_the_verdict_and_registry_copies_last_good_entries_answered(monkeypatch):
+    """In an outage the customer's last good entry vouches for its id and the restricted registry's entry leaves it
+    out. This pod keeps both answers in its memory only, never in Redis; a block once the database answers again drops
+    both, so the next request reads the blocked customer instead of either copy."""
+    from litellm.proxy.auth.auth_checks import _load_end_user_restricted_registry, resolve_and_validate_end_user_id
+    from litellm.proxy.management_endpoints.customer_endpoints import block_user
+
+    monkeypatch.setattr("litellm.validate_end_user_id_in_db", True)
+    monkeypatch.setattr("litellm.max_end_user_budget_id", None)
+    rows: Final = _EndUserRows(LiteLLM_EndUserTable(user_id="c1", blocked=False))
+    redis: Final = fake_redis_cache()
+    cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+    _serve_end_user_rows(monkeypatch, rows, cache)
+    database: Final = SimpleNamespace(db=SimpleNamespace(litellm_endusertable=rows, litellm_usertable=_EmptyTable()))
+    copy_keys: Final = ("end_user_validation:c1", "end_user_restricted_registry")
+
+    async def registry() -> frozenset[str] | None:
+        return await _load_end_user_restricted_registry(
+            prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+            user_api_key_cache=cache,
+        )
+
+    async def resolve() -> str | None:
+        return await resolve_and_validate_end_user_id(
+            raw_end_user_id="c1",
+            prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+            user_api_key_cache=cache,
+        )
+
+    assert (await registry(), await resolve()) == (frozenset(), "c1")
+    for key in ("end_user_id:c1", *copy_keys):
+        await cache.async_delete_cache(key)
+    rows.stopped = True
+    assert (await registry(), await resolve()) == (frozenset(), "c1")
+    assert [cache.in_memory_cache.get_cache(key=key) for key in copy_keys] == ["valid_from_last_good", {"ids": []}]
+    assert [await redis.cache.async_get_cache(key) for key in copy_keys] == [None, None]
+    rows.stopped = False
+
+    await block_user(data=BlockUsers(user_ids=["c1"]))
+
+    assert [cache.in_memory_cache.get_cache(key=key) for key in copy_keys] == [None, None]
