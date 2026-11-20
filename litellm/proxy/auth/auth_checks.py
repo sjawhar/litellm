@@ -163,12 +163,11 @@ from .auth_checks_organization import (
     organization_role_based_access_check,
 )
 from .auth_utils import (
-    body_fallbacks_go_to_anthropic,
+    FallbackModelNames,
     explained_fallback_name_refusal,
     get_model_from_request,
     get_request_route_template,
     key_fallback_model_names,
-    request_fallback_model_names,
 )
 
 if TYPE_CHECKING:
@@ -948,10 +947,7 @@ def deny_ambiguous_provider_fallbacks(
 
 async def _run_fallback_model_checks(
     *,
-    fallback_models: Sequence[str],
-    provider_fallback_models: Sequence[str],
-    request_body: Mapping[str, object],
-    anthropic_owns_body_fallbacks: bool,
+    names: FallbackModelNames,
     team_object: LiteLLM_TeamTable | None,
     user_object: LiteLLM_UserTable | None,
     project_object: LiteLLM_ProjectTableCachedObj | None,
@@ -964,21 +960,20 @@ async def _run_fallback_model_checks(
     """
     The team, team member, user, project and agent model checks common_checks() runs on the requested model, run on
     each fallback target: a target can serve the request in the requested model's place. A team key whose team could
-    not be read is held to the team models its token records. ``provider_fallback_models`` are the names Anthropic
-    gets as sent; each must mean the model Anthropic serves. A refusal says which names came from an entry of the
-    ``request_body``'s fallbacks that the checks read both ways.
+    not be read is held to the team models its token records. ``names.anthropic`` are the names Anthropic gets as
+    sent; each must mean the model Anthropic serves. A refusal says which names came from an entry of a ``fallbacks``
+    list that the checks read both ways.
     """
     from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
 
     deny_ambiguous_provider_fallbacks(
-        provider_fallback_models=provider_fallback_models, valid_token=valid_token, llm_router=llm_router
+        provider_fallback_models=names.anthropic, valid_token=valid_token, llm_router=llm_router
     )
 
     key_model_aliases: Final = key_model_aliases_for_auth_check(valid_token)
+    fallback_models: Final = tuple(dict.fromkeys((*names.litellm, *names.anthropic)))
     for model in fallback_models:
-        with explained_fallback_name_refusal(
-            request_body, (model,), skip_body_fallbacks=anthropic_owns_body_fallbacks
-        ):
+        with explained_fallback_name_refusal(names, (model,)):
             if team_object is not None:
                 try:
                     await can_team_access_model(
@@ -1033,7 +1028,7 @@ async def _run_fallback_model_checks(
     # The agent checks take every target at once, so a managed agent's access groups, read from the database on each
     # check, load once per request
     targets: Final = list(fallback_models)
-    with explained_fallback_name_refusal(request_body, targets, skip_body_fallbacks=anthropic_owns_body_fallbacks):
+    with explained_fallback_name_refusal(names, targets):
         _check_managed_agent_model_access(model=targets, valid_token=valid_token, llm_router=llm_router)
         await _check_agent_access_group_model_access(model=targets, valid_token=valid_token, llm_router=llm_router)
         await _check_agent_caller_model_access(
@@ -1395,6 +1390,9 @@ async def common_checks(
                 key_model_aliases=key_model_aliases_for_auth_check(valid_token),
             )
 
+    # A fallback target can serve the request in the requested model's place. LiteLLM dispatches its own fallback
+    # lists through aliases, but Anthropic gets the names in its own list as sent.
+    fallback_names: Final = key_fallback_model_names(_typed_request_body(request_body), route=route, request=request)
     if end_user_object is not None and end_user_object.models:
         with tracer.trace("litellm.proxy.auth.common_checks.can_customer_call_model"):
             if _model:
@@ -1404,7 +1402,7 @@ async def common_checks(
                     llm_router=llm_router,
                     valid_token=valid_token,
                 )
-            for fallback_model in request_fallback_model_names(_typed_request_body(request_body)):
+            for fallback_model in dict.fromkeys((*fallback_names.litellm, *fallback_names.anthropic)):
                 can_customer_access_model(
                     model=fallback_model,
                     end_user_object=end_user_object,
@@ -1423,20 +1421,10 @@ async def common_checks(
             proxy_logging_obj=proxy_logging_obj,
         )
 
-    # 2.4 A fallback target can serve the request in the requested model's place, so it passes the same team, team
-    # member, user, project and agent model checks. LiteLLM dispatches its own fallback lists through aliases, but
-    # Anthropic gets the names in its own list as sent.
-    typed_body: Final = _typed_request_body(request_body)
-    anthropic_owns_body_fallbacks: Final = body_fallbacks_go_to_anthropic(route, request, typed_body)
-    router_fallback_models, provider_fallback_models = key_fallback_model_names(
-        typed_body, anthropic_owns_body_fallbacks=anthropic_owns_body_fallbacks
-    )
+    # 2.4 A fallback target passes the same team, team member, user, project and agent model checks
     with tracer.trace("litellm.proxy.auth.common_checks.run_fallback_model_checks"):
         await _run_fallback_model_checks(
-            fallback_models=tuple(dict.fromkeys((*router_fallback_models, *provider_fallback_models))),
-            provider_fallback_models=provider_fallback_models,
-            request_body=typed_body,
-            anthropic_owns_body_fallbacks=anthropic_owns_body_fallbacks,
+            names=fallback_names,
             team_object=team_object,
             user_object=user_object,
             project_object=project_object,

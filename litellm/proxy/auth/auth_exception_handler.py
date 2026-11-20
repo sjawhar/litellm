@@ -74,6 +74,16 @@ def _as_proxy_exception(e: Exception) -> ProxyException:
         return e
     if PrismaDBExceptionHandler.is_database_service_unavailable_error(e):
         return PrismaDBExceptionHandler.service_unavailable_proxy_exception(e)
+    from litellm.router_utils.fallback_event_handlers import FallbackListShapeError
+
+    if isinstance(e, FallbackListShapeError):
+        # A malformed fallback list is the caller's request, refused with the 400 the Router and saved settings give
+        return ProxyException(
+            message=str(e),
+            type=ProxyErrorTypes.bad_request_error,
+            param=e.param,
+            code=status.HTTP_400_BAD_REQUEST,
+        )
     return ProxyException(
         message="Authentication Error, " + str(e),
         type=ProxyErrorTypes.auth_error,
