@@ -10924,13 +10924,18 @@ async def test_each_mcp_request_starts_its_own_auth_reads(path: str, monkeypatch
     cache: Final = UserApiKeyCache(
         redis_cache=redis.cache, serve_last_good_entries=True, last_good_wall_clock=lambda: wall
     )
-    scope: Final = {"type": "http", "method": "POST", "path": path, "headers": [(b"x-litellm-api-key", b"sk-1234")]}
+    scope: Final = {
+        "type": "http",
+        "method": "POST",
+        "path": path,
+        "headers": [(b"x-litellm-api-key", b"sk-not-a-secret")],
+    }
 
     with (
         last_good_reads_started_at(time.monotonic() - 600),
         patch(
             "litellm.proxy._experimental.mcp_server.auth.user_api_key_auth_mcp.user_api_key_auth",
-            AsyncMock(return_value=UserAPIKeyAuth(api_key="sk-1234", user_id="u1")),
+            AsyncMock(return_value=UserAPIKeyAuth(api_key="sk-not-a-secret", user_id="u1")),
         ),
     ):
         await MCPRequestHandler.process_mcp_request(scope)

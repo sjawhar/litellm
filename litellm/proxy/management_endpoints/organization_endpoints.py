@@ -52,6 +52,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     UserApiKeyCache,
     revoke_and_delete_read_rows,
     revoke_last_good,
+    revoke_last_good_then,
     serves_last_good_entries,
 )
 from litellm.proxy.management_endpoints.budget_management_endpoints import (
@@ -125,7 +126,7 @@ async def _enterprise_license_required(
 
 router: Final = APIRouter(dependencies=[Depends(_enterprise_license_required)])
 
-_Row = TypeVar("_Row")
+_Row: Final = TypeVar("_Row")
 
 
 class _ObjectPermissionRow(Protocol):
@@ -206,10 +207,6 @@ class _VerificationTokenTableClient(Protocol):
 
 class _OrganizationIdFilter(TypedDict):
     organization_id: ReadOnly[str]
-
-
-class _OrganizationIdInFilter(TypedDict):
-    organization_id: ReadOnly[Mapping[str, Sequence[str]]]
 
 
 class _ObjectPermissionTxClient(Protocol):
@@ -1081,22 +1078,28 @@ async def delete_organization(
             detail={"error": "Only proxy admins can delete organizations"},
         )
 
-    # The organizations' entries, their teams', their keys' and their members' (a member's entry carries its
-    # organization memberships) are revoked before the first delete, so a Redis that cannot record the revocation
-    # refuses the request with nothing deleted
-    orgs_filter: Final[_OrganizationIdInFilter] = {"organization_id": {"in": data.organization_ids}}
-    teams: Final = await _table(TeamRepository(prisma_client)).find_many(where=orgs_filter)
-    keys: Final = await _table(VerificationTokenRepository(prisma_client)).find_many(where=orgs_filter)
-    members: Final = await _table(OrganizationMembershipRepository(prisma_client)).find_many(where=orgs_filter)
-    await revoke_last_good(
-        user_api_key_cache,
-        (
-            *chain.from_iterable(organization_cache_keys(organization_id) for organization_id in data.organization_ids),
-            *chain.from_iterable(team_cache_keys(team.team_id, team.team_alias) for team in teams),
-            *(key.token for key in keys),
-            *(member.user_id for member in members),
-        ),
-    )
+    # While last good entries are served, the organizations' entries, their teams', their keys' and their members' (a
+    # member's entry carries its organization memberships) are revoked before the first delete, so a Redis that cannot
+    # record the revocation refuses the request with nothing deleted. With the setting off nothing is revoked, so none
+    # of these reads runs
+    if serves_last_good_entries(user_api_key_cache):
+        org_ids: Final = data.organization_ids
+        teams: Final = await find_many_in(_table(TeamRepository(prisma_client)), "organization_id", org_ids)
+        keys: Final = await find_many_in(_table(VerificationTokenRepository(prisma_client)), "organization_id", org_ids)
+        members: Final = await find_many_in(
+            _table(OrganizationMembershipRepository(prisma_client)), "organization_id", org_ids
+        )
+        await revoke_last_good(
+            user_api_key_cache,
+            (
+                *chain.from_iterable(
+                    organization_cache_keys(organization_id) for organization_id in data.organization_ids
+                ),
+                *chain.from_iterable(team_cache_keys(team.team_id, team.team_alias) for team in teams),
+                *(key.token for key in keys),
+                *(member.user_id for member in members),
+            ),
+        )
 
     deleted_orgs: Final = []
     for organization_id in data.organization_ids:
@@ -1115,10 +1118,16 @@ async def delete_organization(
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
         )
-        # delete the organization
-        deleted_org = await _table(OrganizationRepository(prisma_client)).delete(
-            where={"organization_id": organization_id},
-            include={"members": True, "teams": True, "litellm_budget_table": True},
+        # The child deletes above, and the earlier organizations', can outlast the first revocation's tombstones, so the
+        # organization's entries are revoked again right before its delete: no Redis while those tombstones stand
+        deleted_org = await revoke_last_good_then(
+            user_api_key_cache,
+            organization_cache_keys(organization_id),
+            partial(
+                _table(OrganizationRepository(prisma_client)).delete,
+                where={"organization_id": organization_id},
+                include={"members": True, "teams": True, "litellm_budget_table": True},
+            ),
         )
         if deleted_org is None:
             raise HTTPException(
@@ -1158,14 +1167,16 @@ async def _delete_organization_teams(
     user_api_key_cache: UserApiKeyCache,
     proxy_logging_obj: ProxyLogging | None,
 ) -> None:
-    """Delete the organization's teams, revoked with the request's first revocation or, for a team added since, in the
-    round that deletes it, and tombstone them again now that the rows are gone."""
+    """Delete the organization's teams and tombstone them again now that the rows are gone. While last good entries are
+    served, each round deletes right after the revocation of its teams' entries, with no Redis while the request's first
+    revocation of them stands (``_delete_organization_rows``)."""
     org_filter: Final[_OrganizationIdFilter] = {"organization_id": organization_id}
     team_table: Final = _table(TeamRepository(prisma_client))
     teams: Final = await _delete_organization_rows(
         user_api_key_cache,
         partial(team_table.find_many, where=org_filter),
         lambda rows: tuple(chain.from_iterable(team_cache_keys(team.team_id, team.team_alias) for team in rows)),
+        # bounded-ok: revoke_and_delete_read_rows hands each call at most IN_LIST_CHUNK_SIZE rows
         lambda rows: team_table.delete_many(where={**org_filter, "team_id": {"in": [team.team_id for team in rows]}}),
         partial(team_table.delete_many, where=org_filter),
     )
@@ -1191,6 +1202,7 @@ async def _delete_organization_members(
         partial(membership_table.find_many, where=org_filter),
         lambda rows: tuple(member.user_id for member in rows),
         lambda rows: membership_table.delete_many(
+            # bounded-ok: revoke_and_delete_read_rows hands each call at most IN_LIST_CHUNK_SIZE rows
             where={**org_filter, "user_id": {"in": [member.user_id for member in rows]}}
         ),
         partial(membership_table.delete_many, where=org_filter),
@@ -1206,9 +1218,10 @@ async def _delete_organization_keys(
     user_api_key_cache: UserApiKeyCache,
     proxy_logging_obj: ProxyLogging | None,
 ) -> None:
-    """Delete the organization's keys, revoked with the request's first revocation or, for a key added since, in the
-    round that deletes it, and tombstone them again now that the rows are gone. A key's JWT mappings go with it by
-    cascade, so each read of keys also reads the cache keys of their mappings, before those keys are deleted."""
+    """Delete the organization's keys and tombstone them again now that the rows are gone. While last good entries are
+    served, each round deletes right after the revocation of its keys' entries, with no Redis while the request's first
+    revocation of them stands (``_delete_organization_rows``). A key's JWT mappings go with it by cascade, so each read
+    of keys also reads the cache keys of their mappings, before those keys are deleted."""
     key_filter: Final[_OrganizationIdFilter] = {"organization_id": organization_id}
     key_table: Final = _table(VerificationTokenRepository(prisma_client))
     jwt_mapping_cache_keys: Final[list[str]] = []  # mutable-ok: grows by the mappings of each read's keys
@@ -1226,6 +1239,7 @@ async def _delete_organization_keys(
         user_api_key_cache,
         read_keys,
         lambda rows: tuple(key.token for key in rows),
+        # bounded-ok: revoke_and_delete_read_rows hands each call at most IN_LIST_CHUNK_SIZE rows
         lambda rows: key_table.delete_many(where={**key_filter, "token": {"in": [key.token for key in rows]}}),
         partial(key_table.delete_many, where=key_filter),
     )

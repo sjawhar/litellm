@@ -79,6 +79,7 @@ from litellm.proxy.utils import (  # noqa: F401  # legacy module exports
     handle_exception_on_proxy,
     premium_user_check,
 )
+from litellm.repositories.chunked_in import find_many_in
 from litellm.repositories.table_repositories import (
     InvitationLinkRepository,
     OrganizationMembershipRepository,
@@ -1053,7 +1054,7 @@ async def _revoke_scim_user(
     teams: Final = tuple(LiteLLM_TeamTable.model_validate(team.model_dump()) for team in found if team)
     keys: Final = _table(VerificationTokenRepository(prisma_client))
     to_block: Final = await keys.find_many(where=_unblocked_keys_filter(user_id)) if ends_user else None
-    in_left_teams: Final = await keys.find_many(where={"user_id": user_id, "team_id": {"in": left}}) if left else ()
+    in_left_teams: Final = await find_many_in(keys, "team_id", left, where={"user_id": user_id})
     rosters_naming_user: Final = (
         team_cache_keys(team.team_id, team.team_alias)
         for team in teams
@@ -1065,6 +1066,26 @@ async def _revoke_scim_user(
         user_api_key_cache, (user_id, *chain.from_iterable(rosters_naming_user), *memberships, *tokens)
     )
     return to_block
+
+
+async def _keys_to_set_blocked(
+    prisma_client: PrismaClient,
+    user_id: str,
+    blocked: bool,
+    revoked_keys: "Sequence[PrismaVerificationToken] | None",
+) -> "Sequence[PrismaVerificationToken]":
+    """The keys ``_set_user_keys_blocked`` writes: for a block given ``revoked_keys``, the current rows of those keys
+    still unblocked; for any other block, the user's unblocked keys; for an unblock, the user's keys SCIM blocked."""
+    keys: Final = _table(VerificationTokenRepository(prisma_client))
+    if blocked and revoked_keys is not None:
+        # Current rows, so the merge keeps an edit made since; no key outside the preflight's is read
+        return await find_many_in(
+            keys, "token", (key_row.token for key_row in revoked_keys), where=_unblocked_keys_filter(user_id)
+        )
+    if blocked:
+        return await keys.find_many(where=_unblocked_keys_filter(user_id))
+    candidates: Final = await keys.find_many(where={"user_id": user_id, "blocked": True})
+    return [k for k in candidates if _key_was_scim_blocked(k.metadata)]
 
 
 async def _set_user_keys_blocked(
@@ -1092,25 +1113,7 @@ async def _set_user_keys_blocked(
 
     prisma_client: Final = await _get_prisma_client_or_raise_exception()
 
-    if blocked and revoked_keys is not None:
-        # Current rows, so the merge below keeps an edit made since; no key outside the preflight's is read
-        revoked_tokens: Final = [key_row.token for key_row in revoked_keys]
-        affected_keys = (
-            await _table(VerificationTokenRepository(prisma_client)).find_many(
-                where={**_unblocked_keys_filter(user_id), "token": {"in": revoked_tokens}}
-            )
-            if revoked_tokens
-            else ()
-        )
-    elif blocked:
-        affected_keys = await _table(VerificationTokenRepository(prisma_client)).find_many(
-            where=_unblocked_keys_filter(user_id)
-        )
-    else:
-        candidates = await _table(VerificationTokenRepository(prisma_client)).find_many(
-            where={"user_id": user_id, "blocked": True},
-        )
-        affected_keys = [k for k in candidates if _key_was_scim_blocked(k.metadata)]
+    affected_keys: Final = await _keys_to_set_blocked(prisma_client, user_id, blocked, revoked_keys)
 
     if not affected_keys:
         return 0
@@ -1187,6 +1190,7 @@ async def _delete_rows_referencing_user(prisma_client: PrismaClient, *, user_id:
         partial(team_memberships.find_many, where={"user_id": user_id}),
         lambda rows: tuple(team_membership_auth_cache_key(team_id=row.team_id, user_id=user_id) for row in rows),
         lambda rows: team_memberships.delete_many(
+            # bounded-ok: revoke_and_delete_read_rows hands each call at most IN_LIST_CHUNK_SIZE rows
             where={"user_id": user_id, "team_id": {"in": [row.team_id for row in rows]}}
         ),
     )
@@ -2856,8 +2860,15 @@ async def delete_group(
 
         await _recompute_scim_member_roles(prisma_client, member_ids)
 
-        # Delete team
-        await _table(TeamRepository(prisma_client)).delete(where={"team_id": group_id})
+        from litellm.proxy.proxy_server import user_api_key_cache
+
+        # Delete team. The member writes since the first revocation can outlast its tombstones, so the team's entries
+        # are revoked again right before its delete: no Redis while those tombstones stand
+        await revoke_last_good_then(
+            user_api_key_cache,
+            team_cache_keys(group_id, existing_team.team_alias),
+            partial(_table(TeamRepository(prisma_client)).delete, where={"team_id": group_id}),
+        )
         await _evict_patched_team(group_id, existing_team.team_alias, None, revoked=True)
 
         return Response(status_code=204)

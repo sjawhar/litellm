@@ -755,3 +755,33 @@ async def test_claim_token_reads_its_invitation_from_the_writer_only_while_last_
         await claim_onboarding_link(data=data, request=_make_claim_request())
 
     assert (refused.value.status_code, refused.value.detail["error"]) == (401, refusal)
+
+
+@pytest.mark.asyncio
+async def test_claim_token_with_a_plain_dual_cache_as_the_auth_cache_reads_its_invitation_as_before():
+    """The auth cache can be a plain DualCache, which keeps no last good entries: the claim pins nothing and reads its
+    invitation where it always did, here the lagging replica that has no row for it yet, rather than failing on the
+    setting only the cache's subclass carries."""
+    from litellm.caching.dual_cache import DualCache
+    from litellm.proxy.db.prisma_client import PrismaWrapper
+    from litellm.proxy.db.routing_prisma_wrapper import RoutingPrismaWrapper
+    from litellm.proxy.proxy_server import claim_onboarding_link
+
+    writer: Final = PrismaWrapper(
+        original_prisma=SimpleNamespace(
+            litellm_invitationlink=_invitation_table(_make_invite(is_accepted=True, claimed=True))
+        )
+    )
+    reader: Final = PrismaWrapper(original_prisma=SimpleNamespace(litellm_invitationlink=_invitation_table(None)))
+    prisma: Final = SimpleNamespace(db=RoutingPrismaWrapper(writer=writer, reader=reader), writer_db=writer)
+    # The claim is refused at its invitation, before any password check, so the password is a placeholder
+    data: Final = InvitationClaim(invitation_link="invite-abc", user_id="user-123", password="not-a-secret")
+
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", prisma),  # test-quality-ok: the endpoint reads this global
+        patch("litellm.proxy.proxy_server.user_api_key_cache", DualCache()),  # test-quality-ok: the endpoint reads it
+        pytest.raises(HTTPException) as refused,
+    ):
+        await claim_onboarding_link(data=data, request=_make_claim_request())
+
+    assert (refused.value.status_code, refused.value.detail["error"]) == (401, "Invitation link does not exist in db.")

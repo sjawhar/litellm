@@ -2426,3 +2426,21 @@ async def test_a_second_auth_run_in_one_context_sets_the_writer_pin_anew(monkeyp
 
     await _master_key_auth("POST", "/chat/completions")
     assert _reads_go_to_the_reader() is True
+
+
+@pytest.mark.asyncio
+async def test_auth_with_a_plain_dual_cache_as_the_auth_cache_answers_and_pins_nothing(monkeypatch: pytest.MonkeyPatch):
+    """The auth cache can be a plain DualCache, which keeps no last good entries: auth of a key delete answers as
+    without the setting, and sets the reads of the request back on the reader, rather than failing on the setting
+    only the cache's subclass carries."""
+    from litellm.caching.dual_cache import DualCache
+    from litellm.proxy.db.routing_prisma_wrapper import reads_pinned_to_writer
+
+    _serve_master_key_calls(monkeypatch, serve_last_good_entries=False)
+    monkeypatch.setattr(  # test-quality-ok: auth reads the setting off this module global; no injection seam
+        litellm.proxy.proxy_server, "user_api_key_cache", DualCache()
+    )
+
+    with reads_pinned_to_writer():
+        await _master_key_auth("POST", "/key/delete")
+        assert _reads_go_to_the_reader() is True

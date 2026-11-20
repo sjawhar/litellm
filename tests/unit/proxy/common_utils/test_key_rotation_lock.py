@@ -268,3 +268,44 @@ async def test_a_rotation_run_picks_its_due_keys_from_the_writer_only_while_last
 
     rotated: Final = [awaited.args[0] for awaited in rotate_key.await_args_list]
     assert rotated == ([due_key] if reads_from_writer else [])
+
+
+@pytest.mark.asyncio
+async def test_a_rotation_run_with_a_plain_dual_cache_as_the_auth_cache_still_rotates_its_due_keys():
+    """The auth cache can be a plain DualCache, which keeps no last good entries: the run pins nothing, reads its due
+    keys where it always did, and rotates them, rather than stopping on the setting only the cache's subclass
+    carries."""
+    from litellm.caching.dual_cache import DualCache
+    from litellm.proxy.db.prisma_client import PrismaWrapper
+    from litellm.proxy.db.routing_prisma_wrapper import RoutingPrismaWrapper
+
+    due_key: Final = LiteLLM_VerificationToken(
+        token="due-token", auto_rotate=True, rotation_interval="30d", key_rotation_at=None, key_name="due-key"
+    )
+    writer: Final = PrismaWrapper(
+        original_prisma=SimpleNamespace(
+            litellm_verificationtoken=SimpleNamespace(find_many=AsyncMock(return_value=[]), create=AsyncMock()),
+            litellm_deprecatedverificationtoken=SimpleNamespace(delete_many=AsyncMock(return_value=0)),
+        )
+    )
+    reader: Final = PrismaWrapper(
+        original_prisma=SimpleNamespace(
+            litellm_verificationtoken=SimpleNamespace(find_many=AsyncMock(return_value=[due_key]), create=AsyncMock())
+        )
+    )
+    prisma: Final = SimpleNamespace(db=RoutingPrismaWrapper(writer=writer, reader=reader), writer_db=writer)
+    manager: Final = KeyRotationManager(prisma)  # pyright: ignore[reportArgumentType]  # a fake for PrismaClient
+    rotated: Final[list[LiteLLM_VerificationToken]] = []  # mutable-ok: records each key the run rotates
+
+    async def rotate_key(key: LiteLLM_VerificationToken) -> None:
+        rotated.append(key)
+
+    with (
+        patch.object(manager, "_rotate_key", rotate_key),  # test-quality-ok: records the keys the run rotates
+        patch(  # test-quality-ok: the run reads the setting off this proxy_server global; no injection seam
+            "litellm.proxy.proxy_server.user_api_key_cache", DualCache()
+        ),
+    ):
+        await manager.process_rotations()
+
+    assert rotated == [due_key]

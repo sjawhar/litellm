@@ -225,7 +225,7 @@ async def update_budget(
     return response
 
 
-_EvictionStep = TypeVar("_EvictionStep")
+_EvictionStep: Final = TypeVar("_EvictionStep")
 
 
 async def _best_effort(budget_id: str, what: str, step: Callable[[], Awaitable[_EvictionStep]]) -> _EvictionStep | None:

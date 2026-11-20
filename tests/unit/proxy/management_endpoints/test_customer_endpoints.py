@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
+from litellm.constants import LAST_GOOD_TOMBSTONE_TTL_SECONDS
 from litellm.proxy._types import (
     BlockUsers,
     LiteLLM_BudgetTable,
@@ -23,9 +24,9 @@ from litellm.proxy._types import (
     UpdateCustomerRequest,
 )
 from litellm.proxy.auth.user_api_key_auth import UserAPIKeyAuth, user_api_key_auth
-from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+from litellm.proxy.common_utils.user_api_key_cache import LAST_GOOD_LATE_STORE_MARGIN_SECONDS, UserApiKeyCache
 from litellm.proxy.management_endpoints.customer_endpoints import _should_update_field, router
-from tests.unit.caching.fake_redis_cache import fake_redis_cache
+from tests.unit.caching.fake_redis_cache import FakeRedisCache, fake_redis_cache
 from litellm.types.proxy.management_endpoints.common_daily_activity import (
     SpendAnalyticsPaginatedResponse,
 )
@@ -1619,3 +1620,304 @@ async def test_a_customer_block_drops_the_verdict_and_registry_copies_last_good_
     await block_user(data=BlockUsers(user_ids=["c1"]))
 
     assert [cache.in_memory_cache.get_cache(key=key) for key in copy_keys] == [None, None]
+
+
+class _DrivenClock:
+    """The last good entries' clock, which a test moves instead of waiting."""
+
+    def __init__(self) -> None:
+        self.now: float = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+# Past this since a revocation, the request's record no longer skips Redis for the key: its tombstone may lapse first
+_PAST_THE_RECORD: Final = LAST_GOOD_TOMBSTONE_TTL_SECONDS - LAST_GOOD_LATE_STORE_MARGIN_SECONDS + 1
+
+
+async def _outlast_the_tombstones(redis: FakeRedisCache, clock: _DrivenClock, *, loses_redis: bool) -> None:
+    """A step that takes past the time the request's record of its revocations allows: the tombstones in Redis lapse
+    meanwhile, and Redis is lost once the step ends when ``loses_redis``."""
+    clock.now += _PAST_THE_RECORD
+    client: Final = redis.cache.init_async_client()
+    lapsed: Final = await client.keys("last_good_tombstone:*")
+    if lapsed:
+        await client.delete(*lapsed)
+    if loses_redis:
+        redis.server.connected = False
+
+
+def _driven_cache(redis: FakeRedisCache, clock: _DrivenClock, *, serves_last_good: bool) -> UserApiKeyCache:
+    return UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=serves_last_good, last_good_clock=clock)
+
+
+def _customer_cache_keys(user_id: str) -> tuple[str, ...]:
+    """What a write that blocks or restricts customer ``user_id`` ends: its entry, its id's validation verdict, and the
+    restricted registry."""
+    return (f"end_user_id:{user_id}", f"end_user_validation:{user_id}", "end_user_restricted_registry")
+
+
+class _WitnessedEndUserRows(_EndUserRows):
+    """End-user rows that record, for each upsert, create and update in turn, the customer's id and which of the cache
+    keys its write ends have a tombstone in Redis as the write runs, none while Redis is lost. The upsert of
+    ``outlasting`` then takes past the time the request's record of its revocations allows."""
+
+    def __init__(
+        self,
+        redis: FakeRedisCache,
+        clock: _DrivenClock,
+        *rows: LiteLLM_EndUserTable,
+        outlasting: str | None = None,
+        loses_redis: bool = False,
+    ) -> None:
+        super().__init__(*rows)
+        self.standing: Final[list[tuple[str, tuple[str, ...]]]] = []  # mutable-ok: one entry per end-user row write
+        self._redis: Final = redis
+        self._clock: Final = clock
+        self._outlasting: Final = outlasting
+        self._loses_redis: Final = loses_redis
+
+    async def _witness(self, user_id: str) -> None:
+        connected: Final = self._redis.server.connected
+        client: Final = self._redis.cache.init_async_client()
+        self.standing.append(
+            (
+                user_id,
+                tuple(
+                    [
+                        cache_key
+                        for cache_key in _customer_cache_keys(user_id)
+                        if connected and await client.exists(f"last_good_tombstone:{cache_key}") == 1
+                    ]
+                ),
+            )
+        )
+
+    async def upsert(self, where: dict[str, str], data: dict[str, dict[str, object]]) -> LiteLLM_EndUserTable:
+        await self._witness(where["user_id"])
+        row: Final = await super().upsert(where, data)
+        if where["user_id"] == self._outlasting:
+            await _outlast_the_tombstones(self._redis, self._clock, loses_redis=self._loses_redis)
+        return row
+
+    async def create(self, data: dict[str, object], include: object = None) -> LiteLLM_EndUserTable:
+        await self._witness(str(data["user_id"]))
+        return await super().create(data, include)
+
+    async def update(
+        self, where: dict[str, str], data: dict[str, object], include: object = None
+    ) -> LiteLLM_EndUserTable:
+        await self._witness(where["user_id"])
+        return await super().update(where, data, include)
+
+
+class _OutlastingBudgetRows(_BudgetRows):
+    """The budget table a customer create or update adds a budget to: each create takes past the time the request's
+    record of its revocations allows, then answers with the new row as the database returns it."""
+
+    def __init__(self, redis: FakeRedisCache, clock: _DrivenClock, *, loses_redis: bool) -> None:
+        super().__init__()
+        self._redis: Final = redis
+        self._clock: Final = clock
+        self._loses_redis: Final = loses_redis
+
+    async def create(self, data: dict[str, object], include: object = None) -> _DbBudgetRow:
+        await _outlast_the_tombstones(self._redis, self._clock, loses_redis=self._loses_redis)
+        created: Final = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        row: Final = _DbBudgetRow.model_validate(
+            {**data, "budget_id": f"budget-{len(self.rows) + 1}", "created_at": created, "updated_at": created}
+        )
+        self.rows[row.budget_id] = row
+        return row
+
+
+def _two_unblocked_customers(
+    redis: FakeRedisCache, clock: _DrivenClock, *, loses_redis: bool
+) -> tuple[_WitnessedEndUserRows, _OutlastingBudgetRows]:
+    """Customers c1 and c2, neither restricted, whose block's upsert of c1 and whose budget creates each outlast the
+    tombstones."""
+    return (
+        _WitnessedEndUserRows(
+            redis,
+            clock,
+            LiteLLM_EndUserTable(user_id="c1", blocked=False),
+            LiteLLM_EndUserTable(user_id="c2", blocked=False),
+            outlasting="c1",
+            loses_redis=loses_redis,
+        ),
+        _OutlastingBudgetRows(redis, clock, loses_redis=loses_redis),
+    )
+
+
+@pytest.mark.asyncio
+async def test_customer_block_revokes_a_later_customer_again_when_an_earlier_upsert_outlasts_the_tombstones(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The block revokes every customer before its first upsert, then upserts them one by one. The first upsert takes
+    past the time the request's record of that revocation allows and the tombstones lapse meanwhile, so another pod may
+    store the second customer's entry, its verdict or the registry again: the second upsert revokes them again right
+    before it writes, so their tombstones stand in Redis as it runs."""
+    from litellm.proxy.management_endpoints.customer_endpoints import block_user
+
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    rows, budgets = _two_unblocked_customers(redis, clock, loses_redis=False)
+    _serve_end_user_rows(monkeypatch, rows, _driven_cache(redis, clock, serves_last_good=True), budgets)
+
+    await block_user(data=BlockUsers(user_ids=["c1", "c2"]))
+
+    assert rows.standing == [("c1", _customer_cache_keys("c1")), ("c2", _customer_cache_keys("c2"))]
+
+
+@pytest.mark.asyncio
+async def test_customer_block_answers_503_before_a_later_upsert_when_redis_is_lost_after_an_earlier_one_outlasts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Redis is lost once the first upsert has outlasted the tombstones: the second customer's revocation cannot be
+    recorded again, so the block answers 503 before that customer's upsert and it stays unblocked, rather than its
+    entry outliving the lapsed tombstone into an outage."""
+    from litellm.proxy.management_endpoints.customer_endpoints import block_user
+
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    rows, budgets = _two_unblocked_customers(redis, clock, loses_redis=True)
+    _serve_end_user_rows(monkeypatch, rows, _driven_cache(redis, clock, serves_last_good=True), budgets)
+
+    with pytest.raises(HTTPException) as refused:
+        await block_user(data=BlockUsers(user_ids=["c1", "c2"]))
+
+    assert (refused.value.status_code, rows.standing, rows.rows["c2"].blocked) == (
+        503,
+        [("c1", _customer_cache_keys("c1"))],
+        False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_restricted_customer_create_revokes_it_again_when_its_budget_create_outlasts_the_tombstones(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A customer created with a budget joins the restricted registry, so it is revoked before the budget's create.
+    That create takes past the time the request's record allows and the tombstones lapse meanwhile: the customer's
+    create revokes its entry, its verdict and the registry again right before it writes, so their tombstones stand."""
+    from litellm.proxy.management_endpoints.customer_endpoints import new_end_user
+
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    rows, budgets = _two_unblocked_customers(redis, clock, loses_redis=False)
+    _serve_end_user_rows(monkeypatch, rows, _driven_cache(redis, clock, serves_last_good=True), budgets)
+
+    created: Final = await new_end_user(
+        data=NewCustomerRequest(user_id="c-new", max_budget=5.0), user_api_key_dict=_ADMIN
+    )
+
+    assert (created.budget_id, rows.standing) == ("budget-1", [("c-new", _customer_cache_keys("c-new"))])
+
+
+@pytest.mark.asyncio
+async def test_restricted_customer_create_answers_503_and_writes_no_customer_when_redis_is_lost_after_its_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Redis is lost once the budget's create has outlasted the tombstones: the customer's revocation cannot be
+    recorded again, so the create answers 503 with no customer written, and the new budget stays linked to none."""
+    from litellm.proxy.management_endpoints.customer_endpoints import new_end_user
+
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    rows, budgets = _two_unblocked_customers(redis, clock, loses_redis=True)
+    _serve_end_user_rows(monkeypatch, rows, _driven_cache(redis, clock, serves_last_good=True), budgets)
+
+    with pytest.raises(ProxyException) as refused:
+        await new_end_user(data=NewCustomerRequest(user_id="c-new", max_budget=5.0), user_api_key_dict=_ADMIN)
+
+    assert (str(refused.value.code), rows.standing, sorted(rows.rows), sorted(budgets.rows)) == (
+        "503",
+        [],
+        ["c1", "c2"],
+        ["budget-1"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_customer_update_giving_a_budget_revokes_it_again_when_the_budget_create_outlasts_the_tombstones(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An update that gives an unrestricted customer a new budget moves it into the restricted registry, so it is
+    revoked before the budget's create. That create takes past the time the request's record allows and the tombstones
+    lapse meanwhile: the customer's update revokes its entry, its verdict and the registry again right before it
+    writes, so their tombstones stand."""
+    from litellm.proxy.management_endpoints.customer_endpoints import update_end_user
+
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    rows, budgets = _two_unblocked_customers(redis, clock, loses_redis=False)
+    _serve_end_user_rows(monkeypatch, rows, _driven_cache(redis, clock, serves_last_good=True), budgets)
+
+    updated: Final = await update_end_user(
+        data=UpdateCustomerRequest(user_id="c1", max_budget=5.0), user_api_key_dict=_ADMIN
+    )
+
+    assert (updated.budget_id, rows.standing) == ("budget-1", [("c1", _customer_cache_keys("c1"))])
+
+
+@pytest.mark.asyncio
+async def test_customer_update_giving_a_budget_answers_503_and_leaves_the_customer_when_redis_is_lost_after_the_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Redis is lost once the budget's create has outlasted the tombstones: the customer's revocation cannot be
+    recorded again, so the update answers 503 and the customer's row is left as it was."""
+    from litellm.proxy.management_endpoints.customer_endpoints import update_end_user
+
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    rows, budgets = _two_unblocked_customers(redis, clock, loses_redis=True)
+    _serve_end_user_rows(monkeypatch, rows, _driven_cache(redis, clock, serves_last_good=True), budgets)
+
+    with pytest.raises(ProxyException) as refused:
+        await update_end_user(data=UpdateCustomerRequest(user_id="c1", max_budget=5.0), user_api_key_dict=_ADMIN)
+
+    assert (str(refused.value.code), rows.standing, rows.rows["c1"]) == (
+        "503",
+        [],
+        LiteLLM_EndUserTable(user_id="c1", blocked=False),
+    )
+
+
+async def _customer_write(write: str) -> object:
+    """The customer write a test names: a block of c1 then c2, the create of c-new with a budget, or an update that
+    gives c1 a budget."""
+    from litellm.proxy.management_endpoints.customer_endpoints import block_user, new_end_user, update_end_user
+
+    if write == "block":
+        return await block_user(data=BlockUsers(user_ids=["c1", "c2"]))
+    if write == "create":
+        return await new_end_user(data=NewCustomerRequest(user_id="c-new", max_budget=5.0), user_api_key_dict=_ADMIN)
+    return await update_end_user(data=UpdateCustomerRequest(user_id="c1", max_budget=5.0), user_api_key_dict=_ADMIN)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("write", "written"),
+    [
+        ("block", [("c1", True, None), ("c2", True, None)]),
+        ("create", [("c-new", False, "budget-1")]),
+        ("update", [("c1", False, "budget-1")]),
+    ],
+)
+async def test_with_last_good_entries_off_each_customer_write_runs_in_its_order_while_redis_is_lost(
+    monkeypatch: pytest.MonkeyPatch, write: str, written: list[tuple[str, bool, str | None]]
+) -> None:
+    """With ``serve_last_good_auth_entries`` off nothing is revoked: a block, a restricted create and an update that
+    gives a budget write every row in their order, as they always have, though Redis is lost after a step that outlasts
+    the tombstone time."""
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    rows, budgets = _two_unblocked_customers(redis, clock, loses_redis=True)
+    _serve_end_user_rows(monkeypatch, rows, _driven_cache(redis, clock, serves_last_good=False), budgets)
+
+    await _customer_write(write)
+
+    assert [
+        (user_id, rows.rows[user_id].blocked, rows.rows[user_id].budget_id) for user_id, _ in rows.standing
+    ] == written

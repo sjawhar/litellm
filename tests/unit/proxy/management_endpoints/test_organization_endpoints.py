@@ -17,7 +17,9 @@ from tests.unit.proxy.management_endpoints.jwt_key_mapping_doubles import (
 )
 
 if TYPE_CHECKING:
+    from litellm.proxy._types import LiteLLM_OrganizationTable
     from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from tests.unit.caching.fake_redis_cache import FakeRedisCache
 
 
 @pytest.mark.asyncio
@@ -2191,3 +2193,233 @@ async def test_organization_member_delete_by_email_pinned_to_the_writer_removes_
     assert [membership.user_id for membership in memberships.rows] == ["u-former"]
     assert await recall_last_good(cache, "u-current", LiteLLM_UserTable) is None
     assert await recall_last_good(cache, "u-former", LiteLLM_UserTable) is not None
+
+
+_FIRST_ORG: Final = "org-first"
+_SECOND_ORG: Final = "org-second"
+
+
+class _DrivenClock:
+    """The last good entries' clock, which a test moves instead of waiting."""
+
+    def __init__(self) -> None:
+        self.now: float = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+async def _outlast_the_tombstones(redis: "FakeRedisCache", clock: _DrivenClock, *, loses_redis: bool) -> None:
+    """A write that takes past the time the request's record of its revocations allows, so the request revokes those
+    keys through Redis again: the tombstones in Redis lapse meanwhile, and Redis is lost once the write lands when
+    ``loses_redis``."""
+    from litellm.constants import LAST_GOOD_TOMBSTONE_TTL_SECONDS
+    from litellm.proxy.common_utils.user_api_key_cache import LAST_GOOD_LATE_STORE_MARGIN_SECONDS
+
+    clock.now += LAST_GOOD_TOMBSTONE_TTL_SECONDS - LAST_GOOD_LATE_STORE_MARGIN_SECONDS + 1
+    client: Final = redis.cache.init_async_client()
+    lapsed: Final = await client.keys("last_good_tombstone:*")
+    if lapsed:
+        await client.delete(*lapsed)
+    if loses_redis:
+        redis.server.connected = False
+
+
+async def _tombstones_standing(redis: "FakeRedisCache", cache_keys: Sequence[str]) -> tuple[str, ...]:
+    """Which of ``cache_keys`` have a tombstone in Redis now; none while Redis is lost."""
+    if not redis.server.connected:
+        return ()
+    client: Final = redis.cache.init_async_client()
+    return tuple(
+        [cache_key for cache_key in cache_keys if await client.exists(f"last_good_tombstone:{cache_key}") == 1]
+    )
+
+
+class _LoggedTable:
+    """``table`` with each read and delete the endpoint awaits noted in ``log`` as ``<name>.<method>``, in order."""
+
+    def __init__(self, name: str, table: _Rows, log: list[str]) -> None:
+        self._name: Final = name
+        self._table: Final = table
+        self._log: Final = log
+
+    async def find_many(self, where: Mapping[str, object]) -> list[object]:
+        self._log.append(f"{self._name}.find_many")
+        return await self._table.find_many(where)
+
+    async def delete_many(self, where: Mapping[str, object]) -> int:
+        self._log.append(f"{self._name}.delete_many")
+        return await self._table.delete_many(where)
+
+
+class _OrganizationTable:
+    """The organization table holding ``org_ids``. Each delete is noted in ``log``, and in ``deletes`` with which of
+    the organization's cache keys had a tombstone in Redis as it ran; deleting ``slow_org`` then outlasts the
+    tombstones (``_outlast_the_tombstones``)."""
+
+    def __init__(
+        self,
+        org_ids: Sequence[str],
+        redis: "FakeRedisCache",
+        clock: _DrivenClock,
+        log: list[str],
+        *,
+        slow_org: str,
+        loses_redis: bool,
+    ) -> None:
+        self.org_ids: Final[list[str]] = list(org_ids)  # mutable-ok: a delete takes its row
+        self.deletes: Final[list[tuple[str, tuple[str, ...]]]] = []  # mutable-ok: one entry per delete, in order
+        self._redis: Final = redis
+        self._clock: Final = clock
+        self._log: Final = log
+        self._slow_org: Final = slow_org
+        self._loses_redis: Final = loses_redis
+
+    async def delete(
+        self, where: Mapping[str, str], include: Mapping[str, bool] | None = None
+    ) -> "LiteLLM_OrganizationTable | None":
+        from litellm.proxy._types import LiteLLM_OrganizationTable
+        from litellm.proxy.auth.auth_checks import organization_cache_keys
+
+        org_id: Final = where["organization_id"]
+        self._log.append("organizations.delete")
+        if org_id not in self.org_ids:
+            return None
+        self.deletes.append((org_id, await _tombstones_standing(self._redis, organization_cache_keys(org_id))))
+        self.org_ids.remove(org_id)
+        if org_id == self._slow_org:
+            await _outlast_the_tombstones(self._redis, self._clock, loses_redis=self._loses_redis)
+        return LiteLLM_OrganizationTable(
+            organization_id=org_id, budget_id=f"budget-{org_id}", created_by="admin", updated_by="admin"
+        )
+
+
+def _two_organizations_the_first_outlasting(
+    monkeypatch: pytest.MonkeyPatch, *, serving: bool, loses_redis: bool, log: list[str]
+) -> tuple[_OrganizationTable, tuple[_Rows, _Rows, _Rows]]:
+    """Two organizations behind Redis, on a driven clock, with last good entries served or not: the first holds a
+    team, a key and a member, the second nothing, and the first's row delete outlasts the tombstones, Redis lost once
+    it lands when ``loses_redis``. Every read and delete is noted in ``log``. Returns the organization table and the
+    team, key and member tables."""
+    from datetime import datetime, timezone
+
+    from litellm.proxy._types import (
+        LiteLLM_OrganizationMembershipTable,
+        LiteLLM_TeamTable,
+        LiteLLM_VerificationToken,
+    )
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    joined: Final = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    teams: Final = _Rows((LiteLLM_TeamTable(team_id="t-first", organization_id=_FIRST_ORG),))
+    keys: Final = _Rows((LiteLLM_VerificationToken(token="hashed-first-key", organization_id=_FIRST_ORG),))
+    members: Final = _Rows(
+        (
+            LiteLLM_OrganizationMembershipTable(
+                user_id="first-member", organization_id=_FIRST_ORG, created_at=joined, updated_at=joined
+            ),
+        )
+    )
+    organizations: Final = _OrganizationTable(
+        (_FIRST_ORG, _SECOND_ORG), redis, clock, log, slow_org=_FIRST_ORG, loses_redis=loses_redis
+    )
+    database: Final = SimpleNamespace(
+        db=SimpleNamespace(
+            litellm_teamtable=_LoggedTable("teams", teams, log),
+            litellm_verificationtoken=_LoggedTable("keys", keys, log),
+            litellm_organizationmembership=_LoggedTable("members", members, log),
+            litellm_jwtkeymapping=CascadingJWTMappingTable([]),
+            litellm_organizationtable=organizations,
+        )
+    )
+    cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=serving, last_good_clock=clock)
+    _org_endpoints_use(monkeypatch, database, cache)
+    return organizations, (teams, keys, members)
+
+
+@pytest.mark.asyncio
+async def test_delete_organization_revokes_the_second_organization_again_after_the_first_outlasts_the_tombstones(
+    monkeypatch,
+):
+    """The request revokes both organizations before its first delete, then the first organization's deletes take past
+    the time the request's record of that revocation allows and the tombstones lapse meanwhile, so another pod may
+    store the second organization's entries again. The second organization's delete revokes them again right before
+    it: its tombstones stand in Redis when its row is deleted."""
+    from litellm.proxy._types import DeleteOrganizationRequest, LitellmUserRoles, UserAPIKeyAuth
+    from litellm.proxy.auth.auth_checks import organization_cache_keys
+    from litellm.proxy.management_endpoints.organization_endpoints import delete_organization
+
+    organizations, _children = _two_organizations_the_first_outlasting(
+        monkeypatch, serving=True, loses_redis=False, log=[]
+    )
+
+    deleted: Final = await delete_organization(
+        data=DeleteOrganizationRequest(organization_ids=[_FIRST_ORG, _SECOND_ORG]),
+        user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN),
+    )
+
+    assert [org.organization_id for org in deleted] == [_FIRST_ORG, _SECOND_ORG]
+    assert organizations.deletes == [
+        (_FIRST_ORG, organization_cache_keys(_FIRST_ORG)),
+        (_SECOND_ORG, organization_cache_keys(_SECOND_ORG)),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_delete_organization_answers_503_with_the_second_organization_kept_when_redis_is_lost_after_the_first(
+    monkeypatch,
+):
+    """The same slow first organization, with Redis lost once its row is deleted: the second organization's revocation
+    has to reach Redis again and cannot, so the request answers 503 with the second organization's row not deleted."""
+    from litellm.proxy._types import DeleteOrganizationRequest, LitellmUserRoles, UserAPIKeyAuth
+    from litellm.proxy.management_endpoints.organization_endpoints import delete_organization
+
+    organizations, _children = _two_organizations_the_first_outlasting(
+        monkeypatch, serving=True, loses_redis=True, log=[]
+    )
+
+    with pytest.raises(HTTPException) as refused:
+        await delete_organization(
+            data=DeleteOrganizationRequest(organization_ids=[_FIRST_ORG, _SECOND_ORG]),
+            user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN),
+        )
+
+    assert refused.value.status_code == 503
+    assert [org_id for org_id, _standing in organizations.deletes] == [_FIRST_ORG]
+    assert organizations.org_ids == [_SECOND_ORG]
+
+
+@pytest.mark.asyncio
+async def test_delete_organization_with_last_good_entries_off_reads_nothing_before_its_first_delete(monkeypatch):
+    """With the setting off nothing is revoked, so no read runs before the first organization's tables, which are read
+    and deleted in the order they were before last good entries existed: the team and member reads, which find what
+    the cache evictions after their deletes drop, are the only additions. Redis lost after the first organization
+    stops nothing."""
+    from litellm.proxy._types import DeleteOrganizationRequest, LitellmUserRoles, UserAPIKeyAuth
+    from litellm.proxy.management_endpoints.organization_endpoints import delete_organization
+
+    log: Final[list[str]] = []  # mutable-ok: every read and delete, in order
+    organizations, children = _two_organizations_the_first_outlasting(
+        monkeypatch, serving=False, loses_redis=True, log=log
+    )
+
+    await delete_organization(
+        data=DeleteOrganizationRequest(organization_ids=[_FIRST_ORG, _SECOND_ORG]),
+        user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN),
+    )
+
+    each_organization: Final = (
+        "teams.find_many",
+        "teams.delete_many",
+        "members.find_many",
+        "members.delete_many",
+        "keys.find_many",
+        "keys.delete_many",
+        "organizations.delete",
+    )
+    assert log == [*each_organization, *each_organization]
+    assert organizations.org_ids == []
+    assert [table.rows for table in children] == [(), (), ()]

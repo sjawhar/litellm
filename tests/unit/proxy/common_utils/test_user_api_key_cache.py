@@ -1449,6 +1449,70 @@ class TestLastGoodEntries:
         assert deletes == [("read first",)]
 
     @pytest.mark.asyncio
+    async def test_an_exact_delete_prepares_each_round_before_its_revocation_and_deletes_right_after_it(self):
+        """``prepare`` gets each round's rows before their revocation, so their tombstone is not in Redis yet, and the
+        delete runs right after it, with the tombstone standing; Redis lost while the late round is prepared refuses its
+        revocation with 503, and its delete never runs."""
+        from fastapi import HTTPException
+
+        redis: Final = fake_redis_cache()
+        cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=_Clock())
+        answers: Final = [("a",), ("late",)]  # mutable-ok: each read takes the next answer
+        steps: Final[list[tuple[str, tuple[str, ...], bool]]] = []  # mutable-ok: each step, its rows, their tombstones
+
+        async def tombstoned(rows: Sequence[str]) -> bool:
+            return all([await redis.cache.async_get_cache(f"last_good_tombstone:{row}") for row in rows])
+
+        async def read() -> tuple[str, ...]:
+            return answers.pop(0)
+
+        async def prepare(rows: Sequence[str]) -> None:
+            steps.append(("prepare", tuple(rows), await tombstoned(rows)))
+            if tuple(rows) == ("late",):
+                redis.server.connected = False
+
+        async def delete(rows: Sequence[str]) -> None:
+            steps.append(("delete", tuple(rows), await tombstoned(rows)))
+
+        with pytest.raises(HTTPException) as refused:
+            await revoke_and_delete_read_rows(cache, read, tuple, delete, prepare=prepare)
+
+        assert refused.value.status_code == 503
+        assert steps == [("prepare", ("a",), False), ("delete", ("a",), True), ("prepare", ("late",), False)]
+
+    @pytest.mark.asyncio
+    async def test_an_exact_delete_goes_in_chunks_each_prepared_revoked_and_deleted_on_its_own(self):
+        """A round of more rows than ``chunk_size`` goes in chunks: each chunk is prepared, then revoked, then deleted
+        before the next chunk is prepared, so no callback gets more than ``chunk_size`` rows for an ``in`` filter, and
+        each delete runs with its own chunk's tombstones standing and the next chunk's not yet written."""
+        redis: Final = fake_redis_cache()
+        cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=_Clock())
+        answers: Final = [("a", "b", "c")]  # mutable-ok: each read takes the next answer
+        steps: Final[list[tuple[str, tuple[str, ...], tuple[bool, ...]]]] = []  # mutable-ok: each call in order
+
+        async def tombstones() -> tuple[bool, ...]:
+            return tuple([await redis.cache.async_get_cache(f"last_good_tombstone:{row}") is not None for row in "abc"])
+
+        async def read() -> tuple[str, ...]:
+            return answers.pop(0) if answers else ()
+
+        async def prepare(rows: Sequence[str]) -> None:
+            steps.append(("prepare", tuple(rows), await tombstones()))
+
+        async def delete(rows: Sequence[str]) -> None:
+            steps.append(("delete", tuple(rows), await tombstones()))
+
+        deleted: Final = await revoke_and_delete_read_rows(cache, read, tuple, delete, prepare=prepare, chunk_size=2)
+
+        assert deleted == ("a", "b", "c")
+        assert steps == [
+            ("prepare", ("a", "b"), (False, False, False)),
+            ("delete", ("a", "b"), (True, True, False)),
+            ("prepare", ("c",), (True, True, False)),
+            ("delete", ("c",), (True, True, True)),
+        ]
+
+    @pytest.mark.asyncio
     async def test_rows_that_keep_appearing_refuse_with_409_after_the_last_round_and_stay(self):
         """Every read finds a new row: after LAST_GOOD_EXACT_DELETE_ROUNDS deletes the request answers 409 and the row
         of the last read is neither revoked nor deleted."""

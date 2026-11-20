@@ -27,6 +27,7 @@ from litellm.constants import (
     LAST_GOOD_TOMBSTONE_TTL_SECONDS,
 )
 from litellm.proxy.common_utils.cache_pydantic_utils import CacheCodec
+from litellm.repositories.chunked_in import IN_LIST_CHUNK_SIZE
 
 if TYPE_CHECKING:
     from opentelemetry.trace import Span
@@ -34,8 +35,8 @@ if TYPE_CHECKING:
     from litellm.caching.redis_batch import BatchResult
 
 T = TypeVar("T", bound=BaseModel)
-_Written = TypeVar("_Written")
-_Row = TypeVar("_Row")
+_Written: Final = TypeVar("_Written")
+_Row: Final = TypeVar("_Row")
 
 AUTH_OBJECTS_TARGET: Final = "auth_objects"
 
@@ -176,6 +177,13 @@ class UserApiKeyCache(DualCache):
 
     def in_memory_cache_for(self, key: str) -> InMemoryCache:
         return self.key_object_cache.in_memory_cache if is_user_key_cache_key(key) else self.in_memory_cache
+
+    def keep_served_copy_end(self, cache_key: str, ends_at: float) -> None:
+        """Record when this pod's memory copy of a value served from a last good entry ends, keeping the newest
+        ``LAST_GOOD_AUTH_ENTRIES_IN_MEMORY`` of them."""
+        self.last_good_copy_ends[cache_key] = ends_at
+        while len(self.last_good_copy_ends) > LAST_GOOD_AUTH_ENTRIES_IN_MEMORY:
+            _ = self.last_good_copy_ends.popitem(last=False)
 
     def update_cache_ttl(self, default_in_memory_ttl: float | None, default_redis_ttl: float | None) -> None:
         super().update_cache_ttl(default_in_memory_ttl=default_in_memory_ttl, default_redis_ttl=default_redis_ttl)
@@ -793,9 +801,7 @@ def keep_last_good_served_copy(
     if seconds <= 0:
         return
     memory.set_cache(key=cache_key, value=CacheCodec.serialize(value), ttl=seconds)
-    cache.last_good_copy_ends[cache_key] = now + seconds
-    while len(cache.last_good_copy_ends) > LAST_GOOD_AUTH_ENTRIES_IN_MEMORY:
-        _ = cache.last_good_copy_ends.popitem(last=False)
+    cache.keep_served_copy_end(cache_key, now + seconds)
 
 
 async def recall_last_good(cache: DualCache, cache_key: str, model_type: type[T]) -> T | None:
@@ -872,9 +878,9 @@ async def forget_missing_last_good(cache: DualCache, cache_key: str) -> None:
 # that task skips by it: a task the request starts, which copies the variable, keeps a record of its own; and the
 # record starts empty where a request's auth begins (``start_last_good_reads``), so two requests one task handles
 # never share it
-_revoked_by_this_request: Final[ContextVar[tuple[asyncio.Task[object], dict[str, float]] | None]] = ContextVar(
-    "last_good_revoked_by_this_request", default=None
-)
+_revoked_by_this_request: Final[  # mutable-ok: the record's dict grows as its task revokes
+    ContextVar[tuple[asyncio.Task[object], dict[str, float]] | None]
+] = ContextVar("last_good_revoked_by_this_request", default=None)
 
 
 async def _tombstone_in_redis(redis: RedisCache, cache_key: str, clock: Callable[[], float]) -> float:
@@ -958,22 +964,33 @@ async def revoke_and_delete_read_rows(
     read: Callable[[], Awaitable[Sequence[_Row]]],
     cache_keys_of: Callable[[Sequence[_Row]], Sequence[str]],
     delete: Callable[[Sequence[_Row]], Awaitable[object]],
+    *,
+    prepare: Callable[[Sequence[_Row]], Awaitable[object]] | None = None,
+    chunk_size: int = IN_LIST_CHUNK_SIZE,
 ) -> tuple[_Row, ...]:
     """Delete the rows ``read`` finds and only those, each round paired with the revocation of their entries
     (``revoke_last_good_then``: ``delete`` runs right after it), then read again, until a read finds none. It starts
     with a read of its own, never an earlier one, so a row added before it began is found too, and a row added between
     a read and its delete is not deleted unrevoked: the next round reads, revokes and deletes it. ``read`` must see
-    what ``delete`` changes, so a caller with a read replica reads from the writer. When the rows of
-    ``LAST_GOOD_EXACT_DELETE_ROUNDS`` deletes are each followed by more, answers 409 with the rows of the last read
-    kept, their entries not revoked by this call. Returns every row it deleted."""
-    deleted: Final[list[_Row]] = []  # mutable-ok: grows by the rows of each round
-    rows = await read()
+    what ``delete`` changes, so a caller with a read replica reads from the writer. ``prepare`` gets the rows before
+    their revocation, for the reads and writes that ready their delete (the cache keys of rows the delete cascades to,
+    an archive), so ``delete`` is only the write that ends them. A round of more than ``chunk_size`` rows goes in
+    chunks, each its own prepare, revocation and delete, so ``prepare`` and ``delete`` never get more than
+    ``chunk_size`` rows: an ``in`` filter built from them stays under Postgres' limit on a statement's parameters. When
+    the rows of ``LAST_GOOD_EXACT_DELETE_ROUNDS`` rounds are each followed by more, answers 409 with the rows of the
+    last read kept, their entries not revoked by this call. Returns every row it deleted."""
+    deleted: Final[list[_Row]] = []  # mutable-ok: grows by the rows of each chunk
+    rows = await read()  # rebind-ok: each round reads again
     for _ in range(LAST_GOOD_EXACT_DELETE_ROUNDS):
         if not rows:
             return tuple(deleted)
-        await revoke_last_good_then(cache, cache_keys_of(rows), partial(delete, rows))
-        deleted.extend(rows)
-        rows = await read()  # rebind-ok: rows added since the last read
+        for start in range(0, len(rows), chunk_size):
+            chunk = rows[start : start + chunk_size]
+            if prepare is not None:
+                await prepare(chunk)
+            await revoke_last_good_then(cache, cache_keys_of(chunk), partial(delete, chunk))
+            deleted.extend(chunk)
+        rows = await read()
     if not rows:
         return tuple(deleted)
     raise HTTPException(

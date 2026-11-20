@@ -2,7 +2,7 @@ import asyncio
 import os
 import traceback
 import httpx
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Final
@@ -31,27 +31,38 @@ from litellm_enterprise.proxy.management_endpoints.project_endpoints import (
 from litellm.proxy.proxy_server import (
     LitellmUserRoles,
 )
-from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+from litellm.proxy.common_utils.user_api_key_cache import (
+    LAST_GOOD_LATE_STORE_MARGIN_SECONDS,
+    UserApiKeyCache,
+    project_cache_key,
+)
 from litellm.proxy.utils import PrismaClient, ProxyLogging
 
 
 
 from litellm.caching.caching import DualCache
+from litellm.constants import LAST_GOOD_TOMBSTONE_TTL_SECONDS
 from litellm.proxy._types import (
     NewProjectRequest,
     UpdateProjectRequest,
     DeleteProjectRequest,
     NewTeamRequest,
     UserAPIKeyAuth,
+    LiteLLM_BudgetTable,
+    LiteLLM_ObjectPermissionBase,
+    LiteLLM_ObjectPermissionTable,
     LiteLLM_OrganizationMembershipTable,
+    LiteLLM_ProjectTable,
     LiteLLM_TeamTable,
     LiteLLM_UserTable,
+    LiteLLM_VerificationToken,
     Member,
     ProxyException,
 )
 from litellm.proxy.management.teams.authz import TeamAccess
 from litellm.proxy.management.users.service import PrismaOrgRoles
 from tests._master_key import MASTER_KEY
+from tests.unit.caching.fake_redis_cache import FakeRedisCache, fake_redis_cache
 
 proxy_logging_obj = ProxyLogging(user_api_key_cache=DualCache())
 
@@ -1029,14 +1040,27 @@ async def test_update_project_succeeds_when_cache_eviction_fails(monkeypatch):
 
 class _ProjectRows:
     """One project row the update and delete endpoints write and auth reads. While ``stopped`` every read fails the
-    way an unreachable Postgres does; ``pause_next_read`` holds the next read once it has the row."""
+    way an unreachable Postgres does; ``pause_next_read`` holds the next read once it has the row. Behind ``redis``,
+    each update and delete records in ``tombstone_stood`` whether the project's tombstone stood in Redis as it ran
+    (never while Redis is lost)."""
 
-    def __init__(self, project_id: str) -> None:
+    def __init__(
+        self,
+        project_id: str,
+        *,
+        budget_id: str | None = None,
+        object_permission_id: str | None = None,
+        redis: FakeRedisCache | None = None,
+    ) -> None:
         self.project_id = project_id
+        self.budget_id = budget_id
+        self.object_permission_id = object_permission_id
         self.blocked = False
         self.deleted = False
         self.stopped = False
         self.read_held = asyncio.Event()
+        self.tombstone_stood: Final[list[bool]] = []  # mutable-ok: one entry for each write behind redis
+        self._redis = redis
         self._release: asyncio.Event | None = None
 
     def pause_next_read(self) -> asyncio.Event:
@@ -1044,7 +1068,7 @@ class _ProjectRows:
         return self._release
 
     def _row(self) -> mock.MagicMock:
-        row = mock.MagicMock(team_id=None, budget_id=None, object_permission_id=None)
+        row = mock.MagicMock(team_id=None, budget_id=self.budget_id, object_permission_id=self.object_permission_id)
         columns = {"project_id": self.project_id, "team_id": None, "models": [], "blocked": self.blocked}
         row.model_dump = lambda: columns
         return row
@@ -1061,12 +1085,18 @@ class _ProjectRows:
         return row
 
     async def update(self, where: Mapping[str, object], data: Mapping[str, object], include: object = None):
+        await self._record_tombstone()
         self.blocked = bool(data.get("blocked", self.blocked))
         return self._row()
 
     async def delete(self, where: Mapping[str, object]) -> mock.MagicMock:
+        await self._record_tombstone()
         self.deleted = True
         return self._row()
+
+    async def _record_tombstone(self) -> None:
+        if self._redis is not None:
+            self.tombstone_stood.append(await _tombstone_stands(self._redis, project_cache_key(self.project_id)))
 
 
 def _serve_project_rows(monkeypatch, rows: _ProjectRows, cache: UserApiKeyCache) -> mock.MagicMock:
@@ -1089,8 +1119,6 @@ async def _block_project(project_id: str) -> None:
 
 @pytest.mark.asyncio
 async def test_project_block_answers_503_and_writes_nothing_when_redis_cannot_record_it(monkeypatch):
-    from tests.unit.caching.fake_redis_cache import fake_redis_cache
-
     redis = fake_redis_cache()
     redis.server.connected = False
     rows = _ProjectRows(f"project-{uuid.uuid4()}")
@@ -1106,8 +1134,6 @@ async def test_project_block_answers_503_and_writes_nothing_when_redis_cannot_re
 async def test_project_delete_answers_503_and_deletes_nothing_when_redis_cannot_record_it(monkeypatch):
     """A deleted project's entry is revoked before the delete, so a Redis that cannot record the revocation refuses
     the delete and the project stays."""
-    from tests.unit.caching.fake_redis_cache import fake_redis_cache
-
     redis: Final = fake_redis_cache()
     redis.server.connected = False
     rows: Final = _ProjectRows(f"project-{uuid.uuid4()}")
@@ -1151,6 +1177,283 @@ async def test_after_a_project_block_a_read_in_flight_cannot_bring_the_unblocked
 
     with pytest.raises(LastGoodEntryMissing):
         await project()
+
+
+class _DrivenClock:
+    """The last good entries' clock, which a test moves instead of waiting."""
+
+    def __init__(self) -> None:
+        self.now: float = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+# Past this since a revocation, the request's record no longer skips Redis for the key: its tombstone may lapse first
+_PAST_THE_RECORD: Final = LAST_GOOD_TOMBSTONE_TTL_SECONDS - LAST_GOOD_LATE_STORE_MARGIN_SECONDS + 1
+
+_PROXY_ADMIN: Final = UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN, api_key=MASTER_KEY, user_id="1234")
+
+
+def _outlasts_the_tombstones(
+    redis: FakeRedisCache, clock: _DrivenClock, *, loses_redis: bool
+) -> Callable[..., Awaitable[object]]:
+    """A write's side effect: the write takes past the time the request's record of its revocations allows, the
+    tombstones in Redis lapse meanwhile, and Redis is lost once it lands when ``loses_redis``. A mock's write then
+    answers as configured."""
+
+    async def outlast(*_args: object, **_kwargs: object) -> object:
+        clock.now += _PAST_THE_RECORD
+        client: Final = redis.cache.init_async_client()
+        lapsed: Final = await client.keys("last_good_tombstone:*")
+        if lapsed:
+            await client.delete(*lapsed)
+        if loses_redis:
+            redis.server.connected = False
+        return mock.DEFAULT
+
+    return outlast
+
+
+async def _tombstone_stands(redis: FakeRedisCache, cache_key: str) -> bool:
+    """Whether ``cache_key`` has a tombstone in Redis now; never while Redis is lost."""
+    tombstone: Final = f"last_good_tombstone:{cache_key}"
+    return redis.server.connected and await redis.cache.init_async_client().exists(tombstone) == 1
+
+
+def _driven_cache(redis: FakeRedisCache, clock: _DrivenClock, *, serves_last_good: bool = True) -> UserApiKeyCache:
+    return UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=serves_last_good, last_good_clock=clock)
+
+
+# The writes /project/update makes before the project row's own update
+_EARLIER_PROJECT_WRITES: Final = ("budget update", "permission update", "permission create")
+
+
+def _serve_a_project_block_after(
+    monkeypatch: pytest.MonkeyPatch,
+    earlier_write: str,
+    redis: FakeRedisCache,
+    clock: _DrivenClock,
+    *,
+    loses_redis: bool,
+    serves_last_good: bool = True,
+) -> tuple[_ProjectRows, mock.AsyncMock, dict[str, object]]:
+    """A project whose block, a /project/update with ``blocked``, first makes ``earlier_write``, which outlasts the
+    tombstones (``_outlasts_the_tombstones``). Returns the project, the earlier write's mock and the update's fields."""
+    rows: Final = _ProjectRows(
+        f"project-{uuid.uuid4()}",
+        budget_id="budget-1" if earlier_write == "budget update" else None,
+        object_permission_id="op-1" if earlier_write == "permission update" else None,
+        redis=redis,
+    )
+    cache: Final = _driven_cache(redis, clock, serves_last_good=serves_last_good)
+    prisma: Final = _serve_project_rows(monkeypatch, rows, cache)
+    outlast: Final = _outlasts_the_tombstones(redis, clock, loses_redis=loses_redis)
+    if earlier_write == "budget update":
+        budget_write: Final = mock.AsyncMock(
+            side_effect=outlast, return_value=LiteLLM_BudgetTable(budget_id="budget-1", max_budget=10.0)
+        )
+        prisma.db.litellm_budgettable.update = budget_write
+        return rows, budget_write, {"blocked": True, "max_budget": 10.0}
+    permission_write: Final = mock.AsyncMock(
+        side_effect=outlast,
+        return_value=LiteLLM_ObjectPermissionTable(
+            object_permission_id="op-1" if earlier_write == "permission update" else "op-new", vector_stores=["vs-1"]
+        ),
+    )
+    if earlier_write == "permission update":
+        prisma.db.litellm_objectpermissiontable.update = permission_write
+    else:
+        prisma.db.litellm_objectpermissiontable.create = permission_write
+    permissions: Final = LiteLLM_ObjectPermissionBase(vector_stores=["vs-1"])
+    return rows, permission_write, {"blocked": True, "object_permission": permissions}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("earlier_write", _EARLIER_PROJECT_WRITES)
+async def test_project_block_revokes_the_project_again_when_an_earlier_write_outlasts_the_tombstone(
+    monkeypatch, earlier_write
+):
+    """The block revokes the project before its first write; that write, to the project's budget or permissions,
+    takes past the time the request's record of the revocation allows and the tombstone lapses meanwhile, so another
+    pod may store the unblocked project's entry again. The project row's update revokes the project again right
+    before it: its tombstone stands in Redis when the project is blocked."""
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    rows, earlier, fields = _serve_a_project_block_after(monkeypatch, earlier_write, redis, clock, loses_redis=False)
+
+    await _run_project_update(rows.project_id, **fields)
+
+    earlier.assert_awaited_once()
+    assert (rows.blocked, rows.tombstone_stood) == (True, [True])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("earlier_write", _EARLIER_PROJECT_WRITES)
+async def test_project_block_answers_503_with_the_project_unblocked_when_redis_is_lost_after_an_earlier_write(
+    monkeypatch, earlier_write
+):
+    """The same slow earlier write, with Redis lost once it lands: the project's revocation has to reach Redis again
+    and cannot, so the block answers 503 with the project row not updated."""
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    rows, earlier, fields = _serve_a_project_block_after(monkeypatch, earlier_write, redis, clock, loses_redis=True)
+
+    with pytest.raises(ProxyException) as refused:
+        await _run_project_update(rows.project_id, **fields)
+
+    earlier.assert_awaited_once()
+    assert (str(refused.value.code), rows.blocked, rows.tombstone_stood) == ("503", False, [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("earlier_write", _EARLIER_PROJECT_WRITES)
+async def test_project_block_with_the_setting_off_blocks_the_project_after_a_slow_earlier_write_with_redis_lost(
+    monkeypatch, earlier_write
+):
+    """With last good entries not served the revocations return at once, so the block makes its writes and blocks
+    the project as it always did, whatever Redis does meanwhile."""
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    rows, earlier, fields = _serve_a_project_block_after(
+        monkeypatch, earlier_write, redis, clock, loses_redis=True, serves_last_good=False
+    )
+
+    await _run_project_update(rows.project_id, **fields)
+
+    earlier.assert_awaited_once()
+    assert (rows.blocked, rows.tombstone_stood) == (True, [False])
+
+
+class _ProjectTable:
+    """Projects by id, as /project/delete reads and deletes them. ``calls`` records each read of a project, of its
+    keys (one key for each project in ``keyed``), and each delete, in order; each delete records in ``deletes``
+    whether its project's tombstone stood in ``redis`` as it ran (never while Redis is lost). The first delete then
+    runs ``after_first_delete`` when given."""
+
+    def __init__(
+        self,
+        project_ids: Sequence[str],
+        redis: FakeRedisCache,
+        *,
+        keyed: Sequence[str] = (),
+        after_first_delete: Callable[..., Awaitable[object]] | None = None,
+    ) -> None:
+        # mutable-ok: each delete removes its row
+        self.rows: Final[dict[str, LiteLLM_ProjectTable]] = {
+            project_id: LiteLLM_ProjectTable(project_id=project_id) for project_id in project_ids
+        }
+        self.calls: Final[list[tuple[str, str]]] = []  # mutable-ok: one entry for each read and delete
+        self.deletes: Final[list[tuple[str, bool]]] = []  # mutable-ok: one entry for each delete
+        self._keyed: Final = frozenset(keyed)
+        self._redis: Final = redis
+        self._after_first_delete: Final = after_first_delete
+
+    async def find_unique(self, where: Mapping[str, object], include: object = None) -> LiteLLM_ProjectTable | None:
+        project_id: Final = str(where["project_id"])
+        self.calls.append(("read", project_id))
+        return self.rows.get(project_id)
+
+    async def find_keys(self, where: Mapping[str, object]) -> list[LiteLLM_VerificationToken]:
+        project_id: Final = str(where["project_id"])
+        self.calls.append(("keys", project_id))
+        return (
+            [LiteLLM_VerificationToken(token=f"hashed-key-of-{project_id}", project_id=project_id)]
+            if project_id in self._keyed
+            else []
+        )
+
+    async def delete(self, where: Mapping[str, object]) -> LiteLLM_ProjectTable:
+        project_id: Final = str(where["project_id"])
+        self.calls.append(("delete", project_id))
+        self.deletes.append((project_id, await _tombstone_stands(self._redis, project_cache_key(project_id))))
+        deleted: Final = self.rows.pop(project_id)
+        if len(self.deletes) == 1 and self._after_first_delete is not None:
+            await self._after_first_delete()
+        return deleted
+
+
+def _serve_project_table(monkeypatch: pytest.MonkeyPatch, projects: _ProjectTable, cache: UserApiKeyCache) -> None:
+    prisma: Final = mock.MagicMock()
+    prisma.db.litellm_projecttable = projects
+    prisma.db.litellm_verificationtoken.find_many = mock.AsyncMock(side_effect=projects.find_keys)
+    monkeypatch.setattr(litellm.proxy.proxy_server, "premium_user", True)
+    monkeypatch.setattr(litellm.proxy.proxy_server, "prisma_client", prisma)
+    monkeypatch.setattr(litellm.proxy.proxy_server, "user_api_key_cache", cache)
+
+
+async def _delete_projects(*project_ids: str) -> list[LiteLLM_ProjectTable]:
+    return await delete_project(
+        data=DeleteProjectRequest(project_ids=list(project_ids)),
+        http_request=Request(scope={"type": "http"}),
+        user_api_key_dict=_PROXY_ADMIN,
+    )
+
+
+@pytest.mark.asyncio
+async def test_project_delete_revokes_a_later_project_again_when_an_earlier_delete_outlasts_the_tombstones(monkeypatch):
+    """The delete revokes both projects before its first read; the first project's delete takes past the time the
+    request's record of that revocation allows and the tombstones lapse meanwhile, so another pod may store the
+    second project's entry again. The second project's delete revokes it again right before it: its tombstone stands
+    in Redis when that project is deleted."""
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    first, second = f"project-{uuid.uuid4()}", f"project-{uuid.uuid4()}"
+    projects: Final = _ProjectTable(
+        (first, second), redis, after_first_delete=_outlasts_the_tombstones(redis, clock, loses_redis=False)
+    )
+    _serve_project_table(monkeypatch, projects, _driven_cache(redis, clock))
+
+    deleted: Final = await _delete_projects(first, second)
+
+    assert [project.project_id for project in deleted] == [first, second]
+    assert projects.deletes == [(first, True), (second, True)]
+
+
+@pytest.mark.asyncio
+async def test_project_delete_answers_503_with_the_later_project_kept_when_redis_is_lost_after_an_earlier_delete(
+    monkeypatch,
+):
+    """The same slow first delete, with Redis lost once it lands: the second project's revocation has to reach Redis
+    again and cannot, so the request answers 503 with the second project kept."""
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    first, second = f"project-{uuid.uuid4()}", f"project-{uuid.uuid4()}"
+    projects: Final = _ProjectTable(
+        (first, second), redis, after_first_delete=_outlasts_the_tombstones(redis, clock, loses_redis=True)
+    )
+    _serve_project_table(monkeypatch, projects, _driven_cache(redis, clock))
+
+    with pytest.raises(ProxyException) as refused:
+        await _delete_projects(first, second)
+
+    assert str(refused.value.code) == "503"
+    assert projects.deletes == [(first, True)]
+    assert tuple(projects.rows) == (second,)
+
+
+@pytest.mark.asyncio
+async def test_project_delete_with_the_setting_off_reads_and_deletes_each_project_in_turn(monkeypatch):
+    """With last good entries not served, the delete checks and deletes each project before it reads the next, as it
+    always did: a later project that still holds a key is refused with 400 after the earlier one is deleted."""
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    first, second = f"project-{uuid.uuid4()}", f"project-{uuid.uuid4()}"
+    projects: Final = _ProjectTable((first, second), redis, keyed=(second,))
+    _serve_project_table(monkeypatch, projects, _driven_cache(redis, clock, serves_last_good=False))
+
+    with pytest.raises(ProxyException) as refused:
+        await _delete_projects(first, second)
+
+    assert str(refused.value.code) == "400"
+    assert projects.calls == [
+        ("read", first),
+        ("keys", first),
+        ("delete", first),
+        ("read", second),
+        ("keys", second),
+    ]
+    assert tuple(projects.rows) == (second,)
 
 
 @pytest.mark.asyncio

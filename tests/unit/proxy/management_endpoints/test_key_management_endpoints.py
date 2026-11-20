@@ -1,4 +1,4 @@
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import ExitStack
 from typing import Final
 from types import SimpleNamespace
@@ -10,12 +10,13 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import DEFAULT, AsyncMock, MagicMock, patch
 
 from fastapi import HTTPException
 
 import inspect
 
+from litellm.constants import LAST_GOOD_TOMBSTONE_TTL_SECONDS
 from litellm.proxy._types import (
     GenerateKeyRequest,
     KeyManagementRoutes,
@@ -42,7 +43,11 @@ from litellm.proxy.auth.auth_checks import (
     jwt_key_mapping_cache_key,
 )
 from litellm.proxy.auth.user_api_key_auth import UserAPIKeyAuth
-from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, project_cache_key
+from litellm.proxy.common_utils.user_api_key_cache import (
+    LAST_GOOD_LATE_STORE_MARGIN_SECONDS,
+    UserApiKeyCache,
+    project_cache_key,
+)
 from litellm.litellm_core_utils.duration_parser import duration_in_seconds
 from litellm.proxy.management_endpoints.key_management_endpoints import (
     _check_org_key_limits,
@@ -5947,6 +5952,302 @@ async def test_key_update_by_alias_reads_the_alias_from_the_writer_only_while_la
     assert response["key"] == blocked_token
     assert writer_keys.updates == [(blocked_token, serves_last_good_entries)]
     assert (replica_keys if serves_last_good_entries else writer_keys).reads == 0
+
+
+class _DrivenClock:
+    """The last good entries' clock, which a test moves instead of waiting."""
+
+    def __init__(self) -> None:
+        self.now: float = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+# Past this since a revocation, the request's record no longer skips Redis for the key: its tombstone may lapse first
+_PAST_THE_RECORD: Final = LAST_GOOD_TOMBSTONE_TTL_SECONDS - LAST_GOOD_LATE_STORE_MARGIN_SECONDS + 1
+
+
+def _outlasts_the_tombstones(
+    redis: FakeRedisCache, clock: _DrivenClock, *, loses_redis: bool
+) -> Callable[..., Awaitable[object]]:
+    """A write mock's side effect: the write takes past the time the request's record of its revocations allows, the
+    tombstones in Redis lapse meanwhile, and Redis is lost once it lands when ``loses_redis``. The write answers as
+    configured."""
+
+    async def outlast(*_args: object, **_kwargs: object) -> object:
+        clock.now += _PAST_THE_RECORD
+        client: Final = redis.cache.init_async_client()
+        lapsed: Final = await client.keys("last_good_tombstone:*")
+        if lapsed:
+            await client.delete(*lapsed)
+        if loses_redis:
+            redis.server.connected = False
+        return DEFAULT
+
+    return outlast
+
+
+def _permission_write_outlasting_the_tombstones(
+    redis: FakeRedisCache, clock: _DrivenClock, *, loses_redis: bool
+) -> Callable[..., Awaitable[dict[str, object]]]:
+    """``_handle_update_object_permission``'s side effect: its object permission write outlasts the tombstones as
+    ``_outlasts_the_tombstones`` does, then it hands back the update's values."""
+    outlast: Final = _outlasts_the_tombstones(redis, clock, loses_redis=loses_redis)
+
+    async def write(*, data_json: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        await outlast()
+        return data_json
+
+    return write
+
+
+def _tombstones_standing_at(
+    redis: FakeRedisCache, write: str, cache_keys: Sequence[str], standing: list[tuple[str, tuple[str, ...]]]
+) -> Callable[..., Awaitable[object]]:
+    """A write mock's side effect: records under ``write`` which of ``cache_keys`` have a tombstone in Redis when the
+    write runs, none while Redis is lost. The write then answers as configured."""
+
+    async def record(*_args: object, **_kwargs: object) -> object:
+        client: Final = redis.cache.init_async_client()
+        standing.append(
+            (
+                write,
+                tuple(
+                    [
+                        cache_key
+                        for cache_key in cache_keys
+                        if redis.server.connected and await client.exists(f"last_good_tombstone:{cache_key}") == 1
+                    ]
+                ),
+            )
+        )
+        return DEFAULT
+
+    return record
+
+
+def _key_update_database(redis: FakeRedisCache, token: str, standing: list[tuple[str, tuple[str, ...]]]) -> AsyncMock:
+    """A ``PrismaClient`` holding the key ``token``. Each of its two key writes records in ``standing`` whether the
+    key's tombstone stands in Redis as it runs: ``update_data``'s row update ("key row"), and the key's update in a
+    soft budget's transaction ("soft budget transaction"), after the budget's creation in it."""
+    existing_key: Final = LiteLLM_VerificationToken(token=token, user_id="admin-user", models=[])
+    prisma_client: Final = AsyncMock()
+    prisma_client.db.litellm_verificationtoken.find_unique = AsyncMock(return_value=existing_key)
+    prisma_client.jsonify_object = MagicMock(side_effect=lambda data: dict(data))
+    prisma_client.update_data = AsyncMock(
+        return_value={"token": token, "data": existing_key.model_dump()},
+        side_effect=_tombstones_standing_at(redis, "key row", (token,), standing),
+    )
+    transaction: Final = MagicMock()
+    transaction.litellm_budgettable.create = AsyncMock(
+        return_value=LiteLLM_BudgetTable(budget_id="budget-soft", soft_budget=5.0)
+    )
+    transaction.litellm_verificationtoken.update = AsyncMock(
+        return_value=existing_key,
+        side_effect=_tombstones_standing_at(redis, "soft budget transaction", (token,), standing),
+    )
+    opened: Final = MagicMock()
+    opened.__aenter__ = AsyncMock(return_value=transaction)
+    opened.__aexit__ = AsyncMock(return_value=None)
+    prisma_client.tx = MagicMock(return_value=opened)
+    return prisma_client
+
+
+def _key_update_blocking(token: str, writer: str) -> UpdateKeyRequest:
+    """A /key/update blocking the key ``token`` that ``writer`` writes: a soft budget sends it through the
+    transaction."""
+    return (
+        UpdateKeyRequest(key=token, blocked=True, soft_budget=5.0)
+        if writer == "soft budget transaction"
+        else UpdateKeyRequest(key=token, blocked=True)
+    )
+
+
+async def _update_key_after_a_slow_permission_write(
+    data: UpdateKeyRequest, permission_write: Callable[..., Awaitable[dict[str, object]]]
+) -> Mapping[str, object]:
+    """/key/update by a proxy admin, its object permission write being ``permission_write``. Returns the response."""
+    from litellm.proxy.management_endpoints.key_management_endpoints import update_key_fn
+
+    module: Final = "litellm.proxy.management_endpoints.key_management_endpoints"
+    with (
+        patch(  # test-quality-ok: the object permission write stands for any step before the key's own write
+            f"{module}._handle_update_object_permission", new_callable=AsyncMock, side_effect=permission_write
+        ),
+        patch(  # test-quality-ok: the eviction after the write is not what this test observes
+            f"{module}.delete_cache_key_object", new_callable=AsyncMock
+        ),
+        patch(  # test-quality-ok: the audit hook runs in a task this test does not wait for
+            f"{module}.KeyManagementEventHooks.async_key_updated_hook", new_callable=AsyncMock
+        ),
+    ):
+        return await update_key_fn(
+            request=MagicMock(query_params={}),
+            data=data,
+            user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN, user_id="admin-user"),
+            litellm_changed_by=None,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("writer", ["key row", "soft budget transaction"])
+@pytest.mark.parametrize("serves_last_good_entries", [True, False])
+async def test_key_update_block_revokes_the_key_again_when_the_permission_write_outlasts_its_tombstone(
+    monkeypatch: pytest.MonkeyPatch, writer: str, serves_last_good_entries: bool
+) -> None:
+    """/key/update blocks a key: it revokes the key before its first write, then its object permission write takes
+    past the time the request's record of that revocation allows and the key's tombstone lapses meanwhile, so another
+    pod may store the key's entry again. The key's write revokes it again right before it runs, on the key's row or in
+    the soft budget's transaction, which opens right after that revocation: the key's tombstone stands in Redis as
+    the key is written. With last good entries off nothing is revoked, and the key is written after the permission
+    write as before."""
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    token: Final = "f1" * 32
+    standing: Final[list[tuple[str, tuple[str, ...]]]] = []  # mutable-ok: one entry for each key write
+    _setup_update_key_mocks(monkeypatch, _key_update_database(redis, token, standing))
+    monkeypatch.setattr(  # test-quality-ok: the proxy's key cache, on a clock the test drives
+        "litellm.proxy.proxy_server.user_api_key_cache",
+        UserApiKeyCache(
+            redis_cache=redis.cache, serve_last_good_entries=serves_last_good_entries, last_good_clock=clock
+        ),
+    )
+
+    response: Final = await _update_key_after_a_slow_permission_write(
+        _key_update_blocking(token, writer),
+        _permission_write_outlasting_the_tombstones(redis, clock, loses_redis=False),
+    )
+
+    assert response["key"] == token
+    assert standing == [(writer, (token,) if serves_last_good_entries else ())]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("writer", ["key row", "soft budget transaction"])
+async def test_key_update_block_answers_503_and_writes_no_key_when_redis_is_lost_after_the_permission_write(
+    monkeypatch: pytest.MonkeyPatch, writer: str
+) -> None:
+    """The same slow object permission write, with Redis lost once it lands: the key's revocation has to reach Redis
+    again and cannot, so /key/update answers 503 with the key not written and no soft budget transaction opened."""
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    token: Final = "f2" * 32
+    standing: Final[list[tuple[str, tuple[str, ...]]]] = []  # mutable-ok: one entry for each key write
+    prisma_client: Final = _key_update_database(redis, token, standing)
+    _setup_update_key_mocks(monkeypatch, prisma_client)
+    monkeypatch.setattr(  # test-quality-ok: the proxy's key cache, on a clock the test drives
+        "litellm.proxy.proxy_server.user_api_key_cache",
+        UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=clock),
+    )
+
+    with pytest.raises(ProxyException) as refused:
+        await _update_key_after_a_slow_permission_write(
+            _key_update_blocking(token, writer),
+            _permission_write_outlasting_the_tombstones(redis, clock, loses_redis=True),
+        )
+
+    assert str(refused.value.code) == "503"
+    assert redis.server.connected is False
+    assert standing == []
+    prisma_client.update_data.assert_not_awaited()
+    prisma_client.tx.assert_not_called()
+
+
+_SLOWLY_ARCHIVED_TOKENS: Final = ("a7" * 32, "b8" * 32)
+
+
+def _keys_archived_past_their_tombstones(
+    monkeypatch: pytest.MonkeyPatch, redis: FakeRedisCache, clock: _DrivenClock, *, loses_redis: bool
+) -> _KeyTable:
+    """The proxy's database holding user-1's keys ``_SLOWLY_ARCHIVED_TOKENS``, whose archive write before their delete
+    outlasts the tombstones (``_outlasts_the_tombstones``). Returns the key rows."""
+    key_rows: Final = _KeyTable(
+        redis, tuple(LiteLLM_VerificationToken(token=token, user_id="user-1") for token in _SLOWLY_ARCHIVED_TOKENS)
+    )
+    prisma_client: Final = _routed_key_database(key_rows, key_rows)
+    prisma_client.writer_db.litellm_deletedverificationtoken.create_many.side_effect = _outlasts_the_tombstones(
+        redis, clock, loses_redis=loses_redis
+    )
+    monkeypatch.setattr(  # test-quality-ok: the proxy's database, whose archive write is slow
+        "litellm.proxy.proxy_server.prisma_client", prisma_client
+    )
+    return key_rows
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "caller_role", [LitellmUserRoles.PROXY_ADMIN, LitellmUserRoles.INTERNAL_USER], ids=["admin", "owner"]
+)
+@pytest.mark.parametrize("serves_last_good_entries", [True, False])
+async def test_key_delete_revokes_its_keys_again_when_the_archive_write_outlasts_their_tombstones(
+    monkeypatch: pytest.MonkeyPatch, caller_role: LitellmUserRoles, serves_last_good_entries: bool
+) -> None:
+    """A delete of two keys revokes both before its first write, then their archive write takes past the time the
+    request's record of that revocation allows and their tombstones lapse meanwhile, so another pod may store their
+    entries again. The delete revokes them again right before it runs: right before the admin's one delete of every
+    requested key, or the owner's deletes of each key, which run together. Both tombstones stand in Redis as the keys
+    are deleted. With last good entries off nothing is revoked, and the keys are deleted after the archive write as
+    before."""
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    key_rows: Final = _keys_archived_past_their_tombstones(monkeypatch, redis, clock, loses_redis=False)
+
+    await delete_verification_tokens(
+        tokens=list(_SLOWLY_ARCHIVED_TOKENS),
+        user_api_key_cache=UserApiKeyCache(
+            redis_cache=redis.cache, serve_last_good_entries=serves_last_good_entries, last_good_clock=clock
+        ),
+        user_api_key_dict=UserAPIKeyAuth(user_id="user-1", user_role=caller_role.value),
+    )
+
+    tokens: Final = _SLOWLY_ARCHIVED_TOKENS
+    expected: Final = (
+        [(tokens, tokens if serves_last_good_entries else ())]
+        if caller_role is LitellmUserRoles.PROXY_ADMIN
+        else [((token,), (token,) if serves_last_good_entries else ()) for token in tokens]
+    )
+    # The owner's deletes run together, so they may land in either order
+    assert sorted(key_rows.deletes) == sorted(expected)
+    assert key_rows.rows == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "caller_role", [LitellmUserRoles.PROXY_ADMIN, LitellmUserRoles.INTERNAL_USER], ids=["admin", "owner"]
+)
+async def test_key_delete_answers_503_and_deletes_no_key_when_redis_is_lost_after_the_archive_write(
+    monkeypatch: pytest.MonkeyPatch, caller_role: LitellmUserRoles
+) -> None:
+    """The same slow archive write, with Redis lost once it lands: the keys' revocation has to reach Redis again and
+    cannot, so the delete answers 503 with both keys kept."""
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    key_rows: Final = _keys_archived_past_their_tombstones(monkeypatch, redis, clock, loses_redis=True)
+    kept: Final = list(key_rows.rows)
+
+    with pytest.raises(HTTPException) as refused:
+        await delete_verification_tokens(
+            tokens=list(_SLOWLY_ARCHIVED_TOKENS),
+            user_api_key_cache=UserApiKeyCache(
+                redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=clock
+            ),
+            user_api_key_dict=UserAPIKeyAuth(user_id="user-1", user_role=caller_role.value),
+        )
+
+    assert refused.value.status_code == 503
+    # Lost by the archive write, so the refusal is the delete's own revocation, not the one before the archive
+    assert redis.server.connected is False
+    assert key_rows.deletes == []
+    assert key_rows.rows == kept
 
 
 @pytest.mark.asyncio
@@ -13426,6 +13727,115 @@ async def test_execute_virtual_key_regeneration_refuses_and_writes_nothing_when_
     assert mock_prisma_client.db.litellm_verificationtoken.update.await_count == 0
 
 
+def _regeneration_write_outlasting_the_tombstone(prisma_client: AsyncMock, slow_write: str) -> AsyncMock:
+    """The write before the old hash's rewrite that ``slow_write`` names: the old key's archive, or the deprecated key
+    a grace period keeps."""
+    return (
+        prisma_client.db.litellm_deletedverificationtoken.create_many
+        if slow_write == "archive"
+        else prisma_client.db.litellm_deprecatedverificationtoken.upsert
+    )
+
+
+async def _regenerate_after_a_slow_write(
+    prisma_client: AsyncMock, user_api_key_cache: UserApiKeyCache, slow_write: str
+) -> None:
+    """The regenerate /key/regenerate and the scheduled rotation run, of ``_make_regenerate_existing_key``'s key, with
+    a grace period when ``slow_write`` is the deprecated key's write."""
+    module: Final = "litellm.proxy.management_endpoints.key_management_endpoints"
+    with (
+        patch(  # test-quality-ok: deterministic token for the regenerated key
+            f"{module}.get_new_token", new_callable=AsyncMock, return_value="sk-newtoken1234ab12"
+        ),
+        patch(  # test-quality-ok: the eviction after the write is not what this test observes
+            f"{module}.delete_cache_key_object", new_callable=AsyncMock
+        ),
+        patch(  # test-quality-ok: the audit hook runs in a task this test does not wait for
+            f"{module}.KeyManagementEventHooks.async_key_rotated_hook", new_callable=AsyncMock
+        ),
+    ):
+        await _execute_virtual_key_regeneration(
+            prisma_client=prisma_client,
+            key_in_db=_make_regenerate_existing_key(),
+            hashed_api_key="abc123",
+            key="abc123",
+            data=RegenerateKeyRequest(grace_period="24h") if slow_write == "grace period" else RegenerateKeyRequest(),
+            user_api_key_dict=_make_regenerate_user_api_key_dict(),
+            litellm_changed_by=None,
+            user_api_key_cache=user_api_key_cache,
+            proxy_logging_obj=MagicMock(),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("slow_write", ["archive", "grace period"])
+@pytest.mark.parametrize("serves_last_good_entries", [True, False])
+async def test_execute_virtual_key_regeneration_revokes_the_old_hash_again_when_a_write_before_its_rewrite_is_slow(
+    monkeypatch: pytest.MonkeyPatch, slow_write: str, serves_last_good_entries: bool
+) -> None:
+    """A regenerate revokes the old hash before its first write, then the old key's archive, or the deprecated key a
+    grace period keeps, takes past the time the request's record of that revocation allows and the old hash's
+    tombstone lapses meanwhile, so another pod may store its entry again. The rewrite of the old hash to the new one
+    revokes it again right before it runs: the old hash's tombstone stands in Redis as it is rewritten. With last good
+    entries off nothing is revoked, and the rewrite runs after those writes as before."""
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    monkeypatch.delenv("LITELLM_KEY_ROTATION_GRACE_PERIOD", raising=False)
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    standing: Final[list[tuple[str, tuple[str, ...]]]] = []  # mutable-ok: one entry for each rewrite
+    prisma_client: Final = _make_regenerate_mock_prisma()
+    prisma_client.db.litellm_jwtkeymapping = _CascadingJWTMappingTable([])
+    prisma_client.db.litellm_verificationtoken.update.side_effect = _tombstones_standing_at(
+        redis, "old hash rewrite", ("abc123",), standing
+    )
+    _regeneration_write_outlasting_the_tombstone(prisma_client, slow_write).side_effect = _outlasts_the_tombstones(
+        redis, clock, loses_redis=False
+    )
+
+    await _regenerate_after_a_slow_write(
+        prisma_client,
+        UserApiKeyCache(
+            redis_cache=redis.cache, serve_last_good_entries=serves_last_good_entries, last_good_clock=clock
+        ),
+        slow_write,
+    )
+
+    _regeneration_write_outlasting_the_tombstone(prisma_client, slow_write).assert_awaited_once()
+    assert standing == [("old hash rewrite", ("abc123",) if serves_last_good_entries else ())]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("slow_write", ["archive", "grace period"])
+async def test_execute_virtual_key_regeneration_answers_503_when_redis_is_lost_after_a_write_before_its_rewrite(
+    monkeypatch: pytest.MonkeyPatch, slow_write: str
+) -> None:
+    """The same slow write, with Redis lost once it lands: the old hash's revocation has to reach Redis again and
+    cannot, so the regenerate answers 503 with the old hash not rewritten."""
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    monkeypatch.delenv("LITELLM_KEY_ROTATION_GRACE_PERIOD", raising=False)
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    prisma_client: Final = _make_regenerate_mock_prisma()
+    prisma_client.db.litellm_jwtkeymapping = _CascadingJWTMappingTable([])
+    _regeneration_write_outlasting_the_tombstone(prisma_client, slow_write).side_effect = _outlasts_the_tombstones(
+        redis, clock, loses_redis=True
+    )
+
+    with pytest.raises(HTTPException) as refused:
+        await _regenerate_after_a_slow_write(
+            prisma_client,
+            UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=clock),
+            slow_write,
+        )
+
+    assert refused.value.status_code == 503
+    # Lost by the slow write, so the refusal is the rewrite's own revocation, not the one before the first write
+    assert redis.server.connected is False
+    prisma_client.db.litellm_verificationtoken.update.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_execute_virtual_key_regeneration_rejects_when_custom_key_update_hook_denies():
     existing_key = _make_regenerate_existing_key()
@@ -15302,6 +15712,96 @@ async def test_process_single_key_update_moving_expires_into_the_future_writes_w
     written: Final = prisma_client.update_data.await_args.kwargs["data"]
     assert written["expires"] > datetime.now(timezone.utc) + timedelta(days=29)
     assert evict.await_args.kwargs["revoked"] is False
+
+
+async def _bulk_block_after_a_slow_permission_write(
+    prisma_client: AsyncMock,
+    user_api_key_cache: UserApiKeyCache,
+    token: str,
+    permission_write: Callable[..., Awaitable[dict[str, object]]],
+) -> dict[str, object]:
+    """The path /key/bulk_update and /team/key/bulk_update take for an item blocking the key ``token``, its object
+    permission write being ``permission_write``. Returns the updated key's info."""
+    module: Final = "litellm.proxy.management_endpoints.key_management_endpoints"
+    with (
+        patch(  # test-quality-ok: a proxy admin passes the team member check, which reads the team from the database
+            f"{module}.TeamMemberPermissionChecks.can_team_member_execute_key_management_endpoint", return_value=None
+        ),
+        patch(  # test-quality-ok: the object permission write stands for any step before the key's own write
+            f"{module}._handle_update_object_permission", new_callable=AsyncMock, side_effect=permission_write
+        ),
+        patch(  # test-quality-ok: the eviction after the write is not what this test observes
+            f"{module}.delete_cache_key_object", new_callable=AsyncMock
+        ),
+        patch(  # test-quality-ok: the audit hook runs in a task this test does not wait for
+            f"{module}.KeyManagementEventHooks.async_key_updated_hook", new_callable=AsyncMock
+        ),
+    ):
+        return await _process_single_key_update(
+            update_key_request=UpdateKeyRequest(key=token, blocked=True),
+            user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN, user_id="admin-user"),
+            litellm_changed_by=None,
+            prisma_client=prisma_client,
+            user_api_key_cache=user_api_key_cache,
+            proxy_logging_obj=MagicMock(),
+            llm_router=MagicMock(),
+            existing_key_row=LiteLLM_VerificationToken(token=token, user_id="admin-user", models=[]),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("serves_last_good_entries", [True, False])
+async def test_process_single_key_update_block_revokes_the_key_again_when_the_permission_write_outlasts_its_tombstone(
+    serves_last_good_entries: bool,
+) -> None:
+    """A bulk update item blocks a key: it revokes the key before its first write, then its object permission write
+    takes past the time the request's record of that revocation allows and the key's tombstone lapses meanwhile, so
+    another pod may store the key's entry again. The key's row update revokes it again right before it runs: the
+    key's tombstone stands in Redis as the row is written. With last good entries off nothing is revoked, and the row
+    is written after the permission write as before."""
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    token: Final = "f3" * 32
+    standing: Final[list[tuple[str, tuple[str, ...]]]] = []  # mutable-ok: one entry for each key write
+
+    await _bulk_block_after_a_slow_permission_write(
+        _key_update_database(redis, token, standing),
+        UserApiKeyCache(
+            redis_cache=redis.cache, serve_last_good_entries=serves_last_good_entries, last_good_clock=clock
+        ),
+        token,
+        _permission_write_outlasting_the_tombstones(redis, clock, loses_redis=False),
+    )
+
+    assert standing == [("key row", (token,) if serves_last_good_entries else ())]
+
+
+@pytest.mark.asyncio
+async def test_process_single_key_update_block_answers_503_when_redis_is_lost_after_the_permission_write() -> None:
+    """The same slow object permission write, with Redis lost once it lands: the key's revocation has to reach Redis
+    again and cannot, so the item answers 503 with the key's row not written."""
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    token: Final = "f4" * 32
+    standing: Final[list[tuple[str, tuple[str, ...]]]] = []  # mutable-ok: one entry for each key write
+    prisma_client: Final = _key_update_database(redis, token, standing)
+
+    with pytest.raises(HTTPException) as refused:
+        await _bulk_block_after_a_slow_permission_write(
+            prisma_client,
+            UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=clock),
+            token,
+            _permission_write_outlasting_the_tombstones(redis, clock, loses_redis=True),
+        )
+
+    assert refused.value.status_code == 503
+    # Lost by the permission write, so the refusal is the row write's own revocation, not the one before it
+    assert redis.server.connected is False
+    prisma_client.update_data.assert_not_awaited()
 
 
 @pytest.mark.asyncio
