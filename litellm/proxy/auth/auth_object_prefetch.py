@@ -27,12 +27,10 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     AUTH_OBJECTS_TARGET,
     UserApiKeyCache,
     get_management_object_ttl,
-    last_good_read_start,
     remember_last_good,
     team_membership_auth_cache_key,
     team_membership_reservation_cache_key,
 )
-from litellm.proxy.db.db_lookup_gate import bounded_db_lookup
 from litellm.proxy.db.db_span import db_span
 from litellm.proxy.utils import PrismaClient
 
@@ -269,17 +267,13 @@ async def _fetch_rows(
     refs: AuthObjectRefs, kinds: frozenset[_RowKind], prisma_client: PrismaClient
 ) -> Mapping[str, object]:
     async with db_span("prefetch_auth_objects", AUTH_OBJECTS_TARGET):
-        # Bounded like every read that stores a last good entry, so the store fits inside a revocation's tombstone time
-        row: Final[object] = await bounded_db_lookup(
-            prisma_client.db.query_first(  # pyright: ignore[reportAny]  # prisma types query_first as Any
-                _SQL,
-                refs.user_id if "user_row" in kinds else None,
-                refs.team_id if kinds & _TEAM_BOUND_ROWS else None,
-                refs.membership_user_id if "membership_row" in kinds else None,
-                refs.organization_id if "organization_row" in kinds else None,
-                refs.project_id if "project_row" in kinds else None,
-            ),
-            name="prefetch_auth_objects",
+        row: Final[object] = await prisma_client.db.query_first(  # pyright: ignore[reportAny]  # prisma types query_first as Any
+            _SQL,
+            refs.user_id if "user_row" in kinds else None,
+            refs.team_id if kinds & _TEAM_BOUND_ROWS else None,
+            refs.membership_user_id if "membership_row" in kinds else None,
+            refs.organization_id if "organization_row" in kinds else None,
+            refs.project_id if "project_row" in kinds else None,
         )
     return _RowValues.validate_python(row) if row is not None else _NO_ROWS
 
@@ -311,7 +305,6 @@ async def _fill_from_db(
     model_for: Final[Mapping[_RowKind, type[BaseModel]]] = MappingProxyType(
         {entry.row: entry.model_type for entry in entries}
     )
-    read_started: Final = last_good_read_start(cache)
     rows: Final = await _fetch_rows(refs, frozenset(model_for), prisma_client)
     refreshed_at: Final = time.time()
     objects: Final[Mapping[_RowKind, BaseModel | None]] = MappingProxyType(
@@ -321,7 +314,7 @@ async def _fill_from_db(
     if writes:
         await _write_back(writes, cache)
     for entry, value in writes:
-        await remember_last_good(cache, entry.cache_key, value, read_started=read_started)
+        await remember_last_good(cache, entry.cache_key, value)
 
 
 async def prefetch_auth_objects(

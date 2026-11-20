@@ -232,7 +232,7 @@ async def test_subscriber_drops_this_pods_last_good_entry_on_message() -> None:
     the database and Redis are both away."""
     hashed_token = hashlib.sha256(b"sk-deleted-on-another-pod").hexdigest()
     cache = UserApiKeyCache(serve_last_good_entries=True)
-    await remember_last_good(cache, hashed_token, UserAPIKeyAuth(token=hashed_token), read_started=time.monotonic())
+    await remember_last_good(cache, hashed_token, UserAPIKeyAuth(token=hashed_token))
 
     pubsub = _QueuePubSub(initial_messages=[_invalidation_message(hashed_token)])
     subscriber = AuthCacheInvalidationSubscriber(
@@ -257,7 +257,7 @@ async def test_subscriber_clears_this_pods_last_good_memory_when_it_subscribes()
     Redis, reachable again, answers first."""
     hashed_token = hashlib.sha256(b"sk-held-across-a-redis-gap").hexdigest()
     cache = UserApiKeyCache(serve_last_good_entries=True)
-    await remember_last_good(cache, hashed_token, UserAPIKeyAuth(token=hashed_token), read_started=time.monotonic())
+    await remember_last_good(cache, hashed_token, UserAPIKeyAuth(token=hashed_token))
 
     subscriber = AuthCacheInvalidationSubscriber(
         redis_cache=_FakeRedisCache(client=_ScriptedPubSubRedisClient(pubsubs=[_QueuePubSub(initial_messages=[])])),

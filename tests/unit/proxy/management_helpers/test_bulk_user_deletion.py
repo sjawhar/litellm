@@ -844,7 +844,7 @@ async def test_bulk_delete_skips_the_key_audit_log_when_the_tx_rolls_back(mocker
     mock_audit_write.assert_not_called()
 
 
-def _redis_down_cache(*, serve_last_good_entries: bool) -> UserApiKeyCache:
+def _unreachable_redis_cache(*, serve_last_good_entries: bool) -> UserApiKeyCache:
     from tests.unit.caching.fake_redis_cache import fake_redis_cache
 
     redis: Final = fake_redis_cache()
@@ -858,14 +858,14 @@ async def test_bulk_member_delete_answers_503_and_writes_nothing_when_redis_cann
     serves_last_good: bool,
 ):
     """The team's entry lists the member on its roster, the user's entry lists the team and the membership's entry
-    carries the member's limits, none expiring, so a removal Redis cannot revoke them for is a 503 problem with
-    nothing written, even when the member holds no key; with last good entries off it removes as before."""
+    carries the member's limits, so a removal Redis cannot revoke them for is a 503 problem with nothing written, even
+    when the member holds no key; with last good entries off it removes as before."""
     prisma: Final = _FakePrisma(
         users=[_user("u1", "t1"), _user("keep", "t1")],
         teams=[_team("t1", "u1", "keep")],
         memberships=[("t1", "u1"), ("t1", "keep")],
     )
-    cache: Final = _redis_down_cache(serve_last_good_entries=serves_last_good)
+    cache: Final = _unreachable_redis_cache(serve_last_good_entries=serves_last_good)
 
     if not serves_last_good:
         results: Final = await _remove(prisma, "t1", [{"user_id": "u1"}], cache=cache)
@@ -881,3 +881,25 @@ async def test_bulk_member_delete_answers_503_and_writes_nothing_when_redis_cann
         {"team_id": "t1", "user_id": "u1"},
         {"team_id": "t1", "user_id": "keep"},
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("serves_last_good", [True, False], ids=["serving", "not_serving"])
+async def test_bulk_user_delete_fails_the_row_and_deletes_nothing_when_redis_cannot_record_the_revocation(
+    serves_last_good: bool,
+):
+    """A deleted user's own entry is revoked before the batch writes, even for a user with no key and no team: Redis
+    unable to record it fails that row and the batch deletes nothing; with last good entries off it deletes as
+    before."""
+    prisma: Final = _FakePrisma(users=[_user("u1"), _user("keep")])
+    cache: Final = _unreachable_redis_cache(serve_last_good_entries=serves_last_good)
+
+    results: Final = await _delete(prisma, ["u1"], cache=cache)
+
+    if not serves_last_good:
+        assert [(r.user_id, r.success) for r in results] == [("u1", True)]
+        assert sorted(prisma.db.litellm_usertable.rows) == ["keep"]
+        return
+    assert [(r.user_id, r.success) for r in results] == [("u1", False)]
+    assert results[0].error is not None and "could not record this revocation" in results[0].error
+    assert sorted(prisma.db.litellm_usertable.rows) == ["keep", "u1"]

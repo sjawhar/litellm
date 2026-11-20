@@ -15183,57 +15183,64 @@ async def test_load_config_serve_last_good_auth_entries_turns_on_the_last_good_s
     monkeypatch.setattr(proxy_server_module, "general_settings", {}, raising=False)
 
     await ProxyConfig().load_config(router=None, config_file_path=str(config_file))
-    stored_token: Final = "hashed-token"
-    await remember_last_good(cache, stored_token, UserAPIKeyAuth(token=stored_token), read_started=time.monotonic())
+    await remember_last_good(cache, "hashed-token", UserAPIKeyAuth(token="hashed-token"))
 
     assert (await recall_last_good(cache, "hashed-token", UserAPIKeyAuth) is not None) is kept
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("tombstone_seconds", "kept"),
-    [(20, False), (25, False), (30, True), (None, True)],
-    ids=["shorter_than_the_bound", "equal_to_the_bound", "30_s", "default"],
+    ("entry_seconds", "cache_seconds", "kept", "notice"),
+    [
+        (0, 60, False, ("ERROR", "turned off: LAST_GOOD_ENTRY_TTL_SECONDS=0,")),
+        (-1, 60, False, ("ERROR", "turned off: LAST_GOOD_ENTRY_TTL_SECONDS=-1,")),
+        (30, 60, True, ("WARNING", "LAST_GOOD_ENTRY_TTL_SECONDS=30 is below user_api_key_cache_ttl=60.0,")),
+        (30, None, True, ("WARNING", "LAST_GOOD_ENTRY_TTL_SECONDS=30 is below user_api_key_cache_ttl=60,")),
+        (None, None, True, None),
+    ],
+    ids=["zero", "negative", "below_user_api_key_cache_ttl", "below_the_default_cache_ttl", "default"],
 )
-async def test_load_config_turns_serve_last_good_auth_entries_off_when_the_tombstone_does_not_outlive_a_store(
-    tmp_path, monkeypatch, caplog, tombstone_seconds: int | None, kept: bool
+async def test_load_config_checks_the_last_good_entry_expiry(
+    tmp_path,
+    monkeypatch,
+    caplog,
+    entry_seconds: int | None,
+    cache_seconds: int | None,
+    kept: bool,
+    notice: tuple[str, str] | None,
 ):
-    """A tombstone must outlive the longest database read plus the storing of its entry, the bound
-    PROXY_DB_LOOKUP_DEADLINE_SECONDS + LAST_GOOD_STORE_MARGIN_SECONDS (10 + 15 at their defaults) outside which a store
-    is refused, or a read in flight across an update, a delete or a block keeps the old entry. A pair that breaks this
-    starts the proxy with the setting off and an error naming the three values."""
-    from litellm import constants as litellm_constants
+    """0 or less leaves no entry to serve, so the setting starts off with an error naming the value. An expiry below
+    the effective user_api_key_cache_ttl (60 s when unset) only warns, naming both: callers in steady use then lose
+    their entry between database reads. The default 600 s stays on without a word."""
     from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
     from litellm.proxy.proxy_server import ProxyConfig
 
-    monkeypatch.setattr(litellm_constants, "PROXY_DB_LOOKUP_DEADLINE_SECONDS", 10.0)
-    monkeypatch.setattr(litellm_constants, "LAST_GOOD_STORE_MARGIN_SECONDS", 15.0)
-    if tombstone_seconds is None:
-        assert litellm_constants.LAST_GOOD_TOMBSTONE_TTL_SECONDS == 60
+    if entry_seconds is None:
+        assert proxy_server_module.LAST_GOOD_ENTRY_TTL_SECONDS == 600
     else:
-        monkeypatch.setattr(litellm_constants, "LAST_GOOD_TOMBSTONE_TTL_SECONDS", tombstone_seconds)
+        monkeypatch.setattr(proxy_server_module, "LAST_GOOD_ENTRY_TTL_SECONDS", entry_seconds)
+    cache_ttl: Final = {} if cache_seconds is None else {"user_api_key_cache_ttl": cache_seconds}
     config_file: Final = tmp_path / "config.yaml"
-    config_file.write_text(yaml.dump({"general_settings": {"serve_last_good_auth_entries": True}}))
+    config_file.write_text(yaml.dump({"general_settings": {"serve_last_good_auth_entries": True, **cache_ttl}}))
     cache: Final = UserApiKeyCache()
     monkeypatch.setattr(proxy_server_module, "user_api_key_cache", cache)
     monkeypatch.setattr(proxy_server_module, "general_settings", {}, raising=False)
-    caplog.set_level(logging.ERROR, logger="LiteLLM Proxy")
+    caplog.set_level(logging.WARNING, logger="LiteLLM Proxy")
 
     await ProxyConfig().load_config(router=None, config_file_path=str(config_file))
 
     assert cache.serve_last_good_entries is kept
-    refusals: Final = [
-        r.getMessage()
-        for r in caplog.records
-        if r.levelname == "ERROR" and "serve_last_good_auth_entries is turned off" in r.getMessage()
+    notices: Final = [
+        (r.levelname, r.getMessage()) for r in caplog.records if "LAST_GOOD_ENTRY_TTL_SECONDS=" in r.getMessage()
     ]
-    if kept:
-        assert refusals == []
+    if notice is None:
+        assert notices == []
     else:
-        assert len(refusals) == 1
-        assert f"LAST_GOOD_TOMBSTONE_TTL_SECONDS={tombstone_seconds} " in refusals[0]
-        assert "PROXY_DB_LOOKUP_DEADLINE_SECONDS=10.0 " in refusals[0]
-        assert "LAST_GOOD_STORE_MARGIN_SECONDS=15.0," in refusals[0]
+        assert len(notices) == 1
+        assert notices[0][0] == notice[0]
+        assert notice[1] in notices[0][1]
+        if notice[0] == "WARNING":
+            assert "callers in steady use lose their last good entry between database reads" in notices[0][1]
 
 
 def test_docs_redoc_openapi_are_reachable_by_default():

@@ -13,7 +13,7 @@ Endpoints for /organization operations
 
 #### ORGANIZATION MANAGEMENT ####
 
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from itertools import chain
 from types import MappingProxyType
 from typing import (
@@ -46,20 +46,11 @@ from litellm.proxy.auth.auth_checks import (
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_broadcast
 from litellm.proxy.common_utils.timezone_utils import get_budget_reset_time
-from litellm.proxy.common_utils.user_api_key_cache import (
-    UserApiKeyCache,
-    rearm_last_good,
-    revoke_last_good,
-    serves_last_good_entries,
-)
+from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, revoke_last_good
 from litellm.proxy.management_endpoints.budget_management_endpoints import (
-    BudgetHolders,
-    budget_update_data,
     evict_budget_holders,
     new_budget,
-    read_budget_holders,
-    read_holders,
-    write_budget_update,
+    update_budget,
 )
 from litellm.proxy.management_endpoints.common_daily_activity import get_daily_activity
 from litellm.proxy.management_endpoints.common_utils import (  # noqa: F401  # legacy module exports
@@ -206,6 +197,10 @@ class _VerificationTokenTableClient(Protocol):
 
 class _OrganizationIdFilter(TypedDict):
     organization_id: ReadOnly[str]
+
+
+class _OrganizationIdInFilter(TypedDict):
+    organization_id: ReadOnly[Mapping[str, Sequence[str]]]
 
 
 class _ObjectPermissionTxClient(Protocol):
@@ -712,76 +707,6 @@ async def _set_object_permission(
     return None
 
 
-# A key's own entry embeds only its organization's metadata, alias and budget row (PrismaClient's combined_view)
-ORG_FIELDS_NO_KEY_ENTRY_EMBEDS: Final = frozenset(
-    {"organization_id", "models", "object_permission", "spend", "updated_by"}
-)
-
-
-def organization_update_changes_key_entries(changed_fields: Collection[str]) -> bool:
-    """Fail closed: an organization update changes what its keys' own last good entries embed unless every field it
-    changes is one of ``ORG_FIELDS_NO_KEY_ENTRY_EMBEDS``."""
-    return not ORG_FIELDS_NO_KEY_ENTRY_EMBEDS.issuperset(changed_fields)
-
-
-async def _organization_key_tokens(organization_id: str, user_api_key_cache: UserApiKeyCache) -> tuple[str, ...]:
-    """Hashed tokens of the organization's keys. Only their revocation needs them, so they are read, strictly, only
-    while last good entries are served."""
-    from litellm.proxy.proxy_server import prisma_client
-
-    if prisma_client is None or not serves_last_good_entries(user_api_key_cache):
-        return ()
-    keys: Final = await read_holders(
-        f"organization {organization_id}",
-        "keys",
-        lambda: _table(VerificationTokenRepository(prisma_client)).find_many(
-            where={"organization_id": organization_id}
-        ),
-        required=True,
-    )
-    return tuple(key.token for key in keys or ())
-
-
-class _OrganizationRevocation(NamedTuple):
-    # Every last good entry revoked before the update; the caller re-arms them after its last write
-    revoked: tuple[str, ...]
-    # The holders of the budget row the update writes in place, if any, to evict after the write
-    budget_holders: BudgetHolders | None
-
-
-async def _revoke_before_organization_update(
-    organization_id: str,
-    budget_id: str | None,
-    changed_fields: Collection[str],
-    user_api_key_cache: UserApiKeyCache,
-    permission_holder_keys: Sequence[str] = (),
-) -> _OrganizationRevocation:
-    """Revoke, in one call before an organization update's first write, every last good entry that carries what it
-    changes: the organization's own entries on every update, every holder of ``budget_id`` (the budget row it writes in
-    place, if any; they include the organization's keys), else the organization's keys unless
-    ``organization_update_changes_key_entries`` clears the change, and ``permission_holder_keys``, the holders of a
-    permission row the caller writes itself. Returns what it revoked, and the budget holders to evict after the write.
-    """
-    budget_holders: Final = await read_budget_holders(budget_id) if budget_id is not None else None
-    key_tokens: Final = (
-        await _organization_key_tokens(organization_id, user_api_key_cache)
-        if budget_holders is None and organization_update_changes_key_entries(changed_fields)
-        else ()
-    )
-    revoked: Final = tuple(
-        dict.fromkeys(
-            (
-                *organization_cache_keys(organization_id),
-                *(budget_holders.last_good_keys if budget_holders is not None else ()),
-                *key_tokens,
-                *permission_holder_keys,
-            )
-        )
-    )
-    await revoke_last_good(user_api_key_cache, revoked)
-    return _OrganizationRevocation(revoked=revoked, budget_holders=budget_holders)
-
-
 @router.patch(
     "/organization/update",
     tags=["organization management"],
@@ -873,39 +798,25 @@ async def update_organization(
     updated_organization_row = _STR_OBJECT_DICT_ADAPTER.validate_python(
         prisma_client.jsonify_object(updated_organization_row_json)
     )
-    budget_fields: Final = {
-        k: v
-        for k, v in _STR_OBJECT_DICT_ADAPTER.validate_python(data.model_dump()).items()
-        if k in _BUDGET_SETTABLE_FIELDS and k in data.model_fields_set
-    }
-    # The organization's budget row, when this update writes it in place
-    budget_id: Final = (
-        existing_organization_row.budget_id if budget_fields and existing_organization_row.budget_id else None
-    )
-    # A refused budget value answers 400 before the revocation, and the revocation comes before the first write
-    budget_update: Final = (
-        budget_update_data(
-            BudgetNewRequest.model_validate({"budget_id": budget_id, **budget_fields}), user_api_key_dict
-        )
-        if budget_id is not None
-        else None
-    )
-    revocation: Final = await _revoke_before_organization_update(
-        organization_id=data.organization_id,
-        budget_id=budget_id,
-        changed_fields=data.model_fields_set,
-        user_api_key_cache=user_api_key_cache,
-    )
-    budget_holders: Final = revocation.budget_holders
-
     if data.object_permission is not None:
         updated_organization_row = await handle_update_object_permission(
             data_json=updated_organization_row,
             existing_organization_row=existing_organization_row,
         )
 
-    if budget_id is not None and budget_update is not None and budget_holders is not None:
-        await write_budget_update(budget_id, budget_update, budget_holders)
+    budget_fields: Final = {
+        k: v
+        for k, v in _STR_OBJECT_DICT_ADAPTER.validate_python(data.model_dump()).items()
+        if k in _BUDGET_SETTABLE_FIELDS and k in data.model_fields_set
+    }
+
+    if budget_fields and existing_organization_row.budget_id:
+        await update_budget(
+            budget_obj=BudgetNewRequest.model_validate(
+                {"budget_id": existing_organization_row.budget_id, **budget_fields}
+            ),
+            user_api_key_dict=user_api_key_dict,
+        )
 
     # Remove budget fields from organization update data
     for field in LiteLLM_BudgetTable.model_fields:
@@ -916,8 +827,6 @@ async def update_organization(
         data=updated_organization_row,
         include={"members": True, "teams": True, "litellm_budget_table": True},
     )
-    # Tombstoned again from the last write, so a read in flight across it cannot keep the old entry
-    await rearm_last_good(user_api_key_cache, revocation.revoked)
     await evict_and_broadcast(
         cache_keys=organization_cache_keys(data.organization_id), user_api_key_cache=user_api_key_cache
     )
@@ -1087,14 +996,6 @@ async def update_organization_v2(
         )
     )
 
-    # Before the transaction, so a refused revocation leaves the permission, the budget and the organization unchanged
-    revocation: Final = await _revoke_before_organization_update(
-        organization_id=organization_id,
-        budget_id=existing_organization_row.budget_id if budget_updates else None,
-        changed_fields=present_fields,
-        user_api_key_cache=user_api_key_cache,
-        permission_holder_keys=object_permission_upsert.holder_keys if object_permission_upsert is not None else (),
-    )
     tx_manager: Final[_TransactionManager] = prisma_client.db.tx()
     async with tx_manager as tx:
         if object_permission_upsert is not None:
@@ -1119,12 +1020,10 @@ async def update_organization_v2(
             include={"members": True, "teams": True, "litellm_budget_table": True},
         )
 
-    # Tombstoned again from the commit, so a read in flight across it cannot keep the old entry
-    await rearm_last_good(user_api_key_cache, revocation.revoked)
     await _evict_updated_organization(
         organization_id=organization_id,
         budget_id=existing_organization_row.budget_id,
-        budget_holders=revocation.budget_holders,
+        budget_changed=bool(budget_updates),
         user_api_key_cache=user_api_key_cache,
     )
 
@@ -1132,14 +1031,14 @@ async def update_organization_v2(
 
 
 async def _evict_updated_organization(
-    organization_id: str, budget_id: str, budget_holders: BudgetHolders | None, user_api_key_cache: UserApiKeyCache
+    organization_id: str, budget_id: str, budget_changed: bool, user_api_key_cache: UserApiKeyCache
 ) -> None:
     """The organization's cached copies always go, and a budget change also evicts everything else on that budget."""
     await evict_and_broadcast(
         cache_keys=organization_cache_keys(organization_id), user_api_key_cache=user_api_key_cache
     )
-    if budget_holders is not None:
-        await evict_budget_holders(budget_id, budget_holders)
+    if budget_changed:
+        await evict_budget_holders(budget_id)
 
 
 @router.delete(
@@ -1172,6 +1071,20 @@ async def delete_organization(
             status_code=401,
             detail={"error": "Only proxy admins can delete organizations"},
         )
+
+    # The organizations' entries, their teams' and their keys' are revoked before the first delete, so a Redis that
+    # cannot record the revocation refuses the request with nothing deleted
+    orgs_filter: Final[_OrganizationIdInFilter] = {"organization_id": {"in": data.organization_ids}}
+    teams: Final = await _table(TeamRepository(prisma_client)).find_many(where=orgs_filter)
+    keys: Final = await _table(VerificationTokenRepository(prisma_client)).find_many(where=orgs_filter)
+    await revoke_last_good(
+        user_api_key_cache,
+        (
+            *chain.from_iterable(organization_cache_keys(organization_id) for organization_id in data.organization_ids),
+            *chain.from_iterable(team_cache_keys(team.team_id, team.team_alias) for team in teams),
+            *(key.token for key in keys),
+        ),
+    )
 
     deleted_orgs: Final = []
     for organization_id in data.organization_ids:
@@ -1215,18 +1128,10 @@ async def _delete_organization_teams(
     user_api_key_cache: UserApiKeyCache,
     proxy_logging_obj: ProxyLogging | None,
 ) -> None:
-    """Delete the organization's teams after recording the revocation of their last good entries and those of the
-    organization's keys, so neither outlives the delete in a store that never expires."""
+    """Delete the organization's teams, whose last good entries the request revoked before its first delete, and
+    tombstone them again now that the rows are gone."""
     org_filter: Final[_OrganizationIdFilter] = {"organization_id": organization_id}
     teams: Final = await _table(TeamRepository(prisma_client)).find_many(where=org_filter)
-    keys: Final = await _table(VerificationTokenRepository(prisma_client)).find_many(where=org_filter)
-    await revoke_last_good(
-        user_api_key_cache,
-        (
-            *chain.from_iterable(team_cache_keys(team.team_id, team.team_alias) for team in teams),
-            *(key.token for key in keys),
-        ),
-    )
     await _table(TeamRepository(prisma_client)).delete_many(where=org_filter)
     for team in teams:
         await delete_cache_team_object(
@@ -1617,7 +1522,7 @@ async def organization_member_update(
     Update a member's role in an organization
     """
     try:
-        from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
+        from litellm.proxy.proxy_server import prisma_client
 
         if prisma_client is None:
             raise HTTPException(
@@ -1695,40 +1600,6 @@ async def organization_member_update(
                     },
                 )
 
-        # if budget_id is None, create a new budget
-        member_budget: Final = (
-            BudgetNewRequest(
-                budget_id=existing_organization_membership.budget_id or str(uuid.uuid4()),
-                max_budget=data.max_budget_in_organization,
-            )
-            if data.max_budget_in_organization is not None
-            else None
-        )
-        # A refused budget value answers 400 before the revocation, and the revocation comes before the first write
-        member_budget_update: Final = (
-            budget_update_data(member_budget, user_api_key_dict) if member_budget is not None else None
-        )
-        # A budget row written in place may be shared, so every holder of it is revoked with the member
-        budget_holders: Final = (
-            await read_budget_holders(existing_organization_membership.budget_id)
-            if member_budget is not None and existing_organization_membership.budget_id is not None
-            else None
-        )
-        # The user's entry carries its organization memberships, the role an organization admin acts with included
-        revoked: Final = (
-            tuple(
-                dict.fromkeys(
-                    (
-                        *((data.user_id,) if data.user_id is not None else ()),
-                        *(budget_holders.last_good_keys if budget_holders is not None else ()),
-                    )
-                )
-            )
-            if data.role is not None or member_budget is not None
-            else ()
-        )
-        await revoke_last_good(user_api_key_cache, revoked)
-
         # Update member role
         if data.role is not None:
             await _table(OrganizationMembershipRepository(prisma_client)).update(
@@ -1740,12 +1611,18 @@ async def organization_member_update(
                 },
                 data={"user_role": data.role},
             )
-        if member_budget is not None and member_budget.budget_id is not None and member_budget_update is not None:
-            if budget_holders is None:
-                await new_budget(budget_obj=member_budget, user_api_key_dict=user_api_key_dict)
+        if data.max_budget_in_organization is not None:
+            # if budget_id is None, create a new budget
+            budget_id: Final = existing_organization_membership.budget_id or str(uuid.uuid4())
+            if existing_organization_membership.budget_id is None:
+                new_budget_obj = BudgetNewRequest(budget_id=budget_id, max_budget=data.max_budget_in_organization)
+                await new_budget(budget_obj=new_budget_obj, user_api_key_dict=user_api_key_dict)
             else:
                 # update budget table with new max_budget
-                await write_budget_update(member_budget.budget_id, member_budget_update, budget_holders)
+                await update_budget(
+                    budget_obj=BudgetNewRequest(budget_id=budget_id, max_budget=data.max_budget_in_organization),
+                    user_api_key_dict=user_api_key_dict,
+                )
 
             # update organization membership with new budget_id
             await _table(OrganizationMembershipRepository(prisma_client)).update(
@@ -1755,10 +1632,8 @@ async def organization_member_update(
                         "organization_id": data.organization_id,
                     }
                 },
-                data={"budget_id": member_budget.budget_id},
+                data={"budget_id": budget_id},
             )
-        # Tombstoned again from the last write, so a read in flight across it cannot keep the old role or budget
-        await rearm_last_good(user_api_key_cache, revoked)
         final_organization_membership = await _table(OrganizationMembershipRepository(prisma_client)).find_unique(
             where={
                 "user_id_organization_id": {
@@ -1797,7 +1672,7 @@ async def organization_member_delete(
     Delete a member from an organization
     """
     try:
-        from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
+        from litellm.proxy.proxy_server import prisma_client
 
         if prisma_client is None:
             raise HTTPException(
@@ -1818,9 +1693,6 @@ async def organization_member_delete(
             existing_user_email_row: Final = await find_member_if_email(data.user_email, prisma_client)
             data.user_id = existing_user_email_row.user_id
 
-        # The user's entry carries its organization memberships, the role an organization admin acts with included
-        revoked: Final = (data.user_id,) if data.user_id is not None else ()
-        await revoke_last_good(user_api_key_cache, revoked)
         member_to_delete: Final = await _table(OrganizationMembershipRepository(prisma_client)).delete(
             where={
                 "user_id_organization_id": {
@@ -1829,8 +1701,6 @@ async def organization_member_delete(
                 }
             }
         )
-        # Tombstoned again from the commit, so a read in flight across it cannot keep the membership
-        await rearm_last_good(user_api_key_cache, revoked)
         return member_to_delete
 
     except Exception as e:

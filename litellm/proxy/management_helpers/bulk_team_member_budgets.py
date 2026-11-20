@@ -4,19 +4,13 @@ Every read runs on the writer inside the batch transaction, so the write plan ca
 built from a lagging read replica. Any budget row that more than one membership points at,
 the team's shared default included, is cloned before it is written, so raising one member's
 cap never moves another member's.
-
-While last good entries are served, the memberships are also read on the writer before the
-transaction, so every holder of a row the batch writes in place is revoked before any write;
-a member re-pointed at another row in between refuses the batch with 409.
 """
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from datetime import datetime, timedelta
-from itertools import chain
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
-from fastapi import HTTPException
 from pydantic import ConfigDict
 
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
@@ -27,14 +21,8 @@ from litellm.proxy._types import (
     UserAPIKeyAuth,
 )
 from litellm.proxy.auth.auth_checks import invalidate_team_member_spend_state
-from litellm.proxy.common_utils.user_api_key_cache import (
-    UserApiKeyCache,
-    rearm_last_good,
-    revoke_last_good,
-    serves_last_good_entries,
-)
+from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.proxy.db.routing_prisma_wrapper import WriterPinnedClient
-from litellm.proxy.list_api.common import PROBLEM_TYPE_BASE, ManagementProblem
 from litellm.proxy.management.teams.authz import TEAM_OR_ORG_ADMIN
 from litellm.proxy.management.teams.dependencies import get_team_access
 from litellm.proxy.management_endpoints.common_utils import (  # noqa: F401  # legacy module exports
@@ -48,15 +36,12 @@ from litellm.proxy.management_helpers.bulk_user_deletion import (
     _eq_filter,  # pyright: ignore[reportPrivateUsage]  # same prisma filter shape as members/bulk_delete
     _forbidden,  # pyright: ignore[reportPrivateUsage]  # same problem shape as members/bulk_delete
     _in_filter,  # pyright: ignore[reportPrivateUsage]  # same prisma filter shape as members/bulk_delete
-    _revocation_refused,  # pyright: ignore[reportPrivateUsage]  # same 503 problem as members/bulk_delete
     _team_not_found,  # pyright: ignore[reportPrivateUsage]  # same problem shape as members/bulk_delete
     _team_users_filter,  # pyright: ignore[reportPrivateUsage]  # same prisma filter shape as members/bulk_delete
 )
 from litellm.proxy.utils import PrismaClient
-from litellm.repositories.table_repositories import TeamMembershipRepository
 from litellm.repositories.team_repository import TeamRepository
 from litellm.types.llms.base import LiteLLMBaseModel
-from litellm.types.proxy.management_endpoints.management_v1 import ProblemDetail
 from litellm.types.proxy.management_endpoints.team_endpoints import (
     BulkTeamMemberBudgetUpdateRequest,
     TeamMemberBudgetPatch,
@@ -101,23 +86,6 @@ async def _shared_budget_ids(tx: "Prisma", budget_ids: frozenset[str]) -> frozen
         return frozenset()
     rows: Final = await _membership_tx_db(tx).find_many(where=_in_filter("budget_id", budget_ids))
     return frozenset(budget_id for budget_id in budget_ids if sum(1 for row in rows if row.budget_id == budget_id) > 1)
-
-
-def _rows_written_in_place(
-    budget_id_of: Mapping[str, str | None],
-    patched: frozenset[str],
-    team_default_budget_id: str | None,
-    shared: frozenset[str],
-) -> frozenset[str]:
-    """The rows ``upsert_budget_and_membership`` may write in place for the ``patched`` members: each one's own row,
-    unless it is the team default or in ``shared``, which are cloned instead."""
-    return frozenset(
-        budget_id
-        for user_id in patched
-        if (budget_id := budget_id_of.get(user_id)) is not None
-        and budget_id != team_default_budget_id
-        and budget_id not in shared
-    )
 
 
 class _AuditedMemberBudget(LiteLLMBaseModel):
@@ -199,21 +167,6 @@ def _result(
     )
 
 
-def _member_moved(unrevoked: frozenset[str]) -> ManagementProblem:
-    """The holders of a row a member was moved to after the revocation still keep its old limits."""
-    return ManagementProblem(
-        ProblemDetail(
-            type=f"{PROBLEM_TYPE_BASE}conflict",
-            title="Conflict",
-            status=409,
-            detail=(
-                f"Team member budgets {', '.join(sorted(unrevoked))} changed while this request ran, so nothing was "
-                "changed. Retry the request."
-            ),
-        )
-    )
-
-
 async def bulk_update_team_member_budgets(
     team_id: str,
     data: BulkTeamMemberBudgetUpdateRequest,
@@ -224,12 +177,6 @@ async def bulk_update_team_member_budgets(
     litellm_changed_by: str | None = None,
 ) -> tuple[TeamMemberBudgetUpdateResult, ...]:
     """Apply one merge patch of per-member limits per requested member, in one transaction."""
-    from litellm.proxy.management_endpoints.budget_management_endpoints import (
-        evict_budget_holders,
-        read_budget_holders,
-        read_team_member_holders,
-    )
-
     team: Final = await TeamRepository(WriterPinnedClient(prisma_client.db)).find_by_id(team_id)
     if team is None:
         raise _team_not_found(team_id)
@@ -259,54 +206,21 @@ async def bulk_update_team_member_budgets(
     user_ids: Final = sorted(user_id for _, user_id in applied)
     default_budget_id: Final = _team_default_budget_id(team)
     team_members_filter: Final = _team_users_filter(team_id, user_ids)
-    patches: Final = tuple((user_id, member_budget_patch(data.members[index])) for index, user_id in applied)
-    patched: Final = frozenset(user_id for user_id, patch in patches if patch)
-    # With last good entries off revocation does nothing, so the rows and their holders are not read, as before
-    serving: Final = serves_last_good_entries(user_api_key_cache)
-    memberships_before: Final = (
-        await TeamMembershipRepository(WriterPinnedClient(prisma_client.db)).table.find_many(where=team_members_filter)
-        if serving
-        else ()
-    )
-    revoked_rows: Final = _rows_written_in_place(
-        MappingProxyType({m.user_id: m.budget_id for m in memberships_before}), patched, default_budget_id, frozenset()
-    )
 
-    # Each member's entries, and every holder of a row written in place, carry the limits this batch rewrites, so
-    # they go before the transaction writes any
-    try:
-        member_holders: Final = await read_team_member_holders(team_id, user_ids)
-        row_holders: Final = MappingProxyType(
-            {budget_id: await read_budget_holders(budget_id) for budget_id in sorted(revoked_rows)}
-        )
-        revoked: Final = tuple(
-            dict.fromkeys(chain(member_holders.last_good_keys, *(h.last_good_keys for h in row_holders.values())))
-        )
-        await revoke_last_good(user_api_key_cache, revoked)
-    except HTTPException as refused:
-        raise _revocation_refused(refused) from refused
     async with prisma_client.tx(timeout=_BATCH_TX_TIMEOUT) as tx:
         memberships: Final = await _membership_tx_db(tx).find_many(where=team_members_filter, include=_WITH_BUDGET)
         budget_id_of: Final = MappingProxyType({m.user_id: m.budget_id for m in memberships})
         shared: Final = await _shared_budget_ids(
             tx, frozenset(budget_id for budget_id in budget_id_of.values() if budget_id is not None)
         )
-        # A member moved to another row since the holders were read would have that row written unrevoked
-        unrevoked: Final = (
-            _rows_written_in_place(budget_id_of, patched, default_budget_id, shared) - revoked_rows
-            if serving
-            else frozenset()
-        )
-        if unrevoked:
-            raise _member_moved(unrevoked)
-        for user_id, patch in patches:
+        for index, user_id in applied:
             await upsert_budget_and_membership(
                 tx=tx,
                 team_id=team_id,
                 user_id=user_id,
                 existing_budget_id=budget_id_of.get(user_id),
                 user_api_key_dict=user_api_key_dict,
-                budget_patch=patch,
+                budget_patch=member_budget_patch(data.members[index]),
                 team_default_budget_id=default_budget_id,
                 shared_budget_ids=shared,
             )
@@ -317,14 +231,10 @@ async def bulk_update_team_member_budgets(
             else None
         )
 
-    # Tombstoned again from the commit, so a read in flight across it cannot keep a member's old limits
-    await rearm_last_good(user_api_key_cache, revoked)
     for user_id in user_ids:
         await invalidate_team_member_spend_state(
             user_id=user_id, team_id=team_id, user_api_key_cache=user_api_key_cache
         )
-    for budget_id, holders in row_holders.items():
-        await evict_budget_holders(budget_id, holders)
 
     await create_object_audit_log(
         object_id=team_id,

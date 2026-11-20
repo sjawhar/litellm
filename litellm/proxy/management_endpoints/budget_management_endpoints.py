@@ -14,8 +14,7 @@ All /budget management endpoints
 #### BUDGET TABLE MANAGEMENT ####
 import asyncio
 import math
-from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Mapping
 from itertools import chain
 from types import MappingProxyType
 from typing import Final, TypeVar
@@ -31,19 +30,15 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     end_user_cache_key,
     model_access_group_cache_key,
     project_cache_key,
-    rearm_last_good,
-    revoke_last_good,
-    serves_last_good_entries,
     tag_cache_key,
     team_member_default_budget_cache_key,
-    team_membership_auth_cache_key,
 )
 from litellm.proxy.management_endpoints.common_utils import (  # noqa: F401  # legacy module exports
     _user_has_admin_view,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
     user_api_key_has_admin_view,
     validate_budget_duration,
 )
-from litellm.proxy.utils import PrismaClient, jsonify_object
+from litellm.proxy.utils import jsonify_object
 from litellm.repositories.budget_repository import BudgetRepository
 from litellm.repositories.chunked_in import find_many_in
 from litellm.repositories.organization_repository import OrganizationRepository
@@ -167,7 +162,7 @@ async def update_budget(
     - model_max_budget: Optional[dict] - Specify max budget for a given model. Example: {"openai/gpt-4o-mini": {"max_budget": 100.0, "budget_duration": "1d", "tpm_limit": 100000, "rpm_limit": 100000}}
     - budget_reset_at: Optional[datetime] - Update the Datetime when the budget was last reset.
     """
-    from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
+    from litellm.proxy.proxy_server import litellm_proxy_admin_name, prisma_client
 
     if prisma_client is None:
         raise HTTPException(
@@ -176,22 +171,6 @@ async def update_budget(
         )
     if budget_obj.budget_id is None:
         raise HTTPException(status_code=400, detail={"error": "budget_id is required"})
-
-    budget_obj_jsonified: Final = budget_update_data(budget_obj, user_api_key_dict)
-    # Every holder's last good entry is revoked before the write, so a lowered limit cannot stay in one
-    holders: Final = await read_budget_holders(budget_obj.budget_id)
-    revoked: Final = holders.last_good_keys
-    await revoke_last_good(user_api_key_cache, revoked)
-    response: Final = await write_budget_update(budget_obj.budget_id, budget_obj_jsonified, holders)
-    # Tombstoned again from the commit, so a read in flight across the write cannot keep the old limit
-    await rearm_last_good(user_api_key_cache, revoked)
-    return response
-
-
-def budget_update_data(budget_obj: BudgetNewRequest, user_api_key_dict: UserAPIKeyAuth) -> Mapping[str, object]:
-    """The budget row columns ``/budget/update`` writes for ``budget_obj``. A value it refuses raises 400 before
-    anything is read or written, so a caller that revokes before its first write validates with this first."""
-    from litellm.proxy.proxy_server import litellm_proxy_admin_name
 
     # Validate budget values are not negative
     if budget_obj.max_budget is not None and (not math.isfinite(budget_obj.max_budget) or budget_obj.max_budget < 0):
@@ -236,25 +215,12 @@ def budget_update_data(budget_obj: BudgetNewRequest, user_api_key_dict: UserAPIK
             "updated_by": user_api_key_dict.user_id or litellm_proxy_admin_name,
         }
     )
-    return budget_obj_jsonified
 
-
-async def write_budget_update(budget_id: str, data: Mapping[str, object], holders: "BudgetHolders"):
-    """Write ``data`` from ``budget_update_data`` to budget ``budget_id``, then evict ``holders``. The caller read
-    them with ``read_budget_holders``, revoked their ``last_good_keys`` before the first write of its request, and
-    re-arms them with ``rearm_last_good`` after its last write."""
-    from litellm.proxy.proxy_server import prisma_client
-
-    if prisma_client is None:
-        raise HTTPException(
-            status_code=500,
-            detail={"error": CommonProxyErrors.db_not_connected_error.value},
-        )
     response: Final = await BudgetRepository(prisma_client).table.update(
-        where={"budget_id": budget_id},
-        data=data,
+        where={"budget_id": budget_obj.budget_id},
+        data=budget_obj_jsonified,
     )
-    await evict_budget_holders(budget_id, holders)
+    await evict_budget_holders(budget_obj.budget_id)
 
     return response
 
@@ -262,220 +228,98 @@ async def write_budget_update(budget_id: str, data: Mapping[str, object], holder
 _EvictionStep = TypeVar("_EvictionStep")
 
 
-async def _best_effort(subject: str, what: str, step: Callable[[], Awaitable[_EvictionStep]]) -> _EvictionStep | None:
+async def _best_effort(budget_id: str, what: str, step: Callable[[], Awaitable[_EvictionStep]]) -> _EvictionStep | None:
     try:
         return await step()
-    except Exception as e:  # noqa: BLE001  # one failed read or eviction must not skip the others
+    except Exception as e:  # noqa: BLE001  # the budget write committed; one failed step must not skip the rest
         verbose_proxy_logger.warning(
-            "Could not evict %s of %s; they may enforce the old limits until they expire: %s",
+            "Could not evict %s on budget %s; they may enforce the old limits until they expire: %s",
             what,
-            subject,
+            budget_id,
             e,
         )
         return None
 
 
-async def read_holders(
-    subject: str, what: str, read: Callable[[], Awaitable[_EvictionStep]], *, required: bool
-) -> _EvictionStep | None:
-    """``required`` while last good entries are served: a holder that cannot be listed cannot be revoked, so its read
-    failing refuses the change before anything is written. Otherwise best effort, as the eviction always was."""
-    if not required:
-        return await _best_effort(subject, what, read)
-    try:
-        return await read()
-    except Exception as e:
-        verbose_proxy_logger.error(
-            "Refused to change %s: could not read its %s to revoke their last good auth entries: %s", subject, what, e
-        )
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": f"Could not read the {what} of {subject}, so their last good auth entries could not be "
-                "revoked and nothing was changed. Retry once the database answers."
-            },
-        ) from e
-
-
-@dataclass(frozen=True, slots=True)
-class BudgetHolders:
-    """The cached objects that carry a budget, read once before it changes, so that what is revoked before the write
-    and what is evicted after it cannot drift apart."""
-
-    # (user_id, team_id) of each team membership
-    memberships: tuple[tuple[str, str], ...] = ()
-    cache_keys: tuple[str, ...] = ()
-    hashed_tokens: tuple[str, ...] = ()
-
-    @property
-    def last_good_keys(self) -> tuple[str, ...]:
-        """Every key a last good entry of these holders is kept under."""
-        return (
-            *self.cache_keys,
-            *(
-                team_membership_auth_cache_key(team_id=team_id, user_id=user_id)
-                for user_id, team_id in self.memberships
-            ),
-            *self.hashed_tokens,
-        )
-
-
-async def _team_member_keys(prisma_client: PrismaClient, memberships: Sequence[tuple[str, str]]) -> tuple[str, ...]:
-    """Hashed tokens of the keys each ``(user_id, team_id)`` member holds in that team; a key's entry carries the
-    rate limits of its member budget. One read per team, filtered by it, so a member's keys in other teams are not
-    loaded."""
-    members_by_team: Final[dict[str, list[str]]] = {}  # mutable-ok: grouped once, read below
-    for user_id, team_id in dict.fromkeys(memberships):
-        members_by_team.setdefault(team_id, []).append(user_id)
-    table: Final = VerificationTokenRepository(prisma_client).table
-    return tuple(
-        [
-            key.token
-            for team_id, user_ids in members_by_team.items()
-            for key in await find_many_in(table, "user_id", user_ids, where={"team_id": team_id})
-        ]
-    )
-
-
-async def read_budget_holders(budget_id: str) -> BudgetHolders:
+async def evict_budget_holders(budget_id: str) -> None:
     """Keys, team memberships, organizations, projects, customers, tags and model access groups carry their budget row,
     a key also carries the budget of its organization and of its team membership, and the default customer and
-    team-member budgets are cached by id. While last good entries are served, a holder table that cannot be read
-    refuses the change with 503; otherwise each read stands on its own, so one unreadable table still leaves the
-    other holders listed."""
-    from litellm.proxy.auth.auth_checks import organization_cache_keys
-    from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
+    team-member budgets are cached by id, so every cached copy of them, last good entries included, is evicted once
+    the budget changes. Each read and each eviction stands on its own, so one unreadable table still leaves the other
+    holders evicted. Best effort, like every eviction after a committed write."""
+    from litellm.proxy.auth.auth_checks import (
+        delete_cache_key_objects,
+        invalidate_team_member_spend_state,
+        organization_cache_keys,
+    )
+    from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_broadcast
+    from litellm.proxy.proxy_server import prisma_client, proxy_logging_obj, user_api_key_cache
 
     if prisma_client is None:
-        return BudgetHolders()
-    subject: Final = f"budget {budget_id}"
-    required: Final = serves_last_good_entries(user_api_key_cache)
+        return
     on_budget: Final = {"budget_id": budget_id}
     memberships, organizations, projects, customers, tags, access_groups = await asyncio.gather(
-        read_holders(
-            subject,
+        _best_effort(
+            budget_id,
             "team memberships",
             lambda: TeamMembershipRepository(prisma_client).table.find_many(where=on_budget),
-            required=required,
         ),
-        read_holders(
-            subject,
-            "organizations",
-            lambda: OrganizationRepository(prisma_client).table.find_many(where=on_budget),
-            required=required,
+        _best_effort(
+            budget_id, "organizations", lambda: OrganizationRepository(prisma_client).table.find_many(where=on_budget)
         ),
-        read_holders(
-            subject,
-            "projects",
-            lambda: ProjectRepository(prisma_client).table.find_many(where=on_budget),
-            required=required,
-        ),
-        read_holders(
-            subject,
-            "customers",
-            lambda: EndUserRepository(prisma_client).table.find_many(where=on_budget),
-            required=required,
-        ),
-        read_holders(
-            subject, "tags", lambda: TagRepository(prisma_client).table.find_many(where=on_budget), required=required
-        ),
-        read_holders(
-            subject,
+        _best_effort(budget_id, "projects", lambda: ProjectRepository(prisma_client).table.find_many(where=on_budget)),
+        _best_effort(budget_id, "customers", lambda: EndUserRepository(prisma_client).table.find_many(where=on_budget)),
+        _best_effort(budget_id, "tags", lambda: TagRepository(prisma_client).table.find_many(where=on_budget)),
+        _best_effort(
+            budget_id,
             "model access groups",
             lambda: ModelAccessGroupBudgetRepository(prisma_client).table.find_many(where=on_budget),
-            required=required,
         ),
     )
-    member_pairs: Final = tuple(dict.fromkeys((m.user_id, m.team_id) for m in memberships or ()))
-    keys_on_budget, keys_of_its_organizations, keys_of_its_members = await asyncio.gather(
-        read_holders(
-            subject,
-            "keys",
-            lambda: VerificationTokenRepository(prisma_client).table.find_many(where=on_budget),
-            required=required,
+    keys_on_budget, keys_of_its_organizations = await asyncio.gather(
+        _best_effort(
+            budget_id, "keys", lambda: VerificationTokenRepository(prisma_client).table.find_many(where=on_budget)
         ),
-        read_holders(
-            subject,
+        _best_effort(
+            budget_id,
             "keys of its organizations",
             lambda: find_many_in(
                 VerificationTokenRepository(prisma_client).table,
                 "organization_id",
                 tuple(org.organization_id for org in organizations or ()),
             ),
-            required=required,
-        ),
-        read_holders(
-            subject,
-            "keys of its team members",
-            # Only the revocation needs them: invalidate_team_member_spend_state evicts a member's keys after the write
-            lambda: _team_member_keys(prisma_client, member_pairs if required else ()),
-            required=required,
         ),
     )
-    return BudgetHolders(
-        memberships=member_pairs,
-        cache_keys=(
-            default_end_user_budget_cache_key(budget_id),
-            team_member_default_budget_cache_key(budget_id),
-            *chain.from_iterable(organization_cache_keys(org.organization_id) for org in organizations or ()),
-            *(project_cache_key(project.project_id) for project in projects or ()),
-            *(end_user_cache_key(customer.user_id) for customer in customers or ()),
-            *(tag_cache_key(tag.tag_name) for tag in tags or ()),
-            *(model_access_group_cache_key(group.access_group_name) for group in access_groups or ()),
-        ),
-        hashed_tokens=tuple(
-            dict.fromkeys(
-                (
-                    *(key.token for key in keys_on_budget or ()),
-                    *(key.token for key in keys_of_its_organizations or ()),
-                    *(keys_of_its_members or ()),
-                )
-            )
-        ),
-    )
-
-
-async def read_team_member_holders(team_id: str, user_ids: Sequence[str]) -> BudgetHolders:
-    """The entries that carry these members' budgets in ``team_id``: each membership and, while last good entries are
-    served, the keys it holds in the team, read like ``read_budget_holders``."""
-    from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
-
-    memberships: Final = tuple(dict.fromkeys((user_id, team_id) for user_id in user_ids))
-    required: Final = serves_last_good_entries(user_api_key_cache)
-    if prisma_client is None or not memberships or not required:
-        return BudgetHolders(memberships=memberships)
-    keys: Final = await read_holders(
-        f"team {team_id}", "keys of its members", lambda: _team_member_keys(prisma_client, memberships), required=True
-    )
-    return BudgetHolders(memberships=memberships, hashed_tokens=keys or ())
-
-
-async def evict_budget_holders(budget_id: str, holders: BudgetHolders) -> None:
-    """Evict every cached copy of the holders, last good entries included, once their budget changed. Each eviction
-    stands on its own and is best effort, like every eviction after a committed write."""
-    from litellm.proxy.auth.auth_checks import delete_cache_key_objects, invalidate_team_member_spend_state
-    from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_broadcast
-    from litellm.proxy.proxy_server import proxy_logging_obj, user_api_key_cache
-
-    subject: Final = f"budget {budget_id}"
-    for user_id, team_id in holders.memberships:
+    keys: Final = (*(keys_on_budget or ()), *(keys_of_its_organizations or ()))
+    for membership in memberships or ():
         await _best_effort(
-            subject,
-            f"the spend state of team member {user_id}",
-            lambda u=user_id, t=team_id: invalidate_team_member_spend_state(
-                user_id=u, team_id=t, user_api_key_cache=user_api_key_cache
+            budget_id,
+            f"the spend state of team member {membership.user_id}",
+            lambda m=membership: invalidate_team_member_spend_state(
+                user_id=m.user_id, team_id=m.team_id, user_api_key_cache=user_api_key_cache
             ),
         )
     await _best_effort(
-        subject,
+        budget_id,
         "the cached budget holders",
-        lambda: evict_and_broadcast(cache_keys=holders.cache_keys, user_api_key_cache=user_api_key_cache),
+        lambda: evict_and_broadcast(
+            cache_keys=(
+                default_end_user_budget_cache_key(budget_id),
+                team_member_default_budget_cache_key(budget_id),
+                *chain.from_iterable(organization_cache_keys(org.organization_id) for org in organizations or ()),
+                *(project_cache_key(project.project_id) for project in projects or ()),
+                *(end_user_cache_key(customer.user_id) for customer in customers or ()),
+                *(tag_cache_key(tag.tag_name) for tag in tags or ()),
+                *(model_access_group_cache_key(group.access_group_name) for group in access_groups or ()),
+            ),
+            user_api_key_cache=user_api_key_cache,
+        ),
     )
     await _best_effort(
-        subject,
+        budget_id,
         "the cached keys",
         lambda: delete_cache_key_objects(
-            hashed_tokens=holders.hashed_tokens,
+            hashed_tokens=tuple(key.token for key in keys or ()),
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
         ),

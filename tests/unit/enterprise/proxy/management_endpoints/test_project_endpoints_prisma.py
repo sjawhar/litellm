@@ -2,7 +2,7 @@ import asyncio
 import os
 import traceback
 import httpx
-from collections.abc import Awaitable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Final
@@ -23,7 +23,6 @@ from litellm.proxy.management_endpoints.team_endpoints import (
     new_team,
 )
 from litellm_enterprise.proxy.management_endpoints.project_endpoints import (
-    PROJECT_UNENFORCED_FIELDS,
     new_project,
     update_project,
     delete_project,
@@ -44,10 +43,7 @@ from litellm.proxy._types import (
     DeleteProjectRequest,
     NewTeamRequest,
     UserAPIKeyAuth,
-    LiteLLM_BudgetTable,
-    LiteLLM_EndUserTable,
     LiteLLM_OrganizationMembershipTable,
-    LiteLLM_ProjectTable,
     LiteLLM_TeamTable,
     LiteLLM_UserTable,
     Member,
@@ -1032,12 +1028,13 @@ async def test_update_project_succeeds_when_cache_eviction_fails(monkeypatch):
 
 
 class _ProjectRows:
-    """One project row the update endpoint writes and auth reads. While ``stopped`` every read fails the way an
-    unreachable Postgres does; ``pause_next_read`` holds the next read once it has the row."""
+    """One project row the update and delete endpoints write and auth reads. While ``stopped`` every read fails the
+    way an unreachable Postgres does; ``pause_next_read`` holds the next read once it has the row."""
 
     def __init__(self, project_id: str) -> None:
         self.project_id = project_id
         self.blocked = False
+        self.deleted = False
         self.stopped = False
         self.read_held = asyncio.Event()
         self._release: asyncio.Event | None = None
@@ -1065,6 +1062,10 @@ class _ProjectRows:
 
     async def update(self, where: Mapping[str, object], data: Mapping[str, object], include: object = None):
         self.blocked = bool(data.get("blocked", self.blocked))
+        return self._row()
+
+    async def delete(self, where: Mapping[str, object]) -> mock.MagicMock:
+        self.deleted = True
         return self._row()
 
 
@@ -1099,6 +1100,32 @@ async def test_project_block_answers_503_and_writes_nothing_when_redis_cannot_re
         await _block_project(rows.project_id)
 
     assert (str(refused.value.code), rows.blocked) == ("503", False)
+
+
+@pytest.mark.asyncio
+async def test_project_delete_answers_503_and_deletes_nothing_when_redis_cannot_record_it(monkeypatch):
+    """A deleted project's entry is revoked before the delete, so a Redis that cannot record the revocation refuses
+    the delete and the project stays."""
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis: Final = fake_redis_cache()
+    redis.server.connected = False
+    rows: Final = _ProjectRows(f"project-{uuid.uuid4()}")
+    prisma: Final = _serve_project_rows(
+        monkeypatch, rows, UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+    )
+    prisma.db.litellm_verificationtoken.find_many = mock.AsyncMock(return_value=[])
+
+    with pytest.raises(ProxyException) as refused:
+        await delete_project(
+            data=DeleteProjectRequest(project_ids=[rows.project_id]),
+            http_request=Request(scope={"type": "http"}),
+            user_api_key_dict=UserAPIKeyAuth(
+                user_role=LitellmUserRoles.PROXY_ADMIN, api_key=MASTER_KEY, user_id="1234"
+            ),
+        )
+
+    assert (str(refused.value.code), rows.deleted) == ("503", False)
 
 
 @pytest.mark.asyncio
@@ -1414,279 +1441,6 @@ async def test_update_project_clears_only_the_explicit_budget_cap(monkeypatch):
         data={"max_budget": None, "updated_by": "1234"},
     )
     assert "max_budget" not in _written_project_data(mock_prisma)
-
-
-class _BudgetRows:
-    """The budget table: rows by id, changed only by an update."""
-
-    def __init__(self, *rows: LiteLLM_BudgetTable) -> None:
-        self.rows = {row.budget_id: row for row in rows}
-
-    async def update(self, where: Mapping[str, str], data: Mapping[str, object]) -> LiteLLM_BudgetTable:
-        written = self.rows[where["budget_id"]].model_copy(
-            update={column: value for column, value in data.items() if column in LiteLLM_BudgetTable.model_fields}
-        )
-        self.rows[where["budget_id"]] = written
-        return written
-
-
-_KEY_ON_THE_SHARED_BUDGET: Final = "hashed-key-on-the-shared-budget"
-
-
-def _serve_project_on_a_shared_budget(monkeypatch, cache: UserApiKeyCache) -> tuple[mock.MagicMock, _BudgetRows]:
-    """Project p1 on budget row b-shared, which customer c1 and a key hold too. Team team-b exists, and p1 has no
-    permission row yet."""
-    project = mock.MagicMock(project_id="p1", team_id=None, budget_id="b-shared", object_permission_id=None)
-    budgets = _BudgetRows(LiteLLM_BudgetTable(budget_id="b-shared", max_budget=10.0))
-    prisma = mock.MagicMock()
-    prisma.jsonify_object = lambda data: data
-    prisma.db.litellm_projecttable.find_unique = mock.AsyncMock(return_value=project)
-    prisma.db.litellm_projecttable.find_many = mock.AsyncMock(return_value=[project])
-    prisma.db.litellm_projecttable.update = mock.AsyncMock(return_value=project)
-    prisma.db.litellm_teamtable.find_unique = mock.AsyncMock(
-        return_value=mock.MagicMock(model_dump=lambda: {"team_id": "team-b"})
-    )
-    prisma.db.litellm_objectpermissiontable.create = mock.AsyncMock(
-        return_value=mock.MagicMock(object_permission_id="permission-p1")
-    )
-    prisma.db.litellm_budgettable = budgets
-    prisma.db.litellm_endusertable.find_many = mock.AsyncMock(return_value=[mock.MagicMock(user_id="c1")])
-    prisma.db.litellm_verificationtoken.find_many = mock.AsyncMock(
-        return_value=[mock.MagicMock(token=_KEY_ON_THE_SHARED_BUDGET)]
-    )
-    for table in (
-        "litellm_teammembership",
-        "litellm_organizationtable",
-        "litellm_tagtable",
-        "litellm_modelaccessgroupbudgettable",
-    ):
-        getattr(prisma.db, table).find_many = mock.AsyncMock(return_value=[])
-    monkeypatch.setattr(litellm.proxy.proxy_server, "premium_user", True)
-    monkeypatch.setattr(litellm.proxy.proxy_server, "prisma_client", prisma)
-    monkeypatch.setattr(litellm.proxy.proxy_server, "user_api_key_cache", cache)
-    return prisma, budgets
-
-
-#: The tables a budget's holders are listed from
-_BUDGET_HOLDER_TABLES: Final = (
-    "litellm_projecttable",
-    "litellm_endusertable",
-    "litellm_verificationtoken",
-    "litellm_teammembership",
-    "litellm_organizationtable",
-    "litellm_tagtable",
-    "litellm_modelaccessgroupbudgettable",
-)
-
-
-class _ProjectsOnOneBudget:
-    """The project table: p1 and p2 on budget row b-shared, as ``budgets`` holds it now. While ``stopped`` every read
-    fails the way an unreachable Postgres does; ``pause_next_read_of`` holds the next read of one project once it has
-    the row."""
-
-    def __init__(self, budgets: _BudgetRows) -> None:
-        self.budgets = budgets
-        self.stopped = False
-        self.read_held = asyncio.Event()
-        self._held: tuple[str, asyncio.Event] | None = None
-
-    def _answer(self) -> None:
-        if self.stopped:
-            raise httpx.ConnectError("All connection attempts failed")
-
-    def _row(self, project_id: str) -> LiteLLM_ProjectTable:
-        return LiteLLM_ProjectTable(
-            project_id=project_id, budget_id="b-shared", litellm_budget_table=self.budgets.rows["b-shared"]
-        )
-
-    def pause_next_read_of(self, project_id: str) -> asyncio.Event:
-        release: Final = asyncio.Event()
-        self._held = (project_id, release)
-        return release
-
-    async def find_unique(self, where: Mapping[str, str], include: object = None) -> LiteLLM_ProjectTable:
-        self._answer()
-        row: Final = self._row(where["project_id"])
-        held: Final = self._held
-        if held is not None and held[0] == where["project_id"]:
-            self._held = None
-            self.read_held.set()
-            await held[1].wait()
-        return row
-
-    async def find_many(self, where: object = None, **_: object) -> list[LiteLLM_ProjectTable]:
-        self._answer()
-        return [self._row("p1"), self._row("p2")]
-
-    async def update(
-        self, where: Mapping[str, str], data: Mapping[str, object], include: object = None
-    ) -> LiteLLM_ProjectTable:
-        return self._row(where["project_id"])
-
-
-def _redis_down_cache(serve_last_good_entries: bool) -> UserApiKeyCache:
-    from tests.unit.caching.fake_redis_cache import fake_redis_cache
-
-    redis = fake_redis_cache()
-    redis.server.connected = False
-    return UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=serve_last_good_entries)
-
-
-@pytest.mark.asyncio
-async def test_project_budget_update_answers_503_and_writes_nothing_when_redis_cannot_record_it(monkeypatch):
-    """The project's budget row is written in place, and the last good entry of every holder of it carries it. With
-    Redis unable to record their revocation, the budget stays as it was rather than the old limit staying in them."""
-    prisma, budgets = _serve_project_on_a_shared_budget(monkeypatch, _redis_down_cache(serve_last_good_entries=True))
-
-    with pytest.raises(ProxyException) as refused:
-        await _run_project_update("p1", max_budget=5.0)
-
-    assert (str(refused.value.code), budgets.rows["b-shared"].max_budget) == ("503", 10.0)
-    prisma.db.litellm_projecttable.update.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_project_budget_update_with_last_good_entries_off_reads_no_holder_and_writes_while_redis_is_down(
-    monkeypatch,
-):
-    """With last good entries not served nothing is revoked, so the update lists none of its budget's holders and
-    evicts none of them: it reads and evicts what it did before last good entries existed."""
-    from litellm.proxy.common_utils.user_api_key_cache import end_user_cache_key
-
-    cache: Final = _redis_down_cache(serve_last_good_entries=False)
-    prisma, budgets = _serve_project_on_a_shared_budget(monkeypatch, cache)
-    customer: Final = LiteLLM_EndUserTable(user_id="c1", blocked=False, budget_id="b-shared")
-    await cache.async_set_cache(end_user_cache_key("c1"), customer, local_only=True)
-
-    await _run_project_update("p1", max_budget=5.0)
-    holder_reads: Final = sum(getattr(prisma.db, table).find_many.await_count for table in _BUDGET_HOLDER_TABLES)
-    cached: Final = await cache.async_get_cache(
-        end_user_cache_key("c1"), local_only=True, model_type=LiteLLM_EndUserTable
-    )
-
-    assert (holder_reads, budgets.rows["b-shared"].max_budget, cached) == (0, 5.0, customer)
-
-
-@pytest.mark.asyncio
-async def test_after_a_shared_project_budget_is_lowered_a_read_in_flight_of_another_project_on_it_cannot_keep_it(
-    monkeypatch,
-):
-    """/project/new accepts an existing budget_id, so the row a project update writes in place can be shared: p2 is on
-    p1's row. A read of p2 that took its row before p1's update lowered the budget, and finishes after, must not keep
-    the higher limit as p2's last good entry: the next outage refuses p2 instead of serving it."""
-    from litellm.proxy.auth.auth_checks import get_project_object
-    from litellm.proxy.common_utils.user_api_key_cache import project_cache_key
-    from litellm.proxy.db.exception_handler import LastGoodEntryMissing
-
-    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
-    prisma, budgets = _serve_project_on_a_shared_budget(monkeypatch, cache)
-    projects: Final = _ProjectsOnOneBudget(budgets)
-    prisma.db.litellm_projecttable = projects
-
-    async def p2():
-        return await get_project_object(project_id="p2", prisma_client=prisma, user_api_key_cache=cache)
-
-    release: Final = projects.pause_next_read_of("p2")
-    in_flight: Final = asyncio.create_task(p2())
-    await projects.read_held.wait()
-    await _run_project_update("p1", max_budget=5.0)
-    release.set()
-    assert ((await in_flight).litellm_budget_table.max_budget, budgets.rows["b-shared"].max_budget) == (10.0, 5.0)
-    await cache.async_delete_cache(project_cache_key("p2"))
-    projects.stopped = True
-
-    with pytest.raises(LastGoodEntryMissing):
-        await p2()
-
-
-#: Each project field auth enforces from the project's last good entry, beside the line that reads it there
-_PROJECT_FIELDS_ENFORCED_FROM_ITS_ENTRY: Final = (
-    ("blocked", True),  # litellm/proxy/auth/auth_checks.py:782, project_object.blocked
-    ("models", ["gpt-4o"]),  # litellm/proxy/auth/auth_checks.py:788, project_object.models
-    ("team_id", "team-b"),  # litellm/proxy/management_helpers/auto_router_permissions.py:182, objects.project.team_id
-    # litellm/proxy/hooks/parallel_request_limiter_v3.py:3480 reads project_metadata, which
-    # litellm/proxy/auth/user_api_key_auth.py:2670 copies from the project's entry
-    ("model_rpm_limit", {"gpt-4o": 1}),
-    ("metadata", {"guardrails": ["pii-mask"]}),  # litellm/proxy/litellm_pre_call_utils.py:3125, project_metadata
-    ("max_budget", 5.0),  # litellm/proxy/auth/auth_checks.py:6925, litellm_budget_table.max_budget
-    ("soft_budget", 1.0),  # litellm/proxy/auth/auth_checks.py:6981, litellm_budget_table.soft_budget
-)
-
-
-async def _status_of(update: Awaitable[None]) -> str:
-    """The status code ``update`` ends with: "200" when it returns."""
-    try:
-        await update
-    except ProxyException as refused:
-        return str(refused.code)
-    return "200"
-
-
-async def _project_update_outcome(monkeypatch, serve_last_good_entries: bool, **fields: object) -> tuple[str, bool]:
-    """The status of an update of p1 while Redis is down, and whether it wrote any row."""
-    prisma, budgets = _serve_project_on_a_shared_budget(monkeypatch, _redis_down_cache(serve_last_good_entries))
-    status: Final = await _status_of(_run_project_update("p1", **fields))
-    written: Final = (
-        prisma.db.litellm_projecttable.update.await_count > 0
-        or prisma.db.litellm_objectpermissiontable.create.await_count > 0
-        or budgets.rows["b-shared"] != LiteLLM_BudgetTable(budget_id="b-shared", max_budget=10.0)
-    )
-    return status, written
-
-
-@pytest.mark.asyncio
-async def test_a_project_update_of_each_field_enforced_from_its_entry_answers_503_and_writes_nothing_without_redis(
-    monkeypatch,
-):
-    """Each field is read from the project's last good entry by the check beside it, so an update of any one of them
-    revokes that entry first; while Redis cannot record the revocation the update is refused before it writes."""
-    outcomes: Final = {
-        field: await _project_update_outcome(monkeypatch, True, **{field: value})
-        for field, value in _PROJECT_FIELDS_ENFORCED_FROM_ITS_ENTRY
-    }
-
-    assert outcomes == {field: ("503", False) for field, _ in _PROJECT_FIELDS_ENFORCED_FROM_ITS_ENTRY}
-
-
-@pytest.mark.asyncio
-async def test_a_project_update_of_a_field_no_one_classified_answers_503_and_writes_nothing_without_redis(monkeypatch):
-    """No check is known to read a project's permission row from its entry, but the field is not proven unenforced
-    either, so its update revokes the entry like any other and is refused while Redis cannot record that."""
-    outcome: Final = await _project_update_outcome(monkeypatch, True, object_permission={"vector_stores": ["vs-1"]})
-
-    assert outcome == ("503", False)
-
-
-@pytest.mark.asyncio
-async def test_linking_a_project_to_its_first_budget_row_answers_503_and_writes_nothing_without_redis(monkeypatch):
-    """The entry of a project with no budget row enforces no budget. Linking it to a row makes the project enforce
-    that row's limits, so the link revokes the entry first and is refused while Redis cannot record that."""
-    prisma, _ = _serve_project_on_a_shared_budget(monkeypatch, _redis_down_cache(serve_last_good_entries=True))
-    prisma.db.litellm_projecttable.find_unique.return_value.budget_id = None
-
-    code: Final = await _status_of(_run_project_update("p1", budget_id="b-shared"))
-
-    assert (code, prisma.db.litellm_projecttable.update.await_count) == ("503", 0)
-
-
-@pytest.mark.asyncio
-async def test_a_project_update_of_only_its_unenforced_fields_writes_while_redis_cannot_record_a_revocation(
-    monkeypatch,
-):
-    """Nothing on the request path reads a project's alias or description from its entry, so an update of only those
-    revokes nothing, and Redis being down refuses nothing."""
-    outcome: Final = await _project_update_outcome(
-        monkeypatch, True, **dict.fromkeys(PROJECT_UNENFORCED_FIELDS, "renamed")
-    )
-
-    assert outcome == ("200", True)
-
-
-@pytest.mark.asyncio
-async def test_a_project_update_of_its_models_writes_while_redis_is_down_when_last_good_entries_are_off(monkeypatch):
-    outcome: Final = await _project_update_outcome(monkeypatch, False, models=["gpt-4o"])
-
-    assert outcome == ("200", True)
 
 
 @pytest.mark.parametrize("entry", ["all-proxy-models", "*", "azure/*"])

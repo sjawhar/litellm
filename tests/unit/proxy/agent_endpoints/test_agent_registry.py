@@ -2,15 +2,13 @@
 
 import hashlib
 import json
-import time
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Final
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from fastapi import HTTPException
 from prisma.models import LiteLLM_AgentsTable
 
 from litellm.constants import REDACTED_BY_LITELM_STRING
@@ -542,9 +540,7 @@ async def test_agent_deletion_drops_and_tombstones_its_keys_last_good_entries(mo
     from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, recall_last_good, remember_last_good
 
     cache: Final = UserApiKeyCache(serve_last_good_entries=True)
-    await remember_last_good(
-        cache, "agent-key-1", UserAPIKeyAuth(token="agent-key-1", agent_id="agent-123"), read_started=time.monotonic()
-    )
+    await remember_last_good(cache, "agent-key-1", UserAPIKeyAuth(token="agent-key-1", agent_id="agent-123"))
     monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
     monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", None)
     database: Final = MagicMock()
@@ -557,9 +553,7 @@ async def test_agent_deletion_drops_and_tombstones_its_keys_last_good_entries(mo
     tx.litellm_retiredagent.upsert = AsyncMock()
 
     await AgentRegistry().delete_agent_from_db("agent-123", database)
-    await remember_last_good(
-        cache, "agent-key-1", UserAPIKeyAuth(token="agent-key-1", agent_id="agent-123"), read_started=time.monotonic()
-    )
+    await remember_last_good(cache, "agent-key-1", UserAPIKeyAuth(token="agent-key-1", agent_id="agent-123"))
 
     assert await recall_last_good(cache, "agent-key-1", UserAPIKeyAuth) is None
 
@@ -1663,79 +1657,3 @@ async def test_application_registration_preserves_its_existing_owner(operation: 
                 "issuer": "https://login.microsoftonline.com/11111111-1111-4111-8111-111111111111/v2.0",
             }
         }
-
-
-@pytest.mark.asyncio
-async def test_agent_permission_write_is_refused_with_503_when_redis_cannot_revoke_a_key_on_its_row() -> None:
-    """An agent keeps no last good entry, but a key linked to the same permission row does: the agent's write to
-    the row is refused while Redis cannot revoke that key's entry, before the agent row is touched."""
-    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
-    from tests.unit.caching.fake_redis_cache import fake_redis_cache
-
-    redis: Final = fake_redis_cache()
-    redis.server.connected = False
-    key_on_the_row: Final = "hashed-key-on-op-agent"
-    # Every required column of LiteLLM_ObjectPermissionTable, and of the LiteLLM_VerificationToken linked to it
-    columns: Final[dict[str, object]] = {
-        "object_permission_id": "op-agent",
-        "mcp_servers": [],
-        "mcp_access_groups": [],
-        "vector_stores": [],
-        "agents": ["agent-a"],
-        "agent_access_groups": [],
-        "models": [],
-        "blocked_tools": [],
-        "mcp_toolsets": [],
-        "search_tools": [],
-        "skills": [],
-    }
-    linked_key: Final = SimpleNamespace(
-        token=key_on_the_row,
-        soft_budget_cooldown=False,
-        spend=0.0,
-        total_spend=0.0,
-        models=[],
-        aliases={},
-        config={},
-        permissions={},
-        metadata={},
-        allowed_cache_controls=[],
-        allowed_routes=[],
-        policies=[],
-        access_group_ids=[],
-        model_spend={},
-        model_max_budget={},
-        budget_fallbacks={},
-    )
-    permission_row: Final = SimpleNamespace(
-        **columns,
-        verification_tokens=[linked_key],
-        teams=[],
-        organizations=[],
-        projects=[],
-        users=[],
-        end_users=[],
-        model_dump=lambda **_: dict(columns),
-    )
-    stored: Final = _stored_agent_row({"agent_name": "Old Agent", "object_permission_id": "op-agent"})
-    client: Final = MagicMock()
-    client.db.litellm_agentstable.find_unique = AsyncMock(return_value=stored)
-    client.db.litellm_agentstable.update = AsyncMock(return_value=stored)
-    client.db.litellm_objectpermissiontable.find_unique = AsyncMock(return_value=permission_row)
-
-    with (
-        patch(  # test-quality-ok: the agent registry obtains its cache from the proxy singleton
-            "litellm.proxy.proxy_server.user_api_key_cache",
-            new=UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True),
-        ),
-        pytest.raises(HTTPException) as refused,
-    ):
-        await AgentRegistry().patch_agent_in_db(
-            agent_id="agent-123",
-            agent=PatchAgentRequest(object_permission={"agents": ["agent-b"]}),
-            prisma_client=client,
-            updated_by="admin",
-        )
-
-    assert refused.value.status_code == 503
-    client.db.litellm_agentstable.update.assert_not_awaited()

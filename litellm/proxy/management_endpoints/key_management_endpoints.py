@@ -35,7 +35,6 @@ from litellm._logging import verbose_proxy_logger
 from litellm._uuid import uuid
 from litellm.caching.dual_cache import DualCache
 from litellm.constants import (
-    EMPTY_MAPPING,
     LENGTH_OF_LITELLM_GENERATED_KEY,
     LITELLM_PROXY_ADMIN_NAME,
     MINIMUM_CUSTOM_KEY_LENGTH,
@@ -86,13 +85,7 @@ from litellm.proxy.common_utils.config_sync_pubsub import (
 )
 from litellm.proxy.common_utils.rbac_utils import check_org_admin_can_generate_keys
 from litellm.proxy.common_utils.timezone_utils import get_budget_reset_time
-from litellm.proxy.common_utils.user_api_key_cache import (
-    AUTH_OBJECTS_TARGET,
-    UserApiKeyCache,
-    rearm_last_good,
-    revoke_last_good,
-    serves_last_good_entries,
-)
+from litellm.proxy.common_utils.user_api_key_cache import AUTH_OBJECTS_TARGET, UserApiKeyCache, revoke_last_good
 from litellm.proxy.hooks.key_management_event_hooks import KeyManagementEventHooks
 from litellm.proxy.hooks.model_max_budget_limiter import build_model_max_budget_usage
 from litellm.proxy.management.teams.authz import TEAM_ADMIN_ONLY, TEAM_OR_ORG_ADMIN, is_team_admin
@@ -2734,54 +2727,22 @@ def _resolve_token_to_update(data: UpdateKeyRequest, existing_key_row: LiteLLM_V
     return existing_key_row.token
 
 
-# Update fields no request-path check reads from the key's last good entry: only the key rotation job reads them, from
-# the database
-KEY_FIELDS_NOT_ENFORCED: Final = frozenset({"auto_rotate", "rotation_interval"})
-# Never a change of the key's entry: the key the update names, and its spend, which stays outside the revocation as a
-# spend edit, as before
-_KEY_FIELDS_NOT_REVOKED: Final = frozenset({"key", "spend", *KEY_FIELDS_NOT_ENFORCED})
-# Fields an alias-addressed or bulk update sends with the stored value; they change nothing when they match it
-_KEY_FIELDS_SENT_AS_STORED: Final = frozenset({"key_alias", "team_id", "user_id", "project_id", "organization_id"})
-# Fields an update folds into the key's metadata, so they change the entry exactly where the written metadata does
-_KEY_METADATA_WRITTEN_FIELDS: Final = frozenset({"metadata", *_KEY_METADATA_REQUEST_FIELDS})
-
-
-def _metadata_view(metadata: object) -> Mapping[str, object]:
-    return (
-        cast(  # cast-ok: stored and written key metadata are JSON objects keyed by name
-            "Mapping[str, object]", metadata
-        )
-        if isinstance(metadata, Mapping)
-        else EMPTY_MAPPING
-    )
-
-
-def _key_field_changes(field: str, data: UpdateKeyRequest, existing_key_row: LiteLLM_VerificationToken) -> bool:
-    if field in _KEY_FIELDS_NOT_REVOKED or field in _KEY_METADATA_WRITTEN_FIELDS:
-        return False
-    return field not in _KEY_FIELDS_SENT_AS_STORED or getattr(data, field) != getattr(existing_key_row, field, None)
-
-
-def key_update_changes_its_entry(
-    data: UpdateKeyRequest, existing_key_row: LiteLLM_VerificationToken, update_values: Mapping[str, object]
+async def _revoke_key_if_update_ends_it(
+    data: UpdateKeyRequest,
+    non_default_values: Mapping[str, object],
+    existing_key_row: LiteLLM_VerificationToken,
+    user_api_key_cache: UserApiKeyCache,
 ) -> bool:
-    """Fail-closed: whether writing ``update_values`` may change what the key's last good entry carries. Every field
-    the request sends counts, except ``KEY_FIELDS_NOT_ENFORCED``, the key, its spend and a field sent with its stored
-    value; ``metadata`` and the fields folded into it count only where the written metadata differs from the stored."""
-    if any(_key_field_changes(field, data, existing_key_row) for field in data.model_fields_set):
-        return True
-    return "metadata" in update_values and _metadata_view(update_values["metadata"]) != _metadata_view(
-        getattr(existing_key_row, "metadata", None)
-    )
-
-
-def _own_entry_to_revoke(
-    data: UpdateKeyRequest, existing_key_row: LiteLLM_VerificationToken, update_values: Mapping[str, object]
-) -> tuple[str, ...]:
-    """The key's own last good entry when the update may change what that entry carries, a block included."""
-    if key_update_changes_its_entry(data, existing_key_row, update_values):
-        return (hash_token_if_needed(_resolve_token_to_update(data=data, existing_key_row=existing_key_row)),)
-    return ()
+    """A block, or an expiry moved to now or earlier, ends the key as a delete does: its last good entry is revoked
+    before the first write, and the eviction after the write tombstones it again. Returns whether the update ends it."""
+    expires: Final = non_default_values.get("expires")
+    ends_key: Final = data.blocked is True or (isinstance(expires, datetime) and expires <= datetime.now(timezone.utc))
+    if ends_key:
+        await revoke_last_good(
+            user_api_key_cache,
+            (hash_token_if_needed(_resolve_token_to_update(data=data, existing_key_row=existing_key_row)),),
+        )
+    return ends_key
 
 
 async def _process_single_key_update(
@@ -2945,8 +2906,9 @@ async def _process_single_key_update(
             detail={"error": "Database not connected"},
         )
 
-    revoked: Final = _own_entry_to_revoke(key_request, existing_key_row, non_default_values)
-    await revoke_last_good(user_api_key_cache, revoked)
+    ends_key: Final = await _revoke_key_if_update_ends_it(
+        key_request, non_default_values, existing_key_row, user_api_key_cache
+    )
     update_values: Final = await _handle_update_object_permission(
         data_json=non_default_values,
         existing_key_row=existing_key_row,
@@ -2970,7 +2932,7 @@ async def _process_single_key_update(
         hashed_token=hash_token_if_needed(key_request.key),
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
-        revoked=key_request.blocked is True,
+        revoked=ends_key,
     )
 
     # After the key's own cache entry is dropped, so a failure here cannot leave the key
@@ -2981,8 +2943,6 @@ async def _process_single_key_update(
         data=key_request,
         existing_key_row=existing_key_row,
     )
-    # Tombstoned again from the last write, so a read in flight across it cannot keep the old entry
-    await rearm_last_good(user_api_key_cache, revoked)
 
     # Trigger async hook
     asyncio.create_task(
@@ -3548,11 +3508,6 @@ async def update_key_fn(
     ```
     """
     from litellm.proxy import proxy_server
-    from litellm.proxy.management_endpoints.budget_management_endpoints import (
-        BudgetHolders,
-        evict_budget_holders,
-        read_budget_holders,
-    )
     from litellm.proxy.proxy_server import (
         litellm_proxy_admin_name,
         llm_router,
@@ -3631,22 +3586,9 @@ async def update_key_fn(
         if prisma_client is None:
             raise Exception("Not connected to DB!")
 
-        # soft_budget is written in place on the key's budget row, which other keys, customers and members may hold.
-        # Only their last good entries need them read; with those off, the update reads and evicts what it always did
-        shared_budget_id: Final = (
-            existing_key_row.budget_id
-            if "soft_budget" in data.model_fields_set and serves_last_good_entries(user_api_key_cache)
-            else None
+        ends_key: Final = await _revoke_key_if_update_ends_it(
+            data, non_default_values, existing_key_row, user_api_key_cache
         )
-        budget_holders: Final = (
-            await read_budget_holders(shared_budget_id) if shared_budget_id is not None else BudgetHolders()
-        )
-        revoked_entries: Final = tuple(
-            dict.fromkeys(
-                (*_own_entry_to_revoke(data, existing_key_row, non_default_values), *budget_holders.last_good_keys)
-            )
-        )
-        await revoke_last_good(user_api_key_cache, revoked_entries)
         update_values: Final = await _handle_update_object_permission(
             data_json=non_default_values,
             existing_key_row=existing_key_row,
@@ -3679,10 +3621,8 @@ async def update_key_fn(
             hashed_token=hash_token_if_needed(key),
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
-            revoked=data.blocked is True,
+            revoked=ends_key,
         )
-        if shared_budget_id is not None:
-            await evict_budget_holders(shared_budget_id, budget_holders)
 
         # After the key's own cache entry is dropped, so a failure here cannot leave the key
         # authenticating against the access groups it just lost.
@@ -3692,8 +3632,6 @@ async def update_key_fn(
             data=data,
             existing_key_row=existing_key_row,
         )
-        # Tombstoned again from the last write, so a read in flight across it cannot keep the old entry
-        await rearm_last_good(user_api_key_cache, revoked_entries)
 
         if data.spend is not None:
             from litellm.proxy.proxy_server import spend_counter_cache

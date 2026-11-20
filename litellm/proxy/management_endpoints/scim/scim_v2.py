@@ -57,7 +57,11 @@ from litellm.proxy.common_utils.http_parsing_utils import (  # noqa: F401  # leg
     _safe_get_request_headers,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
     safe_get_request_headers,
 )
-from litellm.proxy.common_utils.user_api_key_cache import revoke_last_good
+from litellm.proxy.common_utils.user_api_key_cache import (
+    revoke_last_good,
+    serves_last_good_entries,
+    team_membership_auth_cache_key,
+)
 from litellm.proxy.management_endpoints.internal_user_endpoints import new_user
 from litellm.proxy.management_endpoints.scim.scim_transformations import (
     ScimTransformations,
@@ -1008,6 +1012,27 @@ def _key_was_scim_blocked(metadata: object) -> bool:
     return isinstance(metadata, dict) and metadata.get(SCIM_BLOCKED_METADATA_KEY) is True
 
 
+def _unblocked_keys_filter(user_id: str) -> Mapping[str, object]:
+    # `blocked` is a nullable column with no default, so existing rows
+    # typically hold NULL; treat NULL as "not blocked" since SQL equality
+    # on NULL would otherwise silently skip them.
+    return {"user_id": user_id, "OR": [{"blocked": False}, {"blocked": None}]}
+
+
+async def _revoke_scim_user(prisma_client: PrismaClient, user_id: str, cache_keys: Sequence[str] = ()) -> None:
+    """Revoke, before the request's first write, the entries a deactivation or a delete of the user changes: its own,
+    from which auth refuses an inactive user, those of the keys SCIM blocks, and ``cache_keys``. The keys are read
+    only while last good entries are served."""
+    from litellm.proxy.proxy_server import user_api_key_cache
+
+    keys: Final = (
+        await _table(VerificationTokenRepository(prisma_client)).find_many(where=_unblocked_keys_filter(user_id))
+        if serves_last_good_entries(user_api_key_cache)
+        else ()
+    )
+    await revoke_last_good(user_api_key_cache, (user_id, *(key_row.token for key_row in keys), *cache_keys))
+
+
 async def _set_user_keys_blocked(user_id: str, blocked: bool) -> int:
     """
     Block or unblock virtual keys owned by a user and invalidate them in the
@@ -1024,14 +1049,8 @@ async def _set_user_keys_blocked(user_id: str, blocked: bool) -> int:
     prisma_client: Final = await _get_prisma_client_or_raise_exception()
 
     if blocked:
-        # `blocked` is a nullable column with no default, so existing rows
-        # typically hold NULL; treat NULL as "not blocked" since SQL equality
-        # on NULL would otherwise silently skip them.
         candidates = await _table(VerificationTokenRepository(prisma_client)).find_many(
-            where={
-                "user_id": user_id,
-                "OR": [{"blocked": False}, {"blocked": None}],
-            },
+            where=_unblocked_keys_filter(user_id)
         )
         affected_keys = candidates
     else:
@@ -1793,6 +1812,11 @@ async def update_user(
             roles=user_data["roles"],
         )
 
+        # A deactivation blocks the user's keys and auth refuses an inactive user from its entry, so both are revoked
+        # before the first write
+        if client_set_active and _scim_active_value(metadata) is False and prev_active is not False:
+            await _revoke_scim_user(prisma_client, user_id)
+
         # SCIM User.groups is readOnly (RFC 7643 4.1.2): IdPs sync membership via /Groups and send
         # no groups or `groups: []` on profile PUTs, so empty means unspecified, not "remove from every team"
         target_teams: Final = user_data["teams"] or existing_user.teams
@@ -1862,9 +1886,25 @@ async def delete_user(
             ]
         )
         teams: Final = tuple(team for team in found_teams if team)
+        team_rows: Final = tuple(LiteLLM_TeamTable.model_validate(team.model_dump()) for team in teams)
+        # The user's entry, its keys', the entries of the teams whose roster names it and its memberships are revoked
+        # before the first write
+        await _revoke_scim_user(
+            prisma_client,
+            user_id,
+            (
+                *chain.from_iterable(
+                    team_cache_keys(team_row.team_id, team_row.team_alias)
+                    for team_row in team_rows
+                    if user_id in team_row.members
+                    or any(member.user_id == user_id for member in team_row.members_with_roles)
+                ),
+                *(team_membership_auth_cache_key(team_id=team_row.team_id, user_id=user_id) for team_row in team_rows),
+            ),
+        )
 
         # Remove user from all teams
-        for team in teams:
+        for team, team_row in zip(teams, team_rows, strict=True):
             current_members: Sequence[str] = team.members or []
             if user_id in current_members:
                 new_members = [m for m in current_members if m != user_id]
@@ -1872,7 +1912,6 @@ async def delete_user(
                     where={"team_id": team.team_id}, data={"members": new_members}
                 )
 
-            team_row = LiteLLM_TeamTable.model_validate(team.model_dump())
             if any(member.user_id == user_id for member in team_row.members_with_roles or []):
                 await team_member_delete(
                     data=TeamMemberDeleteRequest(team_id=team_row.team_id, user_id=user_id),
@@ -2370,6 +2409,11 @@ async def patch_user(
 
         patched_metadata: Final = update_data.get("metadata")
         new_active: Final = _scim_active_value(patched_metadata if isinstance(patched_metadata, Mapping) else None)
+
+        # A deactivation blocks the user's keys and auth refuses an inactive user from its entry, so both are revoked
+        # before the first write
+        if new_active is False and prev_active is not False:
+            await _revoke_scim_user(prisma_client, user_id)
 
         # Handle team membership changes
         await _handle_team_membership_changes(

@@ -36,9 +36,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     end_user_cache_key,
     end_user_restricted_registry_cache_key,
     end_user_validation_cache_key,
-    rearm_last_good,
     revoke_last_good,
-    serves_last_good_entries,
 )
 from litellm.proxy.management_endpoints.common_daily_activity import get_daily_activity
 from litellm.proxy.management_endpoints.common_utils import validate_budget_duration
@@ -64,10 +62,6 @@ from litellm.types.proxy.management_endpoints.customer_endpoints import (
 _RowT_co: Final = TypeVar("_RowT_co", covariant=True)
 _STR_OBJECT_DICT: Final = TypeAdapter(dict[str, object])
 _CLEARABLE_LIST_FIELDS: Final = frozenset({"models"})
-#: Customer fields nothing on the request path reads from a customer's last good entry: the alias is read only from the
-#: database, by the customer daily activity report. An update that writes any other field revokes the customer's entry
-#: before its first write.
-END_USER_UNENFORCED_FIELDS: Final = frozenset({"alias"})
 
 
 def _should_update_field(field: str, value: object, sent_fields: AbstractSet[str]) -> bool:
@@ -192,9 +186,8 @@ async def block_user(data: BlockUsers):
     """
     from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
 
-    revoked: Final = _end_user_cache_keys(data.user_ids)
     if prisma_client is not None:
-        await revoke_last_good(user_api_key_cache, revoked)
+        await revoke_last_good(user_api_key_cache, _end_user_cache_keys(data.user_ids))
     try:
         records: Final = []
         if prisma_client is not None:
@@ -207,8 +200,6 @@ async def block_user(data: BlockUsers):
                     },
                 )
                 records.append(record)
-            # Tombstoned again from the commit, so a read in flight across it cannot keep the unblocked customer
-            await rearm_last_good(user_api_key_cache, revoked)
             await _evict_end_user_cache_keys(_end_user_cache_keys(data.user_ids))
         else:
             raise HTTPException(
@@ -469,18 +460,10 @@ async def new_end_user(
         # object_permission_id. When the restricted registry would hold it, the registry and the id's entry are revoked
         # before any write, as for a block, so neither Redis failing at the eviction nor a registry read in flight
         # keeps a copy that leaves this customer out
-        revoked: Final = (
-            _end_user_cache_keys((data.user_id,))
-            if end_user_row_is_restricted(
-                {
-                    **_user_data,
-                    "budget_id": _new_budget or data.budget_id,
-                    "object_permission_id": data.object_permission,
-                }
-            )
-            else ()
-        )
-        await revoke_last_good(user_api_key_cache, revoked)
+        if end_user_row_is_restricted(
+            {**_user_data, "budget_id": _new_budget or data.budget_id, "object_permission_id": data.object_permission}
+        ):
+            await revoke_last_good(user_api_key_cache, _end_user_cache_keys((data.user_id,)))
 
         ## CREATE BUDGET ## if set
         if _new_budget is not None:
@@ -525,8 +508,6 @@ async def new_end_user(
             data=new_end_user_obj,
             include={"litellm_budget_table": True, "object_permission": True},
         )
-        # Tombstoned again from the commit, so a registry read in flight across the create cannot leave it out
-        await rearm_last_good(user_api_key_cache, revoked)
 
         await _evict_end_user_cache_keys(_end_user_cache_keys((data.user_id,)))
 
@@ -700,11 +681,6 @@ async def update_end_user(
     ```
     """
 
-    from litellm.proxy.management_endpoints.budget_management_endpoints import (
-        BudgetHolders,
-        evict_budget_holders,
-        read_budget_holders,
-    )
     from litellm.proxy.proxy_server import litellm_proxy_admin_name, prisma_client, user_api_key_cache
 
     try:
@@ -758,30 +734,8 @@ async def update_end_user(
             *(("object_permission_id",) if "object_permission" in non_default_values else ()),
             *(("budget_id",) if budget_table_data and end_user_budget_table is None else ()),
         }
-        # A budget field on a customer that has a budget row changes that row in place, and every holder of the row
-        # carries it, other customers on it among them: a lowered limit must not stay in one of their entries. Holders
-        # are read and evicted only while last good entries are served: with the setting off nothing is revoked, and
-        # the update reads and evicts what it did before last good entries existed
-        updated_budget_id: Final = (
-            end_user_budget_table.budget_id
-            if budget_table_data and end_user_budget_table is not None and serves_last_good_entries(user_api_key_cache)
-            else None
-        )
-        budget_holders: Final = (
-            await read_budget_holders(updated_budget_id) if updated_budget_id is not None else BudgetHolders()
-        )
-        # Fail closed: a field outside END_USER_UNENFORCED_FIELDS may be enforced from the customer's entry, so it
-        # revokes that entry; a restriction column also moves the customer in or out of the registry
-        customer_entry_changes: Final = not non_default_values.keys() <= {"user_id", *END_USER_UNENFORCED_FIELDS}
-        customer_keys: Final = (
-            _end_user_cache_keys((data.user_id,))
-            if not END_USER_RESTRICTION_COLUMNS.isdisjoint(written_columns)
-            else (end_user_cache_key(data.user_id),)
-            if customer_entry_changes
-            else ()
-        )
-        revoked: Final = tuple(dict.fromkeys((*customer_keys, *budget_holders.last_good_keys)))
-        await revoke_last_good(user_api_key_cache, revoked)
+        if not END_USER_RESTRICTION_COLUMNS.isdisjoint(written_columns):
+            await revoke_last_good(user_api_key_cache, _end_user_cache_keys((data.user_id,)))
 
         ## Handle object permission updates (MCP servers, vector stores, etc.)
         await _handle_customer_object_permission_update(
@@ -811,8 +765,6 @@ async def update_end_user(
                     where={"budget_id": end_user_budget_table.budget_id},
                     data=budget_table_data,
                 )
-                if updated_budget_id is not None:
-                    await evict_budget_holders(updated_budget_id, budget_holders)
 
         ## Update user table, with update params + new budget id (if set) ##
         verbose_proxy_logger.debug("/customer/update: Received data = %s", data)
@@ -834,8 +786,6 @@ async def update_end_user(
                 data=update_end_user_table_data,
                 include={"litellm_budget_table": True, "object_permission": True},
             )
-            # Tombstoned again from the commit, so a read in flight across the update cannot keep the old entry
-            await rearm_last_good(user_api_key_cache, revoked)
             if response is None:
                 raise ValueError(f"Failed updating customer data. User ID does not exist passed user_id={data.user_id}")
             verbose_proxy_logger.debug("received response from updating prisma client. response=%s", response)
@@ -910,16 +860,13 @@ async def delete_end_user(
                     param="user_ids",
                 )
 
-            # A deleted customer falls back to the default end-user budget, which can be lower than its own, so its
-            # entry is revoked before the delete, as for a block
-            revoked: Final = _end_user_cache_keys(data.user_ids)
-            await revoke_last_good(user_api_key_cache, revoked)
+            # A deleted customer falls back to the default end-user budget and leaves the restricted registry, so its
+            # entries are revoked before the delete, as for a block
+            await revoke_last_good(user_api_key_cache, _end_user_cache_keys(data.user_ids))
             # All users exist, proceed with deletion
             response: Final = await _typed_table(EndUserRepository(prisma_client)).delete_many(
                 where={"user_id": {"in": data.user_ids}}
             )
-            # Tombstoned again from the commit, so a read in flight across it cannot bring the deleted customer back
-            await rearm_last_good(user_api_key_cache, revoked)
             verbose_proxy_logger.debug("received response from updating prisma client. response=%s", response)
 
             await _evict_end_user_cache_keys(_end_user_cache_keys(data.user_ids))

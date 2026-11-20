@@ -36,7 +36,6 @@ from litellm.proxy.auth.auth_checks import (
 from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_broadcast
 from litellm.proxy.common_utils.user_api_key_cache import (
     UserApiKeyCache,
-    rearm_last_good,
     revoke_last_good,
     team_membership_auth_cache_key,
 )
@@ -104,8 +103,6 @@ class _TeamRemoval:
     matched: frozenset[int]
     deleted_keys: tuple["prisma_models.LiteLLM_VerificationToken", ...]
     jwt_mapping_cache_keys: tuple[str, ...]
-    # Revoked before the rewrite; the caller re-arms them once the transaction commits
-    revoked: tuple[str, ...]
 
     @property
     def deleted_key_tokens(self) -> tuple[str, ...]:
@@ -282,15 +279,18 @@ async def _remove_members_from_team(
         hashed_tokens=tuple(k.token for k in keys),
         prisma_client=prisma_client,
     )
-    # The roster rides on the team's entry, the team on each user's entry and the member limits on each membership's
-    revoked: Final = (
-        *(team_cache_keys(team_id, team_alias) if removed_members else ()),
-        *(row.user_id for row in stale_rows),
-        *(team_membership_auth_cache_key(team_id=team_id, user_id=user_id) for user_id in sorted(cleanup_ids)),
-        *(k.token for k in keys),
-    )
+    # The roster rides on the team's entry, the team on each user's entry and the member limits on each membership's,
+    # so all of them are revoked before the first write, as the deleted keys are
     try:
-        await revoke_last_good(user_api_key_cache, revoked)
+        await revoke_last_good(
+            user_api_key_cache,
+            (
+                *(team_cache_keys(team_id, team_alias) if removed_members else ()),
+                *(row.user_id for row in stale_rows),
+                *(team_membership_auth_cache_key(team_id=team_id, user_id=user_id) for user_id in sorted(cleanup_ids)),
+                *(k.token for k in keys),
+            ),
+        )
     except HTTPException as refused:
         raise _revocation_refused(refused) from refused
 
@@ -322,7 +322,6 @@ async def _remove_members_from_team(
         matched=matched,
         deleted_keys=tuple(keys),
         jwt_mapping_cache_keys=jwt_mapping_cache_keys,
-        revoked=revoked,
     )
 
 
@@ -373,8 +372,6 @@ async def bulk_remove_team_members(
         removal: Final = await _remove_members_from_team(
             prisma_client, tx, team_id, team.team_alias, members, user_api_key_dict, user_api_key_cache
         )
-    # Tombstoned again from the commit, so a read in flight across it cannot keep the old roster or member limits
-    await rearm_last_good(user_api_key_cache, removal.revoked)
     if removal.deleted_keys:
         KeyManagementEventHooks.create_key_deleted_audit_logs(
             keys_being_deleted=removal.deleted_keys,
@@ -441,7 +438,8 @@ async def _delete_user_rows(
         hashed_tokens=tuple(k.token for k in keys),
         prisma_client=prisma_client,
     )
-    await revoke_last_good(user_api_key_cache, tuple(k.token for k in keys))
+    # A deleted user's entry goes with its keys' entries, before the first write
+    await revoke_last_good(user_api_key_cache, (*sorted(user_ids), *(k.token for k in keys)))
     if keys:
         await persist_deleted_verification_tokens(
             keys=keys,  # pyright: ignore[reportArgumentType]  # generated row model carries the same columns as LiteLLM_VerificationToken
@@ -534,8 +532,6 @@ async def _delete_users(
     except Exception as e:  # noqa: BLE001  # the rolled-back batch is reported per row, not as a request failure
         verbose_proxy_logger.error("users/bulk_delete: failed to delete users %s: %s", sorted(user_ids), e)
         return _error_message(e)
-    # Tombstoned again from the commit, so a read in flight across it cannot keep the old rosters or member limits
-    await rearm_last_good(user_api_key_cache, tuple(key for r in deletion.removals.values() for key in r.revoked))
     if deletion.deleted_keys:
         KeyManagementEventHooks.create_key_deleted_audit_logs(
             keys_being_deleted=deletion.deleted_keys,

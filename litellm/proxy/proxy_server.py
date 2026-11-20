@@ -310,6 +310,7 @@ from litellm.constants import (
     DEFAULT_MAX_LRU_CACHE_SIZE,
     DEFAULT_MODEL_CREATED_AT_TIME,
     GLOBAL_PROXY_SPEND_CACHE_KEY,
+    LAST_GOOD_ENTRY_TTL_SECONDS,
     LITELLM_PROXY_ADMIN_NAME,
     LITELLM_PROXY_BUDGET_NAME,
     MONTHLY_SPEND_REPORT_JOB_ID,
@@ -6975,27 +6976,25 @@ class ProxyConfig:
                     {"serve_last_good_auth_entries": typed_general_settings.get("serve_last_good_auth_entries", False)}
                 )
             ).serve_last_good_auth_entries
-            from litellm.constants import (
-                LAST_GOOD_STORE_MARGIN_SECONDS,
-                LAST_GOOD_TOMBSTONE_TTL_SECONDS,
-                PROXY_DB_LOOKUP_DEADLINE_SECONDS,
-            )
-
-            # A tombstone that lapses before a store in flight across the write is refused lets the old entry back.
-            if (
-                user_api_key_cache.serve_last_good_entries
-                and LAST_GOOD_TOMBSTONE_TTL_SECONDS <= PROXY_DB_LOOKUP_DEADLINE_SECONDS + LAST_GOOD_STORE_MARGIN_SECONDS
-            ):
+            # An entry that expires as it is written keeps nothing; one shorter than the auth cache lapses between reads
+            if user_api_key_cache.serve_last_good_entries and LAST_GOOD_ENTRY_TTL_SECONDS <= 0:
                 verbose_proxy_logger.error(
-                    "general_settings.serve_last_good_auth_entries is turned off: LAST_GOOD_TOMBSTONE_TTL_SECONDS=%s "
-                    "must exceed PROXY_DB_LOOKUP_DEADLINE_SECONDS=%s plus LAST_GOOD_STORE_MARGIN_SECONDS=%s, the "
-                    "longest a store of a last good entry may take, or a read in flight across an update, a delete or "
-                    "a block could keep the old entry after its tombstone lapsed",
-                    LAST_GOOD_TOMBSTONE_TTL_SECONDS,
-                    PROXY_DB_LOOKUP_DEADLINE_SECONDS,
-                    LAST_GOOD_STORE_MARGIN_SECONDS,
+                    "general_settings.serve_last_good_auth_entries is turned off: LAST_GOOD_ENTRY_TTL_SECONDS=%s, the "
+                    "seconds a last good auth entry may be served after the database read that produced it, must be "
+                    "above 0",
+                    LAST_GOOD_ENTRY_TTL_SECONDS,
                 )
                 user_api_key_cache.serve_last_good_entries = False
+            cached_object_ttl: Final = get_management_object_ttl(user_api_key_cache)
+            if user_api_key_cache.serve_last_good_entries and LAST_GOOD_ENTRY_TTL_SECONDS < cached_object_ttl:
+                verbose_proxy_logger.warning(
+                    "general_settings.serve_last_good_auth_entries: LAST_GOOD_ENTRY_TTL_SECONDS=%s is below "
+                    "user_api_key_cache_ttl=%s, so callers in steady use lose their last good entry between database "
+                    "reads and a database outage then refuses them; set it above user_api_key_cache_ttl plus the "
+                    "longest outage to ride out",
+                    LAST_GOOD_ENTRY_TTL_SECONDS,
+                    cached_object_ttl,
+                )
             verbose_proxy_logger.info(
                 "general_settings.serve_last_good_auth_entries=%s: the last good team and key entries are %s",
                 user_api_key_cache.serve_last_good_entries,

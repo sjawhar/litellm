@@ -2031,7 +2031,7 @@ class TestLastGoodEntryWhileTheDatabaseIsUnreachable:
     @pytest.mark.asyncio
     async def test_rotated_out_key_read_in_its_grace_period_is_not_kept_under_the_old_hash(self):
         """During a regenerate grace period the old hash reads back the new key's row. Keeping that under the old
-        hash, with no expiry, would let a later outage admit the old key after its grace period ended."""
+        hash, until it expires, would let a later outage admit the old key after its grace period ended."""
         database = _Database()
         database.keys["old-hash"] = UserAPIKeyAuth(token="new-hash", models=["claude-opus-5-5"])
         cache = _serving_cache()
@@ -2089,9 +2089,7 @@ class TestLastGoodEntryWhileTheDatabaseIsUnreachable:
 
         cache = _serving_cache()
         key = team_membership_auth_cache_key(team_id="t1", user_id="u1")
-        await remember_last_good(
-            cache, key, LiteLLM_TeamMembership(user_id="u1", team_id="t1"), read_started=time.monotonic()
-        )
+        await remember_last_good(cache, key, LiteLLM_TeamMembership(user_id="u1", team_id="t1"))
 
         await invalidate_team_member_spend_state(user_id="u1", team_id="t1", user_api_key_cache=cache)
 
@@ -2122,9 +2120,7 @@ class TestLastGoodEntryWhileTheDatabaseIsUnreachable:
         )
         cache = _serving_cache()
         for row in rows:
-            await remember_last_good(
-                cache, row.token, UserAPIKeyAuth(token=row.token, team_member_spend=1.0), read_started=time.monotonic()
-            )
+            await remember_last_good(cache, row.token, UserAPIKeyAuth(token=row.token, team_member_spend=1.0))
 
         await invalidate_team_member_spend_state(user_id="u1", team_id="t1", user_api_key_cache=cache)
 
@@ -2133,14 +2129,8 @@ class TestLastGoodEntryWhileTheDatabaseIsUnreachable:
             "hashed-member-other-team": True,
             "hashed-teammate": True,
         }
-        member_token: Final = "hashed-member"
-        await remember_last_good(
-            cache,
-            member_token,
-            UserAPIKeyAuth(token=member_token, team_member_spend=2.0),
-            read_started=time.monotonic(),
-        )
-        assert await recall_last_good(cache, member_token, UserAPIKeyAuth) is not None
+        await remember_last_good(cache, "hashed-member", UserAPIKeyAuth(token="hashed-member", team_member_spend=2.0))
+        assert await recall_last_good(cache, "hashed-member", UserAPIKeyAuth) is not None
 
     @pytest.mark.asyncio
     async def test_budget_reset_drops_the_reset_entries_last_good_copies(self, monkeypatch):
@@ -2148,10 +2138,7 @@ class TestLastGoodEntryWhileTheDatabaseIsUnreachable:
         from litellm.proxy.common_utils.user_api_key_cache import recall_last_good
 
         cache = _serving_cache()
-        reset_token: Final = "hashed-reset"
-        await remember_last_good(
-            cache, reset_token, UserAPIKeyAuth(token=reset_token, spend=99.0), read_started=time.monotonic()
-        )
+        await remember_last_good(cache, "hashed-reset", UserAPIKeyAuth(token="hashed-reset", spend=99.0))
         monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
 
         await ResetBudgetJob._invalidate_cache("user_api_key_cache", ("hashed-reset",))
@@ -2264,82 +2251,6 @@ class TestLastGoodEntryWhileTheDatabaseIsUnreachable:
 
         with pytest.raises(HTTPException):
             await self._team(database, cache, "t1")
-
-    @pytest.mark.asyncio
-    async def test_a_read_held_across_an_update_keeps_nothing_and_a_read_after_the_tombstone_keeps_the_new_key(self):
-        """A read that began before an update and finishes within its lookup deadline meets the update's tombstone and
-        keeps no entry; a read that begins once the tombstone time has passed since the update keeps the new row. The
-        cache's clock is driven, so the tombstone and the bound on a store move without sleeping."""
-        from litellm.constants import LAST_GOOD_TOMBSTONE_TTL_SECONDS, PROXY_DB_LOOKUP_DEADLINE_SECONDS
-        from litellm.proxy.auth.auth_checks import delete_cache_key_object
-        from litellm.proxy.common_utils.user_api_key_cache import rearm_last_good, revoke_last_good
-
-        hashed_token: Final = "k-narrowed"
-        now: Final = [1000.0]
-        database: Final = _HeldDatabase()
-        database.keys[hashed_token] = UserAPIKeyAuth(token=hashed_token, models=["claude-opus-5-5"])
-        cache: Final = _serving_cache(last_good_clock=lambda: now[0])
-        in_flight: Final = asyncio.create_task(self._key(database, cache, hashed_token))
-        await database.read_started.wait()
-
-        await revoke_last_good(cache, (hashed_token,))
-        database.keys[hashed_token] = UserAPIKeyAuth(token=hashed_token, models=["gpt-narrow"])
-        await rearm_last_good(cache, (hashed_token,))
-        await delete_cache_key_object(hashed_token=hashed_token, user_api_key_cache=cache, proxy_logging_obj=None)
-        now[0] += PROXY_DB_LOOKUP_DEADLINE_SECONDS  # the held read finishes within its lookup deadline
-        database.release.set()
-        assert (await in_flight).models == ["claude-opus-5-5"]
-        await self._expire(cache, hashed_token)
-        database.stopped_with = _STOPPED
-
-        with pytest.raises(httpx.ConnectError):
-            await self._key(database, cache, hashed_token)
-
-        now[0] += LAST_GOOD_TOMBSTONE_TTL_SECONDS  # the tombstone time has passed since the update's re-arm
-        database.stopped_with = None
-        assert (await self._key(database, cache, hashed_token)).models == ["gpt-narrow"]
-        await self._expire(cache, hashed_token)
-        database.stopped_with = _STOPPED
-
-        assert (await self._key(database, cache, hashed_token)).models == ["gpt-narrow"]
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("key_read_late", [False, True], ids=["within_the_bound", "past_the_bound"])
-    async def test_a_key_store_is_timed_from_its_key_read_not_its_object_permission_read(self, key_read_late: bool):
-        """The key's entry holds its row and the object permission read after it, so the bound on its store runs from
-        the key read: a key read that took longer than the bound keeps no entry, though the object permission read was
-        quick. The cache's clock is driven, so no read sleeps."""
-        from litellm.constants import LAST_GOOD_STORE_MARGIN_SECONDS, PROXY_DB_LOOKUP_DEADLINE_SECONDS
-        from litellm.proxy._types import LiteLLM_ObjectPermissionTable
-        from litellm.proxy.auth.auth_checks import get_key_object
-        from litellm.proxy.common_utils.user_api_key_cache import recall_last_good
-
-        hashed_token: Final = "k-permitted"
-        permission: Final = LiteLLM_ObjectPermissionTable(object_permission_id="perm-mcp", mcp_servers=["mcp-lane"])
-        bound: Final = PROXY_DB_LOOKUP_DEADLINE_SECONDS + LAST_GOOD_STORE_MARGIN_SECONDS
-        now: Final = [1000.0]
-
-        async def key_read(**_: object) -> UserAPIKeyAuth:
-            now[0] += (bound + 1.0) if key_read_late else 1.0
-            return UserAPIKeyAuth(token=hashed_token, object_permission_id=permission.object_permission_id)
-
-        async def permission_read(where: dict[str, str]) -> LiteLLM_ObjectPermissionTable | None:
-            return permission if where["object_permission_id"] == permission.object_permission_id else None
-
-        permissions: Final = SimpleNamespace(find_unique=permission_read)
-        database: Final = SimpleNamespace(
-            get_data=key_read, db=SimpleNamespace(litellm_objectpermissiontable=permissions)
-        )
-        cache: Final = _serving_cache(last_good_clock=lambda: now[0])
-
-        key: Final = await get_key_object(
-            hashed_token=hashed_token,
-            prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
-            user_api_key_cache=cache,
-        )
-
-        assert key.object_permission == permission
-        assert (await recall_last_good(cache, hashed_token, UserAPIKeyAuth) is not None) is not key_read_late
 
 
 class _LimitRows:
@@ -2772,9 +2683,7 @@ class TestLastGoodLimitsWhileTheDatabaseIsUnreachable:
 
         redis = fake_redis_cache()
         cache = _serving_cache(redis_cache=redis.cache)
-        await remember_last_good(
-            cache, cache_key, LiteLLM_UserTable(user_id="u-mutated"), read_started=time.monotonic()
-        )
+        await remember_last_good(cache, cache_key, LiteLLM_UserTable(user_id="u-mutated"))
 
         await evict_and_broadcast(cache_keys=(cache_key,), user_api_key_cache=cache)
 
@@ -3008,7 +2917,6 @@ class TestLastGoodLimitsWhileTheDatabaseIsUnreachable:
             cache,
             team_membership_auth_cache_key(team_id="t-wait", user_id="u-wait"),
             LiteLLM_TeamMembership(user_id="u-wait", team_id="t-wait"),
-            read_started=time.monotonic(),
         )
 
         async def request() -> tuple[str | None, tuple[str, ...]]:
@@ -3172,46 +3080,6 @@ class TestLastGoodLimitsWhileTheDatabaseIsUnreachable:
         assert (composed, await request()) == ((1, ("LiteLLM_BudgetTable",)), (None, ()))
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("row_read_late", [False, True], ids=["within_the_bound", "past_the_bound"])
-    async def test_a_customer_store_is_timed_from_its_row_read_not_its_default_budget_read(
-        self, monkeypatch, row_read_late: bool
-    ):
-        """The customer's entry holds its row and the default budget read after it, so the bound on its store runs from
-        the row read: a row read that took longer than the bound keeps no customer entry, though the default budget
-        read was quick and keeps its own. The cache's clock is driven, so no read sleeps."""
-        from litellm.constants import LAST_GOOD_STORE_MARGIN_SECONDS, PROXY_DB_LOOKUP_DEADLINE_SECONDS
-        from litellm.proxy.common_utils.user_api_key_cache import (
-            default_end_user_budget_cache_key,
-            end_user_cache_key,
-            recall_last_good,
-        )
-
-        monkeypatch.setattr(litellm, "max_end_user_budget_id", "b-default")
-        bound: Final = PROXY_DB_LOOKUP_DEADLINE_SECONDS + LAST_GOOD_STORE_MARGIN_SECONDS
-        now: Final = [1000.0]
-        database: Final = _LimitsDatabase()
-        database.customers.rows["c-default"] = LiteLLM_EndUserTable(user_id="c-default", blocked=False)
-        database.budgets.rows["b-default"] = LiteLLM_BudgetTable(budget_id="b-default", rpm_limit=1)
-
-        async def row_read(where: dict[str, str], include: object = None) -> BaseModel | None:
-            row: Final = await database.customers.find_unique(where=where, include=include)
-            now[0] += (bound + 1.0) if row_read_late else 1.0
-            return row
-
-        database.db.litellm_endusertable = SimpleNamespace(find_unique=row_read)
-        cache: Final = _serving_cache(last_good_clock=lambda: now[0])
-
-        customer: Final = await self._customer(database, cache, "c-default")
-
-        budget: Final = None if customer is None else customer.litellm_budget_table
-        assert budget is not None and budget.rpm_limit == 1
-        kept_customer: Final = await recall_last_good(cache, end_user_cache_key("c-default"), LiteLLM_EndUserTable)
-        kept_budget: Final = await recall_last_good(
-            cache, default_end_user_budget_cache_key("b-default"), LiteLLM_BudgetTable
-        )
-        assert (kept_customer is not None, kept_budget is not None) == (not row_read_late, True)
-
-    @pytest.mark.asyncio
     async def test_validating_a_customer_id_with_no_entry_refuses_only_one_the_registry_copy_holds(self, monkeypatch):
         """With validate_end_user_id_in_db, a customer id is checked against its row. In an outage, an id the restricted
         registry's copy holds may carry limits no entry keeps, so the request is refused; an id the copy leaves out
@@ -3245,6 +3113,8 @@ class TestLastGoodLimitsWhileTheDatabaseIsUnreachable:
         """A budgeted access group serves the model, and only the key's org could grant it. With no entry for the org,
         the group's budget cannot be checked, so the request is refused, unless its budget checks are skipped; then the
         group the key grants itself is still attributed."""
+        from datetime import datetime, timezone
+
         from litellm import Router
         from litellm.proxy.auth.auth_checks import common_checks, get_model_access_group_budgets_batch, get_org_object
         from litellm.proxy.common_utils.user_api_key_cache import model_access_group_registry_cache_key
@@ -3258,8 +3128,16 @@ class TestLastGoodLimitsWhileTheDatabaseIsUnreachable:
             updated_by="admin",
             litellm_budget_table=LiteLLM_BudgetTable(budget_id="b-grants"),
         )
+        created: Final = datetime(2024, 1, 1, tzinfo=timezone.utc)
         database.access_groups.rows["tier-b"] = SimpleNamespace(  # pyright: ignore[reportArgumentType]  # a prisma row
-            access_group_name="tier-b", spend=0.0, litellm_budget_table=SimpleNamespace(max_budget=10.0)
+            access_group_name="tier-b",
+            spend=0.0,
+            budget_id="b-tier-b",
+            litellm_budget_table=LiteLLM_BudgetTable(budget_id="b-tier-b", max_budget=10.0),
+            created_at=created,
+            created_by="admin",
+            updated_at=created,
+            updated_by="admin",
         )
         cache = _serving_cache()
         # The organization budget check reads, and keeps, the entry with its budget; nothing read the plain one yet

@@ -73,7 +73,7 @@ from litellm.proxy.common_utils.encrypt_decrypt_utils import (
     decrypt_value_helper,
     encrypt_value_helper,
 )
-from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, last_good_read_start
+from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.proxy.db.routing_prisma_wrapper import WriterPinnedClient
 from litellm.proxy.management.teams.authz import TEAM_ADMIN_ONLY, is_team_admin
 from litellm.proxy.management.teams.dependencies import get_team_access
@@ -1968,7 +1968,6 @@ async def _remove_unbacked_team_models(
     if existing_team_row is None:
         return
 
-    read_started: Final = last_good_read_start(user_api_key_cache)
     updated_team_row: Final[LiteLLM_TeamTable] = await _db_team_table(prisma_client).update(
         where={"team_id": team_id},
         data={"models": [model for model in existing_team_row.models if model not in names_to_remove]},
@@ -1978,7 +1977,6 @@ async def _remove_unbacked_team_models(
         team_row=updated_team_row,
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
-        read_started=read_started,
     )
 
 

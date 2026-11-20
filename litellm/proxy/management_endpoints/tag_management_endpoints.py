@@ -23,8 +23,6 @@ from litellm._logging import verbose_proxy_logger
 from litellm.proxy._types import UserAPIKeyAuth, user_api_key_has_admin_view
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.user_api_key_cache import (
-    rearm_last_good,
-    revoke_last_good,
     tag_cache_key,
     tag_registry_cache_key,
 )
@@ -423,7 +421,7 @@ async def update_tag(
     - model_max_budget: Optional[dict] - Max budget for a specific model
     - budget_duration: Optional[str] - Frequency of resetting tag budget
     """
-    from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
+    from litellm.proxy.proxy_server import prisma_client
 
     if prisma_client is None:
         raise HTTPException(status_code=500, detail="Database not connected")
@@ -433,10 +431,6 @@ async def update_tag(
         existing_tag: Final = await _table(TagRepository(prisma_client)).find_unique(where={"tag_name": tag.name})
         if existing_tag is None:
             raise HTTPException(status_code=404, detail=f"Tag {tag.name} not found")
-
-        # The tag's entry carries its budget and models, so every update revokes it before the first write
-        revoked: Final = (tag_cache_key(tag.name),)
-        await revoke_last_good(user_api_key_cache, revoked)
 
         from litellm.proxy.proxy_server import litellm_proxy_admin_name
 
@@ -469,8 +463,6 @@ async def update_tag(
             where={"tag_name": tag.name},
             data=update_data,
         )
-        # Tombstoned again from the commit, so a read in flight across it cannot keep the old budget or models
-        await rearm_last_good(user_api_key_cache, revoked)
 
         await _evict_tag_cache_keys((tag_cache_key(tag.name),))
 
@@ -490,7 +482,7 @@ async def update_tag(
             "tag": tag_config,
         }
     except HTTPException:
-        # keep its status: a missing tag stays a 404, and a 503 refusal means nothing was written
+        # keep its status: a missing tag stays a 404 and a refused budget value a 400, not a 500
         raise
     except Exception as e:
         verbose_proxy_logger.exception("Error updating tag: %s", e)
