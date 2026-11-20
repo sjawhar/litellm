@@ -182,6 +182,7 @@ from .auth_utils import get_model_from_request, get_request_route_template, requ
 
 if TYPE_CHECKING:
     from opentelemetry.trace import Span as _Span
+    from prisma import Prisma
 
     Span = _Span
 else:
@@ -4336,15 +4337,25 @@ class _TokenInFilter(TypedDict):
     token: ReadOnly[Mapping[str, Sequence[str]]]
 
 
+def _jwt_key_mapping_tx_table(tx: "Prisma") -> _PrismaAuthTable[_PrismaJWTKeyMappingRow]:
+    return tx.litellm_jwtkeymapping  # pyright: ignore[reportReturnType]  # the protocol widens the generated inputs
+
+
 async def get_jwt_key_mapping_cache_keys_for_tokens(
     hashed_tokens: Sequence[str],
     prisma_client: PrismaClient,
+    tx: "Prisma | None" = None,
 ) -> tuple[str, ...]:
-    """Cache keys of every JWT claim mapped to any of the given virtual keys."""
+    """Cache keys of every JWT claim mapped to any of the given virtual keys. A caller that holds a transaction open
+    passes it as ``tx`` and the read goes through it: on another connection the read could wait for the one the
+    transaction holds, when the pool has no other to give."""
     if not hashed_tokens:
         return ()
     token_filter: Final[_TokenInFilter] = {"token": {"in": tuple(hashed_tokens)}}
-    mappings: Final = await _jwt_key_mapping_table(JWTKeyMappingRepository(prisma_client)).find_many(where=token_filter)
+    table: Final = (
+        _jwt_key_mapping_table(JWTKeyMappingRepository(prisma_client)) if tx is None else _jwt_key_mapping_tx_table(tx)
+    )
+    mappings: Final = await table.find_many(where=token_filter)
     return tuple(jwt_key_mapping_cache_key(m.jwt_claim_name, m.jwt_claim_value, m.jwt_issuer) for m in mappings)
 
 

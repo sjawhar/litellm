@@ -3669,7 +3669,8 @@ def _request_can_end_access(request: Request) -> bool:
     from litellm.proxy.proxy_server import user_api_key_cache
 
     return (
-        user_api_key_cache.serve_last_good_entries
+        # The auth cache can be a plain DualCache, which keeps no last good entries
+        serves_last_good_entries(user_api_key_cache)
         # A request whose method cannot be read counts as a write, so it reads the writer
         and RouteChecks.get_request_method(request=request) not in _READ_ONLY_METHODS
         and get_request_route(request=request).startswith(_ACCESS_ENDING_ROUTE_PREFIXES)

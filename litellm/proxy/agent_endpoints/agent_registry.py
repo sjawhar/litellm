@@ -456,6 +456,7 @@ async def _retire_identity_managed_agent(tx: "Prisma", agent_id: str) -> tuple[s
         partial(tx.litellm_verificationtoken.find_many, where=keys_where),
         lambda keys: tuple(key.token for key in keys),
         lambda keys: tx.litellm_verificationtoken.delete_many(
+            # bounded-ok: revoke_and_delete_read_rows hands each call at most IN_LIST_CHUNK_SIZE rows
             where={"agent_id": agent_id, "token": {"in": [key.token for key in keys]}}
         ),
     )

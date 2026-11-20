@@ -3509,3 +3509,22 @@ class TestLastGoodLimitsWhileTheDatabaseIsUnreachable:
         served = (await asyncio.wait_for(budgets(), timeout=5))["g-budget"]
 
         assert (served.spend, served.max_budget) == (50.0, 10.0)
+
+
+@pytest.mark.asyncio
+async def test_jwt_key_mapping_cache_keys_for_tokens_are_read_through_the_transaction_the_caller_holds():
+    """A caller holding a transaction open passes it, and the mapping read goes through it rather than asking the
+    routed client for a second connection, which a writer pool of one cannot give while the transaction holds it."""
+    from litellm.proxy.auth.auth_checks import get_jwt_key_mapping_cache_keys_for_tokens, jwt_key_mapping_cache_key
+
+    mapping: Final = SimpleNamespace(token="hashed-k1", jwt_issuer="", jwt_claim_name="sub", jwt_claim_value="alice")
+    tx: Final = MagicMock()
+    tx.litellm_jwtkeymapping.find_many = AsyncMock(return_value=[mapping])
+    prisma_client: Final = MagicMock()
+    prisma_client.db.litellm_jwtkeymapping.find_many = AsyncMock(side_effect=AssertionError("a second connection"))
+
+    keys: Final = await get_jwt_key_mapping_cache_keys_for_tokens(("hashed-k1",), prisma_client, tx=tx)
+
+    assert keys == (jwt_key_mapping_cache_key("sub", "alice", ""),)
+    tx.litellm_jwtkeymapping.find_many.assert_awaited_once_with(where={"token": {"in": ("hashed-k1",)}})
+    prisma_client.db.litellm_jwtkeymapping.find_many.assert_not_awaited()

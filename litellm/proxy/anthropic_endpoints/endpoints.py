@@ -124,14 +124,17 @@ def _strip_total_tokens_from_anthropic_response(response: Any) -> None:
 
 
 def _call_headers(
-    user_api_key_dict: UserAPIKeyAuth, litellm_call_id: str | None, request_data: dict, version: str | None
-) -> dict:
+    user_api_key_dict: UserAPIKeyAuth,
+    litellm_call_id: str | None,
+    request_data: Mapping[str, object],
+    version: str | None,
+) -> Mapping[str, str]:
     return ProxyBaseLLMRequestProcessing.get_custom_headers(
         user_api_key_dict=user_api_key_dict,
         call_id=litellm_call_id,
         version=version,
         model_region=getattr(user_api_key_dict, "allowed_model_region", ""),
-        request_data=request_data,
+        request_data=dict(request_data),
     )
 
 

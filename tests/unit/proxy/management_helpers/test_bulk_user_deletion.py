@@ -1,13 +1,14 @@
 import asyncio
 import copy
 import json
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Final
 
 import pytest
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from litellm.constants import LAST_GOOD_TOMBSTONE_TTL_SECONDS
 from litellm.proxy._types import LiteLLM_TeamTable, LitellmTableNames, LitellmUserRoles, Member, UserAPIKeyAuth
 from litellm.proxy.auth.auth_checks import jwt_key_mapping_cache_key
 from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, team_membership_auth_cache_key
@@ -156,6 +157,7 @@ class _Tx:
         self.litellm_deletedverificationtoken = db.litellm_deletedverificationtoken
         self.litellm_invitationlink = db.litellm_invitationlink
         self.litellm_organizationmembership = db.litellm_organizationmembership
+        self.litellm_jwtkeymapping = db.litellm_jwtkeymapping
         self._on_lock = on_lock
         self._fail_locks = fail_locks
         self.locks: list[str] = []
@@ -248,7 +250,7 @@ def _cache_with_jwt_mapping_keys(*cache_keys: str) -> UserApiKeyCache:
 
 
 async def _delete(
-    prisma: "_FakePrisma | _ReplicatedPrisma",
+    prisma: "_FakePrisma | _ReplicatedPrisma | _OneConnectionPrisma",
     user_ids: Sequence[str],
     caller: UserAPIKeyAuth = ADMIN,
     cache: UserApiKeyCache | None = None,
@@ -265,7 +267,7 @@ async def _delete(
 
 
 async def _remove(
-    prisma: _FakePrisma,
+    prisma: "_FakePrisma | _OneConnectionPrisma",
     team_id: str,
     members: Sequence[Mapping[str, str]],
     caller: UserAPIKeyAuth = ADMIN,
@@ -1015,3 +1017,224 @@ async def test_bulk_user_delete_revokes_the_memberships_a_lagging_replica_lacks_
     assert [(r.success, r.teams_removed) for r in results] == [(True, ())]
     assert _roster(writer, "t1") == ["u1", "keep"]
     assert (memberships.deletes, keys.deletes) == ([((in_t1, in_t2), ())], [(("k1",), ())])
+
+
+class _OneConnectionPrisma:
+    """A client whose writer pool holds one connection: while its transaction holds it, a read through ``db`` would
+    wait for it forever, so here that read fails at once."""
+
+    def __init__(self, prisma: _FakePrisma) -> None:
+        self._prisma = prisma
+        self._in_tx = False
+
+    @property
+    def db(self) -> _Db:
+        assert not self._in_tx, "a read through the client waits for the one connection its open transaction holds"
+        return self._prisma.db
+
+    @asynccontextmanager
+    async def tx(self, *, timeout: object = None) -> AsyncIterator[_Tx]:
+        async with self._prisma.tx(timeout=timeout) as tx:
+            self._in_tx = True
+            try:
+                yield tx
+            finally:
+                self._in_tx = False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("serves_last_good", [True, False], ids=["serving", "not_serving"])
+@pytest.mark.parametrize("path", ["bulk_user_delete", "bulk_member_delete"])
+async def test_bulk_deletes_read_the_deleted_keys_jwt_mappings_through_their_transaction(
+    path: str, serves_last_good: bool
+) -> None:
+    """The JWT mappings of the keys a batch deletes go with those keys, so their cache keys are read inside the batch's
+    transaction, and through it: with one connection in the pool, a read through the client would wait for the one
+    the open transaction holds."""
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    doomed: Final = jwt_key_mapping_cache_key("sub", "alice")
+    kept: Final = jwt_key_mapping_cache_key("sub", "bob")
+    prisma: Final = _FakePrisma(
+        users=[_user("u1", "t1"), _user("keep", "t1")],
+        teams=[_team("t1", "u1", "keep")],
+        tokens=[
+            {"token": "team-key", "user_id": "u1", "team_id": "t1"},
+            {"token": "keep-key", "user_id": "keep", "team_id": "t1"},
+        ],
+        jwt_mappings=[_jwt_mapping("team-key", "alice"), _jwt_mapping("keep-key", "bob")],
+    )
+    cache: Final = UserApiKeyCache(
+        redis_cache=fake_redis_cache().cache if serves_last_good else None, serve_last_good_entries=serves_last_good
+    )
+    for cache_key in (doomed, kept):
+        cache.set_cache(key=cache_key, value={"cache_key": cache_key})
+    one_connection: Final = _OneConnectionPrisma(prisma)
+
+    results: Final = (
+        await _delete(one_connection, ["u1"], cache=cache)
+        if path == "bulk_user_delete"
+        else await _remove(one_connection, "t1", [{"user_id": "u1"}], cache=cache)
+    )
+
+    assert [r.success for r in results] == [True]
+    assert [row["token"] for row in prisma.db.litellm_verificationtoken.rows] == ["keep-key"]
+    assert cache.get_cache(key=doomed) is None and cache.get_cache(key=kept) is not None
+
+
+class _DrivenClock:
+    """The last good entries' clock, which a test moves instead of waiting. ``wall`` moves with it, for
+    ``last_good_wall_clock`` and for fake Redis (``drive_fake_redis_time``), so a tombstone lapses once the test moves
+    the clock past its time."""
+
+    def __init__(self) -> None:
+        self.now: float = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def wall(self) -> float:
+        return self.now + 1_700_000_000.0
+
+
+class _SlowRosterWrites(_TeamTable):
+    """A team table whose every roster write takes ``seconds`` on ``clock``."""
+
+    def __init__(self, teams: Sequence[LiteLLM_TeamTable], clock: _DrivenClock, seconds: float) -> None:
+        super().__init__(teams)
+        self._clock = clock
+        self._seconds = seconds
+
+    async def update(self, where: Mapping[str, str], data: Mapping[str, str]) -> LiteLLM_TeamTable:
+        self._clock.now += self._seconds
+        return await super().update(where, data)
+
+
+class _TombstonesSeenAt(_Rows):
+    """Rows whose ``at`` method, ``find_many``, ``create_many`` or ``delete_many``, records on each call, under
+    ``call``, which of ``cache_keys`` had a tombstone in Redis as it ran. ``tombstoned`` is a plain function, which a
+    transaction's snapshot copies by reference."""
+
+    def __init__(
+        self,
+        rows: Sequence[Mapping[str, object]],
+        *,
+        at: str,
+        call: str,
+        cache_keys: Sequence[str],
+        tombstoned: Callable[[Sequence[str]], Awaitable[tuple[str, ...]]],
+        seen: list[tuple[str, tuple[str, ...]]],
+    ) -> None:
+        super().__init__(rows)
+        self._at = at
+        self._call = call
+        self._cache_keys = tuple(cache_keys)
+        self._tombstoned = tombstoned
+        self._seen = seen
+
+    async def _record(self, method: str) -> None:
+        if method == self._at:
+            self._seen.append((self._call, await self._tombstoned(self._cache_keys)))
+
+    async def find_many(self, where: Mapping[str, object]) -> list[_Record]:
+        await self._record("find_many")
+        return await super().find_many(where)
+
+    async def create_many(self, data: Sequence[Mapping[str, object]]) -> int:
+        await self._record("create_many")
+        return await super().create_many(data)
+
+    async def delete_many(self, where: Mapping[str, object]) -> int:
+        await self._record("delete_many")
+        return await super().delete_many(where)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["bulk_user_delete", "bulk_member_delete"])
+async def test_bulk_deletes_read_a_key_rounds_mappings_and_archive_its_keys_before_the_rounds_revocation(
+    monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """The batch's roster write takes past the tombstone time, so the key round revokes u1's key again in Redis. The
+    round reads the key's JWT mappings and archives the key before that revocation, which the key's delete then
+    follows with nothing awaited between: the key's tombstone has lapsed at the read and at the archive, and stands
+    again at the delete."""
+    from tests.unit.caching.fake_redis_cache import drive_fake_redis_time, fake_redis_cache
+
+    clock: Final = _DrivenClock()
+    drive_fake_redis_time(monkeypatch, clock.wall)
+    redis: Final = fake_redis_cache()
+    tombstoned: Final = _tombstones_standing_in(redis)
+    seen: Final[list[tuple[str, tuple[str, ...]]]] = []  # mutable-ok: the key's tombstone at each call, in order
+    prisma: Final = _FakePrisma(users=[_user("u1", "t1"), _user("keep", "t1")])
+    prisma.db.litellm_teamtable = _SlowRosterWrites(
+        [_team("t1", "u1", "keep")], clock, LAST_GOOD_TOMBSTONE_TTL_SECONDS + 1
+    )
+    prisma.db.litellm_jwtkeymapping = _TombstonesSeenAt(
+        [_jwt_mapping("k1", "alice")],
+        at="find_many",
+        call="JWT mapping read",
+        cache_keys=("k1",),
+        tombstoned=tombstoned,
+        seen=seen,
+    )
+    prisma.db.litellm_deletedverificationtoken = _TombstonesSeenAt(
+        [], at="create_many", call="archive", cache_keys=("k1",), tombstoned=tombstoned, seen=seen
+    )
+    prisma.db.litellm_verificationtoken = _TombstonesSeenAt(
+        [{"token": "k1", "user_id": "u1", "team_id": "t1"}],
+        at="delete_many",
+        call="key delete",
+        cache_keys=("k1",),
+        tombstoned=tombstoned,
+        seen=seen,
+    )
+    cache: Final = UserApiKeyCache(
+        redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=clock, last_good_wall_clock=clock.wall
+    )
+
+    results: Final = (
+        await _delete(prisma, ["u1"], cache=cache)
+        if path == "bulk_user_delete"
+        else await _remove(prisma, "t1", [{"user_id": "u1"}], cache=cache)
+    )
+
+    assert [r.success for r in results] == [True]
+    assert seen == [("JWT mapping read", ()), ("archive", ()), ("key delete", ("k1",))]
+
+
+class _RosterSeenByReads(_Rows):
+    """Rows whose every read records ``roster()`` as it stood then. ``roster`` is a plain function, which a
+    transaction's snapshot copies by reference."""
+
+    def __init__(self, rows: Sequence[Mapping[str, object]], roster: Callable[[], list[str | None]]) -> None:
+        super().__init__(rows)
+        self._roster = roster
+        self.rosters_seen: list[list[str | None]] = []
+
+    async def find_many(self, where: Mapping[str, object]) -> list[_Record]:
+        self.rosters_seen.append(self._roster())
+        return await super().find_many(where)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["bulk_user_delete", "bulk_member_delete"])
+async def test_bulk_deletes_without_last_good_entries_read_the_keys_mappings_before_the_roster_write(path: str) -> None:
+    """With last good entries off nothing is revoked, so a team's removal reads its keys' JWT mappings right after the
+    keys, before it rewrites the roster, as it did before them."""
+    prisma: Final = _FakePrisma(
+        users=[_user("u1", "t1"), _user("keep", "t1")],
+        teams=[_team("t1", "u1", "keep")],
+        tokens=[{"token": "k1", "user_id": "u1", "team_id": "t1"}],
+    )
+    mappings: Final = _RosterSeenByReads([_jwt_mapping("k1", "alice")], lambda: _roster(prisma, "t1"))
+    prisma.db.litellm_jwtkeymapping = mappings
+
+    results: Final = (
+        await _delete(prisma, ["u1"])
+        if path == "bulk_user_delete"
+        else await _remove(prisma, "t1", [{"user_id": "u1"}])
+    )
+
+    assert [r.success for r in results] == [True]
+    assert mappings.rosters_seen == [["u1", "keep"]]
+    assert prisma.db.litellm_verificationtoken.rows == []

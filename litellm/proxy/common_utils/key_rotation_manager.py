@@ -79,11 +79,13 @@ class KeyRotationManager:
                     return
 
             verbose_proxy_logger.info("Starting scheduled key rotation check...")
+            from litellm.proxy.common_utils.user_api_key_cache import serves_last_good_entries
             from litellm.proxy.db.routing_prisma_wrapper import pin_reads_to_writer
             from litellm.proxy.proxy_server import user_api_key_cache
 
-            # Each rotation revokes its old token strictly and runs outside a request, so this run pins its own reads
-            pin_reads_to_writer(user_api_key_cache.serve_last_good_entries)
+            # Each rotation revokes its old token strictly and runs outside a request, so this run pins its own reads;
+            # the auth cache can be a plain DualCache, which keeps no last good entries
+            pin_reads_to_writer(serves_last_good_entries(user_api_key_cache))
 
             # Clean up expired deprecated keys first
             await self._cleanup_expired_deprecated_keys()

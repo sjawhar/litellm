@@ -529,6 +529,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     model_access_group_spend_counter_key,
     project_cache_key,
     project_spend_counter_key,
+    serves_last_good_entries,
     tag_cache_key,
 )
 from litellm.proxy.common_utils.validation_error_body import public_validation_errors
@@ -5215,18 +5216,18 @@ def _redis_major_minor(version: str) -> tuple[int, int]:
     return int(parsed.group(1)), int(parsed.group(2))
 
 
-async def _check_last_good_redis_version(cache: UserApiKeyCache) -> None:
+async def _last_good_redis_version_ok(cache: UserApiKeyCache) -> bool:
     """
-    Turns ``serve_last_good_entries`` off, with an error naming both versions, when the auth cache's Redis is older
-    than 6.2: a last good entry's Redis copy ends at its deadline by SET EXAT, which an older server rejects. Reads
-    nothing when the setting is off or the auth cache has no Redis.
+    False, with an error naming both versions, when the auth cache's Redis is older than 6.2: a last good entry's Redis
+    copy ends at its deadline by SET EXAT, which an older server rejects, so the caller turns
+    ``serve_last_good_entries`` off. Reads nothing, and is True, when the setting is off or the auth cache has no Redis.
 
-    A version that cannot be read leaves the setting on with a warning, since that is safe: a store against a server
-    that rejects EXAT fails, keeps nothing in Redis or in memory, and logs a warning.
+    A version that cannot be read is True, with a warning, since keeping the setting on is safe: a store against a
+    server that rejects EXAT fails, keeps nothing in Redis or in memory, and logs a warning.
     """
     redis: Final = cache.redis_cache
-    if not cache.serve_last_good_entries or redis is None:
-        return
+    if not serves_last_good_entries(cache) or redis is None:
+        return True
     try:
         version: Final = await redis.async_server_version()
         found: Final = _redis_major_minor(version)
@@ -5238,15 +5239,16 @@ async def _check_last_good_redis_version(cache: UserApiKeyCache) -> None:
             e,
             *_LAST_GOOD_MIN_REDIS_VERSION,
         )
-        return
-    if found < _LAST_GOOD_MIN_REDIS_VERSION:
-        verbose_proxy_logger.error(
-            "general_settings.serve_last_good_auth_entries is turned off: Redis %s does not support SET EXAT, which "
-            "last good auth entries need to end at their deadline; it needs Redis %s.%s or later",
-            version,
-            *_LAST_GOOD_MIN_REDIS_VERSION,
-        )
-        cache.serve_last_good_entries = False
+        return True
+    if found >= _LAST_GOOD_MIN_REDIS_VERSION:
+        return True
+    verbose_proxy_logger.error(
+        "general_settings.serve_last_good_auth_entries is turned off: Redis %s does not support SET EXAT, which "
+        "last good auth entries need to end at their deadline; it needs Redis %s.%s or later",
+        version,
+        *_LAST_GOOD_MIN_REDIS_VERSION,
+    )
+    return False
 
 
 def resolve_routing_plugins(
@@ -7048,7 +7050,8 @@ class ProxyConfig:
                 )
                 user_api_key_cache.serve_last_good_entries = False
             # A last good entry's Redis copy ends at its deadline by SET EXAT, which Redis before 6.2 rejects
-            await _check_last_good_redis_version(user_api_key_cache)
+            if not await _last_good_redis_version_ok(user_api_key_cache):
+                user_api_key_cache.serve_last_good_entries = False
             cached_object_ttl: Final = get_management_object_ttl(user_api_key_cache)
             if user_api_key_cache.serve_last_good_entries and LAST_GOOD_ENTRY_TTL_SECONDS < cached_object_ttl:
                 verbose_proxy_logger.warning(
@@ -10700,8 +10703,10 @@ class ProxyStartupEvent:
             enable_redis_auth_cache=litellm_settings.get("enable_redis_auth_cache", False) is True,
         )
         # load_config checked the Redis the auth cache had then; a Redis attached to it only now needs the same check
-        if user_api_key_cache.redis_cache is coordination_redis_cache:
-            await _check_last_good_redis_version(user_api_key_cache)
+        if user_api_key_cache.redis_cache is coordination_redis_cache and not await _last_good_redis_version_ok(
+            user_api_key_cache
+        ):
+            user_api_key_cache.serve_last_good_entries = False
         if llm_router is not None and llm_router.cache.redis_cache is None:
             llm_router.update_redis_cache(cache=coordination_redis_cache)
         verbose_proxy_logger.info(
@@ -18242,7 +18247,7 @@ async def claim_onboarding_link(data: InvitationClaim, request: Request):
     from litellm.proxy.db.routing_prisma_wrapper import pin_reads_to_writer
 
     # A public route, outside user_api_key_auth, whose password write revokes the user's UI session keys strictly
-    pin_reads_to_writer(user_api_key_cache.serve_last_good_entries)
+    pin_reads_to_writer(serves_last_good_entries(user_api_key_cache))
     ### VALIDATE INVITE LINK ###
     if prisma_client is None:
         raise HTTPException(
