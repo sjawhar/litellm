@@ -1948,22 +1948,28 @@ async def test_a_read_that_started_before_a_repoint_cannot_keep_the_old_key_afte
 
 
 @pytest.mark.asyncio
-async def test_issuer_miss_paused_across_auto_registration_and_global_create_keeps_the_issuer_off_the_global_row(
-    monkeypatch,
-):
+async def test_issuer_miss_paused_across_auto_registration_and_global_create_keeps_the_issuer_off_the_global_row():
     """The paused read found no row for the issuer, then the issuer's row is auto-registered to a restricted key and a
     broader global row is created. The resumed read goes on to the global row for its own request, but no outage may
-    send the issuer's caller there: the store keeps no answer for a scope that had no row. Tombstones lapse at once,
-    so the global row is kept as it would be once any tombstone a create wrote had lapsed."""
-    import litellm.proxy.common_utils.user_api_key_cache as user_api_key_cache_module
+    send the issuer's caller there: the store keeps no answer for a scope that had no row. Once the tombstones the
+    create wrote have lapsed, a read that began after them keeps the global row, and the issuer's caller still does not
+    reach it."""
+    import time
+
+    from litellm.constants import LAST_GOOD_TOMBSTONE_TTL_SECONDS
     from litellm.proxy._types import CreateJWTKeyMappingRequest, hash_token
     from litellm.proxy.auth.user_api_key_auth import _auto_register_jwt_mapping
+    from litellm.proxy.common_utils.user_api_key_cache import last_good_reads_started_at
 
-    monkeypatch.setattr(user_api_key_cache_module, "LAST_GOOD_TOMBSTONE_TTL_SECONDS", 0)
+    moved = [0.0]
+
+    def clock() -> float:
+        return time.monotonic() + moved[0]
+
     minted = "minted-by-auto-registration"
     restricted = hash_token(minted)
     table = _MappingTable()
-    user_api_key_cache = await _cache_holding_both_keys()
+    user_api_key_cache = await _cache_holding_both_keys(last_good_clock=clock)
     await user_api_key_cache.async_set_cache(key=restricted, value=UserAPIKeyAuth(token=restricted))
     release = table.pause_next_read()
     read = asyncio.create_task(_resolve(table, user_api_key_cache, _ISSUER))
@@ -1995,6 +2001,14 @@ async def test_issuer_miss_paused_across_auto_registration_and_global_create_kee
         )
     release.set()
     assert (registered.token, (await read).token) == (restricted, _OLD_KEY)
+    assert await recall_last_good(
+        user_api_key_cache, jwt_key_mapping_cache_key("sub", "svc-7", _ISSUER), _JWTKeyMappingTarget
+    ) is None
+    # The create's tombstones lapse, and only a read that begins after them may keep the global row
+    moved[0] += LAST_GOOD_TOMBSTONE_TTL_SECONDS
+    await user_api_key_cache.async_delete_cache(jwt_key_mapping_cache_key("sub", "svc-7"))
+    with last_good_reads_started_at(clock()):
+        assert (await _resolve(table, user_api_key_cache)).token == _OLD_KEY
     global_entry = await recall_last_good(
         user_api_key_cache, jwt_key_mapping_cache_key("sub", "svc-7"), _JWTKeyMappingTarget
     )
