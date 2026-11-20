@@ -12,7 +12,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from prisma.actions import LiteLLM_VerificationTokenActions
 
-from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
+from litellm.proxy._types import LiteLLM_TagTable, LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.proxy_server import app
 from litellm.proxy.utils import PrismaClient
 from litellm.types.tag_management import TagNewRequest
@@ -406,6 +406,72 @@ async def test_update_tag_explicit_null_clears_budget_duration():
         )
 
     assert budget_state.get("budget_duration") is None
+
+
+@pytest.mark.asyncio
+async def test_tag_update_of_a_missing_tag_answers_404_and_writes_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A tag that does not exist is the caller's error: its 404 reaches the caller instead of a 500."""
+    from litellm.proxy import proxy_server
+    from litellm.proxy.management_endpoints.tag_management_endpoints import update_tag
+    from litellm.types.tag_management import TagUpdateRequest
+
+    update_tag_row: Final = AsyncMock()
+    monkeypatch.setattr(
+        proxy_server,
+        "prisma_client",
+        SimpleNamespace(
+            db=SimpleNamespace(
+                litellm_tagtable=SimpleNamespace(find_unique=AsyncMock(return_value=None), update=update_tag_row)
+            )
+        ),
+    )
+
+    with pytest.raises(HTTPException) as refused:
+        await update_tag(
+            tag=TagUpdateRequest(name="missing-tag", description="renamed"),
+            user_api_key_dict=UserAPIKeyAuth(user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+        )
+
+    assert refused.value.status_code == 404
+    update_tag_row.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_tag_update_keeps_the_status_of_an_http_error_its_budget_update_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The budget update refuses a negative max_budget with 400 before it writes; the tag update passes that status on
+    instead of a 500, and writes neither the budget row nor the tag row."""
+    from litellm.proxy import proxy_server
+    from litellm.proxy.management_endpoints.tag_management_endpoints import update_tag
+    from litellm.types.tag_management import TagUpdateRequest
+
+    created: Final = datetime(2024, 1, 1)
+    tag_row: Final = LiteLLM_TagTable(
+        tag_name="budgeted-tag", budget_id="budget-1", created_at=created, created_by="admin", updated_at=created
+    )
+    update_tag_row: Final = AsyncMock()
+    update_budget_row: Final = AsyncMock()
+    monkeypatch.setattr(
+        proxy_server,
+        "prisma_client",
+        SimpleNamespace(
+            db=SimpleNamespace(
+                litellm_tagtable=SimpleNamespace(find_unique=AsyncMock(return_value=tag_row), update=update_tag_row),
+                litellm_budgettable=SimpleNamespace(update=update_budget_row),
+            )
+        ),
+    )
+
+    with pytest.raises(HTTPException) as refused:
+        await update_tag(
+            tag=TagUpdateRequest(name="budgeted-tag", max_budget=-1.0),
+            user_api_key_dict=UserAPIKeyAuth(user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+        )
+
+    assert refused.value.status_code == 400
+    update_budget_row.assert_not_awaited()
+    update_tag_row.assert_not_awaited()
 
 
 @pytest.mark.asyncio
