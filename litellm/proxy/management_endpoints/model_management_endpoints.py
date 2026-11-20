@@ -27,7 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError,
 import litellm
 from litellm._logging import verbose_proxy_logger
 from litellm._uuid import uuid
-from litellm.constants import LITELLM_PROXY_ADMIN_NAME
+from litellm.constants import DEFAULT_MAX_RECURSE_DEPTH, LITELLM_PROXY_ADMIN_NAME
 from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
 from litellm.litellm_core_utils.get_model_cost_map import GetModelCostMap
 from litellm.litellm_core_utils.ptu_pricing import (
@@ -138,12 +138,6 @@ from litellm.router_utils.auto_router_model_naming import (
     validate_strategy_router_model_write,
 )
 from litellm.router_utils.auto_router_tuning_baseline import is_mutable_tuned_candidate, tuning_quota_violation
-from litellm.router_utils.fallback_event_handlers import (
-    FallbackCall,
-    FallbackListShapeError,
-    FallbackReading,
-    iter_body_fallback_entries,
-)
 from litellm.types.llms.base import LiteLLMBaseModel
 from litellm.types.llms.bedrock import AwsSessionTag
 from litellm.types.proxy.management_endpoints.model_management_endpoints import (
@@ -487,46 +481,48 @@ def _decrypted_litellm_params(litellm_params: GenericLiteLLMParams) -> Mapping[s
     )
 
 
-def _deployment_fallback_entries(
-    litellm_params: GenericLiteLLMParams | None, *, refuse_malformed: bool
-) -> tuple[Mapping[str, object], ...]:
+# The one nested mapping where a rule's field names mean something else: the complexity router's classifier connection
+# (OpenSourceClassifierConfig, which forbids any other field). Its api_key and api_base are the classifier's own
+# endpoint, where no federated token goes, so the federation rule would refuse a team admin's classifier for nothing.
+_CLASSIFIER_CONNECTION_PATHS: Final = frozenset(
+    {
+        ("complexity_router_config", "opensource_classifier_config"),
+        ("complexity_router_config", "jev_classifier_config"),
+    }
+)
+
+
+def _nested_param_mappings(litellm_params: GenericLiteLLMParams | None) -> tuple[dict[str, object], ...]:
     """
-    Every mapping a reader merges into a deployment's call from its own fallback lists, at every depth: litellm's own
-    fallback loop reads the deployment's `fallbacks` and merges each mapping into the call. Read as the request's
-    checks read a body, every fallback field and every mapping read both ways, so no mapping in any shape is missed.
+    Every mapping reachable inside a deployment's params, under any key and inside any list, at every depth, read from
+    the dump the write routes store (`model_dump(exclude_none=True)`), never from a validated copy. Readers merge some
+    into a call: an entry of `fallbacks`, the `litellm_params` of a `model_list` entry. The rest no reader merges, and a
+    writer who is not a proxy admin has no reason to put an admin-only field in any of them. The classifier
+    connection is left out (_CLASSIFIER_CONNECTION_PATHS).
     """
     if litellm_params is None:
         return ()
-    try:
-        return tuple(
-            entry.target
-            for entry in iter_body_fallback_entries(
-                litellm_params.model_dump(exclude_none=True), FallbackCall(model="", reading=FallbackReading.BOTH)
+    stored: Final = litellm_params.model_dump(exclude_none=True)
+    found: Final[list[dict[str, object]]] = []
+    pending: Final[list[tuple[object, tuple[str, ...]]]] = [(value, (key,)) for key, value in stored.items()]
+    while pending:
+        value, path = pending.pop()
+        if len(path) > DEFAULT_MAX_RECURSE_DEPTH:
+            raise ProxyException(
+                message="litellm_params nests deeper than the proxy reads.",
+                type=ProxyErrorTypes.bad_request_error.value,
+                code=status.HTTP_400_BAD_REQUEST,
+                param="litellm_params",
             )
-            if not isinstance(entry.target, str)
-        )
-    except FallbackListShapeError as shape_error:
-        if not refuse_malformed:
-            return ()
-        raise ProxyException(
-            message=f"litellm_params holds a fallback list no reader can call: {shape_error}",
-            type=ProxyErrorTypes.bad_request_error.value,
-            code=status.HTTP_400_BAD_REQUEST,
-            param=shape_error.param,
-        ) from shape_error
-
-
-def _fallback_entry_params(entry: Mapping[str, object]) -> updateLiteLLMParams:
-    """A fallback entry as the params it sets on the call it is merged into"""
-    try:
-        return updateLiteLLMParams.model_validate(dict(entry))
-    except ValidationError as invalid:
-        raise ProxyException(
-            message=f"A fallback entry in litellm_params is not valid params: {invalid}",
-            type=ProxyErrorTypes.bad_request_error.value,
-            code=status.HTTP_400_BAD_REQUEST,
-            param="fallbacks",
-        ) from invalid
+        if path in _CLASSIFIER_CONNECTION_PATHS:
+            continue
+        if isinstance(value, Mapping):
+            found.append({key: item for key, item in value.items() if isinstance(key, str)})
+            pending.extend((item, (*path, str(key))) for key, item in value.items())
+        elif isinstance(value, (list, tuple)):
+            # A list adds a level to the path but no key, so a path names where an item sits, not its index
+            pending.extend((item, (*path, "")) for item in value)
+    return tuple(found)
 
 
 def _effective_model(
@@ -2262,14 +2258,15 @@ class ModelManagementAuthChecks:
         null_detaches: bool = False,
     ) -> Literal[True]:
         """
-        What a non-proxy-admin may not set on a deployment, decided for its own litellm_params and for every fallback
-        entry in them, at every depth, by the same rules: litellm's own fallback loop merges an entry into the
-        deployment's call, so an entry may set no more than the params may. Each field keeps its one rule, with its
-        status, message and exceptions: a stored credential (can_user_attach_credential), aws_session_tags
-        (can_user_set_aws_session_tags), and a federation field or a federated deployment's destination
-        (_reject_non_admin_wif_write, which can_user_make_model_call already ran on the params). An entry the stored
-        deployment already carries unchanged passes, as an unchanged field does. ``model_params`` is the deployment
-        the write lands on, the stored one on an update.
+        What a non-proxy-admin may not set on a deployment, decided for its own litellm_params and for every mapping
+        reachable inside them, under any key, at every depth, by the same rules: readers merge such a mapping into a
+        call (a `fallbacks` entry, a `model_list` entry's `litellm_params`), so it may set no more than the params may.
+        Each field keeps its one rule, with its status, message and exceptions: a stored credential
+        (can_user_attach_credential), aws_session_tags (can_user_set_aws_session_tags), and a federation field or a
+        federated deployment's destination (_reject_non_admin_wif_write, which can_user_make_model_call already ran on
+        the params). A nested mapping is read as stored, unvalidated, so the rule sees every key that is written. One
+        the stored deployment already carries unchanged passes, as an unchanged field does. ``model_params`` is the
+        deployment the write lands on, the stored one on an update.
         """
         ModelManagementAuthChecks.can_user_attach_credential(
             litellm_params=litellm_params,
@@ -2284,20 +2281,21 @@ class ModelManagementAuthChecks:
         )
         if user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN:
             return True
-        stored_entries: Final = _deployment_fallback_entries(existing_litellm_params, refuse_malformed=False)
-        for entry in _deployment_fallback_entries(litellm_params, refuse_malformed=True):
-            if entry in stored_entries:
+        stored_mappings: Final = _nested_param_mappings(existing_litellm_params)
+        for mapping in _nested_param_mappings(litellm_params):
+            if mapping in stored_mappings:
                 continue
-            entry_params = _fallback_entry_params(entry)
+            # The stored mapping as the rules' params, unvalidated: what is written is what is read
+            as_written = GenericLiteLLMParams.model_construct(**mapping)
             ModelManagementAuthChecks.can_user_attach_credential(
-                litellm_params=entry_params, user_api_key_dict=user_api_key_dict
+                litellm_params=as_written, user_api_key_dict=user_api_key_dict
             )
             ModelManagementAuthChecks.can_user_set_aws_session_tags(
-                litellm_params=entry_params, user_api_key_dict=user_api_key_dict
+                litellm_params=as_written, user_api_key_dict=user_api_key_dict
             )
             await ModelManagementAuthChecks._reject_non_admin_wif_write(
                 model_params=model_params,
-                incoming_params=entry,
+                incoming_params=mapping,
                 user_api_key_dict=user_api_key_dict,
                 prisma_client=prisma_client,
             )

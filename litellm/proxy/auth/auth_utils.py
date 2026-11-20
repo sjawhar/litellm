@@ -680,9 +680,41 @@ def _reject_fallback_target_credentials(target: Mapping[str, object], allows_cli
         reject_fallback_target_credentials(target)
 
 
+# Root keys the request setup (litellm_pre_call_utils, and the proxy's pre-call logic in common_request_processing)
+# writes over whatever a body carries at its root with a value that is not the caller's: the key's, team's or end
+# user's settings, or the proxy's own for this call. A target merged into the call on a hop would replace it. The keys
+# the setup copies from the caller's own headers (timeout, stream_timeout, num_retries, keepalive_seconds, ttl, the
+# trace and session ids) stay the caller's parameters, in a target as in a body.
+_SETUP_STAMPED_ROOT_FIELDS: Final = frozenset(
+    {
+        "allowed_model_region",  # the key's or end user's region restriction, which the Router's region check reads
+        "cache",  # the key's cache controls
+        "disable_fallbacks",  # the key's own setting
+        "success_callback",  # the team's callbacks
+        "failure_callback",  # the team's callbacks
+        "router_settings_override",  # the key's or team's saved router settings
+        "litellm_call_id",  # this call's id, which spend logs and the response carry
+        "litellm_logging_obj",  # this call's logging
+        "_litellm_strip_stream_usage",  # the proxy's own stream usage marker
+    }
+)
+# Root keys the setup takes off a body and turns into the request's own decision: its guardrails and policies, its
+# message-logging opt-out, and whether fallback errors are shown to the caller
+_SETUP_DROPPED_ROOT_FIELDS: Final = frozenset(
+    {
+        "guardrails",
+        "guardrail_config",
+        "include_guardrail_response",
+        "policies",
+        "turn_off_message_logging",
+        "include_fallback_errors",
+    }
+)
+
+
 @lru_cache(maxsize=1)
 def _setup_stripped_fields() -> tuple[frozenset[str], frozenset[str]]:
-    """The keys the request setup drops from a body's root, and from its metadata, before the call"""
+    """The keys the request setup drops from or writes over at a body's root, and drops from its metadata"""
     from litellm.proxy.litellm_pre_call_utils import (  # the setup module imports this one
         _CLIENT_PRICING_CONTROL_FIELDS,  # pyright: ignore[reportPrivateUsage]  # the setup's own strip lists
         _CLIENT_PRICING_METADATA_FIELDS,  # pyright: ignore[reportPrivateUsage]  # the setup's own strip lists
@@ -690,24 +722,54 @@ def _setup_stripped_fields() -> tuple[frozenset[str], frozenset[str]]:
         _UNTRUSTED_METADATA_CONTROL_FIELDS,  # pyright: ignore[reportPrivateUsage]  # the setup's own strip lists
         _UNTRUSTED_ROOT_CONTROL_FIELDS,  # pyright: ignore[reportPrivateUsage]  # the setup's own strip lists
     )
-    from litellm.types.utils import TRUSTED_CALLBACK_VARS_FIELD
+    from litellm.types.utils import TRUSTED_CALLBACK_VARS_FIELD, StandardCallbackDynamicParams
 
     return (
-        frozenset((*_UNTRUSTED_ROOT_CONTROL_FIELDS, *_CLIENT_PRICING_CONTROL_FIELDS, TRUSTED_CALLBACK_VARS_FIELD)),
+        frozenset(
+            (
+                *_UNTRUSTED_ROOT_CONTROL_FIELDS,
+                *_CLIENT_PRICING_CONTROL_FIELDS,
+                TRUSTED_CALLBACK_VARS_FIELD,
+                # The team's callback vars, which the setup writes at the root under these names
+                *StandardCallbackDynamicParams.__annotations__,
+                *_SETUP_STAMPED_ROOT_FIELDS,
+                *_SETUP_DROPPED_ROOT_FIELDS,
+            )
+        ),
         frozenset(
             (*_UNTRUSTED_METADATA_CONTROL_FIELDS, *_ROUTER_RESERVED_METADATA_FIELDS, *_CLIENT_PRICING_METADATA_FIELDS)
         ),
     )
 
 
+def _proxy_pinned_call_params() -> frozenset[str]:
+    """
+    The call params the setup writes over a body's from an administrator's setting, read when the check runs: a proxy
+    started for one model from the command line (--temperature, --max_tokens, --api_base, --request_timeout), and the
+    key's hash as `user` under litellm.overwrite_user_with_key_hash
+    """
+    from litellm.proxy import proxy_server
+
+    pins: Final = (
+        ("temperature", proxy_server.user_temperature),
+        ("max_tokens", proxy_server.user_max_tokens),
+        ("api_base", proxy_server.user_api_base),
+        ("request_timeout", proxy_server.user_request_timeout),
+        ("user", litellm.overwrite_user_with_key_hash is True),
+    )
+    return frozenset(name for name, pinned in pins if pinned)
+
+
 def _reject_setup_stripped_fields(target: Mapping[str, object]) -> None:
     """
-    The request setup drops these keys from a body's root and from its metadata before the call, so a target merged
-    into the call on a hop may not bring one back: litellm.acompletion's own fallback loop merges a target as it is.
+    The request setup drops these keys from a body's root and from its metadata, or writes its own value over a body's,
+    before the call, so a target merged into the call on a hop may not bring one back or replace the setup's:
+    litellm.acompletion's own fallback loop merges a target as it is.
     """
     root_fields, metadata_fields = _setup_stripped_fields()
+    pinned: Final = _proxy_pinned_call_params()
     stripped: Final = [
-        *(field for field in target if field in root_fields),
+        *(field for field in target if field in root_fields or field in pinned),
         *(
             f"{bucket}.{field}"
             for bucket in _NESTED_METADATA_KEYS
@@ -718,7 +780,7 @@ def _reject_setup_stripped_fields(target: Mapping[str, object]) -> None:
     if stripped:
         raise ValueError(
             f"Rejected Request: a fallback target may not carry {', '.join(sorted(stripped))}, "
-            "which the proxy drops from a request body."
+            "which the proxy drops from or writes over in a request body."
         )
 
 
