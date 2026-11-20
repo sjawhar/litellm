@@ -9,6 +9,7 @@ import ast
 import copy
 import importlib
 import json
+import re
 import sys
 from collections.abc import Callable, Coroutine, Iterable, Iterator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
@@ -1696,6 +1697,166 @@ async def test_a_metadata_bucket_that_is_not_an_object_is_refused_in_a_body_and_
         assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
 
 
+# The header a caller sends in its metadata to turn message redaction off, which the request setup strips unless the
+# key or team allows the opt-out
+_REDACTION_OPT_OUT_HEADERS: Final = MappingProxyType({"headers": {"litellm-disable-message-redaction": "true"}})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("target", "refused_path"),
+    [
+        # The reader's request: the setup strips the header from a body's bucket, and on a chat route drops the whole
+        # litellm_metadata bucket, so a target may not bring either back on the hop
+        pytest.param(
+            {"model": "openai/other", "litellm_metadata": dict(_REDACTION_OPT_OUT_HEADERS)},
+            "litellm_metadata.headers.litellm-disable-message-redaction",
+            id="redaction-opt-out-in-litellm-metadata",
+        ),
+        pytest.param(
+            {"model": "openai/other", "metadata": dict(_REDACTION_OPT_OUT_HEADERS)},
+            "metadata.headers.litellm-disable-message-redaction",
+            id="redaction-opt-out-in-metadata",
+        ),
+        pytest.param(
+            {"model": "openai/other", "litellm_metadata": {"note": "kept"}},
+            "litellm_metadata",
+            id="a-bucket-the-chat-route-drops",
+        ),
+        pytest.param({"model": "openai/other", "metadata": {"note": "kept"}}, None, id="a-bucket-the-setup-keeps"),
+    ],
+)
+async def test_a_targets_metadata_goes_through_the_setups_own_sanitizer(
+    monkeypatch: pytest.MonkeyPatch, target: Mapping[str, object], refused_path: str | None
+) -> None:
+    """
+    With message logging off, the request setup strips a caller's redaction opt-out header from either body bucket and
+    drops the root litellm_metadata on a chat route; a target's buckets go through the same sanitizer on a copy, so a
+    target it would change is refused before any call, naming what would change, and one it leaves alone is served
+    """
+    import litellm
+
+    monkeypatch.setattr(litellm, "turn_off_message_logging", True)
+    response, called = await _chat_served_by_litellm(
+        monkeypatch, [copy.deepcopy(dict(target))], router=True, key_models=("openai/requested", "openai/other")
+    )
+
+    if refused_path is None:
+        assert response.status_code == 200, response.text
+        assert called == ("requested", "other")
+        return
+    assert response.status_code == 401, response.text
+    assert refused_path in response.text
+    assert called == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("bucket", "served"),
+    [pytest.param(dict(_REDACTION_OPT_OUT_HEADERS), False, id="redaction-opt-out"), pytest.param({}, True, id="kept")],
+)
+async def test_on_a_route_that_keeps_both_buckets_a_target_still_gets_the_sanitizer(
+    monkeypatch: pytest.MonkeyPatch, bucket: Mapping[str, object], served: bool
+) -> None:
+    """/v1/messages keeps a body's litellm_metadata, so only what the sanitizer would change is refused there"""
+    result: Final = await _Gateway(monkeypatch).send(
+        {"fallbacks": [{"model": "other", "litellm_metadata": {"note": "kept", **copy.deepcopy(dict(bucket))}}]}
+    )
+
+    if served:
+        assert result.response.status_code == 200, result.response.text
+        assert result.calls == {"requested": 1, "other": 1, "forbidden": 0, "attacker": 0}
+        return
+    assert result.response.status_code == 401, result.response.text
+    assert "litellm_metadata.headers.litellm-disable-message-redaction" in result.response.text
+    assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+
+
+def _dropped_paths(sent: Mapping[str, object], kept: object, path: tuple[str, ...]) -> frozenset[str]:
+    """The dotted paths of what was sent that the setup did not keep as sent; keys it added are not looked at"""
+    if not isinstance(kept, Mapping):
+        return frozenset({".".join(path)})
+    dropped: set[str] = set()
+    for key, value in sent.items():
+        here = (*path, str(key))
+        if key not in kept:
+            dropped.add(".".join(here))
+        elif isinstance(value, Mapping):
+            dropped |= _dropped_paths(value, kept[key], here)
+        elif kept[key] != value:
+            dropped.add(".".join(here))
+    return frozenset(dropped)
+
+
+def _metadata_the_setup_is_sent() -> tuple[object, ...]:
+    """A caller's metadata bucket carrying each kind of field the setup strips, and one it keeps"""
+    from litellm.constants import SESSION_ID_OMITTED_METADATA_KEY
+
+    return (
+        pytest.param({**_REDACTION_OPT_OUT_HEADERS, "note": "kept"}, id="header-control"),
+        pytest.param({"user_api_key_user_id": "someone-else"}, id="identity-slot"),
+        pytest.param({"routing_decision": "forged"}, id="pipeline-control-field"),
+        pytest.param({"model_info": {"input_cost_per_token": 0}}, id="pricing-override"),
+        pytest.param({"attempted_fallbacks": 3}, id="router-stamp"),
+        pytest.param({"dd_site": "logs.example.test"}, id="callback-destination"),
+        pytest.param({"turn_off_message_logging": False}, id="message-logging-opt-out"),
+        pytest.param({SESSION_ID_OMITTED_METADATA_KEY: True}, id="session-marker"),
+        pytest.param({"note": "kept"}, id="nothing-stripped"),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("metadata", _metadata_the_setup_is_sent())
+async def test_the_setup_and_the_target_check_change_the_same_metadata(
+    monkeypatch: pytest.MonkeyPatch, metadata: Mapping[str, object]
+) -> None:
+    """
+    The same bucket through the request setup, as a body's `metadata` on a route that keeps it, and through the target
+    check: what the setup drops is what the check names. The setup must run the one sanitizer the check runs, so a strip
+    added to the setup alone, or a check that stops calling it, fails here.
+    """
+    from unittest.mock import MagicMock as _MagicMock
+
+    import litellm
+    from litellm.proxy import litellm_pre_call_utils as setup
+
+    monkeypatch.setattr(litellm, "turn_off_message_logging", True)
+    sanitizer: Final = setup._sanitize_client_metadata  # pyright: ignore[reportPrivateUsage]  # the shared sanitizer
+    sanitized: Final[list[object]] = []
+
+    def recorded(data: dict[str, object], **opt_ins: bool) -> None:
+        sanitized.append(data)
+        sanitizer(data, **opt_ins)
+
+    monkeypatch.setattr(setup, "_sanitize_client_metadata", recorded)
+    request: Final = _MagicMock(spec=Request)
+    request.url = _MagicMock()
+    request.url.path = "/v1/messages"
+    request.url.__str__.return_value = "http://proxy.test/v1/messages"
+    request.method = "POST"
+    request.query_params = {}
+    request.headers = {}
+    request.client = _MagicMock()
+    request.client.host = "127.0.0.1"
+    body: Final = {"model": "requested", "messages": [{"role": "user", "content": "hi"}]}
+    hashed_key: Final = "-".join(("hashed", "key"))
+    data: Final = await setup.add_litellm_data_to_request(
+        data={**body, "metadata": copy.deepcopy(dict(metadata))},
+        request=request,
+        user_api_key_dict=UserAPIKeyAuth(api_key=hashed_key),
+        proxy_config=_MagicMock(),
+        general_settings={},
+        version="test",
+    )
+
+    assert len(sanitized) == 1, "the request setup runs the shared sanitizer once"
+    named: Final = setup.client_metadata_the_setup_would_change(
+        {"model": "other", "metadata": copy.deepcopy(dict(metadata))}, "litellm_metadata"
+    )
+    assert frozenset(named) == _dropped_paths(metadata, data.get("metadata"), ("metadata",))
+
+
+
 # ── A fallback target is never validated less than a request body ────────────
 #
 # Each row is a key, and the outcome of a /v1/messages body that carries it at its root against the outcome of one
@@ -1763,6 +1924,10 @@ _TARGET_TABLE: Final = (
     _Row("base_model", "anthropic/other", _Rule.STRIPPED, refused=False),
     _Row("metadata", {"user_api_key_user_id": "someone-else"}, _Rule.STRIPPED, refused=False),
     _Row("litellm_metadata", {"user_api_key_team_id": "another-team"}, _Rule.STRIPPED, refused=False),
+    # Stripped inside a body's bucket by the setup's sanitizer, which a target's buckets go through on a copy; stricter
+    # in a target where the key or team allows the opt-out, which the entry check, run before the key is read, takes
+    # as off
+    _Row("metadata", dict(_REDACTION_OPT_OUT_HEADERS), _Rule.STRIPPED, refused=False),
     _Row("guardrails", [], _Rule.STRIPPED, refused=False),
     _Row("policies", [], _Rule.STRIPPED, refused=False),
     _Row("include_fallback_errors", True, _Rule.STRIPPED, refused=False),
@@ -1876,6 +2041,12 @@ _NAME_ROWS: Final = frozenset(
 )
 
 
+def _refused_as_a_parameter(text: str, key: str) -> bool:
+    """Whether a refusal names `key` as a parameter a target or body may not carry: a model-name refusal never does"""
+    name: Final = re.escape(key)
+    return re.search(rf"may not carry [^.]*\b{name}\b|\b{name} is not allowed in", text) is not None
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "row",
@@ -1888,13 +2059,15 @@ async def test_a_mapping_read_both_ways_is_refused_as_the_parameter_override_it_
     """
     `["other", {key: value}]` is a `fallbacks` list in the Router's group format, so the mapping without a `model` is a
     model group map to the Router and a parameter override to litellm's own fallback loop. A key a target is refused
-    for is a parameter's, so the override reading refuses the mapping, and the refusal says it was read both ways. Rows
-    a body accepts, and rows refused for a model name both readings name, prove nothing here and are left out.
+    for is a parameter's, so the override reading refuses the mapping, and the refusal says it was read both ways. The
+    note is the same for a model-name refusal, so each row also asserts the parameter refusal's own words, naming the
+    key: the other reading's refusal of a value as a model name cannot satisfy it. Rows a body accepts, and rows
+    refused for a model name both readings name, prove nothing here and are left out.
     """
     result: Final = await _Gateway(monkeypatch).send({"fallbacks": ["other", {row.key: copy.deepcopy(row.value)}]})
 
     assert _refused(result), result.response.text
-    assert row.key in result.response.text
+    assert _refused_as_a_parameter(result.response.text, row.key), result.response.text
     assert _READ_BOTH_WAYS_NOTE.format(entry=repr(row.key)) in result.response.text
 
 
@@ -1976,6 +2149,28 @@ async def test_a_targets_own_timeout_and_retries_are_the_callers_parameters(monk
 
     assert result.response.status_code == 200, result.response.text
     assert result.calls == {"requested": 1, "other": 1, "forbidden": 0, "attacker": 0}
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        pytest.param("cooldown_time", 3600, id="cooldown-time"),
+        pytest.param("litellm_params", {"model_info": {"id": "forbidden-deployment"}}, id="litellm-params"),
+    ],
+)
+@pytest.mark.parametrize("credentials_opt_in", [False, True], ids=["default", "client-side-credentials"])
+def test_a_target_may_not_set_a_router_owned_call_field(key: str, value: object, credentials_opt_in: bool):
+    """
+    The Router cools the deployment a hop fails on for the call's cooldown_time, and its failure callback reads which
+    deployment that is from the call's litellm_params; a target's own would pick both, whatever opt-in the proxy has
+    """
+    from litellm.proxy.auth.auth_utils import is_request_body_safe
+
+    body: Final = {"model": "primary", "fallbacks": [{"model": "primary", key: copy.deepcopy(value)}]}
+    general_settings: Final = {"allow_client_side_credentials": True} if credentials_opt_in else {}
+    with pytest.raises(ValueError, match=f"a fallback target may not carry {key}"):
+        is_request_body_safe(body, general_settings, _router_without_fallback_group(), "primary")
+
 
 
 async def _chat_served_by_litellm(
@@ -2968,8 +3163,8 @@ _SETUP_DEFAULTS: Final = MappingProxyType(
         "model": "the body's own model, resolved by alias; a target's own model gets the model checks",
         "drop_params": "set only when the body has none (should_auto_drop_params_for_agentic_cli)",
         "stream_options": "merged: include_usage is added; fallback_target_params_over_call keeps the call's keys",
-        "metadata": "merged: fallback_target_params_over_call keeps every key the call holds",
-        "litellm_metadata": "merged: fallback_target_params_over_call keeps every key the call holds",
+        "metadata": "merged on the hop; a target's goes through the setup's own sanitizer on a copy",
+        "litellm_metadata": "the same; on a route that drops it from a body, a target may not bring it",
     }
 )
 # What the setup copies from the caller's own request headers over its body's values: no one else's limit applies to

@@ -139,7 +139,6 @@ from litellm.router_utils.auto_router_model_naming import (
 )
 from litellm.router_utils.auto_router_tuning_baseline import is_mutable_tuned_candidate, tuning_quota_violation
 from litellm.types.llms.base import LiteLLMBaseModel
-from litellm.types.llms.bedrock import AwsSessionTag
 from litellm.types.proxy.management_endpoints.model_management_endpoints import (
     AutoRouterClassifierDefaultPromptResponse,
     UpdateUsefulLinksRequest,
@@ -392,11 +391,17 @@ def _reject_non_admin_blocked_flag_on_create(
         )
 
 
-def _stored_credential_name(existing_litellm_params: GenericLiteLLMParams | None) -> str | None:
-    if existing_litellm_params is None or existing_litellm_params.litellm_credential_name is None:
+def _stored_params(litellm_params: GenericLiteLLMParams | None) -> Mapping[str, object] | None:
+    """A deployment's params as the write routes store them"""
+    return None if litellm_params is None else litellm_params.model_dump(exclude_none=True)
+
+
+def _stored_credential_name(existing_litellm_params: Mapping[str, object] | None) -> str | None:
+    stored: Final = None if existing_litellm_params is None else existing_litellm_params.get("litellm_credential_name")
+    if not isinstance(stored, str):
         return None
     return decrypt_value_helper(
-        value=existing_litellm_params.litellm_credential_name,
+        value=stored,
         key="litellm_credential_name",
         exception_type="debug",
         return_original_value=True,
@@ -420,7 +425,7 @@ async def _raise_on_invalid_credential_name(
             code=status.HTTP_400_BAD_REQUEST,
             param="litellm_credential_name",
         )
-    if credential_name == _stored_credential_name(existing_litellm_params):
+    if credential_name == _stored_credential_name(_stored_params(existing_litellm_params)):
         return
     if CredentialAccessor.find_credential(credential_name) is not None:
         return
@@ -492,17 +497,16 @@ _CLASSIFIER_CONNECTION_PATHS: Final = frozenset(
 )
 
 
-def _nested_param_mappings(litellm_params: GenericLiteLLMParams | None) -> tuple[dict[str, object], ...]:
+def _nested_param_mappings(stored: Mapping[str, object] | None) -> tuple[dict[str, object], ...]:
     """
     Every mapping reachable inside a deployment's params, under any key and inside any list, at every depth, read from
-    the dump the write routes store (`model_dump(exclude_none=True)`), never from a validated copy. Readers merge some
-    into a call: an entry of `fallbacks`, the `litellm_params` of a `model_list` entry. The rest no reader merges, and a
-    writer who is not a proxy admin has no reason to put an admin-only field in any of them. The classifier
-    connection is left out (_CLASSIFIER_CONNECTION_PATHS).
+    the dict the write routes store (_stored_params), never from a validated copy. Readers merge some into a call: an
+    entry of `fallbacks`, the `litellm_params` of a `model_list` entry. The rest no reader merges, and a writer who is
+    not a proxy admin has no reason to put an admin-only field in any of them. The classifier connection is left out
+    (_CLASSIFIER_CONNECTION_PATHS).
     """
-    if litellm_params is None:
+    if stored is None:
         return ()
-    stored: Final = litellm_params.model_dump(exclude_none=True)
     found: Final[list[dict[str, object]]] = []
     pending: Final[list[tuple[object, tuple[str, ...]]]] = [(value, (key,)) for key, value in stored.items()]
     while pending:
@@ -2095,8 +2099,14 @@ async def _update_existing_team_model_assignment(
     # No team_model_add/delete calls required; public name is already registered
 
 
-def _canonical_session_tags(tags: Sequence[AwsSessionTag]) -> tuple[tuple[str, str], ...]:
-    return tuple(sorted((tag["Key"], tag["Value"]) for tag in tags))
+def _canonical_session_tags(tags: object) -> tuple[tuple[str, str], ...] | None:
+    """The tags as sorted (Key, Value) pairs, or None when the value is not a list of tags"""
+    if not isinstance(tags, (list, tuple)):
+        return None
+    pairs: Final = [(tag.get("Key"), tag.get("Value")) for tag in tags if isinstance(tag, Mapping)]
+    if len(pairs) != len(tags) or not all(isinstance(key, str) and isinstance(value, str) for key, value in pairs):
+        return None
+    return tuple(sorted((str(key), str(value)) for key, value in pairs))
 
 
 class ModelManagementAuthChecks:
@@ -2129,19 +2139,23 @@ class ModelManagementAuthChecks:
 
     @staticmethod
     def can_user_attach_credential(
-        litellm_params: GenericLiteLLMParams | None,
+        litellm_params: Mapping[str, object] | None,
         user_api_key_dict: UserAPIKeyAuth,
-        existing_litellm_params: GenericLiteLLMParams | None = None,
+        existing_litellm_params: Mapping[str, object] | None = None,
         *,
         null_detaches: bool = False,
     ) -> Literal[True]:
+        """
+        ``litellm_params`` holds the keys the write sets, as written; ``existing_litellm_params`` the stored
+        deployment's, as stored. Key membership on those mappings decides: no model is built from them.
+        """
         if litellm_params is None:
             return True
-        if "litellm_credential_name" not in litellm_params.model_fields_set:
+        if "litellm_credential_name" not in litellm_params:
             return True
-        if litellm_params.litellm_credential_name is None and not null_detaches:
+        requested_credential_name: Final = litellm_params["litellm_credential_name"]
+        if requested_credential_name is None and not null_detaches:
             return True
-        requested_credential_name: Final = litellm_params.litellm_credential_name
         if requested_credential_name == _stored_credential_name(existing_litellm_params):
             return True
         if user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN:
@@ -2156,18 +2170,21 @@ class ModelManagementAuthChecks:
 
     @staticmethod
     def can_user_set_aws_session_tags(
-        litellm_params: GenericLiteLLMParams | None,
+        litellm_params: Mapping[str, object] | None,
         user_api_key_dict: UserAPIKeyAuth,
-        existing_litellm_params: GenericLiteLLMParams | None = None,
+        existing_litellm_params: Mapping[str, object] | None = None,
     ) -> Literal[True]:
-        if litellm_params is None or litellm_params.aws_session_tags is None:
+        """The same mappings as can_user_attach_credential: what the write sets, and what is stored"""
+        requested_tags: Final = None if litellm_params is None else litellm_params.get("aws_session_tags")
+        if requested_tags is None:
             return True
         if user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN:
             return True
-        existing_tags: Final = existing_litellm_params.aws_session_tags if existing_litellm_params is not None else None
-        if existing_tags is not None and _canonical_session_tags(existing_tags) == _canonical_session_tags(
-            litellm_params.aws_session_tags
-        ):
+        stored_tags: Final = (
+            None if existing_litellm_params is None else existing_litellm_params.get("aws_session_tags")
+        )
+        existing_tags: Final = _canonical_session_tags(stored_tags)
+        if existing_tags is not None and existing_tags == _canonical_session_tags(requested_tags):
             return True
         raise ProxyException(
             message=f"Only a proxy admin can set aws_session_tags on a model. Your role={user_api_key_dict.user_role}.",
@@ -2264,34 +2281,36 @@ class ModelManagementAuthChecks:
         Each field keeps its one rule, with its status, message and exceptions: a stored credential
         (can_user_attach_credential), aws_session_tags (can_user_set_aws_session_tags), and a federation field or a
         federated deployment's destination (_reject_non_admin_wif_write, which can_user_make_model_call already ran on
-        the params). A nested mapping is read as stored, unvalidated, so the rule sees every key that is written. One
-        the stored deployment already carries unchanged passes, as an unchanged field does. ``model_params`` is the
-        deployment the write lands on, the stored one on an update.
+        the params). Every rule reads mappings, never a model built from one: the keys this write sets
+        (submitted_litellm_params) against the stored deployment's, and each nested mapping as it is stored, so a key
+        such as `_fields_set` is one more key of the mapping, not an argument of a constructor. One the stored
+        deployment already carries unchanged passes, as an unchanged field does. ``model_params`` is the deployment
+        the write lands on, the stored one on an update.
         """
+        written: Final = submitted_litellm_params(litellm_params)
+        stored: Final = _stored_params(existing_litellm_params)
         ModelManagementAuthChecks.can_user_attach_credential(
-            litellm_params=litellm_params,
+            litellm_params=written,
             user_api_key_dict=user_api_key_dict,
-            existing_litellm_params=existing_litellm_params,
+            existing_litellm_params=stored,
             null_detaches=null_detaches,
         )
         ModelManagementAuthChecks.can_user_set_aws_session_tags(
-            litellm_params=litellm_params,
+            litellm_params=written,
             user_api_key_dict=user_api_key_dict,
-            existing_litellm_params=existing_litellm_params,
+            existing_litellm_params=stored,
         )
         if user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN:
             return True
-        stored_mappings: Final = _nested_param_mappings(existing_litellm_params)
-        for mapping in _nested_param_mappings(litellm_params):
+        stored_mappings: Final = _nested_param_mappings(stored)
+        for mapping in _nested_param_mappings(_stored_params(litellm_params)):
             if mapping in stored_mappings:
                 continue
-            # The stored mapping as the rules' params, unvalidated: what is written is what is read
-            as_written = GenericLiteLLMParams.model_construct(**mapping)
             ModelManagementAuthChecks.can_user_attach_credential(
-                litellm_params=as_written, user_api_key_dict=user_api_key_dict
+                litellm_params=mapping, user_api_key_dict=user_api_key_dict
             )
             ModelManagementAuthChecks.can_user_set_aws_session_tags(
-                litellm_params=as_written, user_api_key_dict=user_api_key_dict
+                litellm_params=mapping, user_api_key_dict=user_api_key_dict
             )
             await ModelManagementAuthChecks._reject_non_admin_wif_write(
                 model_params=model_params,

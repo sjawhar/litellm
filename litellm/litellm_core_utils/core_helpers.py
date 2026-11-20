@@ -860,8 +860,8 @@ def fallback_target_params_over_call(
     litellm.acompletion's own fallback loop. Its ``metadata``, ``litellm_metadata`` and ``stream_options`` only add keys
     to the call's: a key the call holds keeps the call's value, and no ``user_api_key_*`` identity key comes from the
     target, so every reader of the hop's metadata, whichever bucket it reads first, finds the identity the call was
-    stamped with, and the hop's stream reports the usage the proxy asked for. A target that sets its own timeout marks
-    the hop ``client_side_timeout``, as the proxy marks a request that sets one.
+    stamped with, and the hop's stream reports the usage the proxy asked for. A target that sets a timeout of its own,
+    null included, decides the hop's ``client_side_timeout`` (_caller_timeout_in_effect).
     """
     params: Final = dict(target)
     for name in _CALL_MERGED_PARAMS:
@@ -880,6 +880,22 @@ def fallback_target_params_over_call(
             },
             **(held or {}),
         }
-    if any(target.get(name) is not None for name in _CALLER_TIMEOUT_PARAMS):
-        params["client_side_timeout"] = True
+    touched: Final = tuple(name for name in _CALLER_TIMEOUT_PARAMS if name in target)
+    if touched:
+        params["client_side_timeout"] = _caller_timeout_in_effect(call_kwargs, target, touched)
     return params
+
+
+def _caller_timeout_in_effect(
+    call_kwargs: Mapping[str, object], target: Mapping[str, object], touched: tuple[str, ...]
+) -> bool:
+    """
+    Whether a timeout the caller set is in effect on the hop, as the proxy decides it for a request: a non-null timeout
+    of the target's own, or one the call keeps that was the caller's, which the call's own mark says. A null sets none,
+    so a target that clears the only caller timeout clears the mark, and the hop's deployment timeout is the
+    deployment's again for the Router's cooldown.
+    """
+    if any(target[name] is not None for name in touched):
+        return True
+    kept: Final = (name for name in _CALLER_TIMEOUT_PARAMS if name not in touched)
+    return bool(call_kwargs.get("client_side_timeout")) and any(call_kwargs.get(name) is not None for name in kept)

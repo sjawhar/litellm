@@ -709,6 +709,92 @@ def metadata_variable_name_for_route(route: str) -> Literal["metadata", "litellm
     return "metadata"
 
 
+_CLIENT_METADATA_BUCKETS: Final = ("metadata", "litellm_metadata")
+
+
+def _strip_session_id_omitted_marker(
+    data: dict[str, object],  # mutable-ok: strips in place on the request body the pre-call pipeline threads through
+) -> None:
+    """The proxy's own mark of an omitted session id, which a caller's metadata may not carry"""
+    for metadata_key in _CLIENT_METADATA_BUCKETS:
+        if isinstance(client_metadata := data.get(metadata_key), dict):
+            client_metadata.pop(SESSION_ID_OMITTED_METADATA_KEY, None)
+
+
+def _sanitize_client_metadata(
+    data: dict[str, object],  # mutable-ok: strips in place on the request body the pre-call pipeline threads through
+    *,
+    allow_client_message_redaction_opt_out: bool,
+    allow_client_pricing_override: bool,
+) -> None:
+    """
+    What the request setup drops from what a caller sent, in its `metadata` and `litellm_metadata` and in the body
+    fields the same strips cover: header controls the caller may not set, `user_api_key_*` identity slots (the proxy
+    writes them into one bucket, so a caller's in the other would surface as a forged identity in guardrails, spend
+    tracking and audit logs), pipeline control fields, pricing overrides unless the key or team allows them,
+    router-owned fallback stamps, callback credentials, and message-logging opt-outs when the proxy turns message
+    logging off and the key or team does not allow them. The setup runs it on a request body;
+    client_metadata_the_setup_would_change runs it on a copy of a fallback target.
+    """
+    for metadata_key in _CLIENT_METADATA_BUCKETS:
+        if not isinstance(user_metadata := data.get(metadata_key), dict):
+            continue
+        _strip_untrusted_request_header_controls(
+            user_metadata.get("headers"),
+            allow_client_message_redaction_opt_out=allow_client_message_redaction_opt_out,
+        )
+        for field in [
+            key for key in user_metadata if key.startswith("user_api_key_") or key in _UNTRUSTED_METADATA_CONTROL_FIELDS
+        ]:
+            user_metadata.pop(field, None)
+    if not allow_client_pricing_override:
+        _strip_client_pricing_overrides(data)
+    _strip_router_reserved_metadata(data)
+    _strip_client_callback_credentials(data)
+    if not allow_client_message_redaction_opt_out and litellm.turn_off_message_logging is True:
+        _strip_client_message_redaction_opt_out(data)
+
+
+def _changed_paths(before: object, after: object, path: tuple[str, ...]) -> tuple[str, ...]:
+    """The dotted paths at which ``after`` drops, adds or changes a value of ``before``, mapping by mapping"""
+    if not (isinstance(before, Mapping) and isinstance(after, Mapping)):
+        return () if before == after else (".".join(path),)
+    return tuple(
+        changed
+        for key in {**before, **after}
+        for changed in (
+            _changed_paths(before[key], after[key], (*path, str(key)))
+            if key in before and key in after
+            else (".".join((*path, str(key))),)
+        )
+    )
+
+
+def client_metadata_the_setup_would_change(
+    target: Mapping[str, object], metadata_variable_name: str
+) -> tuple[str, ...]:
+    """
+    The paths of a fallback target that the request setup would drop or change in a request body. The target, its
+    metadata buckets parsed as a body's are, goes through the setup's own strips on a copy: the session marker's and
+    _sanitize_client_metadata's. The key's and team's opt-ins are taken as off, since a target is checked before the
+    key is read; the proxy-wide settings are as they are. On a route whose metadata is `metadata`, the setup merges a
+    body's `litellm_metadata` into it and drops the bucket, so a target may not bring that bucket there.
+    """
+    before: Final = {
+        key: (
+            _normalized_metadata_object(key, value) if key in _CLIENT_METADATA_BUCKETS and value is not None else value
+        )
+        for key, value in target.items()
+    }
+    after: Final = copy.deepcopy(before)
+    _strip_session_id_omitted_marker(after)
+    _sanitize_client_metadata(after, allow_client_message_redaction_opt_out=False, allow_client_pricing_override=False)
+    dropped_bucket: Final = (
+        ("litellm_metadata",) if metadata_variable_name == "metadata" and "litellm_metadata" in target else ()
+    )
+    return (*dropped_bucket, *_changed_paths(before, after, ()))
+
+
 def _promoted_trace_control_fields(
     requester_metadata: Mapping[str, object],
     litellm_metadata: Mapping[str, object],
@@ -857,9 +943,7 @@ def apply_missing_session_id_policy(
     general_settings: Mapping[str, object] | None,
     request: Request,
 ) -> None:
-    for metadata_key in ("metadata", "litellm_metadata"):
-        if isinstance(client_metadata := data.get(metadata_key), dict):
-            client_metadata.pop(SESSION_ID_OMITTED_METADATA_KEY, None)
+    _strip_session_id_omitted_marker(data)
     metadata: Final = data.get(_metadata_variable_name)
     policy: Final = general_settings.get("missing_session_id") if general_settings else None
     if policy is None or not _is_llm_inference_route(request):
@@ -2345,47 +2429,15 @@ async def add_litellm_data_to_request(
     # profile_id) don't see attacker-injected admin slots preserved in
     # the deepcopy.
 
-    # Strip internal pipeline state and admin-injection slots from user input.
-    # Runs AFTER the string-to-dict parse above so JSON-string metadata (sent
-    # via multipart/form-data or extra_body) cannot smuggle admin fields past
-    # the isinstance(dict) guard.
-    #
-    # The proxy populates a family of ``user_api_key_*`` fields below
-    # (user_api_key_metadata, user_api_key_user_id, user_api_key_alias,
-    # user_api_key_spend, user_api_key_team_metadata, …) into
-    # data[_metadata_variable_name]. Because the proxy only writes to ONE of
-    # the two metadata dicts, a caller pre-populating any of these keys on
-    # the OTHER metadata dict would have their forged values surface in
-    # guardrails, spend tracking, audit logs, and identity resolution. Strip
-    # by prefix so new ``user_api_key_*`` fields added in the future are
-    # covered without per-key maintenance.
-    for _meta_key in ("metadata", "litellm_metadata"):
-        _user_meta = data.get(_meta_key)
-        if isinstance(_user_meta, dict):
-            _strip_untrusted_request_header_controls(
-                _user_meta.get("headers"),
-                allow_client_message_redaction_opt_out=(_allow_client_message_redaction_opt_out),
-            )
-            for _k in [
-                k for k in _user_meta if k.startswith("user_api_key_") or k in _UNTRUSTED_METADATA_CONTROL_FIELDS
-            ]:
-                _user_meta.pop(_k, None)
-
-    # Strip pricing overrides AFTER the litellm_metadata string-to-dict parse
-    # above, for the same reason as the user_api_key_* strip — JSON-string
-    # metadata (sent via multipart/form-data or extra_body) wouldn't be a
-    # dict yet at the earlier strip point and the isinstance(dict) guard
-    # would silently skip the field.
-    if not _key_or_team_allows_client_pricing_override(user_api_key_dict):
-        _strip_client_pricing_overrides(data)
-    _strip_router_reserved_metadata(data)
-
-    # Same reason as the strips above: runs after the metadata string-to-dict parse
-    # so JSON-string metadata cannot smuggle callback credentials past the dict guard.
-    _strip_client_callback_credentials(data)
-
-    if not _allow_client_message_redaction_opt_out and litellm.turn_off_message_logging is True:
-        _strip_client_message_redaction_opt_out(data)
+    # Strip internal pipeline state, admin-injection slots, pricing overrides, callback credentials and message-logging
+    # opt-outs from user input. Runs AFTER the string-to-dict parse above so JSON-string metadata (sent via
+    # multipart/form-data or extra_body) cannot smuggle them past the isinstance(dict) guard. A fallback target's
+    # buckets go through the same function (client_metadata_the_setup_would_change).
+    _sanitize_client_metadata(
+        data,
+        allow_client_message_redaction_opt_out=_allow_client_message_redaction_opt_out,
+        allow_client_pricing_override=_key_or_team_allows_client_pricing_override(user_api_key_dict),
+    )
 
     # Fill in the proxy_server_request body snapshot now that metadata has
     # been parsed. Consumers (standard_logging_payload, lago,
