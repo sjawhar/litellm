@@ -29,7 +29,7 @@ from litellm.litellm_core_utils.url_utils import (
     provider_url_destination_candidates,
     validate_url,
 )
-from litellm.llms.anthropic.common_utils import anthropic_beta_opts_into_server_side_fallback
+from litellm.llms.anthropic.common_utils import anthropic_beta_opts_into_server_side_fallback, anthropic_owns_fallbacks
 from litellm.llms.azure.passthrough.transformation import azure_router_model_in_endpoint
 from litellm.llms.nvidia_nim.passthrough.transformation import nvidia_nim_model_group_in_path
 from litellm.proxy._types import *
@@ -38,7 +38,11 @@ from litellm.router_utils.clientside_credential_handler import (
     reject_fallback_target_credentials,
     reject_fallback_target_routing,
 )
-from litellm.router_utils.fallback_event_handlers import ROUTER_FALLBACKS_KWARG, fallback_entry_is_target
+from litellm.router_utils.fallback_event_handlers import (
+    ROUTER_FALLBACKS_KWARG,
+    fallback_entries_are_targets,
+    fallback_entry_is_target,
+)
 from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     LITELLM_PASS_THROUGH_ENDPOINT_MARKER,
 )
@@ -545,42 +549,50 @@ def _is_mapping(value: object) -> TypeIs[Mapping[object, object]]:  # guard-ok: 
     return isinstance(value, Mapping)
 
 
-def _iter_fallback_field_values(request_body: Mapping[str, object], skip_body_fallbacks: bool) -> Iterator[object]:
+def _iter_fallback_field_values(
+    request_body: Mapping[str, object], skip_body_fallbacks: bool
+) -> Iterator[tuple[str | None, object]]:
     override: Final = request_body.get("router_settings_override")
     for source in (request_body, override):
         if _is_mapping(source):
             for field in _FALLBACK_FIELDS:
                 if not (skip_body_fallbacks and source is request_body and field == "fallbacks"):
-                    yield source.get(field)
+                    yield field, source.get(field)
     context_window_swaps: Final = request_body.get(CONTEXT_WINDOW_FALLBACK_DICT_FIELD)
     if _is_mapping(context_window_swaps):
-        yield list(context_window_swaps.values())
+        # Each value is the model the client wrapper swaps in, so the values are a list of targets
+        yield None, list(context_window_swaps.values())
 
 
-def _iter_fallback_targets(value: object, depth: int) -> Iterator[str | Mapping[str, object]]:
+def _iter_fallback_targets(value: object, depth: int, field: str | None) -> Iterator[str | Mapping[str, object]]:
+    """
+    The targets in one fallback list, read as the Router reads it: ``field`` is the fallback field whose value the list
+    is, and None marks a list of targets, such as the one a model group is mapped to.
+    """
     if depth > 2 * litellm.ROUTER_MAX_FALLBACKS:
         raise ValueError("Rejected Request: fallback nesting exceeds the allowed validation depth.")
     if _is_mapping(value):
         # The Router iterates a fallback list, and iterating a mapping walks its keys, so each key is a target
         yield from (key for key in value if isinstance(key, str))
         for target_list in value.values():
-            yield from _iter_fallback_targets(target_list, depth + 1)
+            yield from _iter_fallback_targets(target_list, depth + 1, None)
         return
     if not isinstance(value, list):
         return
+    entries_are_targets: Final = field is None or fallback_entries_are_targets(value, field)
     for item in value:
         if isinstance(item, str):
             yield item
+        elif isinstance(item, Mapping) and (entries_are_targets or fallback_entry_is_target(item)):
+            # Merged into the call with or without a model, so its keys are parameters; only its own fallback fields
+            # hold targets
+            yield item
+            for nested_field in _FALLBACK_FIELDS:
+                yield from _iter_fallback_targets(item.get(nested_field), depth + 1, nested_field)
         elif isinstance(item, Mapping):
-            values = tuple(item.values())
-            if not (values and all(isinstance(v, list) for v in values)):
-                yield item
-            if fallback_entry_is_target(item):
-                for field in _FALLBACK_FIELDS:
-                    yield from _iter_fallback_targets(item.get(field), depth + 1)
-            else:
-                for target_list in values:
-                    yield from _iter_fallback_targets(target_list, depth + 1)
+            # A model group mapped to the targets the Router calls once that group fails
+            for target_list in item.values():
+                yield from _iter_fallback_targets(target_list, depth + 1, None)
 
 
 def iter_request_fallback_targets(
@@ -590,8 +602,8 @@ def iter_request_fallback_targets(
     The targets of every LiteLLM fallback list the request carries. ``skip_body_fallbacks`` leaves out the body's
     ``fallbacks``, for a request whose field is Anthropic's server-side fallback list instead.
     """
-    for value in _iter_fallback_field_values(request_body, skip_body_fallbacks):
-        yield from _iter_fallback_targets(value, 0)
+    for field, value in _iter_fallback_field_values(request_body, skip_body_fallbacks):
+        yield from _iter_fallback_targets(value, 0, field)
 
 
 def fallback_target_model_name(target: object) -> str | None:
@@ -612,15 +624,15 @@ def request_fallback_model_names(request_body: Mapping[str, object]) -> tuple[st
     return _target_model_names(iter_request_fallback_targets(request_body))
 
 
-def body_fallbacks_go_to_anthropic(route: str, request: Request | None) -> bool:
+def body_fallbacks_go_to_anthropic(route: str, request: Request | None, request_body: Mapping[str, object]) -> bool:
     """
     Whether the body's ``fallbacks`` is Anthropic's server-side fallback list, sent to Anthropic as is: a /v1/messages
-    request whose anthropic-beta header opts into server-side fallback
+    request whose anthropic-beta header opts into server-side fallback. The Router also reads that header from the
+    body's ``headers``, ``extra_headers`` and ``provider_specific_header``, so this reads them too.
     """
-    return (
-        route.endswith("/v1/messages")
-        and request is not None
-        and anthropic_beta_opts_into_server_side_fallback(request.headers)
+    return route.endswith("/v1/messages") and (
+        (request is not None and anthropic_beta_opts_into_server_side_fallback(request.headers))
+        or anthropic_owns_fallbacks(request_body)
     )
 
 
@@ -635,7 +647,7 @@ def key_fallback_model_names(
         _target_model_names(
             iter_request_fallback_targets(request_body, skip_body_fallbacks=anthropic_owns_body_fallbacks)
         ),
-        _target_model_names(_iter_fallback_targets(request_body.get("fallbacks"), 0))
+        _target_model_names(_iter_fallback_targets(request_body.get("fallbacks"), 0, None))
         if anthropic_owns_body_fallbacks
         else (),
     )
@@ -649,7 +661,7 @@ def request_names_provider_fallback_models(
     as sent. ``"default"`` names none. A list nested too deep to read counts as naming one.
     """
     readable_request: Final = request if request is not None and "headers" in request.scope else None
-    if not body_fallbacks_go_to_anthropic(route, readable_request):
+    if not body_fallbacks_go_to_anthropic(route, readable_request, request_body):
         return False
     try:
         _, provider_fallback_models = key_fallback_model_names(request_body, anthropic_owns_body_fallbacks=True)
@@ -720,33 +732,51 @@ def is_request_body_safe(
     manages_deployments: Final = route_manages_deployments(route)
     allows_client_credentials: Final[bool] = general_settings.get("allow_client_side_credentials") is True
     _reject_non_list_error_fallbacks(request_body)
-    _check_banned_params(request_body, general_settings, llm_router, model, manages_deployments=manages_deployments)
-    for nested_key in _NESTED_CONFIG_KEYS:
-        nested = _coerce_metadata_to_dict(request_body.get(nested_key))
-        if nested is not None:
-            _check_banned_params(nested, general_settings, llm_router, model, manages_deployments=manages_deployments)
-    for metadata_key in _NESTED_METADATA_KEYS:
-        metadata = _coerce_metadata_to_dict(request_body.get(metadata_key))
-        if metadata is not None:
-            _check_banned_params(metadata, general_settings, llm_router, model, manages_deployments=manages_deployments)
-        if any(isinstance(key, str) and key.startswith(f"{metadata_key}[") for key in request_body):
-            _check_banned_params(
-                extract_nested_form_metadata(form_data=request_body, prefix=f"{metadata_key}["),
-                general_settings,
-                llm_router,
-                model,
-                manages_deployments=manages_deployments,
-            )
+    _check_banned_params_in_body(
+        request_body, general_settings, llm_router, model, manages_deployments=manages_deployments
+    )
     for target in iter_request_fallback_targets(request_body):
         if isinstance(target, Mapping):
-            _check_banned_params(target, general_settings, llm_router, model, manages_deployments=manages_deployments)
+            # The hop merges the target into the call, so the config and metadata it nests reach the call as the body's
+            _check_banned_params_in_body(
+                target, general_settings, llm_router, model, manages_deployments=manages_deployments
+            )
             _reject_fallback_target_credentials(target, allows_client_credentials)
             target_model = target.get("model")
             if isinstance(target_model, str):
                 _reject_url_valued_fallback_target(target_model)
         else:
             _reject_url_valued_fallback_target(target)
-    litellm_params: Final = _coerce_metadata_to_dict(request_body.get("litellm_params"))
+    return True
+
+
+def _check_banned_params_in_body(
+    body: Mapping[str, object],
+    general_settings: dict,
+    llm_router: Router | None,
+    model: str,
+    *,
+    manages_deployments: bool,
+) -> None:
+    """The banned-param checks of one request body: its root, the config and metadata it nests and its litellm_params"""
+    _check_banned_params(body, general_settings, llm_router, model, manages_deployments=manages_deployments)
+    for nested_key in _NESTED_CONFIG_KEYS:
+        nested = _coerce_metadata_to_dict(body.get(nested_key))
+        if nested is not None:
+            _check_banned_params(nested, general_settings, llm_router, model, manages_deployments=manages_deployments)
+    for metadata_key in _NESTED_METADATA_KEYS:
+        metadata = _coerce_metadata_to_dict(body.get(metadata_key))
+        if metadata is not None:
+            _check_banned_params(metadata, general_settings, llm_router, model, manages_deployments=manages_deployments)
+        if any(isinstance(key, str) and key.startswith(f"{metadata_key}[") for key in body):
+            _check_banned_params(
+                extract_nested_form_metadata(form_data=body, prefix=f"{metadata_key}["),
+                general_settings,
+                llm_router,
+                model,
+                manages_deployments=manages_deployments,
+            )
+    litellm_params: Final = _coerce_metadata_to_dict(body.get("litellm_params"))
     if litellm_params is not None:
         reject_server_owned_wif_params(litellm_params)
         if not manages_deployments:
@@ -760,7 +790,6 @@ def is_request_body_safe(
                 model,
                 manages_deployments=manages_deployments,
             )
-    return True
 
 
 def _coerce_metadata_to_dict(value: object) -> dict[str, object] | None:

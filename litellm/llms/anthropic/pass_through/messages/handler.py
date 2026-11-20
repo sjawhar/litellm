@@ -579,7 +579,7 @@ def anthropic_messages_handler(
         litellm_kwargs: Final = cast(dict[str, object], kwargs)  # cast-ok: untyped **kwargs
         if routes_to_responses_api or anthropic_owns_fallbacks(litellm_kwargs):
             litellm_kwargs.pop("fallbacks", None)
-        reject_non_list_litellm_fallbacks(litellm_kwargs.get("fallbacks"), original_model)
+        reject_non_list_litellm_fallbacks(litellm_kwargs.get("fallbacks"), original_model, list_of_targets=True)
         if routes_to_responses_api:
             return LiteLLMMessagesToResponsesAPIHandler.anthropic_messages_handler(
                 max_tokens=max_tokens,

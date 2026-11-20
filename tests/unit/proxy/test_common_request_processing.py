@@ -7176,6 +7176,7 @@ class TestPreCallWithFallbacksOnLocalRateLimit:
         rpm_limit: int | None = None,
         model_rpm_limit: dict[str, int] | None = None,
         disable_fallbacks: bool | None = None,
+        models: tuple[str, ...] = (),
     ) -> ProxyUserAPIKeyAuth:
         from opentelemetry.sdk.trace import TracerProvider
 
@@ -7184,6 +7185,7 @@ class TestPreCallWithFallbacksOnLocalRateLimit:
             api_key="hashed-key",
             parent_otel_span=span,
             rpm_limit=rpm_limit,
+            models=list(models),
             metadata={
                 **({"model_rpm_limit": model_rpm_limit} if model_rpm_limit else {}),
                 **({"disable_fallbacks": disable_fallbacks} if disable_fallbacks is not None else {}),
@@ -7307,6 +7309,71 @@ class TestPreCallWithFallbacksOnLocalRateLimit:
 
         assert data["model"] == fallback_model
         assert rig[3] == [primary_model, primary_model, fallback_model]
+
+    @pytest.mark.asyncio
+    async def test_fallback_the_key_may_not_call_is_skipped_when_fallback_access_is_enforced(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """With ``enforce_fallback_model_access`` the failover runs the check a router fallback hop runs on its target,
+        so a key that may call only the rate-limited model gets its rate limit, not the configured fallback."""
+        from litellm.proxy import proxy_server
+        from litellm.proxy.common_utils.proxy_rate_limit_error import ProxyRateLimitError
+
+        primary_model = "gpt-4.1"
+        fallback_model = "gpt-4.1-mini"
+        monkeypatch.setattr(proxy_server, "general_settings", {"enforce_fallback_model_access": True})
+        key = self._otel_key(model_rpm_limit={primary_model: 1}, models=(primary_model,))
+        rig = self._v3_limiter_rig(monkeypatch, key, [{primary_model: [fallback_model]}])
+        # The request's own empty list leaves the configured one to this failover
+        request = {"model": primary_model, "messages": [{"role": "user", "content": "hi"}], "fallbacks": []}
+
+        await self._pre_call(dict(request), key, rig)
+        with pytest.raises(ProxyRateLimitError) as exc_info:
+            await self._pre_call(dict(request), key, rig)
+
+        assert exc_info.value.status_code == 429
+        assert rig[3] == [primary_model, primary_model]
+
+    @pytest.mark.asyncio
+    async def test_fallback_the_key_may_call_is_served_when_fallback_access_is_enforced(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        from litellm.proxy import proxy_server
+
+        primary_model = "gpt-4.1"
+        fallback_model = "gpt-4.1-mini"
+        monkeypatch.setattr(proxy_server, "general_settings", {"enforce_fallback_model_access": True})
+        key = self._otel_key(model_rpm_limit={primary_model: 1}, models=(primary_model, fallback_model))
+        rig = self._v3_limiter_rig(monkeypatch, key, [{primary_model: [fallback_model]}])
+        request = {"model": primary_model, "messages": [{"role": "user", "content": "hi"}], "fallbacks": []}
+
+        await self._pre_call(dict(request), key, rig)
+        _, (data, _) = await self._pre_call(dict(request), key, rig)
+
+        assert data["model"] == fallback_model
+        assert rig[3] == [primary_model, primary_model, fallback_model]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("source", ["router", "key"])
+    async def test_a_configured_group_mapped_to_a_string_is_refused_not_called_by_character(
+        self, monkeypatch: pytest.MonkeyPatch, source: str
+    ):
+        """The failover reads the configured list, which the request's own list keeps from the Router's refusal"""
+        primary_model = "gpt-4.1"
+        malformed: Final = [{primary_model: "f"}]
+        key = self._otel_key(model_rpm_limit={primary_model: 1})
+        rig = self._v3_limiter_rig(monkeypatch, key, [{primary_model: ["f"]}])
+        if source == "router":
+            rig[1].fallbacks = malformed
+        else:
+            key.router_settings = {"fallbacks": malformed}
+        request = {"model": primary_model, "messages": [{"role": "user", "content": "hi"}], "fallbacks": []}
+
+        await self._pre_call(dict(request), key, rig)
+        with pytest.raises(litellm.BadRequestError, match=f"must map model group '{primary_model}' to a list"):
+            await self._pre_call(dict(request), key, rig)
+
+        assert rig[3] == [primary_model, primary_model]
 
     @pytest.mark.asyncio
     async def test_key_metadata_disable_fallbacks_returns_429_instead_of_retrying(

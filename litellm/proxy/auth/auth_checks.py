@@ -1418,8 +1418,9 @@ async def common_checks(
     # 2.4 A fallback target can serve the request in the requested model's place, so it passes the same team, team
     # member, user, project and agent model checks. LiteLLM dispatches its own fallback lists through aliases, but
     # Anthropic gets the names in its own list as sent.
+    typed_body: Final = _typed_request_body(request_body)
     router_fallback_models, provider_fallback_models = key_fallback_model_names(
-        _typed_request_body(request_body), anthropic_owns_body_fallbacks=body_fallbacks_go_to_anthropic(route, request)
+        typed_body, anthropic_owns_body_fallbacks=body_fallbacks_go_to_anthropic(route, request, typed_body)
     )
     with tracer.trace("litellm.proxy.auth.common_checks.run_fallback_model_checks"):
         await _run_fallback_model_checks(

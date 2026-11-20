@@ -339,27 +339,52 @@ def _router_fallbacks_key(kwargs: Mapping[str, object], anthropic_messages_call:
     )
 
 
-def _group_mapped_to_a_non_list(fallbacks: Sequence[object], field: str) -> str | None:
-    # The Router calls a `fallbacks` list of targets as is. It reads any other entry that is not a target as a group map
-    # and iterates the value it finds there: a string would be called character by character, a mapping key by key.
-    if field == "fallbacks" and check_non_standard_fallback_format(fallbacks):
+def fallback_entries_are_targets(fallbacks: Sequence[object], field: str) -> bool:
+    """
+    Whether the Router calls every entry of this fallback field's list as a target, a string as a model and a mapping
+    merged into the call with or without a ``model``, rather than reading each mapping as a model group mapped to the
+    list of targets it calls once that group fails: so only for a ``fallbacks`` list in the client-side format. The
+    list a model group is mapped to is always a list of targets.
+    """
+    return field in ("fallbacks", ROUTER_FALLBACKS_KWARG) and check_non_standard_fallback_format(fallbacks)
+
+
+def _unsupported_group_map_entry(fallbacks: Sequence[object], field: str) -> str | None:
+    # The Router reads a mapping of a list in the group format by its first key and iterates the value it finds there:
+    # a string would be called character by character, a mapping key by key, and an empty mapping has no key.
+    if fallback_entries_are_targets(fallbacks, field):
         return None
     for entry in fallbacks:
-        if isinstance(entry, dict) and not fallback_entry_is_target(entry):
-            for group, chain in entry.items():
-                if not isinstance(chain, list):
-                    return f"must map model group {group!r} to a list of model groups, got {type(chain).__name__}"
+        if not isinstance(entry, dict):
+            continue
+        if not entry:
+            return "must not hold an empty mapping"
+        if fallback_entry_is_target(entry):
+            if field in ("fallbacks", ROUTER_FALLBACKS_KWARG):
+                continue
+            return f"maps model groups to their fallbacks, so it cannot hold a target naming model {entry['model']!r}"
+        for group, chain in entry.items():
+            if not isinstance(chain, list):
+                return f"must map model group {group!r} to a list of model groups, got {type(chain).__name__}"
     return None
 
 
-def reject_non_list_litellm_fallbacks(fallbacks: object, model: object, *, field: str = "fallbacks") -> None:
-    """LiteLLM fallback fields hold lists of model groups, and a group map in one maps each group to such a list."""
+def reject_non_list_litellm_fallbacks(
+    fallbacks: object, model: object, *, field: str = "fallbacks", list_of_targets: bool = False
+) -> None:
+    """
+    LiteLLM fallback fields hold lists of model groups. In the Router's formats a list of group maps maps each group to
+    such a list, and an error field's list holds no target. ``list_of_targets`` marks a list whose reader calls every
+    entry as a target, as the direct completion fallback does, so only its type is checked.
+    """
     if fallbacks is None:
         return
     problem: Final = (
         f"must be a list of model groups, got {type(fallbacks).__name__}"
         if not isinstance(fallbacks, list)
-        else _group_mapped_to_a_non_list(fallbacks, field)
+        else None
+        if list_of_targets
+        else _unsupported_group_map_entry(fallbacks, field)
     )
     if problem is not None:
         raise litellm.BadRequestError(
@@ -678,6 +703,36 @@ PROVIDER_SCOPED_RESOURCE_FUNCTION_NAMES: Final = frozenset(
 )
 PROVIDER_SCOPED_CREATION_FUNCTION_NAMES: Final = frozenset({"_acreate_file"})
 
+# The proxy stamps the caller's identity into a call's metadata under this prefix, and strips it from a request's own
+_IDENTITY_METADATA_KEY_PREFIX: Final = "user_api_key_"
+
+
+def _target_params_over_call(call_kwargs: Mapping[str, object], target: Mapping[str, object]) -> dict[str, object]:
+    """
+    The params a dict target lays over the call. Its ``metadata`` and ``litellm_metadata`` only add keys to the call's:
+    a key the call holds keeps the call's value, and no ``user_api_key_*`` identity key comes from the target, so every
+    reader of the hop's metadata, whichever bucket it reads first, finds the identity the call was stamped with.
+    """
+    params: Final = dict(target)
+    for bucket in _ROUTER_METADATA_BUCKETS:
+        if bucket not in target:
+            continue
+        held: Final = call_kwargs.get(bucket)
+        if held is not None and not isinstance(held, Mapping):
+            del params[bucket]
+            continue
+        added: Final = target[bucket]
+        params[bucket] = {
+            **{
+                key: value
+                for key, value in (added.items() if isinstance(added, Mapping) else ())
+                if not (isinstance(key, str) and key.startswith(_IDENTITY_METADATA_KEY_PREFIX))
+            },
+            **(held or {}),
+        }
+    return params
+
+
 
 def _get_fallback_target_model_group(fallback_entry: str | Mapping[str, object]) -> str | None:
     if isinstance(fallback_entry, str):
@@ -870,7 +925,7 @@ async def run_async_fallback(
             if isinstance(mg, str):
                 kwargs["model"] = mg
             elif isinstance(mg, dict):
-                kwargs.update(mg)
+                kwargs.update(_target_params_over_call(kwargs, mg))
             fallback_depth = fallback_depth + 1
             _hop_metadata = dict(kwargs.get(metadata_variable_name) or {})
             _original_model_group_stamp = _hop_metadata.pop("original_model_group", original_model_group)
