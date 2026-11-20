@@ -31,6 +31,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     recall_last_good,
     remember_last_good,
     revoke_last_good,
+    start_last_good_reads,
 )
 from litellm.proxy.proxy_server import UserAPIKeyCacheTTLEnum
 from tests.unit.caching.fake_redis_cache import fake_redis_cache
@@ -145,18 +146,20 @@ class _FailsSlowlyBeforeTheWrite(RedisCache):
 
 
 class _SlowWrite(RedisCache):
-    """The reading pod's Redis: the entry write takes ``seconds`` before it lands."""
+    """The pod's Redis: each SET takes ``seconds`` before it lands, and the keys it SETs are recorded in order."""
 
     def __init__(self, redis: RedisCache, clock: _Clock, seconds: float) -> None:
         self._redis = redis
         self._clock = clock
-        self._seconds = seconds
+        self.seconds = seconds
+        self.set_keys: Final[list[str]] = []  # mutable-ok: records every SET in order
 
     async def async_get_cache_or_raise(self, key: str) -> object:
         return await self._redis.async_get_cache_or_raise(key)
 
     async def async_set_cache_or_raise(self, key: str, value: object, ttl: int | None = None) -> None:
-        self._clock.now += self._seconds
+        self._clock.now += self.seconds
+        self.set_keys.append(key)
         await self._redis.async_set_cache_or_raise(key, value, ttl=ttl)
 
     async def async_delete_cache(self, key: str) -> None:
@@ -822,6 +825,33 @@ class TestLastGoodEntries:
         assert reading_pod.last_good_memory.get("team_id:t1") is None
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("write_seconds", "kept"),
+        [(LAST_GOOD_LATE_STORE_MARGIN_SECONDS + 1, False), (LAST_GOOD_LATE_STORE_MARGIN_SECONDS - 1, True)],
+        ids=["slower_than_the_margin", "faster_than_the_margin"],
+    )
+    async def test_a_redis_write_slower_than_the_margin_is_undone_far_inside_the_tombstone_time(
+        self, write_seconds: int, kept: bool
+    ):
+        """The SET carries an expiry computed before it is sent, and Redis counts it from when it runs the SET, so a
+        slow write could keep the entry in Redis that much past its end. A write and check slower than the margin are
+        undone, in Redis and in memory, although the store is far from late; a faster one is kept, and Redis then ends
+        at most the margin plus the rounding after the memory line."""
+        clock: Final = _Clock()
+        redis: Final = fake_redis_cache()
+        cache: Final = UserApiKeyCache(
+            redis_cache=_SlowWrite(redis.cache, clock, seconds=write_seconds),
+            serve_last_good_entries=True,
+            last_good_clock=clock,
+        )
+
+        with last_good_reads_started_at(clock()):
+            await remember_last_good(cache, "team_id:t1", self._team("t1"))
+
+        in_redis: Final = await redis.cache.init_async_client().get("last_good:team_id:t1")
+        assert (in_redis is not None, cache.last_good_memory.get("team_id:t1") is not None) == (kept, kept)
+
+    @pytest.mark.asyncio
     async def test_memory_line_answers_while_redis_is_away(self):
         redis = fake_redis_cache()
         cache = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
@@ -1192,5 +1222,40 @@ class TestLastGoodEntries:
         started_task: Final = await asyncio.create_task(request_starting_a_task())
         with pytest.raises(HTTPException) as refused:
             await started_task
+
+        assert refused.value.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_a_revocation_checks_its_record_when_each_key_comes_up_not_when_the_call_began(self):
+        """K was revoked earlier. A later call that revokes J then K begins 1 s inside the time its record allows, but
+        J's Redis commands take 2 s, so K's tombstone may lapse before the request's write: K goes to Redis again."""
+        clock: Final = _Clock()
+        redis: Final = _SlowWrite(fake_redis_cache().cache, clock, seconds=0.0)
+        cache: Final = UserApiKeyCache(redis_cache=redis, serve_last_good_entries=True, last_good_clock=clock)
+        await revoke_last_good(cache, ("hashed-k",))
+        clock.now += LAST_GOOD_TOMBSTONE_TTL_SECONDS - LAST_GOOD_LATE_STORE_MARGIN_SECONDS - 1
+        redis.seconds = 2.0
+        redis.set_keys.clear()
+
+        await revoke_last_good(cache, ("hashed-j", "hashed-k"))
+
+        assert redis.set_keys == ["last_good_tombstone:hashed-j", "last_good_tombstone:hashed-k"]
+
+    @pytest.mark.asyncio
+    async def test_a_second_auth_run_in_the_same_task_starts_with_an_empty_record_of_revoked_keys(self):
+        """One task can handle two requests: where the second one's auth begins (``start_last_good_reads``, the first
+        statement of user_api_key_auth and of every MCP request), the first one's record is dropped, so the second
+        sends the same key to Redis again and is refused while Redis is away."""
+        from fastapi import HTTPException
+
+        token: Final = "hashed-token-revoked-by-the-earlier-request"
+        redis: Final = fake_redis_cache()
+        cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=_Clock())
+        await revoke_last_good(cache, (token,))
+        redis.server.connected = False
+
+        start_last_good_reads()
+        with pytest.raises(HTTPException) as refused:
+            await revoke_last_good(cache, (token,))
 
         assert refused.value.status_code == 503

@@ -1371,7 +1371,7 @@ async def test_update_user_put_with_valueless_entitlements_deactivates_user(scim
     assert written_metadata["scim_active"] is False
     assert written_metadata["scim_entitlements"] == [{"groups": ["S0506MKA55L", "S0506MKA56M"]}]
     assert written_metadata["scim_roles"] == [{"display": "Viewer"}]
-    set_keys_blocked_mock.assert_awaited_once_with(user_id="suspend-me", blocked=True)
+    set_keys_blocked_mock.assert_awaited_once_with(user_id="suspend-me", blocked=True, revoked_keys=None)
 
 
 @pytest.mark.asyncio
@@ -6516,8 +6516,8 @@ async def test_scim_patch_deactivation_answers_503_and_writes_nothing_when_redis
 
 @pytest.mark.asyncio
 async def test_scim_patch_deactivation_reads_no_key_and_writes_while_redis_is_down_with_last_good_entries_off(mocker):
-    """With last good entries off nothing is revoked, so a deactivation makes no extra key read and Redis being down
-    does not stop it."""
+    """With last good entries off nothing is revoked, so the preflight reads no key and hands the block none, which
+    reads its own, and Redis being down does not stop the deactivation."""
     prisma: Final = _scim_user_with_a_key(mocker, serves_last_good=False)
     mocker.patch(  # test-quality-ok: the roster writes are module-level, not injectable
         f"{_SCIM_MODULE}._handle_team_membership_changes", AsyncMock()
@@ -6529,7 +6529,7 @@ async def test_scim_patch_deactivation_reads_no_key_and_writes_while_redis_is_do
     await patch_user(user_id=_SCIM_USER_ID, patch_ops=_deactivation_patch())
 
     prisma.db.litellm_usertable.update.assert_awaited_once()
-    set_keys_blocked.assert_awaited_once_with(user_id=_SCIM_USER_ID, blocked=True)
+    set_keys_blocked.assert_awaited_once_with(user_id=_SCIM_USER_ID, blocked=True, revoked_keys=None)
     prisma.db.litellm_verificationtoken.find_many.assert_not_awaited()
 
 
@@ -6681,5 +6681,106 @@ async def test_scim_user_delete_completes_when_redis_is_lost_after_its_first_wri
     prisma.db.litellm_teamtable.update.assert_awaited_once()
     member_delete.assert_awaited_once()
     prisma.db.litellm_verificationtoken.update.assert_awaited_once()
+    referencing_rows.assert_awaited_once()
+    prisma.db.litellm_usertable.delete.assert_awaited_once()
+
+
+_KEY_NOTE: Final = "edited during the request"
+
+
+def _a_key_created_after_the_first_read(prisma: MagicMock) -> str:
+    """The key table as the request changes it: after the first read of the user's unblocked keys, which finds its one
+    key, that key gains a metadata field and a second key is created. A later read finds both, a read by token only
+    those it names, and a read by team neither. Returns the created key's hash."""
+    from litellm.proxy._types import LiteLLM_VerificationToken
+
+    created_key_hash: Final = "hashed-scim-key-created-during-the-request"
+    current: Final = (
+        LiteLLM_VerificationToken(token=_SCIM_KEY_HASH, user_id=_SCIM_USER_ID, metadata={"note": _KEY_NOTE}),
+        LiteLLM_VerificationToken(token=created_key_hash, user_id=_SCIM_USER_ID),
+    )
+    reads: Final[list[Mapping[str, object]]] = []  # mutable-ok: grows by one with each read not by team
+
+    async def keys_where(where: Mapping[str, object]) -> list[LiteLLM_VerificationToken]:
+        if "team_id" in where:
+            return []
+        reads.append(where)
+        if len(reads) == 1:
+            return [LiteLLM_VerificationToken(token=_SCIM_KEY_HASH, user_id=_SCIM_USER_ID)]
+        by_token: Final = where.get("token")
+        named: Final = by_token.get("in") if isinstance(by_token, dict) else None
+        return [row for row in current if not isinstance(named, list) or row.token in named]
+
+    prisma.db.litellm_verificationtoken.find_many = AsyncMock(side_effect=keys_where)
+    return created_key_hash
+
+
+def _assert_only_the_key_read_first_was_blocked_and_revoked(prisma: MagicMock, created_key_hash: str) -> None:
+    """The user's unblocked keys were read once and then, by token, only the key that read found; only that key was
+    blocked, with its current metadata and the marker, and revoked."""
+    from litellm.proxy import proxy_server
+
+    unblocked: Final = {"user_id": _SCIM_USER_ID, "OR": [{"blocked": False}, {"blocked": None}]}
+    reads: Final = prisma.db.litellm_verificationtoken.find_many.await_args_list
+    assert [read for read in reads if "team_id" not in read.kwargs["where"]] == [
+        call(where=unblocked),
+        call(where={**unblocked, "token": {"in": [_SCIM_KEY_HASH]}}),
+    ]
+    prisma.db.litellm_verificationtoken.update.assert_awaited_once_with(
+        where={"token": _SCIM_KEY_HASH},
+        data={"blocked": True, "metadata": json.dumps({"note": _KEY_NOTE, "scim_blocked": True})},
+    )
+    assert proxy_server.user_api_key_cache.last_good_memory.tombstoned(_SCIM_KEY_HASH) is True
+    assert proxy_server.user_api_key_cache.last_good_memory.tombstoned(created_key_hash) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["PUT", "PATCH"])
+async def test_scim_deactivation_blocks_only_the_keys_it_revoked_when_redis_is_lost_after_the_user_row_update(
+    mocker, method
+):
+    """The block reads again only the current row of the key the preflight read and revoked, so a key created after
+    that read is neither blocked nor revoked, the metadata the key gained since is kept, and the Redis lost once the
+    user row update is awaited refuses nothing."""
+    redis: Final = fake_redis_cache()
+    prisma: Final = _scim_user_with_a_key(mocker, serves_last_good=True, redis=redis)
+    created_key_hash: Final = _a_key_created_after_the_first_read(prisma)
+    prisma.db.litellm_usertable.update.side_effect = _redis_lost_by(redis)
+
+    scim_user: Final = await (
+        update_user(user_id=_SCIM_USER_ID, user=_scim_put(active=False))
+        if method == "PUT"
+        else patch_user(user_id=_SCIM_USER_ID, patch_ops=_deactivation_patch())
+    )
+
+    assert scim_user.id == _SCIM_USER_ID
+    assert redis.server.connected is False
+    prisma.db.litellm_usertable.update.assert_awaited_once()
+    _assert_only_the_key_read_first_was_blocked_and_revoked(prisma, created_key_hash)
+
+
+@pytest.mark.asyncio
+async def test_scim_user_delete_blocks_only_the_keys_it_revoked_when_redis_is_lost_after_its_first_write(mocker):
+    """The DELETE reads again only the current row of the key its preflight read and revoked, so a key created after
+    that read is neither blocked nor revoked, the metadata the key gained since is kept, and the Redis lost once the
+    first write, the team's legacy roster, is awaited refuses nothing."""
+    redis: Final = fake_redis_cache()
+    prisma: Final = _scim_user_with_a_key(mocker, serves_last_good=True, redis=redis)
+    created_key_hash: Final = _a_key_created_after_the_first_read(prisma)
+    prisma.db.litellm_teamtable.update.side_effect = _redis_lost_by(redis)
+    member_delete: Final = mocker.patch(  # test-quality-ok: the roster writes are module-level, not injectable
+        f"{_SCIM_MODULE}.team_member_delete", _team_member_delete_revoking(prisma)
+    )
+    referencing_rows: Final = mocker.patch(  # test-quality-ok: the row cleanup is module-level, not injectable
+        f"{_SCIM_MODULE}._delete_rows_referencing_user", AsyncMock()
+    )
+
+    response: Final = await delete_user(user_id=_SCIM_USER_ID)
+
+    assert response.status_code == 204
+    assert redis.server.connected is False
+    prisma.db.litellm_teamtable.update.assert_awaited_once()
+    member_delete.assert_awaited_once()
+    _assert_only_the_key_read_first_was_blocked_and_revoked(prisma, created_key_hash)
     referencing_rows.assert_awaited_once()
     prisma.db.litellm_usertable.delete.assert_awaited_once()

@@ -2892,7 +2892,8 @@ class TestLastGoodLimitsWhileTheDatabaseIsUnreachable:
     ):
         """A registry and an end-user verdict a last good entry answered are cached in this pod's memory for
         LAST_GOOD_SERVED_COPY_TTL_SECONDS and not in Redis, which memory would read back with a fresh time, so neither
-        copy can outlive the entry it rests on by more than that."""
+        copy can outlive the entry it rests on by more than that. The cache and its memory run on one driven clock, and
+        each copy rests on an entry recalled at the moment it is cached, so each gets the whole time."""
         from litellm.caching.in_memory_cache import InMemoryCache
         from litellm.constants import LAST_GOOD_SERVED_COPY_TTL_SECONDS
         from litellm.proxy._types import LiteLLM_EndUserTable
@@ -2901,6 +2902,7 @@ class TestLastGoodLimitsWhileTheDatabaseIsUnreachable:
             end_user_cache_key,
             end_user_restricted_registry_cache_key,
             end_user_validation_cache_key,
+            last_good_reads_started_at,
         )
 
         monkeypatch.setattr(litellm, "validate_end_user_id_in_db", True)
@@ -2911,7 +2913,7 @@ class TestLastGoodLimitsWhileTheDatabaseIsUnreachable:
         now: Final = [1_000.0]
         memory: Final = InMemoryCache(clock=lambda: now[0])
         redis: Final = fake_redis_cache()
-        cache: Final = _serving_cache(in_memory_cache=memory, redis_cache=redis.cache)
+        cache: Final = _serving_cache(in_memory_cache=memory, redis_cache=redis.cache, last_good_clock=lambda: now[0])
         registry_key: Final = end_user_restricted_registry_cache_key()
         verdict_key: Final = end_user_validation_cache_key("c-known")
 
@@ -2921,8 +2923,9 @@ class TestLastGoodLimitsWhileTheDatabaseIsUnreachable:
                 user_api_key_cache=cache,
             )
 
-        assert await registry() == frozenset({"c-restricted"})
-        assert await self._customer(database, cache, "c-known") is not None
+        with last_good_reads_started_at(now[0]):
+            assert await registry() == frozenset({"c-restricted"})
+            assert await self._customer(database, cache, "c-known") is not None
         await self._expire(cache, registry_key, end_user_cache_key("c-known"))
         database.stopped_with = _STOPPED
         assert await registry() == frozenset({"c-restricted"})
@@ -2948,6 +2951,132 @@ class TestLastGoodLimitsWhileTheDatabaseIsUnreachable:
         assert copies() == held
         now[0] += 1
         assert copies() == (None, None)
+
+    @pytest.mark.asyncio
+    async def test_a_verdict_derived_from_the_registry_copy_is_cached_no_longer_than_that_copy(self, monkeypatch):
+        """The registry is recalled 1 s before its entry ends, so its copy lives 29 s past that end. A customer id no
+        entry keeps, validated against that copy 2 s before the copy ends, has its verdict cached for those 2 s only:
+        a value derived from a copy never outlives it, so nothing answers more than LAST_GOOD_SERVED_COPY_TTL_SECONDS
+        after the entry it rests on ends."""
+        from litellm.caching.in_memory_cache import InMemoryCache
+        from litellm.constants import LAST_GOOD_ENTRY_TTL_SECONDS, LAST_GOOD_SERVED_COPY_TTL_SECONDS
+        from litellm.proxy.auth.auth_checks import _load_end_user_restricted_registry, resolve_and_validate_end_user_id
+        from litellm.proxy.common_utils.user_api_key_cache import (
+            end_user_restricted_registry_cache_key,
+            end_user_validation_cache_key,
+            last_good_auth_entries_scope,
+            last_good_reads_started_at,
+        )
+
+        monkeypatch.setattr(litellm, "validate_end_user_id_in_db", True)
+        monkeypatch.setattr(litellm, "max_end_user_budget_id", None)
+        database: Final = _LimitsDatabase()
+        database.customers.rows["c-restricted"] = LiteLLM_EndUserTable(user_id="c-restricted", blocked=True)
+        now: Final = [1_000.0]
+        memory: Final = InMemoryCache(clock=lambda: now[0])
+        cache: Final = _serving_cache(
+            in_memory_cache=memory, redis_cache=fake_redis_cache().cache, last_good_clock=lambda: now[0]
+        )
+        registry_key: Final = end_user_restricted_registry_cache_key()
+        verdict_key: Final = end_user_validation_cache_key("c-unknown")
+
+        async def registry() -> frozenset[str] | None:
+            return await _load_end_user_restricted_registry(
+                prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+                user_api_key_cache=cache,
+            )
+
+        with last_good_reads_started_at(now[0]):
+            assert await registry() == frozenset({"c-restricted"})
+        entry_ends: Final = now[0] + LAST_GOOD_ENTRY_TTL_SECONDS
+        await self._expire(cache, registry_key)
+        database.stopped_with = _STOPPED
+        now[0] = entry_ends - 1
+        assert await registry() == frozenset({"c-restricted"})
+        copy_ends: Final = now[0] + LAST_GOOD_SERVED_COPY_TTL_SECONDS
+        now[0] = copy_ends - 2
+        with last_good_auth_entries_scope() as request:
+            assert (
+                await resolve_and_validate_end_user_id(
+                    raw_end_user_id="c-unknown",
+                    prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+                    user_api_key_cache=cache,
+                )
+                is None
+            )
+
+        def copies() -> tuple[object, object]:
+            return memory.get_cache(key=registry_key), memory.get_cache(key=verdict_key)
+
+        assert request.served == ("_RegistryIds",)
+        now[0] = copy_ends
+        assert copies() == ({"ids": ["c-restricted"]}, "invalid")
+        now[0] = copy_ends + 1
+        assert copies() == (None, None)
+
+    @pytest.mark.asyncio
+    async def test_a_value_derived_from_a_copy_with_no_time_left_is_not_cached_and_drops_the_older_copy(
+        self, monkeypatch
+    ):
+        """A customer id validated against the registry copy at the moment that copy ends still rests on it, but no
+        time is left to cache its verdict, so none is cached. A value derived with no time left still drops the older
+        copy under its key, which it supersedes."""
+        from litellm.caching.in_memory_cache import InMemoryCache
+        from litellm.constants import LAST_GOOD_SERVED_COPY_TTL_SECONDS
+        from litellm.proxy.auth.auth_checks import _load_end_user_restricted_registry, resolve_and_validate_end_user_id
+        from litellm.proxy.common_utils.user_api_key_cache import (
+            end_user_restricted_registry_cache_key,
+            end_user_validation_cache_key,
+            keep_last_good_served_copy,
+            last_good_auth_entries_scope,
+            last_good_reads_started_at,
+        )
+
+        monkeypatch.setattr(litellm, "validate_end_user_id_in_db", True)
+        monkeypatch.setattr(litellm, "max_end_user_budget_id", None)
+        database: Final = _LimitsDatabase()
+        database.customers.rows["c-restricted"] = LiteLLM_EndUserTable(user_id="c-restricted", blocked=True)
+        now: Final = [1_000.0]
+        memory: Final = InMemoryCache(clock=lambda: now[0])
+        cache: Final = _serving_cache(in_memory_cache=memory, last_good_clock=lambda: now[0])
+        registry_key: Final = end_user_restricted_registry_cache_key()
+        verdict_key: Final = end_user_validation_cache_key("c-unknown")
+        older_key: Final = end_user_validation_cache_key("c-older")
+
+        async def registry() -> frozenset[str] | None:
+            return await _load_end_user_restricted_registry(
+                prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+                user_api_key_cache=cache,
+            )
+
+        async def validated(end_user_id: str) -> str | None:
+            return await resolve_and_validate_end_user_id(
+                raw_end_user_id=end_user_id,
+                prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+                user_api_key_cache=cache,
+            )
+
+        with last_good_reads_started_at(now[0]):
+            assert await registry() == frozenset({"c-restricted"})
+        await self._expire(cache, registry_key)
+        database.stopped_with = _STOPPED
+        assert await registry() == frozenset({"c-restricted"})
+        copy_ends: Final = now[0] + LAST_GOOD_SERVED_COPY_TTL_SECONDS
+        now[0] = copy_ends - 10
+        assert await validated("c-older") is None
+        now[0] = copy_ends
+        with last_good_auth_entries_scope() as request:
+            assert await validated("c-unknown") is None
+
+        assert (request.served, memory.get_cache(key=registry_key), memory.get_cache(key=verdict_key)) == (
+            ("_RegistryIds",),
+            {"ids": ["c-restricted"]},
+            None,
+        )
+        # Another value derived in that request, under a key that still holds an older copy
+        assert memory.get_cache(key=older_key) == "invalid"
+        keep_last_good_served_copy(cache, older_key, "invalid", request)
+        assert memory.get_cache(key=older_key) is None
 
     @pytest.mark.asyncio
     async def test_each_request_waiting_on_a_membership_load_records_the_last_good_membership(self):
@@ -3136,6 +3265,34 @@ class TestLastGoodLimitsWhileTheDatabaseIsUnreachable:
         del database.budgets.rows["b-default"]
 
         assert (composed, await request()) == ((1, ("LiteLLM_BudgetTable",)), (None, ()))
+
+    @pytest.mark.asyncio
+    async def test_a_customer_composed_with_a_last_good_default_budget_keeps_no_new_entry(self, monkeypatch):
+        """The database returns the customer, then cannot be read for the default budget, so the budget's last good
+        entry gives it. The composed customer is not kept as a new entry, which would keep that budget for a whole
+        expiry after the customer's read, past the budget entry's own end; the customer's earlier entry stays."""
+        from litellm.proxy.common_utils.user_api_key_cache import end_user_cache_key, recall_last_good
+
+        monkeypatch.setattr(litellm, "max_end_user_budget_id", "b-default")
+        database = _LimitsDatabase()
+        database.customers.rows["c-default"] = LiteLLM_EndUserTable(user_id="c-default", blocked=False, spend=1.0)
+        database.budgets.rows["b-default"] = LiteLLM_BudgetTable(budget_id="b-default", rpm_limit=1)
+        cache = _serving_cache()
+        await self._customer(database, cache, "c-default")
+        earlier: Final = await recall_last_good(cache, end_user_cache_key("c-default"), LiteLLM_EndUserTable)
+        database.customers.rows["c-default"] = LiteLLM_EndUserTable(user_id="c-default", blocked=False, spend=2.0)
+        await self._expire(cache, end_user_cache_key("c-default"), "default_end_user_budget:b-default")
+
+        async def stopped(where: object = None, include: object = None) -> BaseModel | None:
+            raise _STOPPED
+
+        database.db.litellm_budgettable = SimpleNamespace(find_unique=stopped)
+        composed: Final = await self._customer(database, cache, "c-default")
+
+        assert composed is not None and composed.spend == 2.0
+        assert composed.litellm_budget_table is not None and composed.litellm_budget_table.rpm_limit == 1
+        assert earlier is not None and earlier.spend == 1.0
+        assert await recall_last_good(cache, end_user_cache_key("c-default"), LiteLLM_EndUserTable) == earlier
 
     @pytest.mark.asyncio
     async def test_validating_a_customer_id_with_no_entry_refuses_only_one_the_registry_copy_holds(self, monkeypatch):

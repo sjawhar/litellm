@@ -10710,7 +10710,8 @@ async def test_fresh_mcp_user_permission_link_ignores_cached_and_replica_grants(
 async def test_a_permission_link_from_a_last_good_user_lives_30_seconds_in_memory_and_none_in_redis(monkeypatch):
     """While the database is unreachable the user's last good entry gives the permission link. The link is cached in
     this pod's memory for LAST_GOOD_SERVED_COPY_TTL_SECONDS and not in Redis, which memory would read back with a
-    fresh time, so the link cannot outlive the user's entry by more than that."""
+    fresh time, so the link cannot outlive the user's entry by more than that. The cache and its memory run on one
+    driven clock, and the user is recalled at the moment the link is cached, so the link gets the whole time."""
     import httpx
 
     from litellm.caching.in_memory_cache import InMemoryCache
@@ -10719,6 +10720,7 @@ async def test_a_permission_link_from_a_last_good_user_lives_30_seconds_in_memor
     from litellm.proxy._types import LiteLLM_UserTable
     from litellm.proxy.common_utils.user_api_key_cache import (
         UserApiKeyCache,
+        last_good_reads_started_at,
         remember_last_good,
         user_object_permission_id_cache_key,
     )
@@ -10728,8 +10730,11 @@ async def test_a_permission_link_from_a_last_good_user_lives_30_seconds_in_memor
     now: Final = [1_000.0]
     memory: Final = InMemoryCache(clock=lambda: now[0])
     redis: Final = fake_redis_cache()
-    cache: Final = UserApiKeyCache(in_memory_cache=memory, redis_cache=redis.cache, serve_last_good_entries=True)
-    await remember_last_good(cache, user_id, LiteLLM_UserTable(user_id=user_id, object_permission_id="op-kept"))
+    cache: Final = UserApiKeyCache(
+        in_memory_cache=memory, redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=lambda: now[0]
+    )
+    with last_good_reads_started_at(now[0]):
+        await remember_last_good(cache, user_id, LiteLLM_UserTable(user_id=user_id, object_permission_id="op-kept"))
     database: Final = MagicMock()
     database.db.litellm_usertable.find_unique = AsyncMock(
         side_effect=httpx.ConnectError("All connection attempts failed")

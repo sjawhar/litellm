@@ -128,7 +128,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     project_cache_key,
     project_spend_counter_key,
     recall_last_good,
-    record_last_good_served,
+    record_last_good_served_copy,
     remember_last_good,
     serves_last_good_entries,
     tag_cache_key,
@@ -1873,7 +1873,7 @@ async def _cached_registry(
     served_from_last_good: Final = CacheCodec.deserialize(cached, _RegistryIds)
     if served_from_last_good is None:
         return _REGISTRY_NOT_CACHED
-    record_last_good_served(_RegistryIds.__name__)
+    record_last_good_served_copy(user_api_key_cache, cache_key, _RegistryIds.__name__)
     return frozenset(served_from_last_good.ids)
 
 
@@ -1905,9 +1905,11 @@ async def _fetch_and_cache_registry(
     try:
         registry_ids: Final = await fetch_ids()
     except Exception as e:  # noqa: BLE001  # fail-safe: any registry load error must degrade to per-id lookups, never break auth
-        kept: Final = (
-            await recall_last_good_after(e, user_api_key_cache, cache_key, _RegistryIds) if keep_last_good else None
-        )
+        # Its own scope, so the copy below ends with what this recall served, not with an earlier copy the request read
+        with last_good_auth_entries_scope() as registry_scope:
+            kept: Final = (
+                await recall_last_good_after(e, user_api_key_cache, cache_key, _RegistryIds) if keep_last_good else None
+            )
         verbose_proxy_logger.warning(
             "Registry %s could not be loaded from the database, so %s for %ss: %s",
             cache_key,
@@ -1926,7 +1928,7 @@ async def _fetch_and_cache_registry(
             )
             return None
         # Not in Redis: memory refills from Redis with a fresh time, so the copy could outlive the entry
-        keep_last_good_served_copy(user_api_key_cache, cache_key, kept)
+        keep_last_good_served_copy(user_api_key_cache, cache_key, kept, registry_scope)
         return frozenset(kept.ids)
 
     if len(registry_ids) > max_size:
@@ -2127,8 +2129,8 @@ async def get_end_user_object(
                 parent_otel_span=parent_otel_span,
             )
 
-        # Not cached when the default budget came from a last good entry: a later read that resolves no default keeps
-        # the cached row's budget, and that read would be fresh
+        # Neither cached nor kept when the default budget came from a last good entry: a later read that resolves no
+        # default keeps the cached row's budget, and a new entry would keep that budget past its own entry's expiry
         if not default_budget_scope.served:
             await user_api_key_cache.async_set_cache(
                 key=_key,
@@ -2136,7 +2138,7 @@ async def get_end_user_object(
                 model_type=LiteLLM_EndUserTable,
                 ttl=get_management_object_ttl(user_api_key_cache),
             )
-        await remember_last_good(user_api_key_cache, _key, end_user_row)
+            await remember_last_good(user_api_key_cache, _key, end_user_row)
 
         if key_end_user_budget_id is None:
             return end_user_row
@@ -2233,7 +2235,7 @@ async def resolve_and_validate_end_user_id(
     cache_key: Final = end_user_validation_cache_key(raw_end_user_id)
     cached: Final = await _raw_cache(user_api_key_cache).async_get_cache(key=cache_key)
     if cached == _END_USER_VALID_FROM_LAST_GOOD:
-        record_last_good_served(_END_USER_VALID_FROM_LAST_GOOD)
+        record_last_good_served_copy(user_api_key_cache, cache_key, _END_USER_VALID_FROM_LAST_GOOD)
         return raw_end_user_id
     if cached == "valid":
         return raw_end_user_id
@@ -2255,7 +2257,7 @@ async def resolve_and_validate_end_user_id(
     )
     if validation_scope.served:
         # Not in Redis: memory refills from Redis with a fresh time, so the verdict could outlive the entry it rests on
-        keep_last_good_served_copy(user_api_key_cache, cache_key, verdict)
+        keep_last_good_served_copy(user_api_key_cache, cache_key, verdict, validation_scope)
     else:
         await user_api_key_cache.async_set_cache(
             key=cache_key,
