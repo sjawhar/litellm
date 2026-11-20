@@ -14065,8 +14065,6 @@ async def test_team_member_role_change_drops_the_teams_cached_and_last_good_entr
     mock_prisma_client.db.litellm_teamtable.find_unique = AsyncMock(return_value=team_row)
     mock_prisma_client.db.litellm_teamtable.update = AsyncMock(side_effect=_roster_writer(team_row))
     mock_prisma_client.db.litellm_auditlog.create = AsyncMock()
-    # While last good entries are served, the role change reads the member's keys in the team to revoke them
-    mock_prisma_client.db.litellm_verificationtoken.find_many = AsyncMock(return_value=[])
     monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", mock_prisma_client)
     monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
     _wire_member_delete_tx(mock_prisma_client)
@@ -17101,9 +17099,9 @@ def _redis_down_cache(*, serve_last_good_entries: bool):
 async def test_team_budget_update_refuses_and_writes_nothing_when_redis_cannot_record_the_revocation(payload):
     """The team's entry and every key's entry carry the team's limits and never expire, so a limit change Redis
     cannot revoke them for is refused with 503 before the team row or its member default budget is written."""
-    from litellm.proxy.management_endpoints.team_endpoints import team_update_changes_key_entries
+    from litellm.proxy.management_endpoints.team_endpoints import team_update_changes_budget
 
-    assert team_update_changes_key_entries(UpdateTeamRequest(team_id=_PATCH_TEAM_ID, **payload), None)
+    assert team_update_changes_budget(UpdateTeamRequest(team_id=_PATCH_TEAM_ID, **payload), None)
     sink: Final[dict[str, AsyncMock | MagicMock]] = {}
 
     with (
@@ -17144,31 +17142,28 @@ async def test_team_budget_update_revokes_the_last_good_entry_of_each_key_of_the
 @pytest.mark.parametrize(
     ("existing_metadata", "payload"),
     [
-        (None, {"default_team_member_models": ["gpt-4o"]}),
-        (None, {"team_member_key_duration": "1d"}),
-        ({"cost_center": "cc-1"}, {"metadata": {"cost_center": "cc-1"}}),
+        (None, {"team_alias": "renamed"}),
+        (None, {"metadata": {"cost_center": "cc-1"}}),
+        ({"model_rpm_limit": {"gpt-4o": 5}}, {"metadata": {"model_rpm_limit": {"gpt-4o": 5}, "cost_center": "cc-1"}}),
     ],
-    ids=["default_team_member_models", "team_member_key_duration", "metadata-as-stored"],
+    ids=["alias", "metadata-without-limits", "metadata-with-unchanged-limits"],
 )
-async def test_team_update_of_only_a_field_no_entry_enforces_writes_with_redis_down(existing_metadata, payload):
-    """A field of TEAM_FIELDS_NOT_ENFORCED, or a metadata body equal to the stored one, changes nothing a team's or a
-    key's last good entry is enforced by, so it revokes nothing and writes while Redis is down."""
-    from litellm.proxy.management_endpoints.team_endpoints import TEAM_FIELDS_NOT_ENFORCED
+async def test_team_update_that_changes_no_limit_writes_with_redis_down(existing_metadata, payload):
+    """Only a limit change has entries to revoke: a rename, or a metadata edit that leaves every limit key as stored,
+    still writes while Redis is down, without reading the team's keys."""
+    from litellm.proxy.management_endpoints.team_endpoints import team_update_changes_budget
 
-    assert set(payload) - {"metadata"} <= TEAM_FIELDS_NOT_ENFORCED
+    assert not team_update_changes_budget(UpdateTeamRequest(team_id=_PATCH_TEAM_ID, **payload), existing_metadata)
     sink: Final[dict[str, AsyncMock | MagicMock]] = {}
 
-    with patch(  # test-quality-ok: proxy_server module global is the endpoint's only injection point
-        "litellm.proxy.proxy_server.premium_user", True
-    ):
-        await _drive_team_write(
-            "post",
-            existing_metadata=existing_metadata,
-            payload=payload,
-            user_api_key_cache=_redis_down_cache(serve_last_good_entries=True),
-            mock_sink=sink,
-            team_keys=("team-key",),
-        )
+    await _drive_team_write(
+        "post",
+        existing_metadata=existing_metadata,
+        payload=payload,
+        user_api_key_cache=_redis_down_cache(serve_last_good_entries=True),
+        mock_sink=sink,
+        team_keys=("team-key",),
+    )
 
     sink["update"].assert_awaited_once()
     sink["team_keys"].assert_not_awaited()
@@ -17202,13 +17197,7 @@ class _ColumnFilteredKeys:
             value: Final = getattr(row, column, None)
             return value in wanted["in"] if isinstance(wanted, dict) else value == wanted
 
-        # A chunked read joins its chunk to the caller's own filter under AND
-        clauses: Final = where["AND"] if "AND" in where else (where,)
-        return [
-            row
-            for row in self.rows
-            if all(matches(row, column, wanted) for clause in clauses for column, wanted in clause.items())
-        ]
+        return [row for row in self.rows if all(matches(row, column, wanted) for column, wanted in where.items())]
 
 
 _BUDGET_HOLDER_TABLES: Final = (
@@ -17278,307 +17267,23 @@ async def test_team_member_budget_update_refuses_and_writes_nothing_when_redis_c
     prisma.tx.assert_not_called()
 
 
-class _HeldMemberBudgetReads:
-    """The database of member-1's private budget row ``own-budget`` in team-1, which another user's key names too. The
-    auth reads of the member's key, the other key and the membership take their row when they start and answer only
-    once ``release`` is set; the member update's own reads answer at once."""
-
-    def __init__(self, member_key: str, budget_key: str) -> None:
-        self.all_started = asyncio.Event()
-        self.release = asyncio.Event()
-        self._started = 0
-        old_budget: Final = LiteLLM_BudgetTable(budget_id="own-budget", max_budget=50.0, rpm_limit=100)
-        self.team: Final = LiteLLM_TeamTable(team_id="team-1", metadata={}, members_with_roles=[])
-        self.membership: Final = LiteLLM_TeamMembership(
-            user_id="member-1", team_id="team-1", budget_id="own-budget", litellm_budget_table=old_budget
-        )
-        self.keys: Final = {
-            member_key: UserAPIKeyAuth(token=member_key, user_id="member-1", team_id="team-1"),
-            budget_key: UserAPIKeyAuth(
-                token=budget_key, user_id="another-user", budget_id="own-budget", max_budget=50.0
-            ),
-        }
-        nothing_on_it: Final = SimpleNamespace(find_many=AsyncMock(return_value=[]))
-        self.db: Final = SimpleNamespace(
-            litellm_teamtable=SimpleNamespace(find_unique=AsyncMock(return_value=self.team)),
-            litellm_teammembership=SimpleNamespace(
-                find_first=self._held_membership, find_many=AsyncMock(return_value=[self.membership])
-            ),
-            litellm_verificationtoken=_ColumnFilteredKeys(
-                SimpleNamespace(
-                    token=member_key, user_id="member-1", team_id="team-1", budget_id=None, organization_id=None
-                ),
-                SimpleNamespace(
-                    token=budget_key, user_id="another-user", team_id=None, budget_id="own-budget", organization_id=None
-                ),
-            ),
-            litellm_organizationtable=nothing_on_it,
-            litellm_projecttable=nothing_on_it,
-            litellm_endusertable=nothing_on_it,
-            litellm_tagtable=nothing_on_it,
-            litellm_modelaccessgroupbudgettable=nothing_on_it,
-        )
-
-    async def _held(self, row: object) -> object:
-        self._started += 1
-        if self._started == 3:
-            self.all_started.set()
-        await self.release.wait()
-        return row
-
-    async def _held_membership(self, where: object, include: object = None) -> object:
-        return await self._held(self.membership)
-
-    async def get_data(self, token: str, table_name: str, **_: object) -> object:
-        return await self._held(self.keys[token])
-
-    async def attempt_db_reconnect(self, **_: object) -> bool:
-        return False
-
-    @asynccontextmanager
-    async def tx(self, **_: object):
-        yield SimpleNamespace()
-
-
 @pytest.mark.asyncio
-@pytest.mark.parametrize("pods", ["one_pod", "two_pods"])
-async def test_a_read_in_flight_across_a_member_budget_written_in_place_leaves_no_holder_the_old_limit(
-    monkeypatch, pods: str
-):
-    """The member's key, another key naming the member's private budget row and the membership are each being read
-    when that row is lowered in place. Each read took its row before the write and stores it after, so without a
-    revocation before the write each would keep the old limit as a last good entry, served in the next outage."""
-    from litellm.proxy.auth.auth_checks import get_key_object
-    from litellm.proxy.auth.user_api_key_auth import (
-        _read_team_membership,  # pyright: ignore[reportPrivateUsage]  # the admission check's read
-    )
-    from litellm.proxy.common_utils.user_api_key_cache import (
-        UserApiKeyCache,
-        recall_last_good,
-        team_membership_auth_cache_key,
-    )
-    from litellm.proxy.utils import PrismaClient
-    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+async def test_team_member_budget_written_in_place_revokes_every_holder_of_that_budget_row(monkeypatch):
+    """A member's private budget row is updated in place, so a key that names the same row carries the changed
+    limits too and must lose its last good entry along with the member's own key."""
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, recall_last_good, remember_last_good
 
     member_key: Final = "hashed-member-key"
     budget_key: Final = "hashed-budget-key"
-    database: Final = _HeldMemberBudgetReads(member_key, budget_key)
-    prisma: Final = cast(PrismaClient, database)
-    redis: Final = fake_redis_cache()
-    reading_pod: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
-    updating_pod: Final = (
-        reading_pod if pods == "one_pod" else UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
-    )
-    upsert: Final = AsyncMock()
-    monkeypatch.setattr("litellm.proxy.proxy_server.premium_user", True)
-    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", database)
-    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", updating_pod)
-    monkeypatch.setattr(
-        "litellm.proxy.management_endpoints.team_endpoints.team_info",
-        AsyncMock(
-            return_value={
-                "team_info": database.team,
-                "team_memberships": [
-                    LiteLLM_TeamMembership(user_id="member-1", team_id="team-1", budget_id="own-budget")
-                ],
-            }
-        ),
-    )
-    monkeypatch.setattr("litellm.proxy.management_endpoints.team_endpoints.upsert_budget_and_membership", upsert)
-    in_flight: Final = asyncio.gather(
-        get_key_object(hashed_token=member_key, prisma_client=prisma, user_api_key_cache=reading_pod),
-        get_key_object(hashed_token=budget_key, prisma_client=prisma, user_api_key_cache=reading_pod),
-        _read_team_membership(prisma, reading_pod, team_id="team-1", user_id="member-1"),
-    )
-    await database.all_started.wait()
-
-    await team_member_update(
-        data=TeamMemberUpdateRequest(team_id="team-1", user_id="member-1", max_budget_in_team=5.0),
-        http_request=MagicMock(),
-        user_api_key_dict=_MEMBER_BUDGET_ADMIN,
-    )
-    database.release.set()
-    await in_flight
-
-    upsert.assert_awaited_once()
-    assert {
-        "member key": await recall_last_good(reading_pod, member_key, UserAPIKeyAuth),
-        "other key on the budget": await recall_last_good(reading_pod, budget_key, UserAPIKeyAuth),
-        "team membership": await recall_last_good(
-            reading_pod, team_membership_auth_cache_key(team_id="team-1", user_id="member-1"), LiteLLM_TeamMembership
-        ),
-    } == {"member key": None, "other key on the budget": None, "team membership": None}
-
-
-@pytest.mark.asyncio
-async def test_team_move_to_an_organization_writes_no_membership_when_redis_cannot_record_the_revocation(monkeypatch):
-    """A proxy admin's move adds the team's missing members to the destination organization. That write comes after
-    the request's checks and the revocation of the team's and its keys' entries, so a move with a budget change Redis
-    cannot revoke them for is refused with 503 before any organization membership or the team row is written."""
-    from litellm.proxy.management_endpoints import team_endpoints
-
-    prisma: Final = MagicMock()
-    prisma.db.litellm_teamtable.find_unique = AsyncMock(
-        return_value=LiteLLM_TeamTable(
-            team_id="team-1",
-            team_alias="lanes",
-            organization_id=None,
-            members_with_roles=[Member(user_id="member-1", role="user")],
-        )
-    )
-    prisma.db.litellm_teamtable.update = AsyncMock()
-    prisma.db.litellm_organizationtable.find_unique = AsyncMock(
-        return_value=LiteLLM_OrganizationTableWithMembers(
-            organization_id="org-2",
-            budget_id="b-org",
-            created_by="admin",
-            updated_by="admin",
-            created_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
-            updated_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
-        )
-    )
-    prisma.db.litellm_verificationtoken.find_many = AsyncMock(return_value=[])
-    add_member: Final = AsyncMock()
-    monkeypatch.setattr(team_endpoints, "add_member_to_organization", add_member)
-    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", prisma)
-    monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", MagicMock())
-    monkeypatch.setattr("litellm.proxy.proxy_server.premium_user", True)
-    monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", MagicMock())
-    monkeypatch.setattr(
-        "litellm.proxy.proxy_server.user_api_key_cache", _redis_down_cache(serve_last_good_entries=True)
-    )
-
-    with pytest.raises(ProxyException) as refused:
-        await team_endpoints.update_team(
-            data=UpdateTeamRequest(team_id="team-1", organization_id="org-2", max_budget=10.0),
-            http_request=MagicMock(),
-            user_api_key_dict=_MEMBER_BUDGET_ADMIN,
-            litellm_changed_by=None,
-        )
-
-    assert refused.value.code == "503"
-    add_member.assert_not_awaited()
-    prisma.db.litellm_teamtable.update.assert_not_awaited()
-
-
-class _RecordedKeyReads(_ColumnFilteredKeys):
-    """The key table, remembering the filter of every read."""
-
-    def __init__(self, *rows: SimpleNamespace) -> None:
-        super().__init__(*rows)
-        self.filters: list[dict[str, object]] = []
-
-    async def find_many(self, where: dict[str, object], **kwargs: object) -> list[SimpleNamespace]:
-        self.filters.append(where)
-        return await super().find_many(where, **kwargs)
-
-
-def _wire_member_update(monkeypatch, cache, budget_id: str | None = None):
-    """/team/member_update of member-1, an admin of team-1 whose membership points at ``budget_id``. The role rewrite
-    runs on a transaction that answers the locked roster read from the team row and writes it back; the budget write
-    is stubbed, and the budget holder tables answer empty. Returns the client, the stubbed budget write and the key
-    table."""
-    team_row: Final = LiteLLM_TeamTable(
-        team_id="team-1", team_alias="lanes", metadata={}, members_with_roles=[Member(user_id="member-1", role="admin")]
-    )
-    prisma: Final = MagicMock()
-    prisma.db.litellm_teamtable.find_unique = AsyncMock(return_value=team_row)
-    prisma.db.litellm_teamtable.update = AsyncMock(side_effect=_roster_writer(team_row))
-    for table in _BUDGET_HOLDER_TABLES:
-        getattr(prisma.db, table).find_many = AsyncMock(return_value=[])
-    keys: Final = _RecordedKeyReads()
-    prisma.db.litellm_verificationtoken = keys
-    _wire_member_delete_tx(prisma)
-    upsert: Final = AsyncMock()
-    monkeypatch.setattr("litellm.proxy.proxy_server.premium_user", True)
-    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", prisma)
-    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
-    monkeypatch.setattr(
-        "litellm.proxy.management_endpoints.team_endpoints.team_info",
-        AsyncMock(
-            return_value={
-                "team_info": team_row,
-                "team_memberships": [
-                    LiteLLM_TeamMembership(user_id="member-1", team_id="team-1", budget_id=budget_id)
-                ],
-            }
-        ),
-    )
-    monkeypatch.setattr("litellm.proxy.management_endpoints.team_endpoints.upsert_budget_and_membership", upsert)
-    return prisma, upsert, keys
-
-
-# Each field /team/member_update writes, beside the check that enforces it from a last good entry
-_MEMBER_UPDATE_ENFORCED_FIELDS: Final = (
-    # The team entry's roster and each member key's team_member: auth/team_grants.py:116-119, proxy/utils.py:5606-5626
-    {"role": "user"},
-    # The membership entry's model scope: auth/auth_checks.py:391-394
-    {"allowed_models": ["gpt-4o"]},
-    # The membership entry's member budget: auth/user_api_key_auth.py:2455, auth/auth_checks.py:6622
-    {"max_budget_in_team": 5.0},
-    # The membership entry and each member key's member limits: auth/team_grants.py:121-126, proxy/utils.py:5542-5543
-    {"tpm_limit": 5},
-    {"rpm_limit": 5},
-    # The member budget's temporary raise: models/budget.py:39-49
-    {"temp_budget_increase": 1.0, "temp_budget_expiry": datetime(2030, 1, 1, tzinfo=timezone.utc)},
-)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "payload",
-    [*_MEMBER_UPDATE_ENFORCED_FIELDS, {"budget_duration": "1d"}],
-    ids=lambda payload: next(iter(payload)),
-)
-async def test_team_member_update_of_each_field_answers_503_and_writes_nothing_when_redis_cannot_record_it(
-    monkeypatch, payload
-):
-    """Every field a member update writes is carried by the team's entry, the membership's entry or the member's keys'
-    entries, none expiring, so an update Redis cannot revoke them for is refused with 503 before the transaction. A
-    field no check reads from an entry (``budget_duration``) revokes too: a membership update has no harmless field."""
-    prisma, upsert, _ = _wire_member_update(monkeypatch, _redis_down_cache(serve_last_good_entries=True))
-
-    with pytest.raises(HTTPException) as refused:
-        await team_member_update(
-            data=TeamMemberUpdateRequest(team_id="team-1", user_id="member-1", **payload),
-            http_request=MagicMock(),
-            user_api_key_dict=_MEMBER_BUDGET_ADMIN,
-        )
-
-    assert refused.value.status_code == 503
-    prisma.tx.assert_not_called()
-    prisma.db.litellm_teamtable.update.assert_not_awaited()
-    upsert.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_team_member_role_and_budget_update_writes_with_redis_down_when_last_good_entries_are_not_served(
-    monkeypatch,
-):
-    """With the setting off nothing is revoked, so a role and budget change needs no Redis and writes as before."""
-    prisma, upsert, _ = _wire_member_update(monkeypatch, _redis_down_cache(serve_last_good_entries=False))
-
-    await team_member_update(
-        data=TeamMemberUpdateRequest(team_id="team-1", user_id="member-1", role="user", max_budget_in_team=5.0),
-        http_request=MagicMock(),
-        user_api_key_dict=_MEMBER_BUDGET_ADMIN,
-    )
-
-    prisma.tx.assert_called_once()
-    prisma.db.litellm_teamtable.update.assert_awaited_once()
-    upsert.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_team_member_budget_written_in_place_reads_no_budget_holder_when_last_good_entries_are_not_served(
-    monkeypatch,
-):
-    """Only a last good entry needs the other holders of a private budget row listed, so with the setting off the
-    update reads none of them: the only key read is the member's own keys in the team, evicted after the write."""
-    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
-
-    prisma, upsert, keys = _wire_member_update(
-        monkeypatch, UserApiKeyCache(serve_last_good_entries=False), budget_id="own-budget"
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    for hashed in (member_key, budget_key):
+        await remember_last_good(cache, hashed, UserAPIKeyAuth(token=hashed))
+    _, upsert = _wire_member_budget_update(
+        monkeypatch,
+        cache,
+        "own-budget",
+        SimpleNamespace(token=member_key, user_id="member-1", team_id="team-1", budget_id=None),
+        SimpleNamespace(token=budget_key, user_id="another-user", team_id=None, budget_id="own-budget"),
     )
 
     await team_member_update(
@@ -17588,405 +17293,5 @@ async def test_team_member_budget_written_in_place_reads_no_budget_holder_when_l
     )
 
     upsert.assert_awaited_once()
-    for table in _BUDGET_HOLDER_TABLES:
-        getattr(prisma.db, table).find_many.assert_not_awaited()
-    assert keys.filters == [{"user_id": "member-1", "team_id": "team-1"}]
-
-
-def _wire_member_removal(monkeypatch, cache):
-    """/team/member_delete of member-1, who holds no key in team-1; the roster, user row, membership and key writes
-    are mocks the endpoint's transaction hands out."""
-    team_row: Final = LiteLLM_TeamTable(
-        team_id="team-1",
-        team_alias="lanes",
-        members_with_roles=[Member(user_id="member-1", role="user"), Member(user_id="admin-user", role="admin")],
-    )
-    prisma: Final = MagicMock()
-    prisma.db.litellm_teamtable.find_unique = AsyncMock(return_value=team_row)
-    prisma.db.litellm_teamtable.update = AsyncMock(return_value=team_row)
-    prisma.db.litellm_usertable.find_many = AsyncMock(
-        return_value=[LiteLLM_UserTable(user_id="member-1", teams=["team-1"])]
-    )
-    prisma.db.litellm_usertable.update = AsyncMock()
-    prisma.db.litellm_teammembership.delete_many = AsyncMock()
-    prisma.db.litellm_verificationtoken.find_many = AsyncMock(return_value=[])
-    prisma.db.litellm_verificationtoken.delete_many = AsyncMock()
-    _wire_member_delete_tx(prisma)
-    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", prisma)
-    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
-    return prisma
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("serves_last_good", [True, False], ids=["serving", "not_serving"])
-async def test_team_member_removal_answers_503_and_writes_nothing_when_redis_cannot_record_the_revocation(
-    monkeypatch, serves_last_good: bool
-):
-    """The team's entry lists the member on its roster, the user's entry lists the team and the membership's entry
-    carries the member's limits, none expiring, so a removal Redis cannot revoke them for is refused with 503 before
-    any write, even when the member holds no key; with last good entries off it writes as before."""
-    from litellm.proxy._types import TeamMemberDeleteRequest
-
-    prisma: Final = _wire_member_removal(monkeypatch, _redis_down_cache(serve_last_good_entries=serves_last_good))
-    writes: Final = (
-        prisma.db.litellm_teamtable.update,
-        prisma.db.litellm_usertable.update,
-        prisma.db.litellm_teammembership.delete_many,
-        prisma.db.litellm_verificationtoken.delete_many,
-    )
-    request: Final = TeamMemberDeleteRequest(team_id="team-1", user_id="member-1")
-
-    if not serves_last_good:
-        await team_member_delete(data=request, user_api_key_dict=_MEMBER_BUDGET_ADMIN)
-        for write in writes:
-            write.assert_awaited_once()
-        return
-    with pytest.raises(HTTPException) as refused:
-        await team_member_delete(data=request, user_api_key_dict=_MEMBER_BUDGET_ADMIN)
-
-    assert refused.value.status_code == 503
-    for write in writes:
-        write.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("serves_last_good", [True, False], ids=["serving", "not_serving"])
-async def test_team_member_budget_reset_answers_503_and_writes_nothing_when_redis_cannot_record_the_revocation(
-    monkeypatch, serves_last_good: bool
-):
-    """Putting a member back on the team default re-points the budget the membership's entry and the member's keys'
-    entries carry, possibly to a stricter one, so a reset Redis cannot revoke them for is refused with 503 before the
-    membership is written; with last good entries off it writes as before."""
-    prisma: Final = MagicMock()
-    prisma.db.litellm_teammembership.find_unique = AsyncMock(
-        return_value=LiteLLM_TeamMembership(user_id="member-1", team_id="team-1", budget_id="custom-b1")
-    )
-    prisma.db.litellm_teammembership.update = AsyncMock()
-    prisma.db.litellm_budgettable.find_unique = AsyncMock(
-        return_value=LiteLLM_BudgetTable(budget_id="team-default-b", max_budget=1.0)
-    )
-    prisma.db.litellm_verificationtoken.find_many = AsyncMock(return_value=[])
-    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", prisma)
-    monkeypatch.setattr(
-        "litellm.proxy.proxy_server.user_api_key_cache", _redis_down_cache(serve_last_good_entries=serves_last_good)
-    )
-    monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", MagicMock())
-    monkeypatch.setattr(
-        "litellm.proxy.management_endpoints.team_endpoints.get_team_object",
-        AsyncMock(return_value=_team_with_default_budget("team-1", "team-default-b")),
-    )
-
-    if not serves_last_good:
-        await reset_team_member_budget_fn(team_id="team-1", user_id="member-1", user_api_key_dict=_reset_budget_admin())
-        prisma.db.litellm_teammembership.update.assert_awaited_once()
-        return
-    with pytest.raises(HTTPException) as refused:
-        await reset_team_member_budget_fn(team_id="team-1", user_id="member-1", user_api_key_dict=_reset_budget_admin())
-
-    assert refused.value.status_code == 503
-    prisma.db.litellm_teammembership.update.assert_not_awaited()
-
-
-# ---------------------------------------------------------------------------
-# /team/update revokes, fail-closed, the entries that carry what it changes
-# ---------------------------------------------------------------------------
-
-
-def _team_metadata_values_key_entries_enforce() -> list[object]:
-    """A stored and a changed value for each metadata key a check reads from the team metadata a key's last good
-    entry embeds (litellm/proxy/utils.py:5533); the names come from the constants those checks read."""
-    from litellm.constants import ADMIN_ONLY_BATCH_LIMIT_METADATA_KEYS
-    from litellm.proxy.auth.auth_utils import (
-        ESTIMATED_OUTPUT_TOKENS_METADATA_FIELDS,
-        ESTIMATED_OUTPUT_TOKENS_PER_MODEL_FIELD,
-    )
-
-    changes: Final[dict[str, tuple[object, object]]] = {
-        # litellm/proxy/openai_files_endpoints/file_usage_caps.py:89-91 and proxy/hooks/batch_enqueued_tokens.py:137
-        **{key: (100, 1) for key in ADMIN_ONLY_BATCH_LIMIT_METADATA_KEYS},
-        # litellm/proxy/auth/auth_utils.py:1261
-        **{
-            key: ({"gpt-4o": 4096}, {"gpt-4o": 16}) if key == ESTIMATED_OUTPUT_TOKENS_PER_MODEL_FIELD else (4096, 16)
-            for key in sorted(ESTIMATED_OUTPUT_TOKENS_METADATA_FIELDS)
-        },
-        # litellm/proxy/hooks/dynamic_rate_limiter_v3.py:158-159
-        "priority": ("high", "low"),
-        # litellm/proxy/auth/auth_utils.py:1134-1135
-        "model_rpm_limit": ({"gpt-4o": 100}, {"gpt-4o": 1}),
-        # litellm/proxy/auth/auth_utils.py:1166-1167
-        "model_tpm_limit": ({"gpt-4o": 100}, {"gpt-4o": 1}),
-        # litellm/proxy/auth/auth_utils.py:1440-1441
-        "mcp_rpm_limit": ({"github": 100}, {"github": 1}),
-        # litellm/proxy/litellm_pre_call_utils.py:1864
-        "tags": (["batch"], ["interactive"]),
-    }
-    return [
-        pytest.param({key: old}, {"metadata": {key: new}}, id=f"metadata.{key}") for key, (old, new) in changes.items()
-    ]
-
-
-# Team columns a check reads from the copy a key's last good entry embeds (litellm/proxy/utils.py:5522-5567)
-_TEAM_COLUMNS_KEY_ENTRIES_ENFORCE: Final = (
-    # litellm/proxy/auth/user_api_key_auth.py:2629, the entry's team_max_budget
-    pytest.param(None, {"max_budget": 10.0}, id="max_budget"),
-    # litellm/proxy/hooks/parallel_request_limiter_v3.py:3254-3262, team_tpm_limit and team_rpm_limit
-    pytest.param(None, {"tpm_limit": 5}, id="tpm_limit"),
-    pytest.param(None, {"rpm_limit": 5}, id="rpm_limit"),
-    # litellm/proxy/hooks/batch_rate_limiter.py:265, team_tpd_limit
-    pytest.param(None, {"tpd_limit": 5}, id="tpd_limit"),
-    # litellm/proxy/auth/auth_checks.py:5258, team_models
-    pytest.param(None, {"models": ["gpt-4o"]}, id="models"),
-    # litellm/proxy/auth/auth_checks.py:5647, team_blocked
-    pytest.param(None, {"blocked": True}, id="blocked"),
-    # litellm/proxy/litellm_pre_call_utils.py:3521-3524, policies attached by team alias
-    pytest.param(None, {"team_alias": "renamed"}, id="team_alias"),
-    # litellm/proxy/auth/user_api_key_auth.py:440, team_model_max_budget
-    pytest.param(
-        None, {"model_max_budget": {"gpt-4o": {"max_budget": 1.0, "budget_duration": "1d"}}}, id="model_max_budget"
-    ),
-    # litellm/proxy/hooks/parallel_request_limiter_v3.py:3270-3279, the membership budget the entry embeds
-    pytest.param(None, {"team_member_rpm_limit": 5}, id="team_member_rpm_limit"),
-    pytest.param(None, {"team_member_tpm_limit": 5}, id="team_member_tpm_limit"),
-)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("existing_metadata", "payload"), [*_TEAM_COLUMNS_KEY_ENTRIES_ENFORCE, *_team_metadata_values_key_entries_enforce()]
-)
-async def test_team_update_of_a_value_a_key_entry_enforces_answers_503_and_writes_nothing_when_redis_is_down(
-    existing_metadata, payload
-):
-    """A key's last good entry carries each of these values of its team and never expires, so a change Redis cannot
-    revoke the team's and its keys' entries for is refused with 503 before the team is written."""
-    sink: Final[dict[str, AsyncMock | MagicMock]] = {}
-
-    with (
-        patch(  # test-quality-ok: proxy_server module global is the endpoint's only injection point
-            "litellm.proxy.proxy_server.premium_user", True
-        ),
-        pytest.raises(ProxyException) as refused,
-    ):
-        await _drive_team_write(
-            "post",
-            existing_metadata=existing_metadata,
-            payload=payload,
-            user_api_key_cache=_redis_down_cache(serve_last_good_entries=True),
-            mock_sink=sink,
-            team_keys=("team-key",),
-        )
-
-    assert refused.value.code == "503"
-    sink["team_keys"].assert_awaited_once()
-    sink["update"].assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "payload",
-    [
-        # litellm/proxy/auth/auth_checks.py:6807-6812, the team entry's budget windows
-        pytest.param({"budget_limits": [{"budget_duration": "1d", "max_budget": 1.0}]}, id="budget_limits"),
-        # litellm/proxy/auth/auth_checks.py:5766, the team entry's access groups
-        pytest.param({"access_group_ids": ["group-1"]}, id="access_group_ids"),
-        # litellm/proxy/proxy_server.py:8009, the team entry's router settings
-        pytest.param({"router_settings": {"num_retries": 2}}, id="router_settings"),
-    ],
-)
-async def test_team_update_of_a_value_only_the_team_entry_enforces_answers_503_without_reading_the_team_keys(payload):
-    """No key's entry embeds these team columns, but the team's own entry does and a check reads them there: a change
-    Redis cannot revoke that entry for is refused with 503 before the team is written, with no read of its keys."""
-    sink: Final[dict[str, AsyncMock | MagicMock]] = {}
-
-    with pytest.raises(ProxyException) as refused:
-        await _drive_team_write(
-            "post",
-            payload=payload,
-            user_api_key_cache=_redis_down_cache(serve_last_good_entries=True),
-            mock_sink=sink,
-            team_keys=("team-key",),
-        )
-
-    assert refused.value.code == "503"
-    sink["team_keys"].assert_not_awaited()
-    sink["update"].assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_team_update_lowering_only_max_batch_file_records_answers_503_and_writes_nothing_when_redis_is_down():
-    """A key's entry carries its team's metadata, from which the batch file check reads max_batch_file_records
-    (litellm/proxy/openai_files_endpoints/file_usage_caps.py:89-102). Lowering only that cap while Redis cannot record
-    the revocation is refused before anything is written, so no worker keeps the higher cap for the next outage."""
-    from litellm.constants import MAX_BATCH_FILE_RECORDS_KEY
-
-    sink: Final[dict[str, AsyncMock | MagicMock]] = {}
-
-    with pytest.raises(ProxyException) as refused:
-        await _drive_team_write(
-            "post",
-            existing_metadata={MAX_BATCH_FILE_RECORDS_KEY: 100},
-            payload={"metadata": {MAX_BATCH_FILE_RECORDS_KEY: 1}},
-            user_api_key_cache=_redis_down_cache(serve_last_good_entries=True),
-            mock_sink=sink,
-            team_keys=("team-key",),
-        )
-
-    assert refused.value.code == "503"
-    sink["team_keys"].assert_awaited_once()
-    sink["update"].assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_team_update_of_an_unclassified_metadata_key_answers_503_and_writes_nothing_when_redis_is_down():
-    """Fail-closed: a metadata key no list names still reaches every key's entry as team metadata, so changing it
-    revokes the team's and its keys' entries like any limit."""
-    sink: Final[dict[str, AsyncMock | MagicMock]] = {}
-
-    with pytest.raises(ProxyException) as refused:
-        await _drive_team_write(
-            "post",
-            existing_metadata={"cost_center": "cc-1"},
-            payload={"metadata": {"cost_center": "cc-2"}},
-            user_api_key_cache=_redis_down_cache(serve_last_good_entries=True),
-            mock_sink=sink,
-            team_keys=("team-key",),
-        )
-
-    assert refused.value.code == "503"
-    sink["team_keys"].assert_awaited_once()
-    sink["update"].assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "payload", [{"budget_duration": "1d"}, {"access_group_ids": ["group-1"]}], ids=["budget_duration", "access_groups"]
-)
-async def test_team_update_of_only_a_column_no_key_entry_embeds_revokes_the_team_entry_and_leaves_the_keys(payload):
-    """The team's entry is revoked before the write (the cached-team refresh after it is stubbed out here), while the
-    team's keys are neither read nor revoked, since their entries do not embed these columns."""
-    from litellm.models.team import LiteLLM_TeamTableCachedObj
-    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, recall_last_good, remember_last_good
-    from litellm.proxy.management_endpoints.team_endpoints import TEAM_FIELDS_NO_KEY_ENTRY_EMBEDS
-    from tests.unit.caching.fake_redis_cache import fake_redis_cache
-
-    assert set(payload) <= TEAM_FIELDS_NO_KEY_ENTRY_EMBEDS
-    redis: Final = fake_redis_cache()
-    cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
-    team_key: Final = "hashed-team-key"
-    team_entry: Final = f"team_id:{_PATCH_TEAM_ID}"
-    await remember_last_good(cache, team_entry, LiteLLM_TeamTableCachedObj(team_id=_PATCH_TEAM_ID))
-    await remember_last_good(cache, team_key, UserAPIKeyAuth(token=team_key, team_id=_PATCH_TEAM_ID))
-    sink: Final[dict[str, AsyncMock | MagicMock]] = {}
-
-    await _drive_team_write("post", payload=payload, user_api_key_cache=cache, mock_sink=sink, team_keys=(team_key,))
-
-    sink["update"].assert_awaited_once()
-    sink["team_keys"].assert_not_awaited()
-    assert await recall_last_good(cache, team_entry, LiteLLM_TeamTableCachedObj) is None
-    assert await recall_last_good(cache, team_key, UserAPIKeyAuth) is not None
-
-
-@pytest.mark.asyncio
-async def test_team_moved_to_another_organization_answers_503_and_writes_nothing_when_redis_is_down():
-    """A key's entry carries its team's organization as org_id (litellm/proxy/utils.py:5539), which the organization
-    budget check reads first (litellm/proxy/auth/auth_checks.py:7110-7113), so a move Redis cannot revoke the team's
-    keys' entries for is refused with 503 before the team is written."""
-    sink: Final[dict[str, AsyncMock | MagicMock]] = {}
-
-    with (
-        patch(  # test-quality-ok: the destination organization's own checks are not under test
-            "litellm.proxy.management_endpoints.team_endpoints.fetch_and_validate_organization",
-            new=AsyncMock(return_value=None),
-        ),
-        patch(  # test-quality-ok: the destination organization sets no team limits here
-            "litellm.proxy.management_endpoints.team_endpoints.get_org_object", new=AsyncMock(return_value=None)
-        ),
-        pytest.raises(ProxyException) as refused,
-    ):
-        await _drive_team_write(
-            "post",
-            payload={"organization_id": "org-2"},
-            user_api_key_cache=_redis_down_cache(serve_last_good_entries=True),
-            mock_sink=sink,
-            team_keys=("team-key",),
-        )
-
-    assert refused.value.code == "503"
-    sink["team_keys"].assert_awaited_once()
-    sink["update"].assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_team_member_default_budget_revokes_each_membership_entry_before_the_backfill_writes_it():
-    """A new member default budget is backfilled onto every membership without one, which that membership's last good
-    entry then no longer matches. The entry is revoked before the backfill writes, not only evicted after it."""
-    from litellm.proxy.common_utils.user_api_key_cache import (
-        UserApiKeyCache,
-        recall_last_good,
-        remember_last_good,
-        team_membership_auth_cache_key,
-    )
-    from litellm.proxy.management_endpoints.team_endpoints import TeamMemberBudgetHandler
-    from tests.unit.caching.fake_redis_cache import fake_redis_cache
-
-    redis: Final = fake_redis_cache()
-    cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
-    membership_entry: Final = team_membership_auth_cache_key(team_id=_PATCH_TEAM_ID, user_id="member-1")
-    await remember_last_good(
-        cache, membership_entry, LiteLLM_TeamMembership(user_id="member-1", team_id=_PATCH_TEAM_ID, budget_id=None)
-    )
-    entry_at_backfill: Final[list[LiteLLM_TeamMembership | None]] = []
-
-    async def create_member_budget(*, updated_kv: dict[str, object], **_: object) -> dict[str, object]:
-        return {**updated_kv, "metadata": {"team_member_budget_id": "member-default-budget"}}
-
-    async def backfill(**_: object) -> None:
-        entry_at_backfill.append(await recall_last_good(cache, membership_entry, LiteLLM_TeamMembership))
-
-    with (
-        patch.object(  # test-quality-ok: the budget row write is not under test
-            TeamMemberBudgetHandler, "upsert_team_member_budget_table", new=AsyncMock(side_effect=create_member_budget)
-        ),
-        patch.object(  # test-quality-ok: observes the membership entry at the backfill write
-            TeamMemberBudgetHandler, "backfill_team_member_budget_entries", new=AsyncMock(side_effect=backfill)
-        ),
-    ):
-        await _drive_team_write(
-            "post",
-            payload={"team_member_budget": 5.0},
-            user_api_key_cache=cache,
-            raw_members_with_roles=[{"user_id": "member-1", "role": "user"}],
-        )
-
-    assert entry_at_backfill == [None]
-
-
-@pytest.mark.asyncio
-async def test_team_update_answers_503_and_writes_nothing_when_the_team_keys_cannot_be_read():
-    """While last good entries are served, a team's keys that cannot be listed cannot have their entries revoked, so a
-    change those entries embed is refused with 503 before anything is written, even with Redis up."""
-    from litellm.constants import MAX_BATCH_FILE_RECORDS_KEY
-    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
-    from tests.unit.caching.fake_redis_cache import fake_redis_cache
-
-    redis: Final = fake_redis_cache()
-    unreadable_keys: Final = SimpleNamespace(find_many=AsyncMock(side_effect=ConnectionError("database unreachable")))
-    sink: Final[dict[str, AsyncMock | MagicMock]] = {}
-
-    with (
-        patch(  # test-quality-ok: the key table read is the failure under test
-            "litellm.proxy.management_endpoints.team_endpoints._tokens_db", new=lambda _prisma_client: unreadable_keys
-        ),
-        pytest.raises(ProxyException) as refused,
-    ):
-        await _drive_team_write(
-            "post",
-            existing_metadata={MAX_BATCH_FILE_RECORDS_KEY: 100},
-            payload={"metadata": {MAX_BATCH_FILE_RECORDS_KEY: 1}},
-            user_api_key_cache=UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True),
-            mock_sink=sink,
-        )
-
-    assert refused.value.code == "503"
-    unreadable_keys.find_many.assert_awaited_once()
-    sink["update"].assert_not_awaited()
+    assert await recall_last_good(cache, budget_key, UserAPIKeyAuth) is None
+    assert await recall_last_good(cache, member_key, UserAPIKeyAuth) is None

@@ -1,18 +1,14 @@
 import asyncio
 import hashlib
 import json
-from typing import Any, Final
+from typing import Any
 
 import pytest
-from fakeredis import FakeServer
-from fastapi import HTTPException
-from redis.asyncio.client import Pipeline
 
-import litellm
 from litellm.caching.dual_cache import DualCache
 from litellm.caching.in_memory_cache import InMemoryCache
 from litellm.caching.redis_cache import RedisCache
-from litellm.constants import DEFAULT_MANAGEMENT_OBJECT_IN_MEMORY_CACHE_TTL, LAST_GOOD_TOMBSTONE_TTL_SECONDS
+from litellm.constants import DEFAULT_MANAGEMENT_OBJECT_IN_MEMORY_CACHE_TTL
 from litellm.models.team import LiteLLM_TeamTableCachedObj
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.common_utils.user_api_key_cache import (
@@ -62,65 +58,6 @@ class _DeleteLandsDuringWrite(RedisCache):
 
     async def async_delete_cache(self, key: str) -> None:
         await self._redis.async_delete_cache(key)
-
-
-class _CountedRoundTrips:
-    """The client a ``fake_redis_cache`` hands its ``RedisCache``, counting round trips: a command sent alone is one, a
-    pipeline is one however many commands it carries. ``lose_redis_at`` ("pipeline" or "delete") takes Redis away as
-    the first such round trip is sent, the way a connection lost part-way through a revocation does."""
-
-    def __init__(self, cache: RedisCache, server: FakeServer, lose_redis_at: str | None = None) -> None:
-        self.uncounted: Final = cache.init_async_client()
-        self._server = server
-        self._lose_redis_at = lose_redis_at
-        self.round_trips = 0
-        litellm.in_memory_llm_clients_cache.set_cache(
-            key=cache._get_async_client_cache_key(),  # pyright: ignore[reportPrivateUsage]  # the cache's client key
-            value=self,
-        )
-
-    def send(self, round_trip: str) -> None:
-        self.round_trips += 1
-        if round_trip == self._lose_redis_at:
-            self._lose_redis_at = None
-            self._server.connected = False
-
-    async def get(self, name: str) -> object:
-        self.send("get")
-        return await self.uncounted.get(name)
-
-    async def set(self, name: str, value: str, ex: int | None = None) -> object:
-        self.send("set")
-        return await self.uncounted.set(name, value, ex=ex)
-
-    async def delete(self, *names: str) -> int:
-        self.send("delete")
-        return await self.uncounted.delete(*names)
-
-    def pipeline(self, transaction: bool = True) -> "_CountedPipeline":
-        return _CountedPipeline(self, self.uncounted.pipeline(transaction=transaction))
-
-
-class _CountedPipeline:
-    """A pipeline of ``_CountedRoundTrips``: queues like the real one and counts one round trip when sent."""
-
-    def __init__(self, counter: _CountedRoundTrips, pipe: Pipeline) -> None:
-        self._counter = counter
-        self._pipe = pipe
-
-    async def __aenter__(self) -> "_CountedPipeline":
-        await self._pipe.__aenter__()
-        return self
-
-    async def __aexit__(self, *exc_info: Any) -> None:
-        await self._pipe.__aexit__(*exc_info)
-
-    def set(self, name: str, value: str, ex: int | None = None) -> None:
-        self._pipe.set(name, value, ex=ex)
-
-    async def execute(self, raise_on_error: bool = True) -> list[object]:
-        self._counter.send("pipeline")
-        return await self._pipe.execute(raise_on_error=raise_on_error)
 
 
 class FakeRedisCache(RedisCache):
@@ -839,84 +776,3 @@ class TestLastGoodEntries:
         await revoke_last_good(cache, ("hashed-token-1",))
 
         assert cache.last_good_memory.tombstoned("hashed-token-1") is False
-
-    async def _remember_fifty_teams(self, cache: UserApiKeyCache) -> tuple[str, ...]:
-        """Fifty team entries, the cache keys a revocation of a large team's keys hands ``revoke_last_good`` at once."""
-        team_ids: Final = tuple(f"t{i}" for i in range(50))
-        for team_id in team_ids:
-            await remember_last_good(cache, f"team_id:{team_id}", self._team(team_id))
-        return team_ids
-
-    @pytest.mark.asyncio
-    async def test_revoking_fifty_entries_takes_two_round_trips_and_leaves_every_tombstone_and_no_entry(self):
-        """One pipeline writes every tombstone, then one DEL drops every entry, where a SET and a DEL per entry made the
-        revocation a hundred serial round trips."""
-        redis: Final = fake_redis_cache()
-        cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
-        team_ids: Final = await self._remember_fifty_teams(cache)
-        counted: Final = _CountedRoundTrips(redis.cache, redis.server)
-
-        await revoke_last_good(cache, tuple(f"team_id:{team_id}" for team_id in team_ids))
-
-        assert counted.round_trips == 2
-        assert await counted.uncounted.exists(*(f"last_good_tombstone:team_id:{t}" for t in team_ids)) == 50
-        assert 0 < await counted.uncounted.ttl("last_good_tombstone:team_id:t49") <= LAST_GOOD_TOMBSTONE_TTL_SECONDS
-        assert await counted.uncounted.exists(*(f"last_good:team_id:{t}" for t in team_ids)) == 0
-        assert all(cache.last_good_memory.tombstoned(f"team_id:{t}") for t in team_ids)
-
-    @pytest.mark.asyncio
-    async def test_revoking_fifty_entries_with_redis_down_answers_503_and_leaves_every_entry(self):
-        redis: Final = fake_redis_cache()
-        cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
-        team_ids: Final = await self._remember_fifty_teams(cache)
-        redis.server.connected = False
-
-        with pytest.raises(HTTPException) as refused:
-            await revoke_last_good(cache, tuple(f"team_id:{team_id}" for team_id in team_ids))
-
-        assert refused.value.status_code == 503
-        redis.server.connected = True
-        assert await redis.cache.init_async_client().exists(*(f"last_good:team_id:{t}" for t in team_ids)) == 50
-        assert not any(cache.last_good_memory.tombstoned(f"team_id:{t}") for t in team_ids)
-
-    @pytest.mark.asyncio
-    async def test_a_tombstone_pipeline_redis_cannot_take_answers_503_before_any_entry_is_deleted(self):
-        """The pipeline's failure reaches the caller, so no DEL runs: no entry is ever left without its tombstone."""
-        redis: Final = fake_redis_cache()
-        cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
-        team_ids: Final = await self._remember_fifty_teams(cache)
-        counted: Final = _CountedRoundTrips(redis.cache, redis.server, lose_redis_at="pipeline")
-
-        with pytest.raises(HTTPException) as refused:
-            await revoke_last_good(cache, tuple(f"team_id:{team_id}" for team_id in team_ids))
-
-        assert refused.value.status_code == 503
-        redis.server.connected = True
-        assert await counted.uncounted.exists(*(f"last_good:team_id:{t}" for t in team_ids)) == 50
-
-    @pytest.mark.asyncio
-    async def test_redis_lost_between_the_tombstones_and_the_deletes_answers_503_and_the_tombstones_refuse_entries(
-        self,
-    ):
-        """Every tombstone is written before any entry is deleted, so a Redis lost in between leaves the entries, still
-        those of the unchanged rows since the caller writes nothing after the 503, under tombstones that refuse a newer
-        entry until they lapse."""
-        redis: Final = fake_redis_cache()
-        cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
-        other_pod: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
-        team_ids: Final = await self._remember_fifty_teams(cache)
-        counted: Final = _CountedRoundTrips(redis.cache, redis.server, lose_redis_at="delete")
-
-        with pytest.raises(HTTPException) as refused:
-            await revoke_last_good(cache, tuple(f"team_id:{team_id}" for team_id in team_ids))
-
-        assert refused.value.status_code == 503
-        redis.server.connected = True
-        assert await counted.uncounted.exists(*(f"last_good_tombstone:team_id:{t}" for t in team_ids)) == 50
-        assert await counted.uncounted.exists(*(f"last_good:team_id:{t}" for t in team_ids)) == 50
-        for team_id in team_ids:
-            await remember_last_good(other_pod, f"team_id:{team_id}", self._team(team_id, alias="read after"))
-        assert [
-            await recall_last_good(other_pod, f"team_id:{team_id}", LiteLLM_TeamTableCachedObj) for team_id in team_ids
-        ] == [self._team(team_id) for team_id in team_ids]
-        assert all(other_pod.last_good_memory.get(f"team_id:{t}") is None for t in team_ids)

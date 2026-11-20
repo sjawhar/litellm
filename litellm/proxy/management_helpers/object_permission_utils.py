@@ -7,7 +7,6 @@ import json
 from collections.abc import Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
-from itertools import chain
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, Optional
 
@@ -19,14 +18,7 @@ from litellm._uuid import uuid
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 from litellm.proxy._types import ObjectPermissionDict, SpecialMCPServerName, SpecialMCPServerNames
 from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_broadcast
-from litellm.proxy.common_utils.user_api_key_cache import (
-    UserApiKeyCache,
-    end_user_cache_key,
-    object_permission_cache_key,
-    project_cache_key,
-    revoke_last_good,
-    serves_last_good_entries,
-)
+from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, object_permission_cache_key
 from litellm.proxy.utils import PrismaClient
 from litellm.repositories.object_permission_repository import ObjectPermissionRepository
 from litellm.repositories.table_repositories import MCPServerRepository
@@ -81,67 +73,10 @@ async def attach_object_permission_to_dict(
     return data_dict
 
 
-#: The relations of a permission row whose objects keep a last good entry: a key, team, organization, project or
-#: customer entry carries the row itself, a user entry its id. No last good entry is kept for an agent.
-_LAST_GOOD_PERMISSION_HOLDERS: Final[Mapping[str, object]] = MappingProxyType(
-    {
-        "verification_tokens": True,
-        "teams": True,
-        "organizations": True,
-        "projects": True,
-        "users": True,
-        "end_users": True,
-    }
-)
-
-
-async def object_permission_holder_keys(
-    object_permission_id: str | None,
-    prisma_client: PrismaClient | None,
-    user_api_key_cache: UserApiKeyCache,
-) -> tuple[str, ...]:
-    """Every key a last good entry of an object linked to this permission row is kept under, so a write to the row
-    can revoke them first: one row may be linked to several objects, such as a user and the key created with it.
-
-    Read only while last good entries are served, and strictly: a holder that cannot be listed cannot be revoked, so
-    the change is refused with 503 before anything is written. A team's keys carry only the row's id, not the row,
-    and a request takes the team's row from the team's own entry.
-    """
-    from litellm.proxy.auth.auth_checks import organization_cache_keys, team_cache_keys
-    from litellm.proxy.management_endpoints.budget_management_endpoints import read_holders
-
-    if object_permission_id is None or prisma_client is None or not serves_last_good_entries(user_api_key_cache):
-        return ()
-    row: Final = await read_holders(
-        f"object permission {object_permission_id}",
-        "holders",
-        lambda: ObjectPermissionRepository(prisma_client).table.find_unique(
-            where={"object_permission_id": object_permission_id}, include=_LAST_GOOD_PERMISSION_HOLDERS
-        ),
-        required=True,
-    )
-    if row is None:
-        return ()
-    return tuple(
-        dict.fromkeys(
-            (
-                *(key.token for key in row.verification_tokens or ()),
-                *chain.from_iterable(team_cache_keys(team.team_id, team.team_alias) for team in row.teams or ()),
-                *chain.from_iterable(organization_cache_keys(org.organization_id) for org in row.organizations or ()),
-                *(project_cache_key(project.project_id) for project in row.projects or ()),
-                *(user.user_id for user in row.users or ()),
-                *(end_user_cache_key(customer.user_id) for customer in row.end_users or ()),
-            )
-        )
-    )
-
-
 @dataclass(frozen=True, slots=True)
 class ObjectPermissionUpsert:
     object_permission_id: str
     record: dict[str, object]
-    # Last good entries of the objects linked to the existing row; whoever writes the row revokes them first
-    holder_keys: tuple[str, ...] = ()
 
 
 async def prepare_object_permission_upsert(
@@ -163,13 +98,7 @@ async def prepare_object_permission_upsert(
     Keeping this separate from the write lets callers run the upsert inside the same
     transaction as the row that links ``object_permission_id``, so a rolled-back
     update cannot leave permission changes live.
-
-    ``holder_keys`` lists the last good entries of every object linked to the existing
-    row (see ``object_permission_holder_keys``); the caller revokes them before its
-    first write.
     """
-    from litellm.proxy.proxy_server import user_api_key_cache
-
     object_permission_id: Final = existing_object_permission_id or str(uuid.uuid4())
     existing_object_permission: Final = await ObjectPermissionRepository(prisma_client).table.find_unique(
         where={"object_permission_id": object_permission_id},
@@ -197,10 +126,7 @@ async def prepare_object_permission_upsert(
             else {}
         ),
     }
-    holder_keys: Final = await object_permission_holder_keys(
-        existing_object_permission_id, prisma_client, user_api_key_cache
-    )
-    return ObjectPermissionUpsert(object_permission_id=object_permission_id, record=record, holder_keys=holder_keys)
+    return ObjectPermissionUpsert(object_permission_id=object_permission_id, record=record)
 
 
 async def handle_update_object_permission_common(
@@ -215,9 +141,8 @@ async def handle_update_object_permission_common(
     1. Extracts `object_permission` from data_json
     2. Looks up existing object permission if it exists
     3. Merges new permissions with existing ones
-    4. Revokes the last good entries of every object linked to the existing row (503 if they cannot be revoked)
-    5. Upserts to the LiteLLM_ObjectPermissionTable
-    6. Returns the object_permission_id
+    4. Upserts to the LiteLLM_ObjectPermissionTable
+    5. Returns the object_permission_id
 
     Args:
         data_json: The data dictionary containing the object_permission to update
@@ -230,8 +155,6 @@ async def handle_update_object_permission_common(
     Raises:
         ValueError: If prisma_client is None
     """
-    from litellm.proxy.proxy_server import user_api_key_cache
-
     if prisma_client is None:
         raise ValueError("Prisma client not found")
 
@@ -247,8 +170,6 @@ async def handle_update_object_permission_common(
         existing_object_permission_id=existing_object_permission_id,
         prisma_client=prisma_client,
     )
-    # A row linked to several objects changes for all of them, so none of their last good entries may outlive it
-    await revoke_last_good(user_api_key_cache, upsert.holder_keys)
     created_object_permission_row: Final = await ObjectPermissionRepository(prisma_client).table.upsert(
         where={"object_permission_id": upsert.object_permission_id},
         data={

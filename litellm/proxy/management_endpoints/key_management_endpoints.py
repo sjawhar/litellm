@@ -35,6 +35,7 @@ from litellm._logging import verbose_proxy_logger
 from litellm._uuid import uuid
 from litellm.caching.dual_cache import DualCache
 from litellm.constants import (
+    ADMIN_ONLY_BATCH_LIMIT_METADATA_KEYS,
     EMPTY_MAPPING,
     LENGTH_OF_LITELLM_GENERATED_KEY,
     LITELLM_PROXY_ADMIN_NAME,
@@ -55,6 +56,7 @@ from litellm.proxy._experimental.mcp_server.outbound_credentials.sso_assertion_s
 from litellm.proxy._types import *
 from litellm.proxy._types import Litellm_EntityType, LiteLLM_VerificationToken, hash_token
 from litellm.proxy.auth.auth_checks import (  # noqa: F401  # legacy module exports
+    KEY_END_USER_BUDGET_ID_METADATA_FIELD,
     _delete_cache_key_object,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
     can_team_access_model,
     delete_cache_key_object,
@@ -66,6 +68,7 @@ from litellm.proxy.auth.auth_checks import (  # noqa: F401  # legacy module expo
     get_team_object,
 )
 from litellm.proxy.auth.auth_utils import (
+    ESTIMATED_OUTPUT_TOKENS_METADATA_FIELDS,
     abbreviate_api_key,
     enforce_batch_limits_are_admin_only,
     enforce_output_token_estimates_are_admin_only,
@@ -86,12 +89,7 @@ from litellm.proxy.common_utils.config_sync_pubsub import (
 )
 from litellm.proxy.common_utils.rbac_utils import check_org_admin_can_generate_keys
 from litellm.proxy.common_utils.timezone_utils import get_budget_reset_time
-from litellm.proxy.common_utils.user_api_key_cache import (
-    AUTH_OBJECTS_TARGET,
-    UserApiKeyCache,
-    revoke_last_good,
-    serves_last_good_entries,
-)
+from litellm.proxy.common_utils.user_api_key_cache import AUTH_OBJECTS_TARGET, UserApiKeyCache, revoke_last_good
 from litellm.proxy.hooks.key_management_event_hooks import KeyManagementEventHooks
 from litellm.proxy.hooks.model_max_budget_limiter import build_model_max_budget_usage
 from litellm.proxy.management.teams.authz import TEAM_ADMIN_ONLY, TEAM_OR_ORG_ADMIN, is_team_admin
@@ -2733,16 +2731,43 @@ def _resolve_token_to_update(data: UpdateKeyRequest, existing_key_row: LiteLLM_V
     return existing_key_row.token
 
 
-# Update fields no request-path check reads from the key's last good entry: only the key rotation job reads them, from
-# the database
-KEY_FIELDS_NOT_ENFORCED: Final = frozenset({"auto_rotate", "rotation_interval"})
-# Never a change of the key's entry: the key the update names, and its spend, which stays outside the revocation as a
-# spend edit, as before
-_KEY_FIELDS_NOT_REVOKED: Final = frozenset({"key", "spend", *KEY_FIELDS_NOT_ENFORCED})
-# Fields an alias-addressed or bulk update sends with the stored value; they change nothing when they match it
-_KEY_FIELDS_SENT_AS_STORED: Final = frozenset({"key_alias", "team_id", "user_id", "project_id", "organization_id"})
-# Fields an update folds into the key's metadata, so they change the entry exactly where the written metadata does
-_KEY_METADATA_WRITTEN_FIELDS: Final = frozenset({"metadata", *_KEY_METADATA_REQUEST_FIELDS})
+# Update fields that set a limit on the key's own row or on its budget row; the key's last good entry carries both
+KEY_LIMIT_FIELDS: Final = frozenset(
+    {
+        "max_budget",
+        "soft_budget",
+        "budget_duration",
+        "budget_id",
+        "model_max_budget",
+        "budget_limits",
+        "tpm_limit",
+        "rpm_limit",
+        "tpd_limit",
+        "max_parallel_requests",
+    }
+)
+# Fields naming the team, user, project and organization whose budgets apply through the key's last good entry
+KEY_LIMIT_SOURCE_FIELDS: Final = frozenset({"team_id", "user_id", "project_id", "organization_id"})
+# Metadata keys that set a limit or a budget of the key, or how one is enforced; the last good entry carries them
+KEY_LIMIT_METADATA_KEYS: Final = frozenset(
+    {
+        "model_rpm_limit",
+        "model_tpm_limit",
+        "model_itpm_limit",
+        "model_otpm_limit",
+        "mcp_rpm_limit",
+        "tag_rpm_limit",
+        "rpm_limit_type",
+        "tpm_limit_type",
+        "priority",
+        "temp_budget_increase",
+        "temp_budget_expiry",
+        "throttle_on_budget_exceeded",
+        KEY_END_USER_BUDGET_ID_METADATA_FIELD,
+        *ESTIMATED_OUTPUT_TOKENS_METADATA_FIELDS,
+        *ADMIN_ONLY_BATCH_LIMIT_METADATA_KEYS,
+    }
+)
 
 
 def _metadata_view(metadata: object) -> Mapping[str, object]:
@@ -2755,30 +2780,29 @@ def _metadata_view(metadata: object) -> Mapping[str, object]:
     )
 
 
-def _key_field_changes(field: str, data: UpdateKeyRequest, existing_key_row: LiteLLM_VerificationToken) -> bool:
-    if field in _KEY_FIELDS_NOT_REVOKED or field in _KEY_METADATA_WRITTEN_FIELDS:
-        return False
-    return field not in _KEY_FIELDS_SENT_AS_STORED or getattr(data, field) != getattr(existing_key_row, field, None)
-
-
-def key_update_changes_its_entry(
+def key_update_changes_limits(
     data: UpdateKeyRequest, existing_key_row: LiteLLM_VerificationToken, update_values: Mapping[str, object]
 ) -> bool:
-    """Fail-closed: whether writing ``update_values`` may change what the key's last good entry carries. Every field
-    the request sends counts, except ``KEY_FIELDS_NOT_ENFORCED``, the key, its spend and a field sent with its stored
-    value; ``metadata`` and the fields folded into it count only where the written metadata differs from the stored."""
-    if any(_key_field_changes(field, data, existing_key_row) for field in data.model_fields_set):
+    """Whether writing ``update_values`` changes a limit the key's last good entry carries: a limit field the request
+    sends, a team, user, project or organization it moves the key to, or a limit key of the metadata it writes.
+    ``metadata`` replaces the stored metadata wholesale, so it counts only where a limit key's value changes."""
+    sent: Final = data.model_fields_set
+    if not KEY_LIMIT_FIELDS.isdisjoint(sent):
         return True
-    return "metadata" in update_values and _metadata_view(update_values["metadata"]) != _metadata_view(
-        getattr(existing_key_row, "metadata", None)
-    )
+    if any(getattr(data, field) != getattr(existing_key_row, field, None) for field in KEY_LIMIT_SOURCE_FIELDS & sent):
+        return True
+    if "metadata" not in update_values:
+        return False
+    stored: Final = _metadata_view(getattr(existing_key_row, "metadata", None))
+    written: Final = _metadata_view(update_values["metadata"])
+    return any(written.get(key) != stored.get(key) for key in KEY_LIMIT_METADATA_KEYS)
 
 
 def _own_entry_to_revoke(
     data: UpdateKeyRequest, existing_key_row: LiteLLM_VerificationToken, update_values: Mapping[str, object]
 ) -> tuple[str, ...]:
-    """The key's own last good entry when the update may change what that entry carries, a block included."""
-    if key_update_changes_its_entry(data, existing_key_row, update_values):
+    """The key's own last good entry when the update blocks the key or changes a limit the entry carries."""
+    if data.blocked is True or key_update_changes_limits(data, existing_key_row, update_values):
         return (hash_token_if_needed(_resolve_token_to_update(data=data, existing_key_row=existing_key_row)),)
     return ()
 
@@ -3627,13 +3651,8 @@ async def update_key_fn(
         if prisma_client is None:
             raise Exception("Not connected to DB!")
 
-        # soft_budget is written in place on the key's budget row, which other keys, customers and members may hold.
-        # Only their last good entries need them read; with those off, the update reads and evicts what it always did
-        shared_budget_id: Final = (
-            existing_key_row.budget_id
-            if "soft_budget" in data.model_fields_set and serves_last_good_entries(user_api_key_cache)
-            else None
-        )
+        # soft_budget is written in place on the key's budget row, which other keys, customers and members may hold
+        shared_budget_id: Final = existing_key_row.budget_id if "soft_budget" in data.model_fields_set else None
         budget_holders: Final = (
             await read_budget_holders(shared_budget_id) if shared_budget_id is not None else BudgetHolders()
         )

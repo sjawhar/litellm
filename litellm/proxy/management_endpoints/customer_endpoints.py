@@ -37,7 +37,6 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     end_user_restricted_registry_cache_key,
     end_user_validation_cache_key,
     revoke_last_good,
-    serves_last_good_entries,
 )
 from litellm.proxy.management_endpoints.common_daily_activity import get_daily_activity
 from litellm.proxy.management_endpoints.common_utils import validate_budget_duration
@@ -63,10 +62,6 @@ from litellm.types.proxy.management_endpoints.customer_endpoints import (
 _RowT_co: Final = TypeVar("_RowT_co", covariant=True)
 _STR_OBJECT_DICT: Final = TypeAdapter(dict[str, object])
 _CLEARABLE_LIST_FIELDS: Final = frozenset({"models"})
-#: Customer fields nothing on the request path reads from a customer's last good entry: the alias is read only from the
-#: database, by the customer daily activity report. An update that writes any other field revokes the customer's entry
-#: before its first write.
-END_USER_UNENFORCED_FIELDS: Final = frozenset({"alias"})
 
 
 def _should_update_field(field: str, value: object, sent_fields: AbstractSet[str]) -> bool:
@@ -745,25 +740,19 @@ async def update_end_user(
             *(("budget_id",) if budget_table_data and end_user_budget_table is None else ()),
         }
         # A budget field on a customer that has a budget row changes that row in place, and every holder of the row
-        # carries it, other customers on it among them: a lowered limit must not stay in one of their entries. Holders
-        # are read and evicted only while last good entries are served: with the setting off nothing is revoked, and
-        # the update reads and evicts what it did before last good entries existed
+        # carries it, other customers on it among them: a lowered limit must not stay in one of their entries
         updated_budget_id: Final = (
-            end_user_budget_table.budget_id
-            if budget_table_data and end_user_budget_table is not None and serves_last_good_entries(user_api_key_cache)
-            else None
+            end_user_budget_table.budget_id if budget_table_data and end_user_budget_table is not None else None
         )
         budget_holders: Final = (
             await read_budget_holders(updated_budget_id) if updated_budget_id is not None else BudgetHolders()
         )
-        # Fail closed: a field outside END_USER_UNENFORCED_FIELDS may be enforced from the customer's entry, so it
-        # revokes that entry; a restriction column also moves the customer in or out of the registry
-        customer_entry_changes: Final = not non_default_values.keys() <= {"user_id", *END_USER_UNENFORCED_FIELDS}
+        # A restriction column moves the customer in or out of the registry; any budget change reaches its own entry
         customer_keys: Final = (
             _end_user_cache_keys((data.user_id,))
             if not END_USER_RESTRICTION_COLUMNS.isdisjoint(written_columns)
             else (end_user_cache_key(data.user_id),)
-            if customer_entry_changes
+            if budget_table_data
             else ()
         )
         await revoke_last_good(
@@ -872,7 +861,7 @@ async def delete_end_user(
     See below for all params 
     ```
     """
-    from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
+    from litellm.proxy.proxy_server import prisma_client
 
     try:
         if prisma_client is None:
@@ -895,9 +884,6 @@ async def delete_end_user(
                     param="user_ids",
                 )
 
-            # A deleted customer falls back to the default end-user budget, which can be lower than its own, so its
-            # entry is revoked before the delete, as for a block
-            await revoke_last_good(user_api_key_cache, _end_user_cache_keys(data.user_ids))
             # All users exist, proceed with deletion
             response: Final = await _typed_table(EndUserRepository(prisma_client)).delete_many(
                 where={"user_id": {"in": data.user_ids}}

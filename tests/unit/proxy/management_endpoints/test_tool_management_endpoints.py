@@ -7,26 +7,20 @@ and litellm.proxy.proxy_server.prisma_client) because the endpoint code
 imports these inside function bodies to avoid circular imports.
 """
 
-import asyncio
 import inspect
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
-from typing import Final, Optional
+from typing import Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
 import pytest
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from prisma.actions import LiteLLM_TeamTableActions
 
 
-from litellm.proxy._types import UserAPIKeyAuth
-from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
-from litellm.proxy.management_endpoints.tool_management_endpoints import router, update_tool_policy
-from litellm.types.tool_management import LiteLLM_ToolTableRow, ToolPolicyUpdateRequest
-from tests.unit.caching.fake_redis_cache import fake_redis_cache
+from litellm.proxy.management_endpoints.tool_management_endpoints import router
+from litellm.types.tool_management import LiteLLM_ToolTableRow
 
 # --- helpers ---
 
@@ -430,149 +424,3 @@ class TestToolManagementEndpoints:
             resp = client.get("/v1/tool/spend")
         assert resp.status_code == 403
         prisma.db.litellm_dailytoolspend.group_by.assert_not_awaited()
-
-
-_TEAM_KEY: Final = "hashed-key-of-team-123"
-
-
-class _HeldKeyDatabase:
-    """Answers the key reads of ``get_key_object``: the first waits for ``release``, and every read fails with
-    ``stopped_with`` once it is set."""
-
-    def __init__(self, key: UserAPIKeyAuth) -> None:
-        self.keys: Final = {key.token: key}
-        self.stopped_with: Exception | None = None
-        self.held = True
-        self.read_started: Final = asyncio.Event()
-        self.release: Final = asyncio.Event()
-
-    async def get_data(
-        self, token: str, table_name: str, parent_otel_span: object, proxy_logging_obj: object, use_writer: bool = False
-    ) -> UserAPIKeyAuth | None:
-        if self.stopped_with is not None:
-            raise self.stopped_with
-        if self.held:
-            self.held = False  # rebind-ok: only the first read is held
-            self.read_started.set()
-            await self.release.wait()
-        return self.keys.get(token)
-
-    async def attempt_db_reconnect(self, *, reason: str, timeout_seconds: float, lock_timeout_seconds: float) -> bool:
-        return False
-
-
-async def _get_team_key(database: _HeldKeyDatabase, cache: UserApiKeyCache) -> UserAPIKeyAuth:
-    from litellm.proxy.auth.auth_checks import get_key_object
-
-    return await get_key_object(
-        hashed_token=_TEAM_KEY,
-        prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
-        user_api_key_cache=cache,
-    )
-
-
-def _team_key_row() -> SimpleNamespace:
-    """The ``LiteLLM_VerificationToken`` row of team-123's key, with every required column; no permission row yet."""
-    return SimpleNamespace(
-        token=_TEAM_KEY,
-        team_id="team-123",
-        object_permission_id=None,
-        soft_budget_cooldown=False,
-        spend=0.0,
-        total_spend=0.0,
-        models=[],
-        aliases={},
-        config={},
-        permissions={},
-        metadata={},
-        allowed_cache_controls=[],
-        allowed_routes=[],
-        policies=[],
-        access_group_ids=[],
-        model_spend={},
-        model_max_budget={},
-        budget_fallbacks={},
-    )
-
-
-def _prisma_linking_a_first_permission_row(scope: str) -> MagicMock:
-    """A key or team with no permission row yet, which the override gives one; team-123 holds one key."""
-    team_row: Final = _team_row(None)
-    team_row.team_alias = None
-    prisma: Final = _team_policy_prisma(FakeTeamTable([team_row]))
-    key_row: Final = _team_key_row() if scope == "key" else None
-    prisma.db.litellm_verificationtoken.find_unique = AsyncMock(return_value=key_row)
-    prisma.db.litellm_verificationtoken.update_many = AsyncMock(return_value=1)
-    prisma.db.litellm_verificationtoken.find_many = AsyncMock(return_value=[_team_key_row()])
-    return prisma
-
-
-def _block_my_tool(scope: str) -> ToolPolicyUpdateRequest:
-    return ToolPolicyUpdateRequest(
-        tool_name="my_tool",
-        input_policy="blocked",
-        key_hash=_TEAM_KEY if scope == "key" else None,
-        team_id="team-123" if scope == "team" else None,
-    )
-
-
-def _no_tool_policy_registry() -> MagicMock:
-    registry: Final = MagicMock()
-    registry.return_value.is_initialized.return_value = False
-    return registry
-
-
-_BLOCK_WRITER: Final = "litellm.proxy.db.tool_registry_writer.add_tool_to_object_permission_blocked"
-_REGISTRY: Final = "litellm.proxy.db.tool_registry_writer.get_tool_policy_registry"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("scope", ["key", "team"])
-async def test_linking_a_first_permission_row_answers_503_and_creates_nothing_when_redis_cannot_revoke(scope: str):
-    """The tool policy guardrail finds blocked tools by the object_permission_id a key's last good entry carries (its
-    own, and its team's): an override that links a first row is refused while Redis cannot revoke those entries."""
-    redis: Final = fake_redis_cache()
-    redis.server.connected = False
-    prisma: Final = _prisma_linking_a_first_permission_row(scope)
-
-    with (
-        patch("litellm.proxy.proxy_server.prisma_client", prisma),
-        patch(  # test-quality-ok: the endpoint obtains its cache from the proxy singleton
-            "litellm.proxy.proxy_server.user_api_key_cache",
-            new=UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True),
-        ),
-        patch(_BLOCK_WRITER, AsyncMock(return_value=True)),
-        patch(_REGISTRY, _no_tool_policy_registry()),
-        pytest.raises(HTTPException) as refused,
-    ):
-        await update_tool_policy(data=_block_my_tool(scope), user_api_key_dict=_override_auth())
-
-    assert refused.value.status_code == 503
-    prisma.db.litellm_objectpermissiontable.create.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_a_team_key_read_in_flight_cannot_keep_the_team_without_its_first_permission_row_for_an_outage():
-    """Linking team-123 to its first permission row changes the team_object_permission_id its keys' entries carry: a
-    read of a team key that started before the link and finishes after it must not leave the old id behind."""
-    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
-    key_database: Final = _HeldKeyDatabase(UserAPIKeyAuth(token=_TEAM_KEY, team_id="team-123"))
-
-    with (
-        patch("litellm.proxy.proxy_server.prisma_client", _prisma_linking_a_first_permission_row("team")),
-        patch(  # test-quality-ok: the endpoint obtains its cache from the proxy singleton
-            "litellm.proxy.proxy_server.user_api_key_cache", new=cache
-        ),
-        patch(_BLOCK_WRITER, AsyncMock(return_value=True)),
-        patch(_REGISTRY, _no_tool_policy_registry()),
-    ):
-        in_flight: Final = asyncio.create_task(_get_team_key(key_database, cache))
-        await key_database.read_started.wait()
-        await update_tool_policy(data=_block_my_tool("team"), user_api_key_dict=_override_auth())
-        key_database.release.set()
-        await in_flight
-    await cache.async_delete_cache(_TEAM_KEY)
-    key_database.stopped_with = httpx.ConnectError("All connection attempts failed")
-
-    with pytest.raises(httpx.ConnectError):
-        await _get_team_key(key_database, cache)

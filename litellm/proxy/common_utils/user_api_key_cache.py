@@ -18,7 +18,6 @@ from litellm.caching.in_memory_cache import InMemoryCache
 from litellm.caching.redis_cache import RedisCache
 from litellm.constants import (
     DEFAULT_MANAGEMENT_OBJECT_IN_MEMORY_CACHE_TTL,
-    DEFAULT_MAX_REDIS_BATCH_CACHE_SIZE,
     LAST_GOOD_AUTH_ENTRIES_IN_MEMORY,
     LAST_GOOD_TOMBSTONE_TTL_SECONDS,
 )
@@ -650,23 +649,6 @@ async def forget_missing_last_good(cache: DualCache, cache_key: str) -> None:
     await forget_last_good(cache, cache_key)
 
 
-async def _revoke_in_redis(redis: RedisCache, cache_keys: Sequence[str]) -> None:
-    """Every tombstone is written before any entry is deleted, one round trip a phase per
-    ``DEFAULT_MAX_REDIS_BATCH_CACHE_SIZE`` keys. A failure part-way leaves some tombstones over intact entries,
-    never an entry deleted with no tombstone: the entries still match the database, since the caller writes nothing
-    after the 503, and each tombstone refuses a store of its entry until it lapses."""
-    chunks: Final = tuple(
-        cache_keys[start : start + DEFAULT_MAX_REDIS_BATCH_CACHE_SIZE]
-        for start in range(0, len(cache_keys), DEFAULT_MAX_REDIS_BATCH_CACHE_SIZE)
-    )
-    for chunk in chunks:
-        await redis.async_set_cache_pipeline_or_raise(
-            [(_last_good_tombstone_key(cache_key), 1) for cache_key in chunk], ttl=LAST_GOOD_TOMBSTONE_TTL_SECONDS
-        )
-    for chunk in chunks:
-        await redis.delete_cache_keys([_last_good_redis_key(cache_key) for cache_key in chunk])
-
-
 async def revoke_last_good(cache: DualCache, cache_keys: Sequence[str]) -> None:
     """Tombstone and drop the last good entries of keys or teams a request is about to delete or block, before it
     writes anything. A Redis entry never expires, so with ``serve_last_good_auth_entries`` on, a Redis that cannot
@@ -677,7 +659,11 @@ async def revoke_last_good(cache: DualCache, cache_keys: Sequence[str]) -> None:
         return
     if store.redis_cache is not None:
         try:
-            await _revoke_in_redis(store.redis_cache, cache_keys)
+            for cache_key in cache_keys:
+                await store.redis_cache.async_set_cache_or_raise(
+                    _last_good_tombstone_key(cache_key), 1, ttl=LAST_GOOD_TOMBSTONE_TTL_SECONDS
+                )
+                _ = await store.redis_cache.async_delete_cache(_last_good_redis_key(cache_key))
         except Exception as e:
             verbose_proxy_logger.error(
                 "Refused to revoke %s: Redis could not record the revocation of their last good auth entries: %s",

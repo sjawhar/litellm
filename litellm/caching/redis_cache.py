@@ -2011,20 +2011,6 @@ class RedisCache(BaseCache):
         ``async_set_cache`` would apply the default TTL."""
         _ = await self._async_commands().set(self.check_and_fix_namespace(key=key), json.dumps(value), ex=ttl)
 
-    @_redis_circuit_breaker_guard
-    async def async_set_cache_pipeline_or_raise(
-        self, cache_list: Sequence[tuple[str, object]], ttl: int | None = None
-    ) -> None:
-        """``async_set_cache_or_raise`` for many keys in one round trip: raises when Redis cannot take every write,
-        where ``async_set_cache_pipeline`` logs and returns. A cluster pipeline sends each node the keys of its own
-        slots, so the keys may live in different slots."""
-        if len(cache_list) == 0:
-            return
-        async with self._async_commands().pipeline(transaction=False) as pipe:
-            for cache_key, cache_value in cache_list:
-                pipe.set(name=self.check_and_fix_namespace(key=cache_key), value=json.dumps(cache_value), ex=ttl)
-            _ = await pipe.execute()
-
     def delete_cache(self, key):
         key = self.check_and_fix_namespace(key=key)
         self.redis_client.delete(key)

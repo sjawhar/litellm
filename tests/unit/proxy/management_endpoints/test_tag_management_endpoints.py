@@ -15,7 +15,7 @@ from prisma.actions import LiteLLM_VerificationTokenActions
 from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.proxy_server import app
 from litellm.proxy.utils import PrismaClient
-from litellm.types.tag_management import TagNewRequest, TagUpdateRequest
+from litellm.types.tag_management import TagNewRequest
 
 client = TestClient(app)
 
@@ -406,118 +406,6 @@ async def test_update_tag_explicit_null_clears_budget_duration():
         )
 
     assert budget_state.get("budget_duration") is None
-
-
-class _BudgetedTag:
-    """The tag table holding one tag on ``budget-1``: the row an update finds, and the holder a change of that budget
-    lists."""
-
-    def __init__(self) -> None:
-        self.row: Final = SimpleNamespace(tag_name="budgeted-tag", budget_id="budget-1")
-        self.update: Final = AsyncMock()
-
-    async def find_unique(self, where: Mapping[str, object]) -> SimpleNamespace | None:
-        return self.row if where == {"tag_name": self.row.tag_name} else None
-
-    async def find_many(self, where: Mapping[str, object]) -> list[SimpleNamespace]:
-        return [self.row] if where == {"budget_id": self.row.budget_id} else []
-
-
-@contextmanager
-def _as_proxy_admin():
-    from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
-
-    app.dependency_overrides[user_api_key_auth] = lambda: UserAPIKeyAuth(
-        user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN
-    )
-    try:
-        yield
-    finally:
-        app.dependency_overrides.clear()
-
-
-# One value per field /tag/update accepts: a field added to the request has no case here, so its test fails until added
-_TAG_UPDATE_VALUES: Final = MappingProxyType(
-    {
-        "description": "renamed",
-        "models": ["gpt-4o-mini"],
-        "model_info": {"model-1": "gpt-4o-mini"},
-        "budget_id": "budget-2",  # points the tag at another budget row
-        "max_budget": 1.0,  # lowers the budget row the tag already holds
-        "soft_budget": 0.5,
-        "max_parallel_requests": 1,
-        "tpm_limit": 10,
-        "rpm_limit": 1,
-        "model_max_budget": {"gpt-4o": {"max_budget": 0.1}},
-        "budget_duration": "1d",
-    }
-)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("field", sorted(TagUpdateRequest.model_fields.keys() - {"name"}))
-async def test_tag_update_answers_503_and_writes_nothing_when_redis_cannot_record_the_revocation(
-    monkeypatch: pytest.MonkeyPatch, field: str
-) -> None:
-    """The tag's last good entry never expires and carries its budget and models, so every update revokes it first. A
-    Redis that cannot record that refuses the update with 503, which tells the caller nothing changed and a retry is
-    safe, and writes neither the tag row nor a budget row."""
-    import httpx
-
-    from litellm.proxy import proxy_server
-    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
-    from tests.unit.caching.fake_redis_cache import fake_redis_cache
-
-    tags: Final = _BudgetedTag()
-    budgets: Final = SimpleNamespace(create=AsyncMock(), update=AsyncMock())
-    nothing_on_it: Final = SimpleNamespace(find_many=AsyncMock(return_value=[]))
-    monkeypatch.setattr(
-        proxy_server,
-        "prisma_client",
-        SimpleNamespace(
-            db=SimpleNamespace(
-                litellm_tagtable=tags,
-                litellm_budgettable=budgets,
-                litellm_proxymodeltable=nothing_on_it,
-                litellm_teammembership=nothing_on_it,
-                litellm_organizationtable=nothing_on_it,
-                litellm_projecttable=nothing_on_it,
-                litellm_endusertable=nothing_on_it,
-                litellm_modelaccessgroupbudgettable=nothing_on_it,
-                litellm_verificationtoken=nothing_on_it,
-            )
-        ),
-    )
-    redis: Final = fake_redis_cache()
-    redis.server.connected = False
-    monkeypatch.setattr(
-        proxy_server, "user_api_key_cache", UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
-    )
-
-    # Served in this test's event loop, the one the fake Redis client is registered for
-    with _as_proxy_admin():
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as route:
-            response: Final = await route.post(
-                "/tag/update", json={"name": "budgeted-tag", field: _TAG_UPDATE_VALUES[field]}
-            )
-
-    assert response.status_code == 503, response.text
-    tags.update.assert_not_awaited()
-    budgets.create.assert_not_awaited()
-    budgets.update.assert_not_awaited()
-
-
-def test_tag_update_of_a_missing_tag_answers_404(monkeypatch: pytest.MonkeyPatch) -> None:
-    from litellm.proxy import proxy_server
-
-    tags: Final = _BudgetedTag()
-    monkeypatch.setattr(proxy_server, "prisma_client", SimpleNamespace(db=SimpleNamespace(litellm_tagtable=tags)))
-
-    with _as_proxy_admin():
-        response: Final = client.post("/tag/update", json={"name": "missing-tag", "description": "renamed"})
-
-    assert response.status_code == 404, response.text
-    tags.update.assert_not_awaited()
 
 
 @pytest.mark.asyncio

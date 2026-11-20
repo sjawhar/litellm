@@ -124,31 +124,28 @@ if TYPE_CHECKING:
 router: Final = APIRouter()
 _USER_MODEL_BUDGET_ADAPTER: Final = TypeAdapter(dict[str, float | BudgetConfig])
 _USER_BUDGET_CACHE_INVALIDATION_BATCH_SIZE: Final = 50
-# User columns no request-path check reads from the user's last good entry: the alias only labels logs and metrics,
-# and login reads the password columns straight from the database
-_USER_FIELDS_NOT_ENFORCED: Final = frozenset(
-    {"user_alias", "password", "password_reset_required", "last_breach_check_at"}
+# The budget and limit columns the user's cached and last good entries carry. Spend is not a limit: a spend change
+# resets the spend counter the budget check reads first, as before
+_USER_BUDGET_FIELDS: Final = frozenset(
+    {
+        "max_budget",
+        "budget_duration",
+        "budget_reset_at",
+        "tpm_limit",
+        "rpm_limit",
+        "max_parallel_requests",
+        "model_max_budget",
+    }
 )
-# Never a change of the user's entry: the user the update names, and its spend, which stays outside the revocation as
-# a spend edit: the spend counter the budget check reads first is reset after the write, as before
-_USER_FIELDS_NOT_REVOKED: Final = frozenset({"user_id", "spend", *_USER_FIELDS_NOT_ENFORCED})
-# The request fields an update folds into the user's metadata
+# The user's metadata holds its per-model limits, and each of these request fields is written into it
 _USER_METADATA_FIELDS: Final = frozenset({"metadata", *LiteLLM_ManagementEndpoint_MetadataFields})
 
 
-def _user_update_changes_its_entry(
-    written: Mapping[str, object], sent: Mapping[str, object], stored_metadata: Mapping[str, object] | None
-) -> bool:
-    """Fail-closed: whether a user update may change what the user's cached and last good entries carry. ``written``
-    is the column payload and ``sent`` the request fields the caller set; every field of either counts, except
-    ``_USER_FIELDS_NOT_REVOKED`` and the email an update finds its user by. The metadata fields count only where the
-    written metadata differs from ``stored_metadata``; None, a stored metadata the caller does not know, counts them.
-    The revoke before the write and the eviction after it both ask this, so the two cannot drift apart."""
-    lookup: Final[frozenset[str]] = frozenset() if "user_id" in sent else frozenset({"user_email"})
-    changed: Final = (frozenset(written) | frozenset(sent)) - _USER_FIELDS_NOT_REVOKED - lookup
-    if stored_metadata is not None and written.get("metadata") == stored_metadata:
-        return not changed <= _USER_METADATA_FIELDS
-    return bool(changed)
+def _user_update_changes_budget(written: Mapping[str, object], sent: Mapping[str, object]) -> bool:
+    """Whether a user update writes a budget or limit the user's cached and last good entries carry. ``written`` is
+    the column payload and ``sent`` the request fields the caller set; the revoke before the write and the eviction
+    after it both ask this, so the two cannot drift apart."""
+    return not _USER_BUDGET_FIELDS.isdisjoint(written) or not _USER_METADATA_FIELDS.isdisjoint(sent)
 
 
 def _user_table(
@@ -1596,8 +1593,8 @@ async def _update_single_user_helper(
         users_with_email[0] if isinstance(users_with_email, list) and len(users_with_email) > 0 else None
     )
     written_user_id: Final = user_request.user_id or (user_with_email.user_id if user_with_email is not None else None)
-    changes_entry: Final = _user_update_changes_its_entry(non_default_values, data_json, existing_metadata)
-    if changes_entry and written_user_id:
+    changes_budget: Final = _user_update_changes_budget(non_default_values, data_json)
+    if changes_budget and written_user_id:
         # Before the first write, the object permission upsert below, so a refused revocation changes nothing
         await revoke_last_good(user_api_key_cache, (written_user_id,))
 
@@ -1662,7 +1659,7 @@ async def _update_single_user_helper(
 
         await _invalidate_user_spend_counter_if_changed(non_default_values)
 
-        if changes_entry:
+        if changes_budget:
             await evict_and_broadcast(
                 cache_keys=(non_default_values["user_id"],),
                 user_api_key_cache=user_api_key_cache,
@@ -2011,9 +2008,8 @@ async def bulk_user_update(
 
         # Revoked before the try, whose fallback would swallow the refusal
         user_ids: Final = [user.user_id for user in all_users_in_db]
-        # The metadata each user holds is not read here, so any metadata field the update sends counts as a change
-        changes_entry: Final = _user_update_changes_its_entry(non_default_values, data_json, None)
-        if changes_entry:
+        changes_budget: Final = _user_update_changes_budget(non_default_values, data_json)
+        if changes_budget:
             await revoke_last_good(user_api_key_cache, user_ids)
 
         try:
@@ -2027,7 +2023,7 @@ async def bulk_user_update(
                 ),
             )
 
-            if changes_entry:
+            if changes_budget:
                 for start in range(0, len(all_users_in_db), _USER_BUDGET_CACHE_INVALIDATION_BATCH_SIZE):
                     await asyncio.gather(
                         *(

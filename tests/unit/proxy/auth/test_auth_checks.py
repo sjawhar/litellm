@@ -3114,20 +3114,12 @@ class TestLastGoodLimitsWhileTheDatabaseIsUnreachable:
         the group's budget cannot be checked, so the request is refused, unless its budget checks are skipped; then the
         group the key grants itself is still attributed."""
         from litellm import Router
-        from litellm.proxy.auth.auth_checks import common_checks, get_model_access_group_budgets_batch, get_org_object
+        from litellm.proxy.auth.auth_checks import common_checks, get_org_object
         from litellm.proxy.common_utils.user_api_key_cache import model_access_group_registry_cache_key
 
         database = _LimitsDatabase()
         database.organizations.rows["o-grants"] = LiteLLM_OrganizationTable(
-            organization_id="o-grants",
-            budget_id="b-grants",
-            models=["tier-a"],
-            created_by="admin",
-            updated_by="admin",
-            litellm_budget_table=LiteLLM_BudgetTable(budget_id="b-grants"),
-        )
-        database.access_groups.rows["tier-b"] = SimpleNamespace(  # pyright: ignore[reportArgumentType]  # a prisma row
-            access_group_name="tier-b", spend=0.0, litellm_budget_table=SimpleNamespace(max_budget=10.0)
+            organization_id="o-grants", models=["tier-a"], created_by="admin", updated_by="admin"
         )
         cache = _serving_cache()
         # The organization budget check reads, and keeps, the entry with its budget; nothing read the plain one yet
@@ -3136,12 +3128,6 @@ class TestLastGoodLimitsWhileTheDatabaseIsUnreachable:
             prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
             user_api_key_cache=cache,
             include_budget_table=True,
-        )
-        # The group the key grants has an entry for its budget, so the org's grant is the only lookup with no entry
-        await get_model_access_group_budgets_batch(
-            access_group_names=("tier-b",),
-            prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
-            user_api_key_cache=cache,
         )
         await cache.async_set_cache(key=model_access_group_registry_cache_key(), value=("tier-a", "tier-b"))
         database.stopped_with = _STOPPED

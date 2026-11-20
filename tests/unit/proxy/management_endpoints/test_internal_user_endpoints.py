@@ -2710,21 +2710,19 @@ _BUDGETED_USER: Final = LiteLLM_UserTable(user_id="user-birch", user_email="birc
 _USER_ADMIN: Final = UserAPIKeyAuth(user_id="admin-birch", user_role=LitellmUserRoles.PROXY_ADMIN)
 
 
-def _serve_user_rows(mocker: MockerFixture, cache: UserApiKeyCache, rows: _UserRows | None = None) -> _UserRows:
-    table: Final = rows if rows is not None else _UserRows(_BUDGETED_USER)
+def _serve_user_rows(mocker: MockerFixture, cache: UserApiKeyCache) -> _UserRows:
+    rows: Final = _UserRows(_BUDGETED_USER)
     prisma_client: Final = mocker.MagicMock()
-    prisma_client.db.litellm_usertable = table
-    # An authoritative auth read goes to the writer
-    prisma_client.writer_db.litellm_usertable = table
-    prisma_client.get_data = table.get_data
-    prisma_client.update_data = table.update_data
+    prisma_client.db.litellm_usertable = rows
+    prisma_client.get_data = rows.get_data
+    prisma_client.update_data = rows.update_data
     mocker.patch(  # test-quality-ok: substitute the database dependency
         "litellm.proxy.proxy_server.prisma_client", prisma_client
     )
     mocker.patch(  # test-quality-ok: exercise a real isolated cache
         "litellm.proxy.proxy_server.user_api_key_cache", cache
     )
-    return table
+    return rows
 
 
 def _redis_down_cache(serve_last_good_entries: bool) -> UserApiKeyCache:
@@ -2808,133 +2806,30 @@ async def test_user_budget_update_writes_while_redis_is_down_when_last_good_entr
     assert rows.rows[_BUDGETED_USER.user_id].max_budget == 5.0
 
 
-class _HeldUserRows(_UserRows):
-    """The user table, whose first auth read takes its row when it starts and answers only once ``release`` is set."""
-
-    def __init__(self, *rows: LiteLLM_UserTable) -> None:
-        super().__init__(*rows)
-        self.read_started: Final = asyncio.Event()
-        self.release: Final = asyncio.Event()
-
-    async def find_unique(self, where: Mapping[str, object], include: object = None) -> LiteLLM_UserTable | None:
-        taken: Final = next(iter(self._matching(where)), None)
-        if not self.read_started.is_set():
-            self.read_started.set()
-            await self.release.wait()
-        return taken
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "change",
-    [
-        {"model_rpm_limit": {"model-birch": 1}},
-        {"max_parallel_requests": 1},
-        {"budget_duration": "1d"},
-        # litellm/proxy/auth/auth_checks.py:5928-5944, the user's model list
-        {"models": ["model-birch"]},
-        # litellm/proxy/auth/route_checks.py:255, the role the route checks read
-        {"user_role": LitellmUserRoles.INTERNAL_USER_VIEW_ONLY},
-    ],
-    ids=["model_rpm_limit", "max_parallel_requests", "budget_duration", "models", "user_role"],
+    [{"model_rpm_limit": {"model-birch": 1}}, {"max_parallel_requests": 1}, {"budget_duration": "1d"}],
+    ids=["model_rpm_limit", "max_parallel_requests", "budget_duration"],
 )
-async def test_a_user_read_in_flight_across_an_update_of_what_its_entry_carries_keeps_no_old_entry(
+async def test_user_update_of_a_limit_its_last_good_entry_carries_drops_that_entry(
     mocker: MockerFixture, change: dict[str, object]
 ) -> None:
-    """A read on another worker took the user's row before the update and stores it after; only a revocation before
-    the write refuses that store, so no last good entry keeps the old row for the next database outage."""
-    from litellm.proxy import proxy_server
-    from litellm.proxy.auth.auth_checks import get_user_object
+    """The user's last good entry carries each of these, the per-model limits inside its metadata; the entry must not
+    outlive the change."""
     from litellm.proxy.common_utils.user_api_key_cache import recall_last_good, remember_last_good
     from litellm.proxy.management_endpoints.internal_user_endpoints import user_update
-    from tests.unit.caching.fake_redis_cache import fake_redis_cache
 
-    redis: Final = fake_redis_cache()
-    reading_pod: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
-    updating_pod: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
-    rows: Final = _HeldUserRows(_BUDGETED_USER)
-    _serve_user_rows(mocker, updating_pod, rows)
-    await remember_last_good(reading_pod, _BUDGETED_USER.user_id, _BUDGETED_USER)
-    in_flight: Final = asyncio.create_task(
-        get_user_object(
-            user_id=_BUDGETED_USER.user_id,
-            prisma_client=proxy_server.prisma_client,
-            user_api_key_cache=reading_pod,
-            user_id_upsert=False,
-            check_db_only=True,
-        )
-    )
-    await rows.read_started.wait()
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    _serve_user_rows(mocker, cache)
+    await remember_last_good(cache, _BUDGETED_USER.user_id, _BUDGETED_USER)
 
     await user_update(
         data=UpdateUserRequest.model_validate({"user_id": _BUDGETED_USER.user_id, **change}),
         user_api_key_dict=_USER_ADMIN,
     )
-    rows.release.set()
-    await in_flight
 
-    assert await recall_last_good(reading_pod, _BUDGETED_USER.user_id, LiteLLM_UserTable) is None
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "change",
-    [
-        # litellm/proxy/auth/auth_checks.py:1240-1248
-        pytest.param({"max_budget": 5.0}, id="max_budget"),
-        # litellm/proxy/auth/user_api_key_auth.py:3738-3739, then proxy/hooks/parallel_request_limiter_v3.py:3238-3246
-        pytest.param({"tpm_limit": 5}, id="tpm_limit"),
-        pytest.param({"rpm_limit": 5}, id="rpm_limit"),
-        # litellm/proxy/auth/user_api_key_auth.py:2416
-        pytest.param({"model_max_budget": {"model-birch": 1.0}}, id="model_max_budget"),
-        # litellm/proxy/auth/auth_checks.py:5928-5944
-        pytest.param({"models": ["model-birch"]}, id="models"),
-        # litellm/proxy/auth/route_checks.py:255
-        pytest.param({"user_role": LitellmUserRoles.INTERNAL_USER_VIEW_ONLY}, id="user_role"),
-        # litellm/proxy/auth/user_api_key_auth.py:2421, a SCIM deactivation kept in the user's metadata
-        pytest.param({"metadata": {"scim_active": False}}, id="metadata.scim_active"),
-        # Fail-closed: no list names allowed_cache_controls, so it revokes like any enforced field
-        pytest.param({"allowed_cache_controls": ["no-cache"]}, id="unclassified.allowed_cache_controls"),
-    ],
-)
-async def test_user_update_of_what_its_entry_carries_answers_503_and_writes_nothing_when_redis_is_down(
-    mocker: MockerFixture, change: dict[str, object]
-) -> None:
-    """The user's last good entry carries each of these and never expires, so a change Redis cannot revoke that entry
-    for is refused with 503 before the user is written."""
-    from litellm.proxy.management_endpoints.internal_user_endpoints import user_update
-
-    rows: Final = _serve_user_rows(mocker, _redis_down_cache(serve_last_good_entries=True))
-
-    with pytest.raises(ProxyException) as refused:
-        await user_update(
-            data=UpdateUserRequest.model_validate({"user_id": _BUDGETED_USER.user_id, **change}),
-            user_api_key_dict=_USER_ADMIN,
-        )
-
-    assert (str(refused.value.code), rows.rows[_BUDGETED_USER.user_id]) == ("503", _BUDGETED_USER)
-
-
-@pytest.mark.asyncio
-async def test_bulk_update_of_a_users_list_reports_a_change_redis_cannot_revoke_as_failed_and_writes_nothing(
-    mocker: MockerFixture,
-) -> None:
-    """Each user of a users list revokes like /user/update: a change its entry carries that Redis cannot record
-    fails for that user, and the user row stays as it was."""
-    from litellm.proxy.management_endpoints.internal_user_endpoints import bulk_user_update
-    from litellm.types.proxy.management_endpoints.internal_user_endpoints import BulkUpdateUserRequest
-
-    rows: Final = _serve_user_rows(mocker, _redis_down_cache(serve_last_good_entries=True))
-
-    response: Final = await bulk_user_update(
-        data=BulkUpdateUserRequest(users=[UpdateUserRequest(user_id=_BUDGETED_USER.user_id, models=["model-birch"])]),
-        user_api_key_dict=_USER_ADMIN,
-        litellm_changed_by=None,
-    )
-
-    assert (response.successful_updates, response.failed_updates) == (0, 1)
-    assert "could not record this revocation" in (response.results[0].error or "")
-    assert rows.rows[_BUDGETED_USER.user_id] == _BUDGETED_USER
+    assert await recall_last_good(cache, _BUDGETED_USER.user_id, LiteLLM_UserTable) is None
 
 
 def test_generate_request_base_validator():

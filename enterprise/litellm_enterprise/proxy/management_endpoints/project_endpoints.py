@@ -22,11 +22,7 @@ from litellm._uuid import uuid
 from litellm.proxy._types import *
 from litellm.proxy.auth.auth_checks import delete_cached_project_object
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
-from litellm.proxy.common_utils.user_api_key_cache import (
-    project_cache_key,
-    revoke_last_good,
-    serves_last_good_entries,
-)
+from litellm.proxy.common_utils.user_api_key_cache import project_cache_key, revoke_last_good
 from litellm.proxy.management.teams.authz import TEAM_OR_ORG_ADMIN, TeamAccess, is_team_admin, is_team_member
 from litellm.proxy.management.teams.dependencies import get_team_access
 from litellm.proxy.management.users.service import org_admin_org_ids
@@ -52,11 +48,6 @@ if TYPE_CHECKING:
 router = APIRouter()
 
 _OBJECT_PERMISSION_PAYLOAD: Final = TypeAdapter(dict[str, object])
-
-#: Project fields no auth check, rate limiter or routing step reads from a project's last good entry: the alias only
-#: labels logs, alerts and metrics, and nothing on the request path reads the description. An update that writes any
-#: other field revokes the project's entry before its first write.
-PROJECT_UNENFORCED_FIELDS: Final = frozenset({"project_alias", "description"})
 
 
 def _team_table(prisma_client: PrismaClient) -> TableActions["prisma_models.LiteLLM_TeamTable"]:
@@ -713,7 +704,6 @@ async def update_project(
         evict_budget_holders,
         read_budget_holders,
     )
-    from litellm.proxy.management_helpers.object_permission_utils import object_permission_holder_keys
     from litellm.proxy.proxy_server import (
         general_settings,
         litellm_proxy_admin_name,
@@ -842,15 +832,15 @@ async def update_project(
 
         # The budget row is written in place and may be shared, so every holder of it is revoked, not just this project
         shared_budget_id: Final = existing_project.budget_id if budget_updates and existing_project.budget_id else None
-        # Holders are read and evicted only while last good entries are served: with the setting off nothing is revoked,
-        # and the update reads and evicts what it did before last good entries existed
-        holders_budget_id: Final = shared_budget_id if serves_last_good_entries(user_api_key_cache) else None
         budget_holders: Final = (
-            await read_budget_holders(holders_budget_id) if holders_budget_id is not None else BudgetHolders()
+            await read_budget_holders(shared_budget_id) if shared_budget_id is not None else BudgetHolders()
         )
-        # Fail closed: a field outside PROJECT_UNENFORCED_FIELDS may be enforced from the project's entry, so it revokes
-        # that entry; updated_by is the audit stamp every update writes. Key entries embed only the project's alias
-        project_entry_changes: Final = not {*update_data, *budget_updates} <= {"updated_by", *PROJECT_UNENFORCED_FIELDS}
+        # The project's own entry carries its blocked flag and, in its metadata, its per-model limits
+        project_entry_changes: Final = (
+            data.blocked is True
+            or "metadata" in update_data
+            or any(field in update_data for field in LiteLLM_ManagementEndpoint_MetadataFields)
+        )
         await revoke_last_good(
             user_api_key_cache,
             tuple(
@@ -858,12 +848,6 @@ async def update_project(
                     (
                         *((project_cache_key(data.project_id),) if project_entry_changes else ()),
                         *budget_holders.last_good_keys,
-                        # The permission row is written in place below, and every object linked to it carries it
-                        *await object_permission_holder_keys(
-                            existing_project.object_permission_id if "object_permission" in update_data else None,
-                            prisma_client,
-                            user_api_key_cache,
-                        ),
                     )
                 )
             ),
@@ -922,8 +906,8 @@ async def update_project(
             project_id=data.project_id,
             user_api_key_cache=user_api_key_cache,
         )
-        if holders_budget_id is not None:
-            await evict_budget_holders(holders_budget_id, budget_holders)
+        if shared_budget_id is not None:
+            await evict_budget_holders(shared_budget_id, budget_holders)
 
         return updated_project
     except Exception as e:
