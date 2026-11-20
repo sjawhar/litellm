@@ -2140,7 +2140,8 @@ async def _evict_created_membership_caches(
     ``LiteLLM_TeamMembership`` row. When a create path (``/team/member_add`` or the ``/team/update``
     budget backfill) later writes that row with a per-member budget, the stale sentinel keeps the
     member's budget unenforced until the membership cache TTL expires, so it must be evicted here. A changed
-    team member budget is evicted the same way, its never-expiring last good membership entries included.
+    team member budget is evicted the same way, its last good membership entries included, which a database outage
+    would otherwise serve with the old budget until they expire.
     """
     await asyncio.gather(
         *(
