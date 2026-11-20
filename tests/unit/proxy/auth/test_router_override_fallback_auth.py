@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from fastapi import HTTPException
 from starlette.requests import Request
 
 from litellm import Router
@@ -136,7 +137,6 @@ def test_a_targets_model_list_is_refused_as_the_bodys_is_even_with_client_side_c
             _router_without_fallback_group(),
             "primary",
         )
-
 
 
 def test_fallback_model_names_empty_or_none():
@@ -1573,6 +1573,31 @@ def _count_visits(monkeypatch: pytest.MonkeyPatch) -> list[object]:
     return visits
 
 
+def _count_walks(monkeypatch: pytest.MonkeyPatch) -> Sequence[Mapping[str, object]]:
+    """The body of every walk of fallback lists from now on, the proxy's checks' and the Router's: one per walk"""
+    from litellm.proxy.auth import auth_utils
+    from litellm.router_utils import fallback_event_handlers
+
+    walks: Final[list[Mapping[str, object]]] = []  # mutable-ok: each walk appends its body as it starts
+    walk_fallback_lists: Final = fallback_event_handlers.walk_fallback_lists
+
+    def counted(
+        body: Mapping[str, object],
+        *,
+        carriers: Mapping[str, object],
+        anthropic_messages_call: bool,
+        budget: int | None = None,
+    ) -> fallback_event_handlers.FallbackWalk:
+        walks.append(body)
+        return walk_fallback_lists(
+            body, carriers=carriers, anthropic_messages_call=anthropic_messages_call, budget=budget
+        )
+
+    for module in (auth_utils, fallback_event_handlers):
+        monkeypatch.setattr(module, "walk_fallback_lists", counted)
+    return walks
+
+
 _BODY_CHECK_ROUTES: Final = (
     pytest.param("/v1/chat/completions", None, False, id="litellms-route"),
     pytest.param("/v1/messages", "context-management-2025-06-27", True, id="messages-without-the-beta"),
@@ -1636,10 +1661,12 @@ async def test_nested_fallbacks_sent_without_credentials_are_answered_after_one_
 ) -> None:
     """
     Before it reads any key, the proxy walks the body's fallback lists in its body check. Answering the refusal does
-    not walk them again: that walk only rules out the database-outage identity, for a database error. The review's
-    bodies are refused at the budget with 400; one at the budget passes the body check and is refused for its missing
-    key with 401.
+    not walk them again: that walk only rules out the database-outage identity, for a database connection error with
+    allow_requests_on_db_unavailable on. The review's bodies are refused at the budget with 400; one at the budget
+    passes the body check and is refused for its missing key with 401. The walks are counted as well as the visits,
+    since with the beta a walk of a body past the budget visits no entry.
     """
+    walks: Final = _count_walks(monkeypatch)
     visits: Final = _count_visits(monkeypatch)
     result: Final = await _Gateway(monkeypatch).send(
         {"fallbacks": _nested_fallbacks(names)}, beta=beta, credentials=False
@@ -1648,6 +1675,7 @@ async def test_nested_fallbacks_sent_without_credentials_are_answered_after_one_
 
     assert result.response.status_code == status, result.response.text
     assert ("hold more than 1000 entries in all" in result.response.text) is (status == 400)
+    assert len(walks) == 1
     assert len(visits) == walk_visits
     assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
 
@@ -2505,7 +2533,6 @@ def test_a_target_may_not_set_a_router_owned_call_field(key: str, value: object,
         is_request_body_safe(body, general_settings, _router_without_fallback_group(), "primary")
 
 
-
 async def _chat_served_by_litellm(
     monkeypatch: pytest.MonkeyPatch,
     fallbacks: Sequence[object],
@@ -3167,6 +3194,107 @@ async def test_a_database_outage_still_recovers_a_request_whose_anthropic_fallba
     assert [body.get("fallbacks") for body in sent] == [forwarded_fallbacks]
 
 
+_CUSTOM_AUTH_REFUSAL: Final = "Refused by the custom auth."
+
+
+def _count_outage_identity_walks(monkeypatch: pytest.MonkeyPatch) -> Sequence[str]:
+    """The routes of the requests whose fallback lists the authentication error handler walks from now on"""
+    from litellm.proxy.auth import auth_exception_handler
+
+    walked: Final[list[str]] = []  # mutable-ok: each walk the handler starts appends its route
+    names_provider_fallback_models: Final = auth_exception_handler.request_names_provider_fallback_models
+
+    def counted(request_body: Mapping[str, object], route: str, request: Request | None) -> bool:
+        walked.append(route)
+        return names_provider_fallback_models(request_body, route, request)
+
+    monkeypatch.setattr(auth_exception_handler, "request_names_provider_fallback_models", counted)
+    return walked
+
+
+async def _answered_auth_failure(
+    monkeypatch: pytest.MonkeyPatch, error: Exception, *, allow_requests_on_db_unavailable: bool
+) -> ProxyException:
+    """
+    The error the proxy answers with when the authentication of a /v1/messages request with the beta, whose Anthropic
+    fallbacks name a model, fails with ``error``
+    """
+    from litellm.caching.dual_cache import DualCache
+    from litellm.proxy import proxy_server
+    from litellm.proxy.auth.auth_exception_handler import UserAPIKeyAuthExceptionHandler
+    from litellm.proxy.utils import ProxyLogging
+
+    monkeypatch.setattr(
+        proxy_server,
+        "general_settings",
+        {"allow_requests_on_db_unavailable": True} if allow_requests_on_db_unavailable else {},
+    )
+    monkeypatch.setattr(proxy_server, "proxy_logging_obj", ProxyLogging(user_api_key_cache=DualCache()))
+    with pytest.raises(ProxyException) as answer:
+        await UserAPIKeyAuthExceptionHandler.handle_authentication_error(
+            error,
+            _messages_request(_SERVER_SIDE_FALLBACK_BETA),
+            {"model": "requested", "fallbacks": [{"model": _OPUS}]},
+            "/v1/messages",
+            None,
+            _CALLER_KEY,
+        )
+    return answer.value
+
+
+@pytest.mark.asyncio
+async def test_an_authentication_error_keeps_its_status_on_a_proxy_without_the_database_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A custom-auth hook's 403 with allow_requests_on_db_unavailable off, on a proxy installed without the optional
+    database client: the handler asks whether the error is a database outage, which imports that client, only with
+    the setting on, so the caller gets the 403
+    """
+    from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
+
+    def without_the_database_client(_error: Exception) -> bool:
+        raise ModuleNotFoundError("No module named 'prisma'", name="prisma")
+
+    monkeypatch.setattr(
+        PrismaDBExceptionHandler, "is_database_connection_error", staticmethod(without_the_database_client)
+    )
+    answer: Final = await _answered_auth_failure(
+        monkeypatch, HTTPException(status_code=403, detail=_CUSTOM_AUTH_REFUSAL), allow_requests_on_db_unavailable=False
+    )
+
+    assert answer.code == "403"
+    assert answer.message == _CUSTOM_AUTH_REFUSAL
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "allow_requests_on_db_unavailable", "status", "walks"),
+    [
+        # The setting recovers a database connection error only, so another error is answered without a walk
+        pytest.param(HTTPException(status_code=403, detail=_CUSTOM_AUTH_REFUSAL), True, "403", 0, id="other-error"),
+        # With the setting off there is no outage identity to rule out
+        pytest.param(httpx.ConnectError("All connection attempts failed"), False, "503", 0, id="setting-off"),
+        # The one error the setting recovers: one walk, which finds the model and withholds the identity
+        pytest.param(httpx.ConnectError("All connection attempts failed"), True, "503", 1, id="recovered-error"),
+    ],
+)
+async def test_the_auth_error_handler_walks_the_fallback_lists_only_for_an_error_the_setting_recovers(
+    monkeypatch: pytest.MonkeyPatch, error: Exception, allow_requests_on_db_unavailable: bool, status: str, walks: int
+) -> None:
+    """
+    The handler walks a request's fallback lists only to rule out the database-outage identity for a request whose
+    Anthropic fallbacks name a model, so only for a database connection error with allow_requests_on_db_unavailable on
+    """
+    walked: Final = _count_outage_identity_walks(monkeypatch)
+    answer: Final = await _answered_auth_failure(
+        monkeypatch, error, allow_requests_on_db_unavailable=allow_requests_on_db_unavailable
+    )
+
+    assert answer.code == status
+    assert walked == ["/v1/messages"] * walks
+
+
 @pytest.mark.asyncio
 async def test_common_checks_refuses_an_aliased_name_in_anthropics_fallbacks_before_the_unread_team_check() -> None:
     """The same order where common_checks is the only check, as for a JWT: the alias refusal comes before the 503"""
@@ -3570,9 +3698,7 @@ def _request_setup_root_keys() -> tuple[frozenset[str], frozenset[str]]:
     for module_name, path, functions in sources:
         tree = ast.parse(path.read_text())
         module = importlib.import_module(module_name)
-        defs = {
-            node.name: node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        }
+        defs = {node.name: node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
 
         def record(node: ast.expr, module: ModuleType = module) -> None:
             value = node.value if isinstance(node, ast.Constant) else None
