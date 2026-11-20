@@ -2,7 +2,6 @@
 
 import hashlib
 import json
-import time
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -542,9 +541,7 @@ async def test_agent_deletion_drops_and_tombstones_its_keys_last_good_entries(mo
     from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, recall_last_good, remember_last_good
 
     cache: Final = UserApiKeyCache(serve_last_good_entries=True)
-    await remember_last_good(
-        cache, "agent-key-1", UserAPIKeyAuth(token="agent-key-1", agent_id="agent-123"), read_started=time.monotonic()
-    )
+    await remember_last_good(cache, "agent-key-1", UserAPIKeyAuth(token="agent-key-1", agent_id="agent-123"))
     monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
     monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", None)
     database: Final = MagicMock()
@@ -557,9 +554,7 @@ async def test_agent_deletion_drops_and_tombstones_its_keys_last_good_entries(mo
     tx.litellm_retiredagent.upsert = AsyncMock()
 
     await AgentRegistry().delete_agent_from_db("agent-123", database)
-    await remember_last_good(
-        cache, "agent-key-1", UserAPIKeyAuth(token="agent-key-1", agent_id="agent-123"), read_started=time.monotonic()
-    )
+    await remember_last_good(cache, "agent-key-1", UserAPIKeyAuth(token="agent-key-1", agent_id="agent-123"))
 
     assert await recall_last_good(cache, "agent-key-1", UserAPIKeyAuth) is None
 

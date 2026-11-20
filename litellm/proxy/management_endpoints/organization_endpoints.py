@@ -46,12 +46,7 @@ from litellm.proxy.auth.auth_checks import (
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_broadcast
 from litellm.proxy.common_utils.timezone_utils import get_budget_reset_time
-from litellm.proxy.common_utils.user_api_key_cache import (
-    UserApiKeyCache,
-    rearm_last_good,
-    revoke_last_good,
-    serves_last_good_entries,
-)
+from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, revoke_last_good, serves_last_good_entries
 from litellm.proxy.management_endpoints.budget_management_endpoints import (
     BudgetHolders,
     budget_update_data,
@@ -742,25 +737,18 @@ async def _organization_key_tokens(organization_id: str, user_api_key_cache: Use
     return tuple(key.token for key in keys or ())
 
 
-class _OrganizationRevocation(NamedTuple):
-    # Every last good entry revoked before the update; the caller re-arms them after its last write
-    revoked: tuple[str, ...]
-    # The holders of the budget row the update writes in place, if any, to evict after the write
-    budget_holders: BudgetHolders | None
-
-
 async def _revoke_before_organization_update(
     organization_id: str,
     budget_id: str | None,
     changed_fields: Collection[str],
     user_api_key_cache: UserApiKeyCache,
     permission_holder_keys: Sequence[str] = (),
-) -> _OrganizationRevocation:
+) -> BudgetHolders | None:
     """Revoke, in one call before an organization update's first write, every last good entry that carries what it
     changes: the organization's own entries on every update, every holder of ``budget_id`` (the budget row it writes in
     place, if any; they include the organization's keys), else the organization's keys unless
     ``organization_update_changes_key_entries`` clears the change, and ``permission_holder_keys``, the holders of a
-    permission row the caller writes itself. Returns what it revoked, and the budget holders to evict after the write.
+    permission row the caller writes itself. Returns the budget holders to evict after the write.
     """
     budget_holders: Final = await read_budget_holders(budget_id) if budget_id is not None else None
     key_tokens: Final = (
@@ -768,18 +756,20 @@ async def _revoke_before_organization_update(
         if budget_holders is None and organization_update_changes_key_entries(changed_fields)
         else ()
     )
-    revoked: Final = tuple(
-        dict.fromkeys(
-            (
-                *organization_cache_keys(organization_id),
-                *(budget_holders.last_good_keys if budget_holders is not None else ()),
-                *key_tokens,
-                *permission_holder_keys,
+    await revoke_last_good(
+        user_api_key_cache,
+        tuple(
+            dict.fromkeys(
+                (
+                    *organization_cache_keys(organization_id),
+                    *(budget_holders.last_good_keys if budget_holders is not None else ()),
+                    *key_tokens,
+                    *permission_holder_keys,
+                )
             )
-        )
+        ),
     )
-    await revoke_last_good(user_api_key_cache, revoked)
-    return _OrganizationRevocation(revoked=revoked, budget_holders=budget_holders)
+    return budget_holders
 
 
 @router.patch(
@@ -890,13 +880,12 @@ async def update_organization(
         if budget_id is not None
         else None
     )
-    revocation: Final = await _revoke_before_organization_update(
+    budget_holders: Final = await _revoke_before_organization_update(
         organization_id=data.organization_id,
         budget_id=budget_id,
         changed_fields=data.model_fields_set,
         user_api_key_cache=user_api_key_cache,
     )
-    budget_holders: Final = revocation.budget_holders
 
     if data.object_permission is not None:
         updated_organization_row = await handle_update_object_permission(
@@ -916,8 +905,6 @@ async def update_organization(
         data=updated_organization_row,
         include={"members": True, "teams": True, "litellm_budget_table": True},
     )
-    # Tombstoned again from the last write, so a read in flight across it cannot keep the old entry
-    await rearm_last_good(user_api_key_cache, revocation.revoked)
     await evict_and_broadcast(
         cache_keys=organization_cache_keys(data.organization_id), user_api_key_cache=user_api_key_cache
     )
@@ -1088,7 +1075,7 @@ async def update_organization_v2(
     )
 
     # Before the transaction, so a refused revocation leaves the permission, the budget and the organization unchanged
-    revocation: Final = await _revoke_before_organization_update(
+    holders: Final = await _revoke_before_organization_update(
         organization_id=organization_id,
         budget_id=existing_organization_row.budget_id if budget_updates else None,
         changed_fields=present_fields,
@@ -1119,12 +1106,10 @@ async def update_organization_v2(
             include={"members": True, "teams": True, "litellm_budget_table": True},
         )
 
-    # Tombstoned again from the commit, so a read in flight across it cannot keep the old entry
-    await rearm_last_good(user_api_key_cache, revocation.revoked)
     await _evict_updated_organization(
         organization_id=organization_id,
         budget_id=existing_organization_row.budget_id,
-        budget_holders=revocation.budget_holders,
+        budget_holders=holders,
         user_api_key_cache=user_api_key_cache,
     )
 
@@ -1714,20 +1699,19 @@ async def organization_member_update(
             if member_budget is not None and existing_organization_membership.budget_id is not None
             else None
         )
-        # The user's entry carries its organization memberships, the role an organization admin acts with included
-        revoked: Final = (
-            tuple(
-                dict.fromkeys(
-                    (
-                        *((data.user_id,) if data.user_id is not None else ()),
-                        *(budget_holders.last_good_keys if budget_holders is not None else ()),
+        if data.role is not None or member_budget is not None:
+            # The user's entry carries its organization memberships, the role an organization admin acts with included
+            await revoke_last_good(
+                user_api_key_cache,
+                tuple(
+                    dict.fromkeys(
+                        (
+                            *((data.user_id,) if data.user_id is not None else ()),
+                            *(budget_holders.last_good_keys if budget_holders is not None else ()),
+                        )
                     )
-                )
+                ),
             )
-            if data.role is not None or member_budget is not None
-            else ()
-        )
-        await revoke_last_good(user_api_key_cache, revoked)
 
         # Update member role
         if data.role is not None:
@@ -1757,8 +1741,6 @@ async def organization_member_update(
                 },
                 data={"budget_id": member_budget.budget_id},
             )
-        # Tombstoned again from the last write, so a read in flight across it cannot keep the old role or budget
-        await rearm_last_good(user_api_key_cache, revoked)
         final_organization_membership = await _table(OrganizationMembershipRepository(prisma_client)).find_unique(
             where={
                 "user_id_organization_id": {
@@ -1819,8 +1801,8 @@ async def organization_member_delete(
             data.user_id = existing_user_email_row.user_id
 
         # The user's entry carries its organization memberships, the role an organization admin acts with included
-        revoked: Final = (data.user_id,) if data.user_id is not None else ()
-        await revoke_last_good(user_api_key_cache, revoked)
+        if data.user_id is not None:
+            await revoke_last_good(user_api_key_cache, (data.user_id,))
         member_to_delete: Final = await _table(OrganizationMembershipRepository(prisma_client)).delete(
             where={
                 "user_id_organization_id": {
@@ -1829,8 +1811,6 @@ async def organization_member_delete(
                 }
             }
         )
-        # Tombstoned again from the commit, so a read in flight across it cannot keep the membership
-        await rearm_last_good(user_api_key_cache, revoked)
         return member_to_delete
 
     except Exception as e:

@@ -1,6 +1,5 @@
 import asyncio
 import json
-import time
 from types import MappingProxyType, SimpleNamespace
 from typing import Final, Mapping, Optional, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1614,15 +1613,8 @@ async def test_delete_organization_drops_the_last_good_entries_of_the_teams_it_d
     from litellm.proxy.management_endpoints.organization_endpoints import delete_organization
 
     cache: Final = UserApiKeyCache(serve_last_good_entries=True)
-    await remember_last_good(
-        cache,
-        "team_id:t-org",
-        LiteLLM_TeamTableCachedObj(team_id="t-org", team_alias="org-lane"),
-        read_started=time.monotonic(),
-    )
-    await remember_last_good(
-        cache, "team_alias:org-lane", LiteLLM_TeamTableCachedObj(team_id="t-org"), read_started=time.monotonic()
-    )
+    await remember_last_good(cache, "team_id:t-org", LiteLLM_TeamTableCachedObj(team_id="t-org", team_alias="org-lane"))
+    await remember_last_good(cache, "team_alias:org-lane", LiteLLM_TeamTableCachedObj(team_id="t-org"))
     prisma_client: Final = AsyncMock()
     prisma_client.db.litellm_teamtable.find_many = AsyncMock(
         return_value=[SimpleNamespace(team_id="t-org", team_alias="org-lane")]
@@ -1639,9 +1631,7 @@ async def test_delete_organization_drops_the_last_good_entries_of_the_teams_it_d
         data=DeleteOrganizationRequest(organization_ids=["org-doomed"]),
         user_api_key_dict=UserAPIKeyAuth(api_key="sk-admin", user_role=LitellmUserRoles.PROXY_ADMIN),
     )
-    await remember_last_good(
-        cache, "team_id:t-org", LiteLLM_TeamTableCachedObj(team_id="t-org"), read_started=time.monotonic()
-    )
+    await remember_last_good(cache, "team_id:t-org", LiteLLM_TeamTableCachedObj(team_id="t-org"))
 
     assert await recall_last_good(cache, "team_id:t-org", LiteLLM_TeamTableCachedObj) is None
     assert await recall_last_good(cache, "team_alias:org-lane", LiteLLM_TeamTableCachedObj) is None
@@ -1829,9 +1819,7 @@ async def test_organization_update_revokes_its_keys_entries_before_writing_what_
     from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, remember_last_good
 
     cache: Final = UserApiKeyCache(serve_last_good_entries=True)
-    await remember_last_good(
-        cache, _ORG_KEY, UserAPIKeyAuth(token=_ORG_KEY, organization_rpm_limit=5), read_started=time.monotonic()
-    )
+    await remember_last_good(cache, _ORG_KEY, UserAPIKeyAuth(token=_ORG_KEY, organization_rpm_limit=5))
     monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
     gone_at_write: Final[list[bool]] = []
     key_rows: Final = (SimpleNamespace(token=_ORG_KEY),)

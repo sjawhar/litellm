@@ -1236,8 +1236,6 @@ async def test_team_update_redis():
     """
     Tests if team update, updates the redis cache if set
     """
-    import time
-
     from litellm.caching.caching import DualCache, RedisCache
     from litellm.proxy._types import LiteLLM_TeamTableCachedObj
     from litellm.proxy.auth.auth_checks import cache_team_object
@@ -1258,7 +1256,6 @@ async def test_team_update_redis():
             team_table=LiteLLM_TeamTableCachedObj(team_id="1234"),
             user_api_key_cache=DualCache(redis_cache=redis_cache),
             proxy_logging_obj=proxy_logging_obj,
-            read_started=time.monotonic(),
         )
 
         mock_client.assert_called()

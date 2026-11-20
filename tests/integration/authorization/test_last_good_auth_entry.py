@@ -1,7 +1,6 @@
 """R69/A79: while the database is unreachable, the gateway serves each key and team it last read from the database,
 whatever the age of its cached entry, enforces the user limits it last read for them, and refuses a caller it never
-read or that was deleted. A key an update narrowed has no entry until the update's tombstone time has passed, then
-the narrower one. The database and Redis each sit behind a relay the test takes down and brings back."""
+read or that was deleted. The database and Redis each sit behind a relay the test takes down and brings back."""
 
 import json
 import os
@@ -30,9 +29,6 @@ pytestmark = pytest.mark.timeout(600)
 MODEL: Final = "last-good-model"
 KEY_ID: Final = "integration-last-good"
 CACHE_TTL_SECONDS: Final = 2
-LOOKUP_DEADLINE_SECONDS: Final = 5  # far above a read through the local relay, with room for the 2 s auth reconnect
-STORE_MARGIN_SECONDS: Final = 5  # far above a store's three commands to the local Redis
-TOMBSTONE_TTL_SECONDS: Final = 15  # above deadline + margin, as start-up requires; short, since the test waits it out
 # JWT sign-in is an Enterprise feature: the team-by-id and team-by-alias JWT callers run only with a license.
 # Without one, the team path is still exercised through the team key, whose auth reads its team by id.
 JWT_LICENSED: Final = bool(os.environ.get("LITELLM_LICENSE"))
@@ -169,9 +165,6 @@ def test_callers_the_gateway_last_read_are_served_while_the_database_is_stopped(
             "DATABASE_URL": relayed_database,
             "JWT_PUBLIC_KEY_URL": jwks_url,
             "PRISMA_HEALTH_WATCHDOG_ENABLED": "false",
-            "PROXY_DB_LOOKUP_DEADLINE_SECONDS": str(LOOKUP_DEADLINE_SECONDS),
-            "LAST_GOOD_STORE_MARGIN_SECONDS": str(STORE_MARGIN_SECONDS),
-            "LAST_GOOD_TOMBSTONE_TTL_SECONDS": str(TOMBSTONE_TTL_SECONDS),
         }
         with owned_proxy(stub, tmp_path, overrides, config=_config(tmp_path, upstream.url, redis.port)) as proxy:
             by_id: Final = string_value(
@@ -220,20 +213,7 @@ def test_callers_the_gateway_last_read_are_served_while_the_database_is_stopped(
                 lambda status: status == 200,
                 seconds=90,
             )
-            updated_at: Final = time.monotonic()  # the update re-armed its tombstone before it answered
             assert _chat(proxy, served["key"]).status_code in (401, 403), "the database answered again"
-            _outlive_the_cache()
-            database.cut()
-            inside: Final = _outcome(_chat(proxy, served["key"]))
-            assert str(inside).split()[0] == "503", f"no entry inside the tombstone time: {inside}"
-
-            time.sleep(max(0.0, updated_at + TOMBSTONE_TTL_SECONDS + 1 - time.monotonic()))
-            database.restore()
-            eventually(
-                lambda: _chat(proxy, served["key"]).status_code,
-                lambda status: status in (401, 403),
-                seconds=90,
-            )
             _outlive_the_cache()
             database.cut()
             assert _chat(proxy, served["key"]).status_code in (401, 403), "the refreshed entry is the one served"

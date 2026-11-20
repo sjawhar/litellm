@@ -40,7 +40,6 @@ from litellm.proxy.auth.roles import TeamRole, map_role, team_role
 from litellm.proxy.common_utils.user_api_key_cache import (
     AUTH_OBJECTS_TARGET,
     forget_missing_last_good,
-    last_good_read_start,
     remember_last_good,
 )
 
@@ -122,7 +121,6 @@ class IdentityStore:
         if self._check_cache_only:
             raise KeyNotInCacheError(hashed_token)
 
-        read_started: Final = last_good_read_start(self._cache)
         try:
             from_db: Final[BaseModel | None] = await fetch_key_object_from_db_with_reconnect(
                 hashed_token=hashed_token,
@@ -163,12 +161,7 @@ class IdentityStore:
             proxy_logging_obj=self._proxy_logging_obj,
         )
         if key.token == hashed_token:
-            await remember_last_good(
-                self._cache,
-                hashed_token,
-                copy_user_api_key_auth_for_cache(user_api_key_obj=key),
-                read_started=read_started,
-            )
+            await remember_last_good(self._cache, hashed_token, copy_user_api_key_auth_for_cache(user_api_key_obj=key))
         return key
 
     @staticmethod

@@ -2,7 +2,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import time
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -2855,7 +2854,7 @@ async def test_a_user_read_in_flight_across_an_update_of_what_its_entry_carries_
     updating_pod: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
     rows: Final = _HeldUserRows(_BUDGETED_USER)
     _serve_user_rows(mocker, updating_pod, rows)
-    await remember_last_good(reading_pod, _BUDGETED_USER.user_id, _BUDGETED_USER, read_started=time.monotonic())
+    await remember_last_good(reading_pod, _BUDGETED_USER.user_id, _BUDGETED_USER)
     in_flight: Final = asyncio.create_task(
         get_user_object(
             user_id=_BUDGETED_USER.user_id,

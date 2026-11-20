@@ -1,11 +1,8 @@
 """Counts the Redis round trips and DB queries auth object reads cost per cache regime, and checks that the
 per-object getters still enforce on their own when the prefetch cannot help."""
 
-import asyncio
 import json
-import logging
-from collections.abc import Iterator, Sequence
-from typing import Final
+from collections.abc import Sequence
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -33,8 +30,6 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     end_user_cache_key,
     end_user_restricted_registry_cache_key,
 )
-from litellm.proxy.db import db_lookup_gate
-from litellm.proxy.db.db_lookup_gate import db_lookup_stall_tracker
 
 USER_ID = "prefetch-user"
 TEAM_ID = "prefetch-team"
@@ -386,41 +381,6 @@ async def test_user_and_organization_rows_the_prefetch_read_are_served_while_the
     assert user is not None and (user.user_id, user.max_budget) == (USER_ID, 50.0)
     assert org is not None and org.litellm_budget_table is not None
     assert (org.organization_id, org.litellm_budget_table.max_budget) == (ORG_ID, 1000.0)
-
-
-@pytest.fixture
-def _clear_db_lookup_stall() -> Iterator[None]:
-    """A read that hits its deadline marks the database stalled for the readiness check; later tests start unmarked."""
-    db_lookup_stall_tracker.clear()
-    yield
-    db_lookup_stall_tracker.clear()
-
-
-@pytest.mark.asyncio
-@pytest.mark.usefixtures("_clear_db_lookup_stall")
-async def test_a_prefetch_query_the_database_does_not_answer_gives_up_at_the_lookup_deadline(monkeypatch, caplog):
-    """The prefetch query is bounded like every read that stores a last good entry, so its stores start within
-    PROXY_DB_LOOKUP_DEADLINE_SECONDS of the read and fit inside a revocation's tombstone time. The prefetch is a
-    warm-up: it logs the deadline it hit, keeps nothing, and the getters read on their own."""
-    never_answered: Final = asyncio.Event()
-
-    async def query_first(*args: object) -> object:
-        await never_answered.wait()
-        return ALL_ROWS
-
-    prisma: Final = _prisma()
-    prisma.db.query_first = query_first
-    cache: Final = UserApiKeyCache(in_memory_cache=InMemoryCache(), serve_last_good_entries=True)
-    monkeypatch.setattr(db_lookup_gate, "PROXY_DB_LOOKUP_DEADLINE_SECONDS", 0.05)
-    caplog.set_level(logging.WARNING, logger="LiteLLM Proxy")
-
-    await asyncio.wait_for(  # fails instead of hanging where the query is not bounded
-        prefetch_auth_objects(refs=_refs(), user_api_key_cache=cache, prisma_client=prisma), timeout=5
-    )
-
-    assert any("prefetch_auth_objects lookup did not answer within" in r.getMessage() for r in caplog.records)
-    assert cache.in_memory_cache.get_cache(f"team_id:{TEAM_ID}") is None
-    assert cache.last_good_memory.get(f"team_id:{TEAM_ID}") is None
 
 
 @pytest.mark.asyncio

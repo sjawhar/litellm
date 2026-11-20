@@ -23,7 +23,6 @@ from litellm._logging import verbose_proxy_logger
 from litellm.proxy._types import UserAPIKeyAuth, user_api_key_has_admin_view
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.user_api_key_cache import (
-    rearm_last_good,
     revoke_last_good,
     tag_cache_key,
     tag_registry_cache_key,
@@ -435,8 +434,7 @@ async def update_tag(
             raise HTTPException(status_code=404, detail=f"Tag {tag.name} not found")
 
         # The tag's entry carries its budget and models, so every update revokes it before the first write
-        revoked: Final = (tag_cache_key(tag.name),)
-        await revoke_last_good(user_api_key_cache, revoked)
+        await revoke_last_good(user_api_key_cache, (tag_cache_key(tag.name),))
 
         from litellm.proxy.proxy_server import litellm_proxy_admin_name
 
@@ -469,8 +467,6 @@ async def update_tag(
             where={"tag_name": tag.name},
             data=update_data,
         )
-        # Tombstoned again from the commit, so a read in flight across it cannot keep the old budget or models
-        await rearm_last_good(user_api_key_cache, revoked)
 
         await _evict_tag_cache_keys((tag_cache_key(tag.name),))
 

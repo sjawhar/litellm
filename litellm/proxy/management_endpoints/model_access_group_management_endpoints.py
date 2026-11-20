@@ -28,7 +28,6 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     UserApiKeyCache,
     model_access_group_cache_key,
     model_access_group_registry_cache_key,
-    rearm_last_good,
     revoke_last_good,
 )
 from litellm.proxy.management_endpoints.common_utils import validate_budget_duration
@@ -1175,8 +1174,7 @@ async def set_access_group_budget(
 
     existing_row: Final = await _model_access_group_budget_row(access_group, prisma_client)
     # Every field of this request is a budget the group's entry carries, so every PUT revokes it before the first write
-    revoked: Final = _model_access_group_cache_keys(access_group)
-    await revoke_last_good(auth_cache, revoked)
+    await revoke_last_good(auth_cache, _model_access_group_cache_keys(access_group))
     budget_id: Final = await handle_budget_for_entity(
         data=data,
         existing_budget_id=existing_row.budget_id if existing_row is not None else None,
@@ -1199,8 +1197,6 @@ async def set_access_group_budget(
     row: Final = await _model_access_group_budget_table(prisma_client).upsert(
         where=where, data=upsert_data, include=include
     )
-    # Tombstoned again from the commit, so a read in flight across it cannot keep the old budget
-    await rearm_last_good(auth_cache, revoked)
     await _evict_model_access_group_cache_keys(access_group, auth_cache)
 
     verbose_proxy_logger.info("Set budget %s on access group '%s'", budget_id, access_group)

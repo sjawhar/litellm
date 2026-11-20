@@ -153,7 +153,6 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     end_user_restricted_registry_cache_key,
     forget_missing_last_good,
     last_good_auth_entries_scope,
-    last_good_read_start,
     model_access_group_registry_cache_key,
     remember_last_good,
     serves_last_good_entries,
@@ -795,7 +794,6 @@ async def fetch_global_spend_with_event_coordination(
     """
 
     async def _load_global_spend() -> float | None:
-        read_started: Final = last_good_read_start(user_api_key_cache)
         proxy_budget_row: Final = await bounded_db_lookup(
             prisma_client.db.litellm_usertable.find_unique(where={"user_id": LITELLM_PROXY_BUDGET_NAME}),
             name="proxy_budget",
@@ -804,9 +802,7 @@ async def fetch_global_spend_with_event_coordination(
             await forget_missing_last_good(user_api_key_cache, cache_key)
             return None
         spend: Final = float(proxy_budget_row.spend)
-        await remember_last_good(
-            user_api_key_cache, cache_key, _ProxyBudgetSpend(spend=spend), read_started=read_started
-        )
+        await remember_last_good(user_api_key_cache, cache_key, _ProxyBudgetSpend(spend=spend))
         return spend
 
     try:
@@ -3525,15 +3521,10 @@ async def _read_team_membership(
     cached: Final = await user_api_key_cache.async_get_cache(key=cache_key, model_type=LiteLLM_TeamMembership)
     if cached is not None:
         return cached
-    read_started: Final = last_good_read_start(user_api_key_cache)
     try:
-        # Bounded like every read that stores a last good entry, so the store fits inside a revocation's tombstone time
-        db_member: Final = await bounded_db_lookup(
-            TeamMembershipRepository(prisma_client).table.find_first(
-                where={"user_id": user_id, "team_id": team_id},
-                include={"litellm_budget_table": True},
-            ),
-            name="team_membership",
+        db_member: Final = await TeamMembershipRepository(prisma_client).table.find_first(
+            where={"user_id": user_id, "team_id": team_id},
+            include={"litellm_budget_table": True},
         )
     except Exception as e:
         served: Final = await recall_last_good_after(e, user_api_key_cache, cache_key, LiteLLM_TeamMembership)
@@ -3545,7 +3536,7 @@ async def _read_team_membership(
         return None
     member: Final = LiteLLM_TeamMembership.model_validate(db_member.model_dump())
     await user_api_key_cache.async_set_cache(key=cache_key, value=member, model_type=LiteLLM_TeamMembership, ttl=5)
-    await remember_last_good(user_api_key_cache, cache_key, member, read_started=read_started)
+    await remember_last_good(user_api_key_cache, cache_key, member)
     return member
 
 
