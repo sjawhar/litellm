@@ -61,7 +61,7 @@ from litellm.proxy._types import (
     TeamCallbackMetadata,
     UserAPIKeyAuth,
 )
-from litellm.proxy.auth.auth_utils import get_request_route
+from litellm.proxy.auth.auth_utils import get_request_route, iter_request_fallback_targets
 from litellm.proxy.auth.route_checks import RouteChecks
 from litellm.proxy.common_utils.callback_utils import (
     decrypt_callback_vars,
@@ -712,6 +712,29 @@ def _strip_client_litellm_params(
     if _CLIENT_LITELLM_PARAMS_FIELD in data:
         data.pop(_CLIENT_LITELLM_PARAMS_FIELD)
         verbose_proxy_logger.debug("Stripped client-supplied field from request body: %s", _CLIENT_LITELLM_PARAMS_FIELD)
+
+
+# The router merges a dict fallback target into the call's parameters when it falls back to it (``kwargs.update`` in
+# ``run_async_fallback``), after this setup ran on the request root: the router-owned fields and a ``litellm_params``
+# would come back, and a metadata bucket would replace the request's own, identity stamp included. A target keeps
+# its other keys.
+_FALLBACK_TARGET_CLIENT_FIELDS: Final = ROUTER_OWNED_REQUEST_FIELDS | {
+    _CLIENT_LITELLM_PARAMS_FIELD,
+    "metadata",
+    "litellm_metadata",
+}
+
+
+def _strip_fallback_target_overrides(
+    data: dict[str, object],  # mutable-ok: strips in place on the request body the pre-call pipeline threads through
+) -> None:
+    """Drop the fields a dict fallback target in the client's request body would merge over the call's own."""
+    for target in iter_request_fallback_targets(data):
+        if not isinstance(target, dict):
+            continue
+        for field in _FALLBACK_TARGET_CLIENT_FIELDS & target.keys():
+            target.pop(field)
+            verbose_proxy_logger.debug("Stripped client-supplied field from a fallback target: %s", field)
 
 
 def get_metadata_variable_name(request: Request) -> str:
@@ -2407,6 +2430,7 @@ async def add_litellm_data_to_request(
     _strip_router_reserved_metadata(data)
     _strip_router_owned_request_fields(data)
     _strip_client_litellm_params(data)
+    _strip_fallback_target_overrides(data)
 
     # Same reason as the strips above: runs after the metadata string-to-dict parse
     # so JSON-string metadata cannot smuggle callback credentials past the dict guard.

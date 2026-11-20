@@ -1661,6 +1661,83 @@ async def test_pre_call_refusal_spend_row_is_filed_under_the_requested_models_gr
     assert payload["model_group"] == "internal-model"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket", ("metadata", "litellm_metadata"))
+@pytest.mark.parametrize(
+    ("requested_model", "claimed_group", "filed_under"),
+    (
+        ("openai/gpt-4.1", "victim-group", "openai/gpt-4.1"),
+        ("configured-deployment", "victim-group", "configured-deployment"),
+        ("not-routed", "victim-group", ""),
+        ("MCP: demo-tool", "MCP: demo-tool", "MCP: demo-tool"),
+    ),
+    ids=("deployment-name", "deployment-id", "unknown-name", "route-written-group"),
+)
+async def test_pre_call_refusal_never_files_its_row_under_a_group_the_body_names(
+    proxy_logging,
+    make_user_api_key_auth,
+    monkeypatch,
+    requested_model: str,
+    claimed_group: str,
+    filed_under: str,
+    bucket: str,
+):
+    """A deployment's own model name and a deployment id route too, and the router files a served call under the
+    name as requested; a name it does not route has no group of its own. A refused request's row is filed under
+    that, never under another group its body names. A group equal to the requested name is what A2A, the MCP REST
+    tool call and search write themselves, and it stays."""
+    from litellm.proxy import proxy_server
+    from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+
+    monkeypatch.setattr(
+        proxy_server,
+        "llm_router",
+        litellm.Router(
+            model_list=[
+                {
+                    "model_name": "internal-model",
+                    "litellm_params": {"model": "openai/gpt-4.1", "api_key": "sk-test"},
+                    "model_info": {"id": "configured-deployment"},
+                },
+                {
+                    "model_name": "victim-group",
+                    "litellm_params": {"model": "openai/gpt-4o", "api_key": "sk-test"},
+                    "model_info": {"id": "victim-deployment"},
+                },
+            ]
+        ),
+    )
+    update_database: Final = _record_failure_spend_rows(monkeypatch)
+    proxy_logging.alert_types = []
+    authenticated: Final = make_user_api_key_auth(request_route="/chat/completions")
+    request_data: Final = await _preprocessed_request_with_its_logging_object(
+        {
+            "model": requested_model,
+            "messages": [{"role": "user", "content": "secret"}],
+            "litellm_call_id": "pre-call-refusal-by-routing-form",
+            bucket: {"model_group": claimed_group},
+        },
+        authenticated,
+    )
+
+    await proxy_logging.post_call_failure_hook(
+        request_data=request_data,
+        original_exception=GuardrailRaisedException(guardrail_name="content-filter", message="blocked"),
+        user_api_key_dict=authenticated,
+        route="/chat/completions",
+    )
+
+    update_database.assert_awaited_once()
+    now: Final = datetime.now()
+    payload: Final = get_logging_payload(
+        kwargs={**update_database.call_args.kwargs["kwargs"], "completion_start_time": now},
+        response_obj=None,
+        start_time=now,
+        end_time=now,
+    )
+    assert payload["model_group"] == filed_under
+
+
 _LOGGING_OBJECT_FIELDS: Final = (
     "litellm_params",
     "optional_params",

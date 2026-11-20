@@ -10,6 +10,8 @@ strips them at the boundary; an opt-in key/team flag preserves the override
 for operators who actually want it.
 """
 
+import asyncio
+import copy
 from unittest.mock import MagicMock
 
 import pytest
@@ -24,6 +26,7 @@ from litellm.proxy.litellm_pre_call_utils import (
     add_litellm_data_to_request,
     strip_client_guardrail_information,
 )
+from litellm.types.router import RouterRateLimitError
 from litellm.types.utils import CustomPricingLiteLLMParams
 
 
@@ -509,6 +512,37 @@ async def test_a_failure_after_dispatch_counts_and_cools_the_deployment_the_rout
     }
 
 
+def _deployment_counters(router: litellm.Router, deployment_ids: tuple[str, ...]) -> dict[str, object]:
+    """What the router's failure callbacks wrote for each deployment: its failures this minute, its active cooldown,
+    and the deployments an RPM usage key names."""
+    from litellm.router_utils.router_callbacks.track_deployment_metrics import (
+        get_deployment_failures_for_current_minute,
+    )
+
+    return {
+        "failures": {
+            deployment_id: get_deployment_failures_for_current_minute(
+                litellm_router_instance=router, deployment_id=deployment_id
+            )
+            for deployment_id in deployment_ids
+        },
+        "cooldowns": {
+            deployment_id: cooldown["cooldown_time"]
+            for deployment_id, cooldown in router.cooldown_cache.get_active_cooldowns(
+                model_ids=list(deployment_ids), parent_otel_span=None
+            )
+        },
+        "rpm_usage": sorted(
+            {
+                key.split(":")[1]
+                for key in router.cache.in_memory_cache.cache_dict
+                if isinstance(key, str) and key.startswith("global_router:") and ":rpm:" in key
+            }
+            & set(deployment_ids)
+        ),
+    }
+
+
 @pytest.mark.asyncio
 async def test_a_provider_error_counts_against_the_deployment_the_router_chose_not_one_a_body_litellm_params_names():
     """On a provider that is not OpenAI the SDK copies the request parameters it does not know into the parameters
@@ -516,11 +550,6 @@ async def test_a_provider_error_counts_against_the_deployment_the_router_chose_n
     callbacks take the deployment and the cooldown from. The request setup removes it: a provider error counts
     against, cools for the router's own ``cooldown_time`` and adds usage to the deployment the router chose, and the
     deployment the body named gets no failure, no cooldown and no usage."""
-    import asyncio
-
-    from litellm.router_utils.router_callbacks.track_deployment_metrics import (
-        get_deployment_failures_for_current_minute,
-    )
 
     deployment_ids = ("chosen-a", "chosen-b", "body-named")
     router = litellm.Router(
@@ -566,28 +595,216 @@ async def test_a_provider_error_counts_against_the_deployment_the_router_chose_n
     pending = asyncio.all_tasks() - {asyncio.current_task()}
     await asyncio.gather(*pending, return_exceptions=True)
 
-    failures = {
-        deployment_id: get_deployment_failures_for_current_minute(
-            litellm_router_instance=router, deployment_id=deployment_id
-        )
-        for deployment_id in deployment_ids
-    }
-    cooldowns = {
-        deployment_id: cooldown["cooldown_time"]
-        for deployment_id, cooldown in router.cooldown_cache.get_active_cooldowns(
-            model_ids=list(deployment_ids), parent_otel_span=None
-        )
-    }
-    chosen = next((deployment_id for deployment_id in ("chosen-a", "chosen-b") if failures[deployment_id]), None)
-    assert {
-        "failures": failures,
-        "cooldowns": cooldowns,
-        "body_named_usage": [key for key in router.cache.in_memory_cache.cache_dict if "body-named" in key],
-    } == {
+    counters = _deployment_counters(router, deployment_ids)
+    chosen = next(
+        (deployment_id for deployment_id in ("chosen-a", "chosen-b") if counters["failures"][deployment_id]), None
+    )
+    assert counters == {
         "failures": {deployment_id: int(deployment_id == chosen) for deployment_id in deployment_ids},
         "cooldowns": {chosen: 13},
-        "body_named_usage": [],
+        "rpm_usage": [chosen],
     }
+
+
+def _cooling_primary_router(backup_mock_response: str, cooldown_time: float | None = None) -> litellm.Router:
+    """A ``primary`` group whose only deployment is cooling, so a request for it reaches its fallback without any
+    provider call; a ``backup`` group of two Anthropic deployments answering ``backup_mock_response``; and another
+    group of two deployments a body may name."""
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "primary",
+                "litellm_params": {"model": "openai/gpt-4.1", "api_key": "sk-test"},
+                "model_info": {"id": "primary-a"},
+            },
+            {
+                "model_name": "backup",
+                "litellm_params": {
+                    "model": "anthropic/claude-sonnet-4-5",
+                    "api_key": "sk-test",
+                    "mock_response": backup_mock_response,
+                },
+                "model_info": {"id": "chosen-a"},
+            },
+            {
+                "model_name": "backup",
+                "litellm_params": {
+                    "model": "anthropic/claude-3-5-haiku-20241022",
+                    "api_key": "sk-test",
+                    "mock_response": backup_mock_response,
+                },
+                "model_info": {"id": "chosen-b"},
+            },
+            {
+                "model_name": "other",
+                "litellm_params": {"model": "anthropic/claude-3-opus-20240229", "api_key": "sk-test"},
+                "model_info": {"id": "body-named"},
+            },
+            {
+                "model_name": "other",
+                "litellm_params": {"model": "anthropic/claude-3-haiku-20240307", "api_key": "sk-test"},
+                "model_info": {"id": "body-named-sibling"},
+            },
+        ],
+        num_retries=0,
+        **({"cooldown_time": cooldown_time} if cooldown_time is not None else {}),
+    )
+    router.cooldown_cache.add_deployment_to_cooldown(
+        model_id="primary-a",
+        original_exception=litellm.RateLimitError("cooling", "openai", "gpt-4.1"),
+        exception_status=429,
+        cooldown_time=600.0,
+    )
+    return router
+
+
+@pytest.mark.asyncio
+async def test_a_dict_fallback_target_cannot_count_cool_or_add_usage_to_a_deployment_its_litellm_params_names():
+    """The router merges a dict fallback target into the call's parameters when it falls back to it, after the
+    request setup ran on the root. The primary reaches no provider, so the only provider call is the backup's: its
+    error counts against, cools for the router's own ``cooldown_time`` and adds usage to the backup deployment the
+    router chose, and the deployment the target's ``litellm_params`` names gets no failure, no cooldown and no usage."""
+    router = _cooling_primary_router(backup_mock_response="litellm.RateLimitError", cooldown_time=13)
+    data = await add_litellm_data_to_request(
+        data={
+            "model": "primary",
+            "messages": [{"role": "user", "content": "hi"}],
+            "fallbacks": [
+                {
+                    "model": "backup",
+                    "litellm_params": {
+                        "model_info": {"id": "body-named"},
+                        "cooldown_time": 86400,
+                        "metadata": {"model_group": "other", "deployment": "anthropic/claude-3-opus-20240229"},
+                    },
+                }
+            ],
+        },
+        request=_make_request_mock(),
+        user_api_key_dict=_user_api_key_auth(),
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    with pytest.raises((litellm.RateLimitError, RouterRateLimitError)):
+        await router.acompletion(**data)
+    pending = asyncio.all_tasks() - {asyncio.current_task()}
+    await asyncio.gather(*pending, return_exceptions=True)
+
+    deployment_ids = ("chosen-a", "chosen-b", "body-named", "body-named-sibling")
+    counters = _deployment_counters(router, deployment_ids)
+    chosen = next(
+        (deployment_id for deployment_id in ("chosen-a", "chosen-b") if counters["failures"][deployment_id]), None
+    )
+    assert counters == {
+        "failures": {deployment_id: int(deployment_id == chosen) for deployment_id in deployment_ids},
+        "cooldowns": {chosen: 13},
+        "rpm_usage": [chosen],
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_served_fallback_keeps_the_requests_own_identity_not_one_its_dict_target_names(monkeypatch):
+    """A dict fallback target's ``metadata`` replaced the request's own when the router merged the target into the
+    call, so a served fallback call carried the key, team and user the body named, and its success spend row is
+    filed under the identity it reads from that metadata. The request setup removes a target's metadata buckets: the
+    fallback hop keeps the identity the proxy stamped."""
+    router = _cooling_primary_router(backup_mock_response="served by the fallback")
+    identity_fields = ("user_api_key", "user_api_key_team_id", "user_api_key_user_id")
+    named_identity = dict(zip(identity_fields, ("victim-key-hash", "victim-team", "victim-user")))
+    data = await add_litellm_data_to_request(
+        data={
+            "model": "primary",
+            "messages": [{"role": "user", "content": "hi"}],
+            "fallbacks": [{"model": "backup", "metadata": named_identity}],
+        },
+        request=_make_request_mock(),
+        user_api_key_dict=_user_api_key_auth().model_copy(update={"team_id": "own-team", "user_id": "own-user"}),
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+    stamped = {field: data["metadata"].get(field) for field in identity_fields}
+    sdk_calls: list[dict[str, object]] = []
+    sdk_acompletion = litellm.acompletion
+
+    async def recording_acompletion(**kwargs):
+        sdk_calls.append(kwargs)
+        return await sdk_acompletion(**kwargs)
+
+    monkeypatch.setattr(litellm, "acompletion", recording_acompletion)
+
+    response = await router.acompletion(**data)
+
+    fallback_hop_metadata = sdk_calls[-1]["metadata"]
+    assert {
+        "content": response.choices[0].message.content,
+        "fallback_hop_identity": {field: fallback_hop_metadata.get(field) for field in identity_fields},
+    } == {
+        "content": "served by the fallback",
+        "fallback_hop_identity": {**stamped, "user_api_key_team_id": "own-team", "user_api_key_user_id": "own-user"},
+    }
+
+
+def _target_with_caller_overrides() -> dict[str, object]:
+    return {
+        "model": "backup",
+        "messages": [{"role": "user", "content": "hi"}],
+        "model_info": {"id": "victim"},
+        "cooldown_time": 86400,
+        "litellm_params": {"model_info": {"id": "victim"}},
+        "metadata": {"user_api_key_team_id": "victim-team", "deployment": "openai/victim"},
+        "litellm_metadata": {"user_api_key_team_id": "victim-team"},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "path"),
+    [
+        ({"fallbacks": ["backup-string", _target_with_caller_overrides()]}, ("fallbacks",)),
+        ({"fallbacks": [{"gpt-4": ["backup-string", _target_with_caller_overrides()]}]}, ("fallbacks", 0, "gpt-4")),
+        (
+            {"context_window_fallbacks": [{"gpt-4": ["backup-string", _target_with_caller_overrides()]}]},
+            ("context_window_fallbacks", 0, "gpt-4"),
+        ),
+        (
+            {"content_policy_fallbacks": [{"gpt-4": ["backup-string", _target_with_caller_overrides()]}]},
+            ("content_policy_fallbacks", 0, "gpt-4"),
+        ),
+        (
+            {
+                "router_settings_override": {
+                    "fallbacks": [{"gpt-4": ["backup-string", _target_with_caller_overrides()]}]
+                }
+            },
+            ("router_settings_override", "fallbacks", 0, "gpt-4"),
+        ),
+        (
+            {"fallbacks": [{"model": "outer", "fallbacks": ["backup-string", _target_with_caller_overrides()]}]},
+            ("fallbacks", 0, "fallbacks"),
+        ),
+    ],
+    ids=["target-list", "group-map", "context-window", "content-policy", "router-settings-override", "nested"],
+)
+async def test_add_litellm_data_to_request_strips_caller_overrides_from_every_dict_fallback_target(body, path):
+    """Every dict fallback target a body supplies, in each shape the router reads, loses the router-owned fields, a
+    ``litellm_params`` and both metadata buckets; its other keys and every string target stay as sent."""
+    updated = await add_litellm_data_to_request(
+        data={"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}], **copy.deepcopy(body)},
+        request=_make_request_mock(),
+        user_api_key_dict=_user_api_key_auth(),
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    targets: object = updated
+    for step in path:
+        targets = targets[step]
+    assert targets == ["backup-string", {"model": "backup", "messages": [{"role": "user", "content": "hi"}]}]
+
 
 
 @pytest.mark.asyncio
