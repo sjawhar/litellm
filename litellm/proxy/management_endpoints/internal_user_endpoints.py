@@ -124,28 +124,7 @@ if TYPE_CHECKING:
 router: Final = APIRouter()
 _USER_MODEL_BUDGET_ADAPTER: Final = TypeAdapter(dict[str, float | BudgetConfig])
 _USER_BUDGET_CACHE_INVALIDATION_BATCH_SIZE: Final = 50
-# The budget and limit columns the user's cached and last good entries carry. Spend is not a limit: a spend change
-# resets the spend counter the budget check reads first, as before
-_USER_BUDGET_FIELDS: Final = frozenset(
-    {
-        "max_budget",
-        "budget_duration",
-        "budget_reset_at",
-        "tpm_limit",
-        "rpm_limit",
-        "max_parallel_requests",
-        "model_max_budget",
-    }
-)
-# The user's metadata holds its per-model limits, and each of these request fields is written into it
-_USER_METADATA_FIELDS: Final = frozenset({"metadata", *LiteLLM_ManagementEndpoint_MetadataFields})
-
-
-def _user_update_changes_budget(written: Mapping[str, object], sent: Mapping[str, object]) -> bool:
-    """Whether a user update writes a budget or limit the user's cached and last good entries carry. ``written`` is
-    the column payload and ``sent`` the request fields the caller set; the revoke before the write and the eviction
-    after it both ask this, so the two cannot drift apart."""
-    return not _USER_BUDGET_FIELDS.isdisjoint(written) or not _USER_METADATA_FIELDS.isdisjoint(sent)
+_USER_LIMIT_CACHE_FIELDS: Final = frozenset({"max_budget", "model_max_budget", "tpm_limit", "rpm_limit"})
 
 
 def _user_table(
@@ -1579,25 +1558,6 @@ async def _update_single_user_helper(
     # Reject NaN/±inf spend before it can reach the DB / spend counter.
     validate_finite_spend(non_default_values.get("spend"))
 
-    # The user this update writes: the one named by id, else the first holding the email; none means a new user
-    users_with_email: Final = (
-        await prisma_client.get_data(
-            key_val={"user_email": user_request.user_email},
-            table_name="user",
-            query_type="find_all",
-        )
-        if not user_request.user_id and user_request.user_email
-        else None
-    )
-    user_with_email: Final = (
-        users_with_email[0] if isinstance(users_with_email, list) and len(users_with_email) > 0 else None
-    )
-    written_user_id: Final = user_request.user_id or (user_with_email.user_id if user_with_email is not None else None)
-    changes_budget: Final = _user_update_changes_budget(non_default_values, data_json)
-    if changes_budget and written_user_id:
-        # Before the first write, the object permission upsert below, so a refused revocation changes nothing
-        await revoke_last_good(user_api_key_cache, (written_user_id,))
-
     # Upsert the grants into their own row and link it, mirroring /key/update and /team/update.
     # This also removes object_permission from the payload, which is not a column on the user table.
     if "object_permission" in non_default_values:
@@ -1617,19 +1577,36 @@ async def _update_single_user_helper(
     # Perform the update
     response: dict[str, Any] | None = None
 
-    if written_user_id:
-        non_default_values["user_id"] = written_user_id
+    if user_request.user_id and len(user_request.user_id) > 0:
+        non_default_values["user_id"] = user_request.user_id
         response = await prisma_client.update_data(
-            user_id=written_user_id,
+            user_id=user_request.user_id,
             data=non_default_values,
             table_name="user",
         )
     elif user_request.user_email:
-        # Create new user if not found
-        non_default_values["user_id"] = str(uuid.uuid4())
-        non_default_values["user_email"] = user_request.user_email
-        inserted_user_row: Final = await prisma_client.insert_data(data=non_default_values, table_name="user")
-        response = inserted_user_row  # pyright: ignore[reportAssignmentType]  # insert_data returns a prisma row
+        # Handle email-based updates
+        existing_user_rows: Final = await prisma_client.get_data(
+            key_val={"user_email": user_request.user_email},
+            table_name="user",
+            query_type="find_all",
+        )
+
+        if existing_user_rows and isinstance(existing_user_rows, list) and len(existing_user_rows) > 0:
+            for existing_user in existing_user_rows:
+                non_default_values["user_id"] = existing_user.user_id
+                response = await prisma_client.update_data(
+                    user_id=existing_user.user_id,
+                    data=non_default_values,
+                    table_name="user",
+                )
+                break  # Update first matching user
+        else:
+            # Create new user if not found
+            non_default_values["user_id"] = str(uuid.uuid4())
+            non_default_values["user_email"] = user_request.user_email
+            inserted_user_row: Final = await prisma_client.insert_data(data=non_default_values, table_name="user")
+            response = inserted_user_row  # pyright: ignore[reportAssignmentType]  # insert_data returns a prisma row
 
     if response is not None:
         if "password" in non_default_values:
@@ -1659,7 +1636,7 @@ async def _update_single_user_helper(
 
         await _invalidate_user_spend_counter_if_changed(non_default_values)
 
-        if changes_budget:
+        if not _USER_LIMIT_CACHE_FIELDS.isdisjoint(non_default_values) or "metadata" in data_json:
             await evict_and_broadcast(
                 cache_keys=(non_default_values["user_id"],),
                 user_api_key_cache=user_api_key_cache,
@@ -2006,12 +1983,6 @@ async def bulk_user_update(
         failed_updates: Final = 0
         results: Final[list[UserUpdateResult]] = []
 
-        # Revoked before the try, whose fallback would swallow the refusal
-        user_ids: Final = [user.user_id for user in all_users_in_db]
-        changes_budget: Final = _user_update_changes_budget(non_default_values, data_json)
-        if changes_budget:
-            await revoke_last_good(user_api_key_cache, user_ids)
-
         try:
             # Perform bulk database update
             await UserRepository(prisma_client).table.update_many(
@@ -2023,7 +1994,7 @@ async def bulk_user_update(
                 ),
             )
 
-            if changes_budget:
+            if not _USER_LIMIT_CACHE_FIELDS.isdisjoint(non_default_values):
                 for start in range(0, len(all_users_in_db), _USER_BUDGET_CACHE_INVALIDATION_BATCH_SIZE):
                     await asyncio.gather(
                         *(

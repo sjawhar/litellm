@@ -3111,8 +3111,7 @@ class TestLastGoodLimitsWhileTheDatabaseIsUnreachable:
         self, monkeypatch, skip_budget_checks: bool
     ):
         """A budgeted access group serves the model, and only the key's org could grant it. With no entry for the org,
-        the group's budget cannot be checked, so the request is refused, unless its budget checks are skipped; then the
-        group the key grants itself is still attributed."""
+        the group's budget cannot be checked, so the request is refused, unless its budget checks are skipped."""
         from litellm import Router
         from litellm.proxy.auth.auth_checks import common_checks, get_org_object
         from litellm.proxy.common_utils.user_api_key_cache import model_access_group_registry_cache_key
@@ -3129,11 +3128,10 @@ class TestLastGoodLimitsWhileTheDatabaseIsUnreachable:
             user_api_key_cache=cache,
             include_budget_table=True,
         )
-        await cache.async_set_cache(key=model_access_group_registry_cache_key(), value=("tier-a", "tier-b"))
+        await cache.async_set_cache(key=model_access_group_registry_cache_key(), value=("tier-a",))
         database.stopped_with = _STOPPED
         monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", database)
         monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
-        valid_token: Final = UserAPIKeyAuth(models=["tier-b"], org_id="o-grants")
 
         async def checked() -> bool:
             return await common_checks(
@@ -3149,12 +3147,12 @@ class TestLastGoodLimitsWhileTheDatabaseIsUnreachable:
                         {
                             "model_name": "gpt-4o",
                             "litellm_params": {"model": "openai/gpt-4o"},
-                            "model_info": {"access_groups": ["tier-a", "tier-b"]},
+                            "model_info": {"access_groups": ["tier-a"]},
                         }
                     ]
                 ),
                 proxy_logging_obj=ProxyLogging(user_api_key_cache=cache),
-                valid_token=valid_token,
+                valid_token=UserAPIKeyAuth(models=[], org_id="o-grants"),
                 request=SimpleNamespace(  # pyright: ignore[reportArgumentType]  # stands in for the request
                     method="POST", headers={}, query_params={}, url=SimpleNamespace(path="/v1/chat/completions")
                 ),
@@ -3163,7 +3161,6 @@ class TestLastGoodLimitsWhileTheDatabaseIsUnreachable:
 
         if skip_budget_checks:
             assert await checked() is True
-            assert valid_token.matched_model_access_groups == ["tier-b"]
         else:
             with pytest.raises(LastGoodEntryMissing):
                 await checked()

@@ -432,12 +432,6 @@ def end_user_cache_key(end_user_id: str) -> str:
     return f"end_user_id:{end_user_id}"
 
 
-def end_user_validation_cache_key(end_user_id: str) -> str:
-    """Cache key of the verdict on whether an end-user id exists, which end-user id validation keeps; every customer
-    mutation evicts it, so a verdict from before the customer was created cannot drop it until the verdict lapses."""
-    return f"end_user_validation:{end_user_id}"
-
-
 def end_user_restricted_registry_cache_key() -> str:
     """Cache key for the set of end-user ids whose row carries a restriction auth enforces."""
     return "end_user_restricted_registry"

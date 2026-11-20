@@ -1772,43 +1772,6 @@ async def test_v2_budget_change_drops_the_last_good_entries_of_the_organizations
 
 @pytest.mark.asyncio
 @_SERVING
-async def test_v2_budget_change_writes_nothing_when_redis_cannot_record_the_revocation(monkeypatch, serving: bool):
-    """The organization's budget row is written in place, so every holder of it is revoked first. While last good
-    entries are served, a Redis that cannot record that leaves the budget and the organization as they were; with them
-    off, nothing is revoked and both are written as before."""
-    import litellm.proxy.proxy_server as proxy_server
-    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
-    from tests.unit.caching.fake_redis_cache import fake_redis_cache
-
-    redis: Final = fake_redis_cache()
-    redis.server.connected = False
-    monkeypatch.setattr(
-        "litellm.proxy.proxy_server.user_api_key_cache",
-        UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=serving),
-    )
-
-    async def update() -> None:
-        await _run_update_organization_v2(
-            monkeypatch, body={"max_budget": 1.0}, existing_budget_id="b-org", existing_metadata=None
-        )
-
-    def tables() -> AsyncMock:
-        return cast(AsyncMock, proxy_server.prisma_client).db
-
-    if not serving:
-        await update()
-        tables().litellm_budgettable.update.assert_awaited_once()
-        return
-    with pytest.raises(HTTPException) as refused:
-        await update()
-
-    assert refused.value.status_code == 503
-    tables().litellm_budgettable.update.assert_not_awaited()
-    tables().litellm_organizationtable.update.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@_SERVING
 async def test_delete_organization_evicts_the_organization_and_its_last_good_entries(monkeypatch, serving: bool):
     from litellm.proxy._types import DeleteOrganizationRequest, LitellmUserRoles, UserAPIKeyAuth
     from litellm.proxy.management_endpoints.organization_endpoints import delete_organization

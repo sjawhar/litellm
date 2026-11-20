@@ -43,8 +43,6 @@ from litellm.proxy._types import (
     DeleteProjectRequest,
     NewTeamRequest,
     UserAPIKeyAuth,
-    LiteLLM_BudgetTable,
-    LiteLLM_EndUserTable,
     LiteLLM_OrganizationMembershipTable,
     LiteLLM_TeamTable,
     LiteLLM_UserTable,
@@ -1412,105 +1410,6 @@ async def test_update_project_clears_only_the_explicit_budget_cap(monkeypatch):
         data={"max_budget": None, "updated_by": "1234"},
     )
     assert "max_budget" not in _written_project_data(mock_prisma)
-
-
-class _BudgetRows:
-    """The budget table: rows by id, changed only by an update."""
-
-    def __init__(self, *rows: LiteLLM_BudgetTable) -> None:
-        self.rows = {row.budget_id: row for row in rows}
-
-    async def update(self, where: Mapping[str, str], data: Mapping[str, object]) -> LiteLLM_BudgetTable:
-        written = self.rows[where["budget_id"]].model_copy(
-            update={column: value for column, value in data.items() if column in LiteLLM_BudgetTable.model_fields}
-        )
-        self.rows[where["budget_id"]] = written
-        return written
-
-
-_KEY_ON_THE_SHARED_BUDGET: Final = "hashed-key-on-the-shared-budget"
-
-
-def _serve_project_on_a_shared_budget(monkeypatch, cache: UserApiKeyCache) -> tuple[mock.MagicMock, _BudgetRows]:
-    """Project p1 on budget row b-shared, which customer c1 and a key hold too."""
-    project = mock.MagicMock(project_id="p1", team_id=None, budget_id="b-shared", object_permission_id=None)
-    budgets = _BudgetRows(LiteLLM_BudgetTable(budget_id="b-shared", max_budget=10.0))
-    prisma = mock.MagicMock()
-    prisma.jsonify_object = lambda data: data
-    prisma.db.litellm_projecttable.find_unique = mock.AsyncMock(return_value=project)
-    prisma.db.litellm_projecttable.find_many = mock.AsyncMock(return_value=[project])
-    prisma.db.litellm_projecttable.update = mock.AsyncMock(return_value=project)
-    prisma.db.litellm_budgettable = budgets
-    prisma.db.litellm_endusertable.find_many = mock.AsyncMock(return_value=[mock.MagicMock(user_id="c1")])
-    prisma.db.litellm_verificationtoken.find_many = mock.AsyncMock(
-        return_value=[mock.MagicMock(token=_KEY_ON_THE_SHARED_BUDGET)]
-    )
-    for table in (
-        "litellm_teammembership",
-        "litellm_organizationtable",
-        "litellm_tagtable",
-        "litellm_modelaccessgroupbudgettable",
-    ):
-        getattr(prisma.db, table).find_many = mock.AsyncMock(return_value=[])
-    monkeypatch.setattr(litellm.proxy.proxy_server, "premium_user", True)
-    monkeypatch.setattr(litellm.proxy.proxy_server, "prisma_client", prisma)
-    monkeypatch.setattr(litellm.proxy.proxy_server, "user_api_key_cache", cache)
-    return prisma, budgets
-
-
-def _redis_down_cache(serve_last_good_entries: bool) -> UserApiKeyCache:
-    from tests.unit.caching.fake_redis_cache import fake_redis_cache
-
-    redis = fake_redis_cache()
-    redis.server.connected = False
-    return UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=serve_last_good_entries)
-
-
-@pytest.mark.asyncio
-async def test_project_budget_update_answers_503_and_writes_nothing_when_redis_cannot_record_it(monkeypatch):
-    """The project's budget row is written in place, and the last good entry of every holder of it carries it. With
-    Redis unable to record their revocation, the budget stays as it was rather than the old limit staying in them."""
-    prisma, budgets = _serve_project_on_a_shared_budget(monkeypatch, _redis_down_cache(serve_last_good_entries=True))
-
-    with pytest.raises(ProxyException) as refused:
-        await _run_project_update("p1", max_budget=5.0)
-
-    assert (str(refused.value.code), budgets.rows["b-shared"].max_budget) == ("503", 10.0)
-    prisma.db.litellm_projecttable.update.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_project_budget_update_writes_while_redis_is_down_when_last_good_entries_are_off(monkeypatch):
-    _, budgets = _serve_project_on_a_shared_budget(monkeypatch, _redis_down_cache(serve_last_good_entries=False))
-
-    await _run_project_update("p1", max_budget=5.0)
-
-    assert budgets.rows["b-shared"].max_budget == 5.0
-
-
-@pytest.mark.asyncio
-async def test_project_budget_update_drops_the_last_good_entries_of_the_other_holders_of_its_budget(monkeypatch):
-    """/project/new accepts an existing budget_id, so the row a project update writes in place can be shared. Every
-    other holder's last good entry carries the old limit, a customer's and a key's here, so those entries go too."""
-    from litellm.proxy.common_utils.user_api_key_cache import (
-        end_user_cache_key,
-        recall_last_good,
-        remember_last_good,
-    )
-
-    cache = UserApiKeyCache(serve_last_good_entries=True)
-    _serve_project_on_a_shared_budget(monkeypatch, cache)
-    budget = LiteLLM_BudgetTable(budget_id="b-shared", max_budget=10.0)
-    customer = LiteLLM_EndUserTable(user_id="c1", blocked=False, budget_id="b-shared", litellm_budget_table=budget)
-    await remember_last_good(cache, end_user_cache_key("c1"), customer)
-    await remember_last_good(cache, _KEY_ON_THE_SHARED_BUDGET, UserAPIKeyAuth(token=_KEY_ON_THE_SHARED_BUDGET))
-
-    await _run_project_update("p1", max_budget=5.0)
-
-    assert {
-        "customer": await recall_last_good(cache, end_user_cache_key("c1"), LiteLLM_EndUserTable),
-        "key": await recall_last_good(cache, _KEY_ON_THE_SHARED_BUDGET, UserAPIKeyAuth),
-    } == {"customer": None, "key": None}
 
 
 @pytest.mark.parametrize("entry", ["all-proxy-models", "*", "azure/*"])

@@ -126,7 +126,6 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     UserApiKeyCache,
     forget_last_good,
     revoke_last_good,
-    serves_last_good_entries,
     team_membership_auth_cache_key,
 )
 from litellm.proxy.db.db_span import db_span
@@ -2139,79 +2138,6 @@ async def _evict_created_membership_caches(
     )
 
 
-# Metadata-backed fields that set a limit or decide how one binds; the others set access, expiry, caching or estimates
-TEAM_METADATA_LIMIT_FIELDS: Final = frozenset(
-    {
-        "model_rpm_limit",
-        "model_tpm_limit",
-        "model_itpm_limit",
-        "model_otpm_limit",
-        "mcp_rpm_limit",
-        "tag_rpm_limit",
-        "rpm_limit_type",
-        "tpm_limit_type",
-        "temp_budget_increase",
-        "temp_budget_expiry",
-        "throttle_on_budget_exceeded",
-        "end_user_budget_id",
-    }
-)
-
-# /team/update fields a last good entry carries as a limit: the team's own, and every key's copy of the team's limits.
-# The member default budget fields count too: creating that budget writes its id into the team's metadata.
-TEAM_BUDGET_FIELDS: Final = frozenset(
-    {
-        "max_budget",
-        "soft_budget",
-        "tpm_limit",
-        "rpm_limit",
-        "tpd_limit",
-        "budget_duration",
-        "budget_limits",
-        "model_max_budget",
-        "team_member_budget",
-        "team_member_rpm_limit",
-        "team_member_tpm_limit",
-        "team_member_budget_duration",
-        *TEAM_METADATA_LIMIT_FIELDS,
-    }
-)
-
-
-def team_update_changes_budget(data: UpdateTeamRequest, stored_metadata: object) -> bool:
-    """Whether a /team/update changes a budget or limit a last good entry carries: it sets a field of
-    ``TEAM_BUDGET_FIELDS``, or its ``metadata``, which replaces the stored one, gives a key of
-    ``TEAM_METADATA_LIMIT_FIELDS`` another value than the stored metadata holds."""
-    if not TEAM_BUDGET_FIELDS.isdisjoint(data.model_fields_set):
-        return True
-    if "metadata" not in data.model_fields_set:
-        return False
-    sent: Final[Mapping[str, object]] = data.metadata or MappingProxyType({})  # pyright: ignore[reportUnknownMemberType]  # request models declare `metadata` as bare dict
-    stored: Final[Mapping[str, object]] = (
-        stored_metadata if isinstance(stored_metadata, Mapping) else MappingProxyType({})
-    )
-    return any(sent.get(field) != stored.get(field) for field in TEAM_METADATA_LIMIT_FIELDS)
-
-
-async def _team_key_tokens(
-    prisma_client: PrismaClient, team_id: str, user_api_key_cache: UserApiKeyCache
-) -> tuple[str, ...]:
-    """Hashed tokens of the team's keys, whose entries carry the team's budget and rate limit columns. Only the
-    revocation needs them, so they are read only while last good entries are served, and strictly: a key that
-    cannot be listed cannot be revoked, so the change is refused before anything is written."""
-    from litellm.proxy.management_endpoints.budget_management_endpoints import read_holders
-
-    if not serves_last_good_entries(user_api_key_cache):
-        return ()
-    keys: Final = await read_holders(
-        f"team {team_id}",
-        "keys",
-        lambda: _tokens_db(prisma_client).find_many(where={"team_id": team_id}),
-        required=True,
-    )
-    return tuple(key.token for key in keys or ())
-
-
 @router.post("/team/update", tags=["team management"], dependencies=[Depends(user_api_key_auth)])
 @management_endpoint_wrapper
 async def update_team(
@@ -2570,15 +2496,8 @@ async def update_team(
                     },
                 }
 
-        # After the request's checks and before the budget and team writes, so no block or old limit outlives the change
-        changes_budget: Final = team_update_changes_budget(data, existing_team_row.metadata)
-        if data.blocked is True or changes_budget:
-            team_key_tokens: Final = (
-                await _team_key_tokens(prisma_client, data.team_id, user_api_key_cache) if changes_budget else ()
-            )
-            await revoke_last_good(
-                user_api_key_cache, (*team_cache_keys(data.team_id, existing_team.team_alias), *team_key_tokens)
-            )
+        if data.blocked is True:
+            await revoke_last_good(user_api_key_cache, team_cache_keys(data.team_id, existing_team.team_alias))
 
         if _team_member_fields_in_request and TeamMemberBudgetHandler.should_create_budget(
             team_member_budget=data.team_member_budget,
@@ -3911,12 +3830,6 @@ async def team_member_update(
 
     Update team member budgets and team member role
     """
-    from litellm.proxy.management_endpoints.budget_management_endpoints import (
-        BudgetHolders,
-        evict_budget_holders,
-        read_budget_holders,
-        read_team_member_holders,
-    )
     from litellm.proxy.proxy_server import (
         litellm_proxy_admin_name,
         premium_user,
@@ -4007,20 +3920,6 @@ async def team_member_update(
 
     ### upsert new budget
     budget_patch: Final = member_budget_patch(data)
-    # A private budget row is written in place, so its other holders change too; the shared default is cloned instead
-    budget_written_in_place: Final = (
-        identified_budget_id
-        if budget_patch and identified_budget_id is not None and identified_budget_id != team_default_budget_id
-        else None
-    )
-    budget_holders: Final = (
-        await read_budget_holders(budget_written_in_place) if budget_written_in_place is not None else BudgetHolders()
-    )
-    if budget_patch:
-        member_holders: Final = await read_team_member_holders(data.team_id, (received_user_id,))
-        await revoke_last_good(
-            user_api_key_cache, tuple(dict.fromkeys((*member_holders.last_good_keys, *budget_holders.last_good_keys)))
-        )
     async with prisma_client.tx() as tx:
         role_change: Final = (
             await _update_team_member_role(
@@ -4049,8 +3948,6 @@ async def team_member_update(
             team_id=data.team_id,
             user_api_key_cache=user_api_key_cache,
         )
-    if budget_written_in_place is not None:
-        await evict_budget_holders(budget_written_in_place, budget_holders)
 
     if role_change is not None:
         members_before_role_update, team_members = role_change

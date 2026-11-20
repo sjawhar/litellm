@@ -35,7 +35,6 @@ from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.user_api_key_cache import (
     end_user_cache_key,
     end_user_restricted_registry_cache_key,
-    end_user_validation_cache_key,
     revoke_last_good,
 )
 from litellm.proxy.management_endpoints.common_daily_activity import get_daily_activity
@@ -137,12 +136,8 @@ async def _evict_end_user_cache_keys(cache_keys: Sequence[str]) -> None:
 
 
 def _end_user_cache_keys(user_ids: Sequence[str]) -> tuple[str, ...]:
-    """The per-id entries, the per-id validation verdicts, whose cached "invalid" would drop a customer just created,
-    and the registry, which any restriction change can move ids in or out of."""
-    return (
-        *(key for user_id in user_ids for key in (end_user_cache_key(user_id), end_user_validation_cache_key(user_id))),
-        end_user_restricted_registry_cache_key(),
-    )
+    """The per-id entries plus the registry, which any restriction change can move ids in or out of."""
+    return (*(end_user_cache_key(user_id) for user_id in user_ids), end_user_restricted_registry_cache_key())
 
 
 def _to_customer_response(record: BaseModel) -> CustomerResponse:
@@ -681,11 +676,6 @@ async def update_end_user(
     ```
     """
 
-    from litellm.proxy.management_endpoints.budget_management_endpoints import (
-        BudgetHolders,
-        evict_budget_holders,
-        read_budget_holders,
-    )
     from litellm.proxy.proxy_server import litellm_proxy_admin_name, prisma_client, user_api_key_cache
 
     try:
@@ -739,25 +729,12 @@ async def update_end_user(
             *(("object_permission_id",) if "object_permission" in non_default_values else ()),
             *(("budget_id",) if budget_table_data and end_user_budget_table is None else ()),
         }
-        # A budget field on a customer that has a budget row changes that row in place, and every holder of the row
-        # carries it, other customers on it among them: a lowered limit must not stay in one of their entries
-        updated_budget_id: Final = (
-            end_user_budget_table.budget_id if budget_table_data and end_user_budget_table is not None else None
-        )
-        budget_holders: Final = (
-            await read_budget_holders(updated_budget_id) if updated_budget_id is not None else BudgetHolders()
-        )
-        # A restriction column moves the customer in or out of the registry; any budget change reaches its own entry
-        customer_keys: Final = (
-            _end_user_cache_keys((data.user_id,))
-            if not END_USER_RESTRICTION_COLUMNS.isdisjoint(written_columns)
-            else (end_user_cache_key(data.user_id),)
-            if budget_table_data
-            else ()
-        )
-        await revoke_last_good(
-            user_api_key_cache, tuple(dict.fromkeys((*customer_keys, *budget_holders.last_good_keys)))
-        )
+        if not END_USER_RESTRICTION_COLUMNS.isdisjoint(written_columns):
+            await revoke_last_good(user_api_key_cache, _end_user_cache_keys((data.user_id,)))
+        elif budget_table_data:
+            # A change to the customer's existing budget row moves it into or out of no registry, but the customer's
+            # entry carries that budget: a lowered limit must not stay there for the next outage
+            await revoke_last_good(user_api_key_cache, (end_user_cache_key(data.user_id),))
 
         ## Handle object permission updates (MCP servers, vector stores, etc.)
         await _handle_customer_object_permission_update(
@@ -787,8 +764,6 @@ async def update_end_user(
                     where={"budget_id": end_user_budget_table.budget_id},
                     data=budget_table_data,
                 )
-                if updated_budget_id is not None:
-                    await evict_budget_holders(updated_budget_id, budget_holders)
 
         ## Update user table, with update params + new budget id (if set) ##
         verbose_proxy_logger.debug("/customer/update: Received data = %s", data)

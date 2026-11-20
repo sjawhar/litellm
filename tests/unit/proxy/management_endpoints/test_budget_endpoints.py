@@ -1,6 +1,5 @@
 # tests/test_budget_endpoints.py
 
-import asyncio
 import json
 import types
 from datetime import datetime, timedelta, timezone
@@ -175,11 +174,9 @@ async def test_update_budget_drops_the_last_good_entries_of_everything_on_it(cli
 
 
 @pytest.mark.asyncio
-async def test_update_budget_refuses_and_writes_nothing_when_a_holder_table_cannot_be_read(
-    client_and_mocks, monkeypatch
-):
-    """While last good entries are served, a holder the update cannot list is a holder it cannot revoke, so the budget
-    is left as it was and the operator retries."""
+async def test_update_budget_evicts_the_other_holders_when_one_table_cannot_be_read(client_and_mocks, monkeypatch):
+    """A budget update reads seven tables. One of them failing must not leave the keys on the budget serving their
+    old limits from a last good entry that never expires."""
     from litellm.proxy._types import LiteLLM_BudgetTable
     from litellm.proxy.common_utils.user_api_key_cache import (
         UserApiKeyCache,
@@ -187,49 +184,22 @@ async def test_update_budget_refuses_and_writes_nothing_when_a_holder_table_cann
         remember_last_good,
     )
 
-    client, mock_prisma, mock_table = client_and_mocks
-    own_budget_key: Final = "hashed-own-budget"
+    client, mock_prisma, _ = client_and_mocks
     mock_prisma.db.litellm_tagtable.find_many = AsyncMock(side_effect=Exception("tag table is unreadable"))
     mock_prisma.db.litellm_verificationtoken = _KeyRows(
         types.SimpleNamespace(
-            token=own_budget_key, budget_id="budget_shared", organization_id=None, team_id=None, user_id=None
+            token="hashed-own-budget", budget_id="budget_shared", organization_id=None, team_id=None, user_id=None
         )
     )
     cache: Final = UserApiKeyCache(serve_last_good_entries=True)
     budget: Final = LiteLLM_BudgetTable(budget_id="budget_shared", max_budget=50.0)
-    await remember_last_good(cache, own_budget_key, budget)
-    monkeypatch.setattr(ps, "user_api_key_cache", cache)
-
-    resp = client.post("/budget/update", json={"budget_id": "budget_shared", "max_budget": 5.0})
-
-    assert resp.status_code == 503, resp.text
-    mock_table.update.assert_not_awaited()
-    assert await recall_last_good(cache, own_budget_key, LiteLLM_BudgetTable) is not None
-
-
-@pytest.mark.asyncio
-async def test_update_budget_evicts_the_other_holders_when_one_table_cannot_be_read(client_and_mocks, monkeypatch):
-    """With last good entries off, a budget update reads seven tables best effort, as before: one of them failing still
-    writes the budget and evicts the keys on it."""
-    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
-
-    client, mock_prisma, mock_table = client_and_mocks
-    own_budget_key: Final = "hashed-own-budget"
-    mock_prisma.db.litellm_tagtable.find_many = AsyncMock(side_effect=Exception("tag table is unreadable"))
-    mock_prisma.db.litellm_verificationtoken = _KeyRows(
-        types.SimpleNamespace(
-            token=own_budget_key, budget_id="budget_shared", organization_id=None, team_id=None, user_id=None
-        )
-    )
-    cache: Final = UserApiKeyCache(serve_last_good_entries=False)
-    cache.set_cache(key=own_budget_key, value="the key object cached before the update")
+    await remember_last_good(cache, "hashed-own-budget", budget)
     monkeypatch.setattr(ps, "user_api_key_cache", cache)
 
     resp = client.post("/budget/update", json={"budget_id": "budget_shared", "max_budget": 5.0})
 
     assert resp.status_code == 200, resp.text
-    mock_table.update.assert_awaited_once()
-    assert cache.get_cache(key=own_budget_key) is None
+    assert await recall_last_good(cache, "hashed-own-budget", LiteLLM_BudgetTable) is None
 
 
 @pytest.mark.parametrize("bad_duration", ["0s", "-5m"])
@@ -599,158 +569,3 @@ async def test_update_budget_serializes_model_max_budget_for_prisma(
         "gpt4o": {"max_budget": 5.0, "budget_duration": "1d"},
         "glm-5.2": {"max_budget": 7.5, "budget_duration": "30d"},
     }
-
-
-async def _update_budget_directly(budget_id: str, max_budget: float):
-    """``/budget/update`` called in the test's own event loop, so a read held in that loop can straddle it."""
-    from litellm.proxy._types import BudgetNewRequest
-    from litellm.proxy.management_endpoints.budget_management_endpoints import update_budget
-
-    return await update_budget(
-        budget_obj=BudgetNewRequest(budget_id=budget_id, max_budget=max_budget),
-        user_api_key_dict=UserAPIKeyAuth(user_id="test_user", user_role=LitellmUserRoles.PROXY_ADMIN),
-    )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("serves_last_good", [True, False], ids=["serving", "not_serving"])
-async def test_update_budget_answers_503_and_changes_nothing_when_redis_cannot_record_the_revocation(
-    client_and_mocks, monkeypatch, serves_last_good: bool
-):
-    """A customer on the budget keeps a last good entry that never expires. With Redis unable to record its revocation,
-    the budget stays as it was rather than the old limit staying in that entry; with last good entries off, nothing is
-    revoked and the budget is written as before."""
-    from fastapi import HTTPException
-    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
-    from tests.unit.caching.fake_redis_cache import fake_redis_cache
-
-    _, mock_prisma, mock_table = client_and_mocks
-    mock_prisma.db.litellm_endusertable.find_many = AsyncMock(return_value=[types.SimpleNamespace(user_id="c1")])
-    redis: Final = fake_redis_cache()
-    redis.server.connected = False
-    monkeypatch.setattr(
-        ps, "user_api_key_cache", UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=serves_last_good)
-    )
-
-    if not serves_last_good:
-        await _update_budget_directly("budget_shared", 5.0)
-        mock_table.update.assert_awaited_once()
-        return
-    with pytest.raises(HTTPException) as refused:
-        await _update_budget_directly("budget_shared", 5.0)
-
-    assert refused.value.status_code == 503
-    mock_table.update.assert_not_awaited()
-
-
-class _HeldAuthReads:
-    """The database of budget ``b1``, held by customer ``c1``, key ``k1`` and the membership of ``u1`` in ``t1``. Each
-    auth read takes its row when it starts and answers only once ``release`` is set; the holder reads of a budget update
-    and its write answer at once."""
-
-    def __init__(self, hashed_key: str) -> None:
-        from litellm.proxy._types import LiteLLM_BudgetTable, LiteLLM_EndUserTable, LiteLLM_TeamMembership
-
-        self.all_started = asyncio.Event()
-        self.release = asyncio.Event()
-        self._started = 0
-        old_budget: Final = LiteLLM_BudgetTable(budget_id="b1", max_budget=50.0, rpm_limit=100)
-        self.customer: Final = LiteLLM_EndUserTable(
-            user_id="c1", blocked=False, budget_id="b1", litellm_budget_table=old_budget
-        )
-        self.membership: Final = LiteLLM_TeamMembership(
-            user_id="u1", team_id="t1", budget_id="b1", litellm_budget_table=old_budget
-        )
-        self.key: Final = UserAPIKeyAuth(token=hashed_key, budget_id="b1", max_budget=50.0)
-        self.budget_writes: Final = AsyncMock(side_effect=lambda *, where, data: {**where, **data})
-        nothing_on_it: Final = types.SimpleNamespace(find_many=AsyncMock(return_value=[]))
-        self.db: Final = types.SimpleNamespace(
-            litellm_budgettable=types.SimpleNamespace(update=self.budget_writes),
-            litellm_endusertable=types.SimpleNamespace(find_unique=self._held_customer, find_many=self._customers),
-            litellm_teammembership=types.SimpleNamespace(
-                find_first=self._held_membership, find_many=AsyncMock(return_value=[self.membership])
-            ),
-            litellm_verificationtoken=_KeyRows(
-                types.SimpleNamespace(
-                    token=hashed_key, budget_id="b1", organization_id=None, team_id=None, user_id=None
-                )
-            ),
-            litellm_organizationtable=nothing_on_it,
-            litellm_projecttable=nothing_on_it,
-            litellm_tagtable=nothing_on_it,
-            litellm_modelaccessgroupbudgettable=nothing_on_it,
-        )
-
-    async def _held(self, row: object) -> object:
-        self._started += 1
-        if self._started == 3:
-            self.all_started.set()
-        await self.release.wait()
-        return row
-
-    async def _held_customer(self, where: object, include: object = None) -> object:
-        return await self._held(self.customer)
-
-    async def _held_membership(self, where: object, include: object = None) -> object:
-        return await self._held(self.membership)
-
-    async def _customers(self, **_: object) -> list[object]:
-        # The holder read of the budget and the restricted-customer registry both find c1
-        return [self.customer]
-
-    async def get_data(self, token: str, table_name: str, **_: object) -> object:
-        return await self._held(self.key)
-
-    async def attempt_db_reconnect(self, **_: object) -> bool:
-        return False
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("pods", ["one_pod", "two_pods"])
-async def test_a_read_in_flight_across_a_budget_update_leaves_no_holder_the_old_limit(monkeypatch, pods: str):
-    """A customer, a key and a team membership on the budget are each being read when the budget is lowered. Each read
-    took its row before the write and stores it after, so without a revocation before the write each would keep the
-    old limit as a last good entry, served in the next outage."""
-    from typing import cast
-
-    from litellm.proxy._types import LiteLLM_EndUserTable, LiteLLM_TeamMembership
-    from litellm.proxy.auth.auth_checks import get_end_user_object, get_key_object
-    from litellm.proxy.auth.user_api_key_auth import _read_team_membership  # pyright: ignore[reportPrivateUsage]  # the admission check's read
-    from litellm.proxy.common_utils.user_api_key_cache import (
-        UserApiKeyCache,
-        end_user_cache_key,
-        recall_last_good,
-        team_membership_auth_cache_key,
-    )
-    from litellm.proxy.utils import PrismaClient
-    from tests.unit.caching.fake_redis_cache import fake_redis_cache
-
-    hashed_key: Final = "hashed-k1"
-    database: Final = _HeldAuthReads(hashed_key)
-    prisma: Final = cast(PrismaClient, database)
-    redis: Final = fake_redis_cache()
-    reading_pod: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
-    updating_pod: Final = (
-        reading_pod if pods == "one_pod" else UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
-    )
-    monkeypatch.setattr(ps, "prisma_client", database)
-    monkeypatch.setattr(ps, "user_api_key_cache", updating_pod)
-    in_flight: Final = asyncio.gather(
-        get_end_user_object(end_user_id="c1", prisma_client=prisma, user_api_key_cache=reading_pod),
-        get_key_object(hashed_token=hashed_key, prisma_client=prisma, user_api_key_cache=reading_pod),
-        _read_team_membership(prisma, reading_pod, team_id="t1", user_id="u1"),
-    )
-    await database.all_started.wait()
-
-    await _update_budget_directly("b1", 5.0)
-    database.release.set()
-    await in_flight
-
-    database.budget_writes.assert_awaited_once()
-    assert {
-        "customer": await recall_last_good(reading_pod, end_user_cache_key("c1"), LiteLLM_EndUserTable),
-        "key": await recall_last_good(reading_pod, hashed_key, UserAPIKeyAuth),
-        "team membership": await recall_last_good(
-            reading_pod, team_membership_auth_cache_key(team_id="t1", user_id="u1"), LiteLLM_TeamMembership
-        ),
-    } == {"customer": None, "key": None, "team membership": None}

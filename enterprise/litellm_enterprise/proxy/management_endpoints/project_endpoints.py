@@ -699,11 +699,6 @@ async def update_project(
     }'
     ```
     """
-    from litellm.proxy.management_endpoints.budget_management_endpoints import (
-        BudgetHolders,
-        evict_budget_holders,
-        read_budget_holders,
-    )
     from litellm.proxy.proxy_server import (
         general_settings,
         litellm_proxy_admin_name,
@@ -819,6 +814,9 @@ async def update_project(
                 data, existing_project, _router_access_group_names(llm_router)
             )
 
+        if data.blocked is True:
+            await revoke_last_good(user_api_key_cache, (project_cache_key(data.project_id),))
+
         # Prepare update data
         update_data = _jsonified(prisma_client, data.model_dump(exclude_none=True, exclude={"project_id"}))
         update_data["updated_by"] = user_api_key_dict.user_id or litellm_proxy_admin_name
@@ -830,33 +828,10 @@ async def update_project(
             **({"max_budget": None} if "max_budget" in data.model_fields_set and data.max_budget is None else {}),
         }
 
-        # The budget row is written in place and may be shared, so every holder of it is revoked, not just this project
-        shared_budget_id: Final = existing_project.budget_id if budget_updates and existing_project.budget_id else None
-        budget_holders: Final = (
-            await read_budget_holders(shared_budget_id) if shared_budget_id is not None else BudgetHolders()
-        )
-        # The project's own entry carries its blocked flag and, in its metadata, its per-model limits
-        project_entry_changes: Final = (
-            data.blocked is True
-            or "metadata" in update_data
-            or any(field in update_data for field in LiteLLM_ManagementEndpoint_MetadataFields)
-        )
-        await revoke_last_good(
-            user_api_key_cache,
-            tuple(
-                dict.fromkeys(
-                    (
-                        *((project_cache_key(data.project_id),) if project_entry_changes else ()),
-                        *budget_holders.last_good_keys,
-                    )
-                )
-            ),
-        )
-
-        if shared_budget_id is not None:
+        if budget_updates and existing_project.budget_id:
             # Update existing budget
             await _budget_table(prisma_client).update(
-                where={"budget_id": shared_budget_id},
+                where={"budget_id": existing_project.budget_id},
                 data={
                     **budget_updates,
                     "updated_by": user_api_key_dict.user_id or litellm_proxy_admin_name,
@@ -906,8 +881,6 @@ async def update_project(
             project_id=data.project_id,
             user_api_key_cache=user_api_key_cache,
         )
-        if shared_budget_id is not None:
-            await evict_budget_holders(shared_budget_id, budget_holders)
 
         return updated_project
     except Exception as e:

@@ -1083,8 +1083,8 @@ def test_customer_new_invalidates_end_user_and_registry_caches(mock_prisma_clien
         )
 
     assert response.status_code == 200, response.text
-    assert recording_cache.deleted == ["end_user_id:c1", "end_user_validation:c1", "end_user_restricted_registry"]
-    assert _published_keys(mock_publish) == ["end_user_id:c1", "end_user_validation:c1", "end_user_restricted_registry"]
+    assert recording_cache.deleted == ["end_user_id:c1", "end_user_restricted_registry"]
+    assert _published_keys(mock_publish) == ["end_user_id:c1", "end_user_restricted_registry"]
 
 
 def test_customer_update_invalidates_end_user_and_registry_caches(mock_prisma_client, mock_user_api_key_auth):
@@ -1102,8 +1102,8 @@ def test_customer_update_invalidates_end_user_and_registry_caches(mock_prisma_cl
         )
 
     assert response.status_code == 200, response.text
-    assert recording_cache.deleted == ["end_user_id:c1", "end_user_validation:c1", "end_user_restricted_registry"]
-    assert _published_keys(mock_publish) == ["end_user_id:c1", "end_user_validation:c1", "end_user_restricted_registry"]
+    assert recording_cache.deleted == ["end_user_id:c1", "end_user_restricted_registry"]
+    assert _published_keys(mock_publish) == ["end_user_id:c1", "end_user_restricted_registry"]
 
 
 def test_customer_block_invalidates_end_user_and_registry_caches(mock_prisma_client, mock_user_api_key_auth):
@@ -1122,16 +1122,12 @@ def test_customer_block_invalidates_end_user_and_registry_caches(mock_prisma_cli
     assert response.status_code == 200, response.text
     assert recording_cache.deleted == [
         "end_user_id:c1",
-        "end_user_validation:c1",
         "end_user_id:c2",
-        "end_user_validation:c2",
         "end_user_restricted_registry",
     ]
     assert _published_keys(mock_publish) == [
         "end_user_id:c1",
-        "end_user_validation:c1",
         "end_user_id:c2",
-        "end_user_validation:c2",
         "end_user_restricted_registry",
     ]
 
@@ -1156,16 +1152,12 @@ def test_customer_delete_invalidates_end_user_and_registry_caches(mock_prisma_cl
     assert response.status_code == 200, response.text
     assert recording_cache.deleted == [
         "end_user_id:c1",
-        "end_user_validation:c1",
         "end_user_id:c2",
-        "end_user_validation:c2",
         "end_user_restricted_registry",
     ]
     assert _published_keys(mock_publish) == [
         "end_user_id:c1",
-        "end_user_validation:c1",
         "end_user_id:c2",
-        "end_user_validation:c2",
         "end_user_restricted_registry",
     ]
 
@@ -1230,9 +1222,6 @@ class _EndUserRows:
 
     async def find_many(self, where: object = None, take: int | None = None) -> list[LiteLLM_EndUserTable]:
         self._answer()
-        if isinstance(where, dict) and "budget_id" in where:
-            # A budget's holder read: the customers on that budget, never held like a registry read
-            return [row for row in self.rows.values() if row.budget_id == where["budget_id"]]
         restricted = [row for row in self.rows.values() if row.blocked or row.models or row.budget_id]
         release = self._release
         if release is not None:
@@ -1254,52 +1243,12 @@ class _BudgetRows:
         return row
 
 
-class _EmptyTable:
-    """A table with no row for any lookup: a budget's holders other than customers, or the user table. While ``stopped``
-    every read fails the way an unreachable Postgres does."""
-
-    def __init__(self) -> None:
-        self.stopped = False
-
-    def _answer(self) -> None:
-        if self.stopped:
-            raise httpx.ConnectError("All connection attempts failed")
-
-    async def find_many(self, where: object = None, take: int | None = None) -> list[object]:
-        self._answer()
-        return []
-
-    async def find_unique(self, where: object = None, include: object = None) -> None:
-        self._answer()
-
-
-_OTHER_BUDGET_HOLDER_TABLES: Final = (
-    "litellm_teammembership",
-    "litellm_organizationtable",
-    "litellm_projecttable",
-    "litellm_tagtable",
-    "litellm_modelaccessgroupbudgettable",
-)
-
-
 def _serve_end_user_rows(
-    monkeypatch: pytest.MonkeyPatch,
-    rows: _EndUserRows,
-    cache: UserApiKeyCache,
-    budgets: _BudgetRows | None = None,
-    keys: _EmptyTable | None = None,
+    monkeypatch: pytest.MonkeyPatch, rows: _EndUserRows, cache: UserApiKeyCache, budgets: _BudgetRows | None = None
 ) -> None:
-    """The customer and budget tables, and every other table a budget's holders are read from, holding none."""
     monkeypatch.setattr(
         "litellm.proxy.proxy_server.prisma_client",
-        SimpleNamespace(
-            db=SimpleNamespace(
-                litellm_endusertable=rows,
-                litellm_budgettable=budgets,
-                litellm_verificationtoken=keys or _EmptyTable(),
-                **{table: _EmptyTable() for table in _OTHER_BUDGET_HOLDER_TABLES},
-            )
-        ),
+        SimpleNamespace(db=SimpleNamespace(litellm_endusertable=rows, litellm_budgettable=budgets)),
     )
     monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
 
@@ -1482,16 +1431,11 @@ async def test_after_a_customer_gains_a_restriction_a_registry_read_in_flight_ca
         await customer()
 
 
-def _budgeted_customer(*others: str) -> tuple[_EndUserRows, _BudgetRows]:
-    """Customer c1, and each of ``others``, on one budget b1 with max_budget 10."""
+def _budgeted_customer() -> tuple[_EndUserRows, _BudgetRows]:
+    """Customer c1 on its own budget b1 with max_budget 10."""
     budget: Final = LiteLLM_BudgetTable(budget_id="b1", max_budget=10.0)
     return (
-        _EndUserRows(
-            *(
-                LiteLLM_EndUserTable(user_id=user_id, blocked=False, budget_id="b1", litellm_budget_table=budget)
-                for user_id in ("c1", *others)
-            )
-        ),
+        _EndUserRows(LiteLLM_EndUserTable(user_id="c1", blocked=False, budget_id="b1", litellm_budget_table=budget)),
         _BudgetRows(budget),
     )
 
@@ -1551,104 +1495,3 @@ async def test_after_a_customer_budget_is_lowered_a_read_in_flight_cannot_keep_t
 
     with pytest.raises(LastGoodEntryMissing):
         await customer()
-
-
-@pytest.mark.asyncio
-async def test_a_customer_budget_update_revokes_the_entry_of_every_other_customer_on_that_budget(monkeypatch):
-    """c1 and c2 share one budget row, so lowering it through c1 lowers c2's limit too. c2's entry is revoked before the
-    write, so a read of c2 that took its row before the write and finishes after cannot keep the higher limit."""
-    from litellm.proxy.auth.auth_checks import get_end_user_object
-    from litellm.proxy.common_utils.user_api_key_cache import recall_last_good
-    from litellm.proxy.management_endpoints.customer_endpoints import update_end_user
-
-    rows, budgets = _budgeted_customer("c2")
-    cache = UserApiKeyCache(serve_last_good_entries=True)
-    _serve_end_user_rows(monkeypatch, rows, cache, budgets)
-    database = SimpleNamespace(db=SimpleNamespace(litellm_endusertable=rows))
-
-    async def c2() -> LiteLLM_EndUserTable | None:
-        return await get_end_user_object(
-            end_user_id="c2",
-            prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
-            user_api_key_cache=cache,
-        )
-
-    assert (await c2()).litellm_budget_table.max_budget == 10.0
-    await cache.async_delete_cache("end_user_id:c2")
-    release = rows.pause_next_row_read()
-    in_flight = asyncio.create_task(c2())
-    await rows.row_read_held.wait()
-    await update_end_user(data=UpdateCustomerRequest(user_id="c1", max_budget=5.0), user_api_key_dict=_ADMIN)
-    release.set()
-    assert (await in_flight).litellm_budget_table.max_budget == 10.0
-    kept: Final = await recall_last_good(cache, "end_user_id:c2", LiteLLM_EndUserTable)
-
-    assert (budgets.rows["b1"].max_budget, kept) == (5.0, None)
-
-
-@pytest.mark.asyncio
-async def test_customer_budget_update_answers_503_and_writes_nothing_when_a_holder_of_the_budget_cannot_be_read(
-    monkeypatch,
-):
-    """A holder that cannot be listed cannot be revoked: with last good entries served, a key table that cannot be read
-    refuses the change to the budget before anything is written."""
-    from litellm.proxy.management_endpoints.customer_endpoints import update_end_user
-
-    rows, budgets = _budgeted_customer("c2")
-    keys: Final = _EmptyTable()
-    keys.stopped = True
-    _serve_end_user_rows(monkeypatch, rows, UserApiKeyCache(serve_last_good_entries=True), budgets, keys)
-
-    with pytest.raises(ProxyException) as refused:
-        await update_end_user(data=UpdateCustomerRequest(user_id="c1", max_budget=5.0), user_api_key_dict=_ADMIN)
-
-    assert (str(refused.value.code), budgets.rows["b1"].max_budget) == ("503", 10.0)
-
-
-@pytest.mark.asyncio
-async def test_customer_shared_budget_update_writes_and_evicts_its_holders_with_redis_down_and_the_setting_off(
-    monkeypatch,
-):
-    """With last good entries not served nothing is revoked, so Redis being down refuses nothing, and the other
-    customer on the budget is still evicted after the write."""
-    from litellm.proxy.management_endpoints.customer_endpoints import update_end_user
-
-    redis = fake_redis_cache()
-    redis.server.connected = False
-    rows, budgets = _budgeted_customer("c2")
-    cache = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=False)
-    _serve_end_user_rows(monkeypatch, rows, cache, budgets)
-    await cache.async_set_cache("end_user_id:c2", rows.rows["c2"], local_only=True)
-
-    await update_end_user(data=UpdateCustomerRequest(user_id="c1", max_budget=5.0), user_api_key_dict=_ADMIN)
-    cached: Final = await cache.async_get_cache("end_user_id:c2", local_only=True)
-
-    assert (budgets.rows["b1"].max_budget, cached) == (5.0, None)
-
-
-@pytest.mark.asyncio
-async def test_a_customer_created_after_a_request_found_its_id_invalid_is_kept_by_the_next_request(monkeypatch):
-    """With end-user ids validated and no default budget, a request naming an id no row holds caches the verdict
-    "invalid" and drops the id. Creating that customer with a model restriction evicts the verdict, so the next request
-    keeps the id and the restriction applies, rather than the id being dropped until the verdict lapses."""
-    from litellm.proxy.auth.auth_checks import resolve_and_validate_end_user_id
-    from litellm.proxy.management_endpoints.customer_endpoints import new_end_user
-
-    monkeypatch.setattr("litellm.validate_end_user_id_in_db", True)
-    monkeypatch.setattr("litellm.max_end_user_budget_id", None)
-    rows = _EndUserRows()
-    cache = UserApiKeyCache()
-    _serve_end_user_rows(monkeypatch, rows, cache)
-    database = SimpleNamespace(db=SimpleNamespace(litellm_endusertable=rows, litellm_usertable=_EmptyTable()))
-
-    async def resolve() -> str | None:
-        return await resolve_and_validate_end_user_id(
-            raw_end_user_id="c1",
-            prisma_client=database,  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
-            user_api_key_cache=cache,
-        )
-
-    assert (await resolve(), await cache.async_get_cache("end_user_validation:c1")) == (None, "invalid")
-    await new_end_user(data=NewCustomerRequest(user_id="c1", models=["m1"]), user_api_key_dict=_ADMIN)
-
-    assert await resolve() == "c1"

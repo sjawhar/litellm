@@ -48,10 +48,8 @@ from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_
 from litellm.proxy.common_utils.timezone_utils import get_budget_reset_time
 from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, revoke_last_good
 from litellm.proxy.management_endpoints.budget_management_endpoints import (
-    BudgetHolders,
     evict_budget_holders,
     new_budget,
-    read_budget_holders,
     update_budget,
 )
 from litellm.proxy.management_endpoints.common_daily_activity import get_daily_activity
@@ -994,10 +992,6 @@ async def update_organization_v2(
         )
     )
 
-    # The budget row is written in place, so every holder of it is revoked first, as /budget/update does
-    holders: Final = await read_budget_holders(existing_organization_row.budget_id) if budget_updates else None
-    if holders is not None:
-        await revoke_last_good(user_api_key_cache, holders.last_good_keys)
     tx_manager: Final[_TransactionManager] = prisma_client.db.tx()
     async with tx_manager as tx:
         if object_permission_upsert is not None:
@@ -1025,7 +1019,7 @@ async def update_organization_v2(
     await _evict_updated_organization(
         organization_id=organization_id,
         budget_id=existing_organization_row.budget_id,
-        budget_holders=holders,
+        budget_changed=bool(budget_updates),
         user_api_key_cache=user_api_key_cache,
     )
 
@@ -1033,14 +1027,14 @@ async def update_organization_v2(
 
 
 async def _evict_updated_organization(
-    organization_id: str, budget_id: str, budget_holders: BudgetHolders | None, user_api_key_cache: UserApiKeyCache
+    organization_id: str, budget_id: str, budget_changed: bool, user_api_key_cache: UserApiKeyCache
 ) -> None:
     """The organization's cached copies always go, and a budget change also evicts everything else on that budget."""
     await evict_and_broadcast(
         cache_keys=organization_cache_keys(organization_id), user_api_key_cache=user_api_key_cache
     )
-    if budget_holders is not None:
-        await evict_budget_holders(budget_id, budget_holders)
+    if budget_changed:
+        await evict_budget_holders(budget_id)
 
 
 @router.delete(
