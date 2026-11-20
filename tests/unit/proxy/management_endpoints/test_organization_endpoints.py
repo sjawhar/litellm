@@ -1828,3 +1828,100 @@ async def test_delete_organization_answers_503_and_deletes_nothing_when_redis_ca
     prisma_client.db.litellm_organizationmembership.delete_many.assert_not_awaited()
     prisma_client.db.litellm_verificationtoken.delete_many.assert_not_awaited()
     prisma_client.db.litellm_organizationtable.delete.assert_not_awaited()
+
+
+def _org_member_removal(monkeypatch, *, serves_last_good: bool) -> AsyncMock:
+    """/organization/member_delete's database, behind an unreachable Redis with last good entries served or not."""
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis: Final = fake_redis_cache()
+    redis.server.connected = False
+    prisma_client: Final = AsyncMock()
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", prisma_client)
+    monkeypatch.setattr(
+        "litellm.proxy.proxy_server.user_api_key_cache",
+        UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=serves_last_good),
+    )
+    return prisma_client
+
+
+@pytest.mark.asyncio
+async def test_organization_member_delete_answers_503_and_deletes_nothing_when_redis_cannot_record_it(monkeypatch):
+    """The user's entry carries its organization memberships, which the org admin route checks read, so a removal
+    Redis cannot revoke that entry for is refused with 503 before the delete."""
+    from litellm.proxy._types import LitellmUserRoles, OrganizationMemberDeleteRequest, UserAPIKeyAuth
+    from litellm.proxy.management_endpoints.organization_endpoints import organization_member_delete
+
+    prisma_client: Final = _org_member_removal(monkeypatch, serves_last_good=True)
+
+    with pytest.raises(HTTPException) as refused:
+        await organization_member_delete(
+            data=OrganizationMemberDeleteRequest(organization_id="org-1", user_id="member-1"),
+            user_api_key_dict=UserAPIKeyAuth(user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+        )
+
+    assert refused.value.status_code == 503
+    prisma_client.db.litellm_organizationmembership.delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_organization_member_delete_deletes_while_redis_is_down_with_last_good_entries_off(monkeypatch):
+    """With last good entries off nothing is revoked, so Redis being down does not stop the removal."""
+    from litellm.proxy._types import LitellmUserRoles, OrganizationMemberDeleteRequest, UserAPIKeyAuth
+    from litellm.proxy.management_endpoints.organization_endpoints import organization_member_delete
+
+    prisma_client: Final = _org_member_removal(monkeypatch, serves_last_good=False)
+
+    await organization_member_delete(
+        data=OrganizationMemberDeleteRequest(organization_id="org-1", user_id="member-1"),
+        user_api_key_dict=UserAPIKeyAuth(user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+    )
+
+    prisma_client.db.litellm_organizationmembership.delete.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_organization_member_role_change_drops_the_users_last_good_entry(monkeypatch):
+    """The user's entry carries its organization memberships, which the org admin route checks read, so a role change
+    drops it: a database outage after it cannot serve the old role."""
+    from datetime import datetime, timezone
+
+    from litellm.proxy._types import (
+        LiteLLM_OrganizationMembershipTable,
+        LiteLLM_UserTable,
+        LitellmUserRoles,
+        OrganizationMemberUpdateRequest,
+        UserAPIKeyAuth,
+    )
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, recall_last_good, remember_last_good
+    from litellm.proxy.management_endpoints.organization_endpoints import organization_member_update
+
+    joined: Final = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    admin_membership: Final = LiteLLM_OrganizationMembershipTable(
+        user_id="member-1",
+        organization_id="org-1",
+        user_role=LitellmUserRoles.ORG_ADMIN.value,
+        created_at=joined,
+        updated_at=joined,
+    )
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    await remember_last_good(
+        cache, "member-1", LiteLLM_UserTable(user_id="member-1", organization_memberships=[admin_membership])
+    )
+    prisma_client: Final = AsyncMock()
+    prisma_client.db.litellm_organizationtable.find_unique = AsyncMock(return_value=MagicMock())
+    prisma_client.db.litellm_organizationmembership.find_unique = AsyncMock(return_value=admin_membership)
+    prisma_client.db.litellm_usertable.find_unique = AsyncMock(return_value=LiteLLM_UserTable(user_id="member-1"))
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", prisma_client)
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
+
+    await organization_member_update(
+        data=OrganizationMemberUpdateRequest(
+            organization_id="org-1", user_id="member-1", role=LitellmUserRoles.INTERNAL_USER
+        ),
+        user_api_key_dict=UserAPIKeyAuth(user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+    )
+
+    prisma_client.db.litellm_organizationmembership.update.assert_awaited_once()
+    assert await recall_last_good(cache, "member-1", LiteLLM_UserTable) is None

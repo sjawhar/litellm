@@ -2247,3 +2247,58 @@ async def test_custom_auth_customer_lookup_with_no_last_good_entry_is_refused_wh
             user_api_key_cache=UserApiKeyCache(serve_last_good_entries=True),
             proxy_logging_obj=None,
         )
+
+
+@pytest.mark.asyncio
+async def test_a_second_auth_run_600_s_after_the_first_in_one_context_keeps_its_store_from_its_own_start(monkeypatch):
+    """A context that outlives one request can run auth again: the second run records its own start, so a store 600 s
+    after the first run is kept, and its entry ends the expiry after the second start, not after the first."""
+    import time
+    from types import SimpleNamespace
+
+    import litellm.proxy.common_utils.user_api_key_cache as user_api_key_cache_module
+    from litellm.constants import LAST_GOOD_ENTRY_TTL_SECONDS
+    from litellm.models.team import LiteLLM_TeamTableCachedObj
+    from litellm.proxy.common_utils.user_api_key_cache import (
+        UserApiKeyCache,
+        last_good_reads_started_at,
+        recall_last_good,
+        remember_last_good,
+    )
+
+    moved: Final = [0.0]
+
+    def clock() -> float:
+        return time.monotonic() + moved[0]
+
+    monkeypatch.setattr(  # test-quality-ok: the start of auth reads is read from this module's clock
+        user_api_key_cache_module, "time", SimpleNamespace(monotonic=clock)
+    )
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True, last_good_clock=clock)
+    monkeypatch.setattr(litellm.proxy.proxy_server, "user_api_key_cache", cache)
+    monkeypatch.setattr(litellm.proxy.proxy_server, "master_key", MASTER_KEY)
+    monkeypatch.setattr(litellm.proxy.proxy_server, "prisma_client", None)
+
+    async def empty_body() -> bytes:
+        return b"{}"
+
+    async def auth_run_then_store(alias: str) -> None:
+        request: Final = FastAPIRequest(
+            scope={"type": "http", "method": "POST", "path": "/chat/completions", "headers": []}
+        )
+        request._url = URL(url="/chat/completions")
+        request.body = empty_body  # pyright: ignore[reportAttributeAccessIssue]  # the test sends no ASGI body
+        await user_api_key_auth(request=request, api_key="Bearer " + MASTER_KEY)
+        await remember_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj(team_id="t1", team_alias=alias))
+
+    with last_good_reads_started_at(None):
+        await auth_run_then_store("first")
+        moved[0] += 600
+        await auth_run_then_store("second")
+
+    moved[0] += LAST_GOOD_ENTRY_TTL_SECONDS - 1
+    assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) == LiteLLM_TeamTableCachedObj(
+        team_id="t1", team_alias="second"
+    )
+    moved[0] += 1
+    assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) is None

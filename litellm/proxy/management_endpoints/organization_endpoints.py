@@ -1522,7 +1522,7 @@ async def organization_member_update(
     Update a member's role in an organization
     """
     try:
-        from litellm.proxy.proxy_server import prisma_client
+        from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
 
         if prisma_client is None:
             raise HTTPException(
@@ -1611,6 +1611,10 @@ async def organization_member_update(
                 },
                 data={"user_role": data.role},
             )
+            # The user's entry carries its organization memberships, which the org admin route checks read
+            await evict_and_broadcast(
+                cache_keys=(data.user_id,) if data.user_id is not None else (), user_api_key_cache=user_api_key_cache
+            )
         if data.max_budget_in_organization is not None:
             # if budget_id is None, create a new budget
             budget_id: Final = existing_organization_membership.budget_id or str(uuid.uuid4())
@@ -1672,7 +1676,7 @@ async def organization_member_delete(
     Delete a member from an organization
     """
     try:
-        from litellm.proxy.proxy_server import prisma_client
+        from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
 
         if prisma_client is None:
             raise HTTPException(
@@ -1693,6 +1697,9 @@ async def organization_member_delete(
             existing_user_email_row: Final = await find_member_if_email(data.user_email, prisma_client)
             data.user_id = existing_user_email_row.user_id
 
+        # The user's entry carries its organization memberships, which the org admin route checks read
+        member_user_ids: Final = (data.user_id,) if data.user_id is not None else ()
+        await revoke_last_good(user_api_key_cache, member_user_ids)
         member_to_delete: Final = await _table(OrganizationMembershipRepository(prisma_client)).delete(
             where={
                 "user_id_organization_id": {
@@ -1701,6 +1708,7 @@ async def organization_member_delete(
                 }
             }
         )
+        await evict_and_broadcast(cache_keys=member_user_ids, user_api_key_cache=user_api_key_cache)
         return member_to_delete
 
     except Exception as e:

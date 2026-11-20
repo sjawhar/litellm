@@ -15243,6 +15243,32 @@ async def test_load_config_checks_the_last_good_entry_expiry(
             assert "callers in steady use lose their last good entry between database reads" in notices[0][1]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("tombstone_seconds", "kept"), [(5, False), (6, True)], ids=["at_the_margin", "above_it"])
+async def test_load_config_turns_last_good_entries_off_when_no_store_could_complete_within_the_tombstone_time(
+    tmp_path, monkeypatch, caplog, tombstone_seconds: int, kept: bool
+):
+    """A store is refused once the tombstone time less the 5 s margin has passed since its read began, so a tombstone
+    time at the margin or below would refuse every store: the setting starts off, with an error naming both values."""
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from litellm.proxy.proxy_server import ProxyConfig
+
+    monkeypatch.setattr(proxy_server_module, "LAST_GOOD_TOMBSTONE_TTL_SECONDS", tombstone_seconds)
+    config_file: Final = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump({"general_settings": {"serve_last_good_auth_entries": True}}))
+    cache: Final = UserApiKeyCache()
+    monkeypatch.setattr(proxy_server_module, "user_api_key_cache", cache)
+    monkeypatch.setattr(proxy_server_module, "general_settings", {}, raising=False)
+    caplog.set_level(logging.WARNING, logger="LiteLLM Proxy")
+
+    await ProxyConfig().load_config(router=None, config_file_path=str(config_file))
+
+    refusals: Final = [r.getMessage() for r in caplog.records if "LAST_GOOD_TOMBSTONE_TTL_SECONDS=" in r.getMessage()]
+    assert (cache.serve_last_good_entries, len(refusals)) == (kept, 0 if kept else 1)
+    if not kept:
+        assert "LAST_GOOD_LATE_STORE_MARGIN_SECONDS=5" in refusals[0]
+
+
 def test_docs_redoc_openapi_are_reachable_by_default():
     """
     LIT-6745: the interactive/machine-readable docs surfaces are on by
