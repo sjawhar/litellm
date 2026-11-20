@@ -1016,6 +1016,24 @@ async def test_every_fallback_target_must_be_a_model_the_key_may_call(gateway: _
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "fallbacks",
+    [
+        pytest.param([{"model": "other"}, {"requested": ["forbidden"]}], id="group-map-beside-a-target"),
+        pytest.param([{"requested": [{"grp": ["forbidden"]}]}], id="group-map-in-a-group-list"),
+    ],
+)
+async def test_every_name_in_anthropics_fallbacks_is_checked_in_any_shape(
+    gateway: _Gateway, fallbacks: Sequence[object]
+) -> None:
+    """Anthropic reads only the `model` of each entry, but a name a caller puts in any other shape is checked too"""
+    result: Final = await gateway.send({"fallbacks": list(fallbacks)}, beta=True)
+
+    assert result.response.status_code in (401, 403), result.response.text
+    assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("field", "requested_error"),
     [
         pytest.param(
@@ -1354,6 +1372,136 @@ async def test_a_saved_settings_target_with_tags_in_its_metadata_is_still_served
 
     assert result.response.status_code == 200, result.response.text
     assert result.calls == {"requested": 1, "other": 1, "forbidden": 0, "attacker": 0}
+
+
+async def _chat_served_by_litellm(
+    monkeypatch: pytest.MonkeyPatch, fallbacks: Sequence[object], *, router: bool
+) -> tuple["httpx.Response", tuple[str, ...]]:
+    """
+    /v1/chat/completions on a proxy where no Router serves `openai/requested`: one started for that model with no
+    Router, or a Router that passes models it does not list through to litellm. Either way litellm.acompletion's own
+    fallback loop reads the body's `fallbacks`. The upstream fails `requested` unless a fallback set its temperature;
+    returns the response and the model of each upstream call.
+    """
+    import httpx
+    import respx
+
+    import litellm
+    from litellm.caching.dual_cache import DualCache
+    from litellm.proxy import proxy_server
+    from litellm.proxy.proxy_server import app, hash_token
+    from litellm.proxy.utils import ProxyLogging
+    from litellm.types.router import RouterGeneralSettings
+
+    llm_router: Final = (
+        Router(
+            model_list=[{"model_name": "listed", "litellm_params": {"model": "openai/listed"}}],
+            router_general_settings=RouterGeneralSettings(pass_through_all_models=True),
+        )
+        if router
+        else None
+    )
+    cache: Final = DualCache()
+    await cache.async_set_cache(
+        key=hash_token(_CALLER_KEY),
+        value=UserAPIKeyAuth(
+            api_key=_CALLER_KEY, token=hash_token(_CALLER_KEY), user_role=LitellmUserRoles.INTERNAL_USER
+        ),
+    )
+    for name, value in {
+        "master_key": "sk-master",
+        "prisma_client": MagicMock(),
+        "user_api_key_cache": cache,
+        "llm_router": llm_router,
+        "llm_model_list": llm_router.get_model_list() if llm_router is not None else None,
+        "user_model": None if router else "openai/requested",
+        "user_api_base": None,
+        "general_settings": {},
+        "user_custom_auth": None,
+        "proxy_logging_obj": ProxyLogging(user_api_key_cache=cache),
+    }.items():
+        monkeypatch.setattr(proxy_server, name, value)
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    monkeypatch.setenv("OPENAI_API_KEY", _DEPLOYMENT_KEY)
+    called: Final[list[str]] = []
+
+    def upstream_reply(request: httpx.Request) -> httpx.Response:
+        sent = json.loads(request.read())
+        called.append(sent["model"])
+        if sent["model"] == "requested" and "temperature" not in sent:
+            return httpx.Response(500, json={"error": {"message": "x", "type": "api_error"}})
+        message: Final = {"role": "assistant", "content": "served"}
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "created": 1,
+                "model": sent["model"],
+                "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    payload: Final = {
+        "model": "openai/requested",
+        "messages": [{"role": "user", "content": "hi"}],
+        "fallbacks": list(fallbacks),
+    }
+    with respx.mock(assert_all_called=False) as upstream:
+        upstream.post("https://api.openai.com/v1/chat/completions").mock(side_effect=upstream_reply)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://proxy.test") as client:
+            response = await client.post(
+                "/v1/chat/completions", json=payload, headers={"Authorization": f"Bearer {_CALLER_KEY}"}
+            )
+    return response, tuple(called)
+
+
+_MOCK_TOOL_CALLS: Final = MappingProxyType({"mock_tool_calls": [{"function": {"name": "f", "arguments": "{}"}}]})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("router", "fallbacks", "refused_param"),
+    [
+        # With no Router every named fallback fails the routing check, so only a list that names none gets through
+        pytest.param(False, [dict(_MOCK_TOOL_CALLS)], "mock_tool_calls", id="no-router"),
+        pytest.param(True, ["a", {"mock_response": ["x"]}], "mock_response", id="pass-through-router"),
+        pytest.param(True, ["a", dict(_MOCK_TOOL_CALLS)], "mock_tool_calls", id="pass-through-router-tool-calls"),
+    ],
+)
+async def test_a_mapping_the_direct_completion_fallback_merges_gets_the_target_checks(
+    monkeypatch: pytest.MonkeyPatch, router: bool, fallbacks: Sequence[object], refused_param: str
+) -> None:
+    """
+    The Router would read the mapping as a model group map and never merge it, but litellm.acompletion's own fallback
+    loop merges every mapping of its list into the call
+    """
+    response, called = await _chat_served_by_litellm(monkeypatch, fallbacks, router=router)
+
+    assert response.status_code in (400, 401), response.text
+    assert f"a fallback target may not carry {refused_param}" in response.text
+    assert called == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("router", "fallbacks"),
+    [
+        pytest.param(False, [{"temperature": 0}], id="no-router-parameter-override"),
+        pytest.param(True, ["openai/other"], id="pass-through-router-model"),
+        pytest.param(True, ["a", {"temperature": 0}], id="pass-through-router-parameter-override"),
+    ],
+)
+async def test_a_documented_fallback_shape_is_still_served_where_no_router_serves_the_request(
+    monkeypatch: pytest.MonkeyPatch, router: bool, fallbacks: Sequence[object]
+) -> None:
+    response, called = await _chat_served_by_litellm(monkeypatch, fallbacks, router=router)
+
+    assert response.status_code == 200, response.text
+    assert "served" in response.text
+    assert called[0] == "requested"
+
 
 
 # A fallback target outside the team's models, in LiteLLM's own list and in Anthropic's list under the beta

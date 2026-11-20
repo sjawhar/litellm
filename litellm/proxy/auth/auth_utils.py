@@ -564,10 +564,15 @@ def _iter_fallback_field_values(
         yield None, list(context_window_swaps.values())
 
 
-def _iter_fallback_targets(value: object, depth: int, field: str | None) -> Iterator[str | Mapping[str, object]]:
+def _iter_fallback_targets(
+    value: object, depth: int, field: str | None, *, widest_reading: bool = False
+) -> Iterator[str | Mapping[str, object]]:
     """
     The targets in one fallback list, read as the Router reads it: ``field`` is the fallback field whose value the list
-    is, and None marks a list of targets, such as the one a model group is mapped to.
+    is, and None marks a list of targets, such as the one a model group is mapped to. Every mapping of the list is
+    yielded, a model group map too, so its keys get the target checks for a reader that merges it into the call.
+    ``widest_reading`` reads every mapping without a string ``model`` as a group map, at every level, for a list whose
+    names no LiteLLM reader calls, so a name in any shape a caller sends gets the checks.
     """
     if depth > 2 * litellm.ROUTER_MAX_FALLBACKS:
         raise ValueError("Rejected Request: fallback nesting exceeds the allowed validation depth.")
@@ -575,11 +580,11 @@ def _iter_fallback_targets(value: object, depth: int, field: str | None) -> Iter
         # The Router iterates a fallback list, and iterating a mapping walks its keys, so each key is a target
         yield from (key for key in value if isinstance(key, str))
         for target_list in value.values():
-            yield from _iter_fallback_targets(target_list, depth + 1, None)
+            yield from _iter_fallback_targets(target_list, depth + 1, None, widest_reading=widest_reading)
         return
     if not isinstance(value, list):
         return
-    entries_are_targets: Final = field is None or fallback_entries_are_targets(value, field)
+    entries_are_targets: Final = not widest_reading and (field is None or fallback_entries_are_targets(value, field))
     for item in value:
         if isinstance(item, str):
             yield item
@@ -588,11 +593,15 @@ def _iter_fallback_targets(value: object, depth: int, field: str | None) -> Iter
             # hold targets
             yield item
             for nested_field in _FALLBACK_FIELDS:
-                yield from _iter_fallback_targets(item.get(nested_field), depth + 1, nested_field)
+                yield from _iter_fallback_targets(
+                    item.get(nested_field), depth + 1, nested_field, widest_reading=widest_reading
+                )
         elif isinstance(item, Mapping):
-            # A model group mapped to the targets the Router calls once that group fails
+            # A model group mapped to the targets the Router calls once that group fails. litellm.acompletion's own
+            # fallback loop, which serves a request no Router serves, merges the mapping itself into the call instead.
+            yield item
             for target_list in item.values():
-                yield from _iter_fallback_targets(target_list, depth + 1, None)
+                yield from _iter_fallback_targets(target_list, depth + 1, None, widest_reading=widest_reading)
 
 
 def iter_request_fallback_targets(
@@ -641,13 +650,14 @@ def key_fallback_model_names(
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """
     The models every LiteLLM fallback list names, and the models the body's ``fallbacks`` names when it is Anthropic's
-    server-side fallback list instead
+    server-side fallback list instead. Anthropic reads only the ``model`` of each entry, so its list is read in the
+    widest way: a name in any other shape is checked too.
     """
     return (
         _target_model_names(
             iter_request_fallback_targets(request_body, skip_body_fallbacks=anthropic_owns_body_fallbacks)
         ),
-        _target_model_names(_iter_fallback_targets(request_body.get("fallbacks"), 0, None))
+        _target_model_names(_iter_fallback_targets(request_body.get("fallbacks"), 0, "fallbacks", widest_reading=True))
         if anthropic_owns_body_fallbacks
         else (),
     )
