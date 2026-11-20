@@ -1600,6 +1600,23 @@ def test_the_router_entry_leaves_a_targets_own_list_to_anthropic_under_the_beta(
     assert request_fallbacks(kwargs, None, anthropic_messages_call=True) == kwargs["router_fallbacks"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["context_window_fallbacks", "content_policy_fallbacks"])
+async def test_the_router_reads_a_nested_targets_own_fallbacks_in_an_error_field_with_the_calls_context(field: str):
+    """The call is not an Anthropic messages call, so a nested target's own `fallbacks` is LiteLLM's, with its rules"""
+    router: Final = Router(
+        model_list=[{"model_name": "requested", "litellm_params": {"model": "openai/requested", "api_key": "fake"}}]
+    )
+    nested: Final = [{"requested": [{"model": "other", "fallbacks": [{"requested": "abc"}]}]}]
+    with pytest.raises(litellm.BadRequestError, match="LiteLLM fallbacks must map model group 'requested' to a list"):
+        await router.async_function_with_retries(
+            original_function=router._acompletion,
+            model="requested",
+            messages=[{"role": "user", "content": "hi"}],
+            mock_response="unused",
+            **{field: nested},
+        )
+
 
 def test_get_fallback_model_group_exact_match_beats_prefixed_match():
     fallbacks = [

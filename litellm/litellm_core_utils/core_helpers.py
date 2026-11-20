@@ -840,3 +840,37 @@ def get_provider_response_headers_from_hidden_params(response: object) -> Mappin
         return _PROVIDER_HEADERS_ADAPTER.validate_python(validated.get("headers"))
     except ValidationError:
         return None
+
+
+# The proxy stamps the caller's identity into a call's metadata under this prefix, and strips it from a request's own
+IDENTITY_METADATA_KEY_PREFIX: Final = "user_api_key_"
+_CALL_METADATA_BUCKETS: Final = ("metadata", "litellm_metadata")
+
+
+def fallback_target_params_over_call(
+    call_kwargs: Mapping[str, object], target: Mapping[str, object]
+) -> dict[str, object]:
+    """
+    The params a fallback target lays over the call, for every reader that merges one: the Router's hop and
+    litellm.acompletion's own fallback loop. Its ``metadata`` and ``litellm_metadata`` only add keys to the call's: a
+    key the call holds keeps the call's value, and no ``user_api_key_*`` identity key comes from the target, so every
+    reader of the hop's metadata, whichever bucket it reads first, finds the identity the call was stamped with.
+    """
+    params: Final = dict(target)
+    for bucket in _CALL_METADATA_BUCKETS:
+        if bucket not in target:
+            continue
+        held: Final = call_kwargs.get(bucket)
+        if held is not None and not isinstance(held, Mapping):
+            del params[bucket]
+            continue
+        added: Final = target[bucket]
+        params[bucket] = {
+            **{
+                key: value
+                for key, value in (added.items() if isinstance(added, Mapping) else ())
+                if not (isinstance(key, str) and key.startswith(IDENTITY_METADATA_KEY_PREFIX))
+            },
+            **(held or {}),
+        }
+    return params

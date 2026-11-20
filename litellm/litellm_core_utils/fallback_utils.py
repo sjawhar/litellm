@@ -4,6 +4,7 @@ import litellm
 from litellm._logging import verbose_logger
 from litellm._uuid import uuid
 from litellm.litellm_core_utils.core_helpers import (
+    fallback_target_params_over_call,
     filter_internal_params,
     safe_deep_copy,
 )
@@ -52,7 +53,7 @@ async def async_completion_with_fallbacks(**kwargs):
             if isinstance(fallback, dict):
                 fallback_config = safe_deep_copy(dict(fallback))
                 model = fallback_config.pop("model", original_model)
-                completion_kwargs.update(fallback_config)
+                completion_kwargs.update(fallback_target_params_over_call(completion_kwargs, fallback_config))
             else:
                 model = fallback
 
