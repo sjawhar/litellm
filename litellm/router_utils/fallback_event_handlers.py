@@ -1,11 +1,13 @@
 import hashlib
 import json
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final
+
+from typing_extensions import TypeIs  # noqa: TID251  # TypeIs reaches typing only on 3.13
 
 import litellm
 from litellm._logging import verbose_router_logger
@@ -375,21 +377,275 @@ def _unsupported_group_map_entry(fallbacks: Sequence[object], field: str) -> str
     return None
 
 
-def reject_non_list_litellm_fallbacks(
-    fallbacks: object, model: object, *, field: str = "fallbacks", list_of_targets: bool = False
-) -> None:
+# The client wrapper swaps a model for this mapping's value on a context-window error (litellm/utils.py)
+CONTEXT_WINDOW_FALLBACK_DICT_FIELD: Final = "context_window_fallback_dict"
+ROUTER_SETTINGS_OVERRIDE_KWARG: Final = "router_settings_override"
+ERROR_FALLBACK_FIELDS: Final = ("context_window_fallbacks", "content_policy_fallbacks")
+# Every request field that holds a LiteLLM fallback list, in a request body and in each target merged into a call
+FALLBACK_LIST_FIELDS: Final = (
+    "fallbacks",
+    ROUTER_FALLBACKS_KWARG,
+    "context_window_fallbacks",
+    "content_policy_fallbacks",
+    # A Router init setting, never read per request; read so a body copy can never carry a target past a check.
+    "default_fallbacks",
+)
+# The kwargs that carry a call's headers to the provider; a target merged into the call replaces each one it carries.
+HEADER_CARRIER_KWARGS: Final = ("headers", "extra_headers", "provider_specific_header")
+
+
+class FallbackListShapeError(ValueError):
     """
-    LiteLLM fallback fields hold lists of model groups. In the Router's formats a list of group maps maps each group to
-    such a list, and an error field's list holds no target. ``list_of_targets`` marks a list whose reader calls every
-    entry as a target, as the direct completion fallback does, so only its type is checked.
+    A fallback list no reader can call as sent: an entry that is neither a model name nor a mapping, an error field
+    that is not a list, or nesting deeper than any reader follows. ``param`` names the field the list came in.
     """
-    if fallbacks is None:
+
+    def __init__(self, message: str, field: str | None) -> None:
+        super().__init__(message)
+        self.param: Final[str] = field or "fallbacks"
+
+
+def _is_mapping(value: object) -> TypeIs[Mapping[object, object]]:  # guard-ok: isinstance cannot type a mapping's keys
+    return isinstance(value, Mapping)
+
+
+def fallback_target_model_name(target: object) -> str | None:
+    """The model a fallback entry names: a string entry, or a mapping's string ``model``"""
+    if isinstance(target, str):
+        return target
+    if _is_mapping(target):
+        model: Final = target.get("model")
+        if isinstance(model, str):
+            return model
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class FallbackCall:
+    """
+    The call a fallback entry is read for: the model a target without its own keeps, and whose list the call's own
+    ``fallbacks`` is, which the Router decides with provider_owns_fallbacks_field on the header carriers in its kwargs.
+    A hop merges a target into the call, so the carriers the target holds replace the call's. ``carriers`` None marks a
+    call whose carriers the reader does not know, whose ``fallbacks`` may then be Anthropic's.
+    """
+
+    model: str
+    anthropic_messages_call: bool
+    carriers: Mapping[str, object] | None
+
+    @classmethod
+    def of_kwargs(
+        cls, kwargs: Mapping[str, object] | None, *, anthropic_messages_call: bool = False
+    ) -> "FallbackCall":
+        if kwargs is None:
+            return cls(model="", anthropic_messages_call=anthropic_messages_call, carriers=None)
+        model: Final = kwargs.get("model")
+        function_name: Final[object] = getattr(kwargs.get("original_generic_function"), "__name__", None)
+        return cls(
+            model=model if isinstance(model, str) else "",
+            anthropic_messages_call=anthropic_messages_call or function_name == "anthropic_messages",
+            carriers={key: kwargs[key] for key in HEADER_CARRIER_KWARGS if key in kwargs},
+        )
+
+    def with_target(self, target: Mapping[str, object]) -> "FallbackCall":
+        """The call once a hop merges ``target`` into it, as the Router's kwargs.update does"""
+        carried: Final = {key: target[key] for key in HEADER_CARRIER_KWARGS if key in target}
+        return FallbackCall(
+            model=fallback_target_model_name(target) or self.model,
+            anthropic_messages_call=self.anthropic_messages_call,
+            carriers=None if self.carriers is None else {**self.carriers, **carried},
+        )
+
+    def anthropic_reads_fallbacks(self) -> bool:
+        """Whether the call's own ``fallbacks`` goes to Anthropic; a call with unknown carriers may send it there"""
+        return self.carriers is None or provider_owns_fallbacks_field(
+            self.carriers, anthropic_messages_call=self.anthropic_messages_call
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class FallbackEntry:
+    """
+    One entry of a fallback list: a model name, or a mapping a reader merges into ``call``. ``group`` is the key of the
+    model group map the entry is or stands under in a ``fallbacks`` list in the Router's group format, a map the Router
+    reads as that group's fallbacks while litellm.acompletion's own fallback loop, which serves a request no Router
+    serves, merges it into the call as a parameter override; ``is_group_map`` marks the map itself. ``anthropic`` marks
+    an entry of a list Anthropic reads.
+    """
+
+    target: str | Mapping[str, object]
+    call: FallbackCall
+    group: str | None = None
+    is_group_map: bool = False
+    anthropic: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class FallbackChecks:
+    """
+    What a reader checks as the walk reaches it: ``entry`` sees every entry, a target before the lists it carries are
+    read, and ``litellm_list`` sees every list LiteLLM reads, with the field it is the value of.
+    """
+
+    entry: Callable[[FallbackEntry], None] | None = None
+    litellm_list: Callable[[object, str], None] | None = None
+
+
+_NO_FALLBACK_CHECKS: Final = FallbackChecks()
+
+
+def _checked(entry: FallbackEntry, checks: FallbackChecks) -> FallbackEntry:
+    if checks.entry is not None:
+        checks.entry(entry)
+    return entry
+
+
+def iter_fallback_entries(
+    value: object,
+    field: str | None,
+    call: FallbackCall,
+    *,
+    checks: FallbackChecks = _NO_FALLBACK_CHECKS,
+    depth: int = 0,
+    widest_reading: bool = False,
+    group: str | None = None,
+) -> Iterator[FallbackEntry]:
+    """
+    The entries of one fallback list, read as its reader reads it: ``field`` is the fallback field whose value the list
+    is, and None marks a list of targets, such as the one a model group is mapped to. Every mapping merged into the
+    call is read as a request body is, by iter_merged_target. A ``fallbacks`` list in the group format is read both
+    ways: a model group map there is also merged as a parameter override, and its names are tagged with its key, which
+    ``group`` carries down. ``widest_reading`` reads every mapping without a string ``model`` as a group map, at every
+    level, for a list Anthropic reads, whose names no LiteLLM reader calls, so a name in any shape gets the checks.
+    """
+    if depth > 2 * litellm.ROUTER_MAX_FALLBACKS:
+        raise FallbackListShapeError("Rejected Request: fallback nesting exceeds the allowed validation depth.", field)
+    if field is not None and not widest_reading and checks.litellm_list is not None:
+        checks.litellm_list(value, field)
+    if _is_mapping(value):
+        # The Router iterates a fallback list, and iterating a mapping walks its keys, so each key is a target
+        for key in value:
+            if isinstance(key, str):
+                yield _checked(FallbackEntry(key, call, group, anthropic=widest_reading), checks)
+        for target_list in value.values():
+            yield from iter_fallback_entries(
+                target_list, None, call, checks=checks, depth=depth + 1, widest_reading=widest_reading, group=group
+            )
+        return
+    if not isinstance(value, list):
+        return
+    entries_are_targets: Final = not widest_reading and (field is None or fallback_entries_are_targets(value, field))
+    read_both_ways: Final = field == "fallbacks" and not widest_reading and not entries_are_targets
+    for item in value:
+        if isinstance(item, str):
+            yield _checked(FallbackEntry(item, call, group, anthropic=widest_reading), checks)
+        elif not isinstance(item, Mapping):
+            # Every reader takes an entry for a model name or a mapping, so a nested list is called as neither
+            raise FallbackListShapeError(
+                "Rejected Request: a fallback list entry must be a model name or a mapping, "
+                f"got {type(item).__name__}.",
+                field,
+            )
+        elif entries_are_targets or fallback_entry_is_target(item):
+            yield from iter_merged_target(
+                item, call, checks=checks, depth=depth + 1, widest_reading=widest_reading, group=group
+            )
+        else:
+            # A model group mapped to the targets the Router calls once that group fails. In `fallbacks`,
+            # litellm.acompletion's own fallback loop merges the mapping itself into the call instead.
+            item_group = ", ".join(str(key) for key in item) if read_both_ways and group is None else group
+            if read_both_ways:
+                yield from iter_merged_target(
+                    item, call, checks=checks, depth=depth + 1, group=item_group, is_group_map=True
+                )
+            for target_list in item.values():
+                yield from iter_fallback_entries(
+                    target_list,
+                    None,
+                    call,
+                    checks=checks,
+                    depth=depth + 1,
+                    widest_reading=widest_reading,
+                    group=item_group,
+                )
+
+
+def iter_merged_target(
+    target: Mapping[str, object],
+    call: FallbackCall,
+    *,
+    checks: FallbackChecks = _NO_FALLBACK_CHECKS,
+    depth: int,
+    widest_reading: bool = False,
+    group: str | None = None,
+    is_group_map: bool = False,
+) -> Iterator[FallbackEntry]:
+    """
+    One mapping a reader merges into ``call``, read as a request body is: the reader's checks see the mapping, then
+    iter_body_fallback_entries reads every list through which the call it lands in picks another model, in the call
+    the merge leaves, so the mapping's own ``fallbacks`` is Anthropic's or LiteLLM's by the carriers the merge leaves.
+    """
+    yield _checked(FallbackEntry(target, call, group, is_group_map, widest_reading), checks)
+    yield from iter_body_fallback_entries(
+        target, call.with_target(target), checks=checks, depth=depth, widest_reading=widest_reading, group=group
+    )
+
+
+def iter_body_fallback_entries(
+    body: Mapping[str, object],
+    call: FallbackCall,
+    *,
+    checks: FallbackChecks = _NO_FALLBACK_CHECKS,
+    depth: int = 0,
+    widest_reading: bool = False,
+    group: str | None = None,
+) -> Iterator[FallbackEntry]:
+    """
+    The entries of every fallback list a request body carries, the request's own or a target's merged into ``call``:
+    its fallback fields, those of its router_settings_override, and the models its context_window_fallback_dict swaps
+    in. Its own ``fallbacks`` is Anthropic's, read in the widest way, when ``call``'s header carriers opt into
+    Anthropic's server-side fallback on an anthropic_messages call, and LiteLLM's otherwise. An error field that is not
+    a list is refused: the Router would refuse it only once the call it rides on fails.
+    """
+    override: Final = body.get(ROUTER_SETTINGS_OVERRIDE_KWARG)
+    for source in (body, override):
+        if not _is_mapping(source):
+            continue
+        for field in FALLBACK_LIST_FIELDS:
+            value = source.get(field)
+            if field in ERROR_FALLBACK_FIELDS and value is not None and not isinstance(value, list):
+                if not widest_reading:
+                    raise FallbackListShapeError(f"Rejected Request: {field} must be a list of model groups.", field)
+            anthropic_list = widest_reading or (
+                source is body and field == "fallbacks" and call.anthropic_reads_fallbacks()
+            )
+            yield from iter_fallback_entries(
+                value, field, call, checks=checks, depth=depth, widest_reading=anthropic_list, group=group
+            )
+    context_window_swaps: Final = body.get(CONTEXT_WINDOW_FALLBACK_DICT_FIELD)
+    if _is_mapping(context_window_swaps):
+        # Each value is the model the client wrapper swaps in, so the values are a list of targets
+        yield from iter_fallback_entries(
+            list(context_window_swaps.values()),
+            None,
+            call,
+            checks=checks,
+            depth=depth,
+            widest_reading=widest_reading,
+            group=group,
+        )
+
+
+# A Router init setting, never read per call, so no Router rule applies to it
+_ROUTER_UNREAD_LIST_FIELDS: Final = frozenset({"default_fallbacks"})
+
+
+def _reject_router_unreadable_list(fallbacks: object, field: str, *, model: object) -> None:
+    if fallbacks is None or field in _ROUTER_UNREAD_LIST_FIELDS:
         return
     problem: Final = (
         f"must be a list of model groups, got {type(fallbacks).__name__}"
         if not isinstance(fallbacks, list)
-        else None
-        if list_of_targets
         else _unsupported_group_map_entry(fallbacks, field)
     )
     if problem is not None:
@@ -400,12 +656,51 @@ def reject_non_list_litellm_fallbacks(
         )
 
 
+def reject_non_list_litellm_fallbacks(
+    fallbacks: object,
+    model: object,
+    *,
+    field: str = "fallbacks",
+    list_of_targets: bool = False,
+    call_kwargs: Mapping[str, object] | None = None,
+    anthropic_messages_call: bool = False,
+) -> None:
+    """
+    LiteLLM fallback fields hold lists of model groups. In the Router's formats a list of group maps maps each group to
+    such a list, and an error field's list holds no target. The same holds for every list a target carries, which the
+    Router reads once a hop merges that target, so each is checked here, through the walk the proxy's checks read the
+    lists with, before the first call. ``call_kwargs`` are the kwargs of the call, whose header carriers decide whether
+    a target's own ``fallbacks`` is Anthropic's; without them no LiteLLM rule is applied to it. ``list_of_targets``
+    marks a list whose reader calls every entry as a target, as the direct completion fallback does, so only its type
+    is checked.
+    """
+    if list_of_targets:
+        if fallbacks is not None and not isinstance(fallbacks, list):
+            _reject_router_unreadable_list(fallbacks, field, model=model)
+        return
+    call: Final = FallbackCall.of_kwargs(call_kwargs, anthropic_messages_call=anthropic_messages_call)
+    checks: Final = FallbackChecks(
+        litellm_list=lambda value, value_field: _reject_router_unreadable_list(value, value_field, model=model)
+    )
+    try:
+        for _entry in iter_fallback_entries(fallbacks, field, call, checks=checks):
+            pass
+    except FallbackListShapeError as shape_error:
+        raise litellm.BadRequestError(
+            message=str(shape_error),
+            model=model if isinstance(model, str) else "",
+            llm_provider="",
+        ) from shape_error
+
+
 def request_fallbacks(
     kwargs: Mapping[str, object], router_fallbacks: Sequence[object] | None, *, anthropic_messages_call: bool = False
 ) -> list[object] | None:
     """The Router's fallback list for this request: the per-request override, else the Router's own"""
     fallbacks: Final = kwargs.get(_router_fallbacks_key(kwargs, anthropic_messages_call), router_fallbacks)
-    reject_non_list_litellm_fallbacks(fallbacks, kwargs.get("model"))
+    reject_non_list_litellm_fallbacks(
+        fallbacks, kwargs.get("model"), call_kwargs=kwargs, anthropic_messages_call=anthropic_messages_call
+    )
     return None if fallbacks is None else OBJECT_LIST_ADAPTER.validate_python(fallbacks)
 
 
@@ -414,7 +709,7 @@ def pop_request_fallbacks(
     router_fallbacks: Sequence[object] | None,
 ) -> list[object] | None:
     fallbacks: Final = kwargs.pop(_router_fallbacks_key(kwargs, False), router_fallbacks)
-    reject_non_list_litellm_fallbacks(fallbacks, kwargs.get("model"))
+    reject_non_list_litellm_fallbacks(fallbacks, kwargs.get("model"), call_kwargs=kwargs)
     return None if fallbacks is None else OBJECT_LIST_ADAPTER.validate_python(fallbacks)
 
 
@@ -646,7 +941,7 @@ def fallback_entry_is_target(entry: Mapping[str, object]) -> bool:
     mapped to the fallbacks under it. The Router's fallback resolution and the proxy's fallback checks both read an
     entry by this, so they agree on which entries are targets.
     """
-    return isinstance(entry.get("model"), str)
+    return fallback_target_model_name(entry) is not None
 
 
 def get_fallback_model_group(fallbacks: list[Any], model_group: str) -> tuple[list[str] | None, int | None]:

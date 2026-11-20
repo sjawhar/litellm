@@ -32,9 +32,11 @@ from litellm.router_utils.fallback_event_handlers import (
     log_success_fallback_event,
     mid_stream_fallback_snapshot_kwargs,
     mid_stream_retry_kwargs,
+    pop_request_fallbacks,
     record_pre_routing_selection,
     record_retry_attempt,
     reject_non_list_litellm_fallbacks,
+    request_fallbacks,
     routed_deployment_id,
     run_async_fallback,
 )
@@ -1558,6 +1560,45 @@ def test_reject_non_list_litellm_fallbacks_refuses_a_nested_list(field: str, fal
 def test_reject_non_list_litellm_fallbacks_reads_no_group_map_in_a_list_of_targets():
     """The Router calls a `fallbacks` list of targets as is, so an entry there without a model is an override"""
     reject_non_list_litellm_fallbacks([{"model": "other"}, {"timeout": 5}, {"stop": ["END"]}, {}], "requested")
+
+
+@pytest.mark.parametrize(
+    ("target_lists", "message"),
+    [
+        pytest.param(
+            {"fallbacks": [["bad"]]}, "LiteLLM fallbacks must hold model names and mappings, got list", id="nested-list"
+        ),
+        pytest.param(
+            {"context_window_fallbacks": [{"model": "x"}]},
+            "LiteLLM context_window_fallbacks maps model groups to their fallbacks",
+            id="target-in-an-error-field",
+        ),
+        pytest.param(
+            {"content_policy_fallbacks": [{"requested": "abc"}]},
+            "LiteLLM content_policy_fallbacks must map model group 'requested' to a list",
+            id="group-mapped-to-a-non-list",
+        ),
+    ],
+)
+def test_the_router_entry_reads_a_targets_own_lists_before_the_first_call(target_lists: dict, message: str):
+    """A hop merges the target, and the Router reads its lists then, so they are refused before the first call"""
+    kwargs: Final[dict[str, object]] = {
+        "model": "requested",
+        "fallbacks": [{"requested": [{"model": "other", **target_lists}]}],
+    }
+    with pytest.raises(litellm.BadRequestError, match=message):
+        pop_request_fallbacks(kwargs, None)
+
+
+def test_the_router_entry_leaves_a_targets_own_list_to_anthropic_under_the_beta():
+    """Under the beta a hop sends the target's own `fallbacks` to Anthropic, which reads `"default"` as its own"""
+    kwargs: Final[dict[str, object]] = {
+        "model": "requested",
+        "extra_headers": {"anthropic-beta": "server-side-fallback-2026-07-01"},
+        "router_fallbacks": [{"requested": [{"model": "other", "fallbacks": "default"}]}],
+    }
+    assert request_fallbacks(kwargs, None, anthropic_messages_call=True) == kwargs["router_fallbacks"]
+
 
 
 def test_get_fallback_model_group_exact_match_beats_prefixed_match():

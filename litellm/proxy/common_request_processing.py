@@ -2226,6 +2226,7 @@ class ProxyBaseLLMRequestProcessing:
                     valid_token=user_api_key_dict,
                     general_settings=general_settings,
                     llm_router=llm_router,
+                    request=request,
                 )
                 try:
                     self.data["_router_weights"] = validate_router_weights(router_settings.get("weights"))
