@@ -22,7 +22,6 @@ from litellm.constants import (
     MINIMUM_CUSTOM_KEY_LENGTH,
     STANDARD_CUSTOMER_ID_HEADERS,
 )
-from litellm.litellm_core_utils.core_helpers import IDENTITY_METADATA_KEY_PREFIX
 from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
 from litellm.litellm_core_utils.safe_json_loads import safe_json_loads
 from litellm.litellm_core_utils.url_utils import (
@@ -670,11 +669,29 @@ def request_names_provider_fallback_models(
     return bool(names.anthropic)
 
 
+# Keys the Router and the SDK own in a call, which no fallback target sets on its hop
+_ROUTER_OWNED_CALL_FIELDS: Final = frozenset(
+    {
+        # How long the Router cools the deployment the hop fails on: completion puts the call's cooldown_time in its
+        # litellm_params, and the Router's failure callback takes it before the response header and its own default
+        "cooldown_time",
+        # Laid over the call's own litellm_params in what the failure and usage callbacks read, whose model_info names
+        # the deployment a failure counts against and cools
+        "litellm_params",
+    }
+)
+
+
 def _reject_fallback_target_credentials(target: Mapping[str, object], allows_client_credentials: bool) -> None:
-    """A caller credential, endpoint or mock param never rides on a fallback target; the opt-in admits only the first two"""
-    mocked: Final = sorted(field for field in target if field in _FALLBACK_TARGET_MOCK_FIELDS)
-    if mocked:
-        raise ValueError(f"Rejected Request: a fallback target may not carry {', '.join(mocked)}.")
+    """
+    A caller credential, endpoint, mock param or Router-owned call field never rides on a fallback target; the opt-in
+    admits only the first two
+    """
+    refused: Final = sorted(
+        field for field in target if field in _FALLBACK_TARGET_MOCK_FIELDS or field in _ROUTER_OWNED_CALL_FIELDS
+    )
+    if refused:
+        raise ValueError(f"Rejected Request: a fallback target may not carry {', '.join(refused)}.")
     reject_fallback_target_routing(target)
     if not allows_client_credentials:
         reject_fallback_target_credentials(target)
@@ -713,32 +730,24 @@ _SETUP_DROPPED_ROOT_FIELDS: Final = frozenset(
 
 
 @lru_cache(maxsize=1)
-def _setup_stripped_fields() -> tuple[frozenset[str], frozenset[str]]:
-    """The keys the request setup drops from or writes over at a body's root, and drops from its metadata"""
+def _setup_stripped_fields() -> frozenset[str]:
+    """The keys the request setup drops from or writes over at a body's root"""
     from litellm.proxy.litellm_pre_call_utils import (  # the setup module imports this one
         _CLIENT_PRICING_CONTROL_FIELDS,  # pyright: ignore[reportPrivateUsage]  # the setup's own strip lists
-        _CLIENT_PRICING_METADATA_FIELDS,  # pyright: ignore[reportPrivateUsage]  # the setup's own strip lists
-        _ROUTER_RESERVED_METADATA_FIELDS,  # pyright: ignore[reportPrivateUsage]  # the setup's own strip lists
-        _UNTRUSTED_METADATA_CONTROL_FIELDS,  # pyright: ignore[reportPrivateUsage]  # the setup's own strip lists
         _UNTRUSTED_ROOT_CONTROL_FIELDS,  # pyright: ignore[reportPrivateUsage]  # the setup's own strip lists
     )
     from litellm.types.utils import TRUSTED_CALLBACK_VARS_FIELD, StandardCallbackDynamicParams
 
-    return (
-        frozenset(
-            (
-                *_UNTRUSTED_ROOT_CONTROL_FIELDS,
-                *_CLIENT_PRICING_CONTROL_FIELDS,
-                TRUSTED_CALLBACK_VARS_FIELD,
-                # The team's callback vars, which the setup writes at the root under these names
-                *StandardCallbackDynamicParams.__annotations__,
-                *_SETUP_STAMPED_ROOT_FIELDS,
-                *_SETUP_DROPPED_ROOT_FIELDS,
-            )
-        ),
-        frozenset(
-            (*_UNTRUSTED_METADATA_CONTROL_FIELDS, *_ROUTER_RESERVED_METADATA_FIELDS, *_CLIENT_PRICING_METADATA_FIELDS)
-        ),
+    return frozenset(
+        (
+            *_UNTRUSTED_ROOT_CONTROL_FIELDS,
+            *_CLIENT_PRICING_CONTROL_FIELDS,
+            TRUSTED_CALLBACK_VARS_FIELD,
+            # The team's callback vars, which the setup writes at the root under these names
+            *StandardCallbackDynamicParams.__annotations__,
+            *_SETUP_STAMPED_ROOT_FIELDS,
+            *_SETUP_DROPPED_ROOT_FIELDS,
+        )
     )
 
 
@@ -760,26 +769,29 @@ def _proxy_pinned_call_params() -> frozenset[str]:
     return frozenset(name for name, pinned in pins if pinned)
 
 
-def _reject_setup_stripped_fields(target: Mapping[str, object]) -> None:
+def _reject_setup_stripped_fields(target: Mapping[str, object], metadata_variable_name: str) -> None:
     """
-    The request setup drops these keys from a body's root and from its metadata, or writes its own value over a body's,
-    before the call, so a target merged into the call on a hop may not bring one back or replace the setup's:
-    litellm.acompletion's own fallback loop merges a target as it is.
+    The request setup drops these keys from a body's root, or writes its own value over a body's, and sanitizes a
+    body's metadata buckets, before the call, so a target merged into the call on a hop may not bring one back or
+    replace the setup's: litellm.acompletion's own fallback loop merges a target as it is. The buckets are not
+    re-listed here: the target goes through the setup's own sanitizer on a copy
+    (client_metadata_the_setup_would_change), and anything it would change is refused.
     """
-    root_fields, metadata_fields = _setup_stripped_fields()
+    from litellm.proxy.litellm_pre_call_utils import (  # the setup module imports this one
+        client_metadata_the_setup_would_change,
+    )
+
+    root_fields: Final = _setup_stripped_fields()
     pinned: Final = _proxy_pinned_call_params()
-    stripped: Final = [
-        *(field for field in target if field in root_fields or field in pinned),
-        *(
-            f"{bucket}.{field}"
-            for bucket in _NESTED_METADATA_KEYS
-            for field in _coerce_metadata_to_dict(target.get(bucket)) or {}
-            if field in metadata_fields or (isinstance(field, str) and field.startswith(IDENTITY_METADATA_KEY_PREFIX))
-        ),
-    ]
+    stripped: Final = sorted(
+        {
+            *(field for field in target if field in root_fields or field in pinned),
+            *client_metadata_the_setup_would_change(target, metadata_variable_name),
+        }
+    )
     if stripped:
         raise ValueError(
-            f"Rejected Request: a fallback target may not carry {', '.join(sorted(stripped))}, "
+            f"Rejected Request: a fallback target may not carry {', '.join(stripped)}, "
             "which the proxy drops from or writes over in a request body."
         )
 
@@ -815,6 +827,8 @@ class _BodyCheckSettings:
     general_settings: dict
     llm_router: Router | None
     manages_deployments: bool
+    # The bucket the request setup keeps on this request's route; the other one it merges in and drops, or keeps too
+    metadata_variable_name: str
 
 
 def _check_fallback_entry(settings: _BodyCheckSettings, entry: FallbackEntry) -> None:
@@ -838,7 +852,7 @@ def _check_fallback_entry(settings: _BodyCheckSettings, entry: FallbackEntry) ->
             _reject_fallback_target_credentials(
                 target, settings.general_settings.get("allow_client_side_credentials") is True
             )
-            _reject_setup_stripped_fields(target)
+            _reject_setup_stripped_fields(target, settings.metadata_variable_name)
         except ValueError as refusal:
             if entry.is_group_map and entry.group is not None:
                 raise ValueError(f"{refusal} {_read_both_ways_note((entry.group,))}") from refusal
@@ -894,12 +908,19 @@ def is_request_body_safe(
     A fallback target is merged into the call, so every entry of every fallback list the body carries, read by the
     walk the Router's own check shares, goes through _check_fallback_entry.
     """
+    from litellm.proxy.litellm_pre_call_utils import (  # the setup module imports this one
+        metadata_variable_name_for_route,
+    )
+
     manages_deployments: Final = route_manages_deployments(route)
     _check_banned_params_in_body(
         request_body, general_settings, llm_router, model, manages_deployments=manages_deployments
     )
+    settings: Final = _BodyCheckSettings(
+        general_settings, llm_router, manages_deployments, metadata_variable_name_for_route(route or "")
+    )
     checks: Final = FallbackChecks(
-        entry=partial(_check_fallback_entry, _BodyCheckSettings(general_settings, llm_router, manages_deployments)),
+        entry=partial(_check_fallback_entry, settings),
         litellm_list=_reject_unreadable_litellm_list,
     )
     for _entry in iter_body_fallback_entries(

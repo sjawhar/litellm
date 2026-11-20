@@ -335,14 +335,14 @@ class TestModelManagementAuthChecks:
 
     def test_can_user_attach_credential_admin_success(self):
         result = ModelManagementAuthChecks.can_user_attach_credential(
-            litellm_params=LiteLLM_Params(model="test_model", litellm_credential_name="shared-credential"),
+            litellm_params={"model": "test_model", "litellm_credential_name": "shared-credential"},
             user_api_key_dict=self.admin_user,
         )
         assert result is True
 
     def test_can_user_attach_credential_without_credential_allows_any_role(self):
         result = ModelManagementAuthChecks.can_user_attach_credential(
-            litellm_params=LiteLLM_Params(model="test_model"),
+            litellm_params={"model": "test_model"},
             user_api_key_dict=self.team_admin_user,
         )
         assert result is True
@@ -350,30 +350,27 @@ class TestModelManagementAuthChecks:
     def test_can_user_attach_credential_team_admin_fails(self):
         with pytest.raises(Exception, match="Only a proxy admin can attach a stored credential") as exc_info:
             ModelManagementAuthChecks.can_user_attach_credential(
-                litellm_params=LiteLLM_Params(model="test_model", litellm_credential_name="shared-credential"),
+                litellm_params={"model": "test_model", "litellm_credential_name": "shared-credential"},
                 user_api_key_dict=self.team_admin_user,
             )
         assert exc_info.value.code == "403"
 
     def test_can_user_attach_credential_unchanged_existing_allows_any_role(self):
         result = ModelManagementAuthChecks.can_user_attach_credential(
-            litellm_params=LiteLLM_Params(model="test_model", litellm_credential_name="shared-credential"),
+            litellm_params={"model": "test_model", "litellm_credential_name": "shared-credential"},
             user_api_key_dict=self.team_admin_user,
-            existing_litellm_params=LiteLLM_Params(model="test_model", litellm_credential_name="shared-credential"),
+            existing_litellm_params={"model": "test_model", "litellm_credential_name": "shared-credential"},
         )
         assert result is True
 
     def test_can_user_attach_credential_non_admin_explicit_null_clear_fails(self):
         from litellm.proxy._types import ProxyException
-        from litellm.types.router import updateLiteLLMParams as litellm_params
 
         with pytest.raises(ProxyException) as exc_info:
             ModelManagementAuthChecks.can_user_attach_credential(
-                litellm_params=litellm_params(litellm_credential_name=None),
+                litellm_params={"litellm_credential_name": None},
                 user_api_key_dict=self.team_admin_user,
-                existing_litellm_params=LiteLLM_Params(
-                    model="test_model", litellm_credential_name="shared-credential"
-                ),
+                existing_litellm_params={"model": "test_model", "litellm_credential_name": "shared-credential"},
                 null_detaches=True,
             )
 
@@ -381,40 +378,30 @@ class TestModelManagementAuthChecks:
         assert exc_info.value.param == "litellm_credential_name"
 
     def test_can_user_attach_credential_admin_explicit_null_clear_succeeds(self):
-        from litellm.types.router import updateLiteLLMParams as litellm_params
-
         result = ModelManagementAuthChecks.can_user_attach_credential(
-            litellm_params=litellm_params(litellm_credential_name=None),
+            litellm_params={"litellm_credential_name": None},
             user_api_key_dict=self.admin_user,
-            existing_litellm_params=LiteLLM_Params(
-                model="test_model", litellm_credential_name="shared-credential"
-            ),
+            existing_litellm_params={"model": "test_model", "litellm_credential_name": "shared-credential"},
             null_detaches=True,
         )
 
         assert result is True
 
     def test_can_user_attach_credential_null_without_existing_allows_any_role(self):
-        from litellm.types.router import updateLiteLLMParams as litellm_params
-
         result = ModelManagementAuthChecks.can_user_attach_credential(
-            litellm_params=litellm_params(litellm_credential_name=None),
+            litellm_params={"litellm_credential_name": None},
             user_api_key_dict=self.team_admin_user,
-            existing_litellm_params=LiteLLM_Params(model="test_model"),
+            existing_litellm_params={"model": "test_model"},
             null_detaches=True,
         )
 
         assert result is True
 
     def test_can_user_attach_credential_null_is_noop_when_null_does_not_detach(self):
-        from litellm.types.router import updateLiteLLMParams as litellm_params
-
         result = ModelManagementAuthChecks.can_user_attach_credential(
-            litellm_params=litellm_params(litellm_credential_name=None),
+            litellm_params={"litellm_credential_name": None},
             user_api_key_dict=self.team_admin_user,
-            existing_litellm_params=LiteLLM_Params(
-                model="test_model", litellm_credential_name="shared-credential"
-            ),
+            existing_litellm_params={"model": "test_model", "litellm_credential_name": "shared-credential"},
         )
 
         assert result is True
@@ -424,9 +411,9 @@ class TestModelManagementAuthChecks:
         encrypted_name = encrypt_value_helper(value="shared-credential")
         assert encrypted_name != "shared-credential"
         result = ModelManagementAuthChecks.can_user_attach_credential(
-            litellm_params=LiteLLM_Params(model="test_model", litellm_credential_name="shared-credential"),
+            litellm_params={"model": "test_model", "litellm_credential_name": "shared-credential"},
             user_api_key_dict=self.team_admin_user,
-            existing_litellm_params=LiteLLM_Params(model="test_model", litellm_credential_name=encrypted_name),
+            existing_litellm_params={"model": "test_model", "litellm_credential_name": encrypted_name},
         )
         assert result is True
 
@@ -509,16 +496,14 @@ class TestModelManagementAuthChecks:
 
     def test_can_user_set_aws_session_tags_admin_success(self):
         result = ModelManagementAuthChecks.can_user_set_aws_session_tags(
-            litellm_params=LiteLLM_Params(
-                model="bedrock/test_model", aws_session_tags=[{"Key": "team", "Value": "genai"}]
-            ),
+            litellm_params={"model": "bedrock/test_model", "aws_session_tags": [{"Key": "team", "Value": "genai"}]},
             user_api_key_dict=self.admin_user,
         )
         assert result is True
 
     def test_can_user_set_aws_session_tags_without_tags_allows_any_role(self):
         result = ModelManagementAuthChecks.can_user_set_aws_session_tags(
-            litellm_params=LiteLLM_Params(model="bedrock/test_model", aws_role_name="arn:aws:iam::123:role/x"),
+            litellm_params={"model": "bedrock/test_model", "aws_role_name": "arn:aws:iam::123:role/x"},
             user_api_key_dict=self.team_admin_user,
         )
         assert result is True
@@ -526,9 +511,7 @@ class TestModelManagementAuthChecks:
     def test_can_user_set_aws_session_tags_team_admin_fails(self):
         with pytest.raises(Exception, match="Only a proxy admin can set aws_session_tags") as exc_info:
             ModelManagementAuthChecks.can_user_set_aws_session_tags(
-                litellm_params=LiteLLM_Params(
-                    model="bedrock/test_model", aws_session_tags=[{"Key": "team", "Value": "genai"}]
-                ),
+                litellm_params={"model": "bedrock/test_model", "aws_session_tags": [{"Key": "team", "Value": "genai"}]},
                 user_api_key_dict=self.team_admin_user,
             )
         assert exc_info.value.code == "403"
@@ -536,28 +519,30 @@ class TestModelManagementAuthChecks:
 
     def test_can_user_set_aws_session_tags_unchanged_existing_allows_any_role(self):
         result = ModelManagementAuthChecks.can_user_set_aws_session_tags(
-            litellm_params=LiteLLM_Params(
-                model="bedrock/test_model",
-                aws_session_tags=[{"Key": "team", "Value": "genai"}, {"Key": "env", "Value": "prod"}],
-            ),
+            litellm_params={
+                "model": "bedrock/test_model",
+                "aws_session_tags": [{"Key": "team", "Value": "genai"}, {"Key": "env", "Value": "prod"}],
+            },
             user_api_key_dict=self.team_admin_user,
-            existing_litellm_params=LiteLLM_Params(
-                model="bedrock/test_model",
-                aws_session_tags=[{"Key": "env", "Value": "prod"}, {"Key": "team", "Value": "genai"}],
-            ),
+            existing_litellm_params={
+                "model": "bedrock/test_model",
+                "aws_session_tags": [{"Key": "env", "Value": "prod"}, {"Key": "team", "Value": "genai"}],
+            },
         )
         assert result is True
 
     def test_can_user_set_aws_session_tags_changed_value_fails_for_team_admin(self):
         with pytest.raises(Exception, match="Only a proxy admin can set aws_session_tags") as exc_info:
             ModelManagementAuthChecks.can_user_set_aws_session_tags(
-                litellm_params=LiteLLM_Params(
-                    model="bedrock/test_model", aws_session_tags=[{"Key": "team", "Value": "platform"}]
-                ),
+                litellm_params={
+                    "model": "bedrock/test_model",
+                    "aws_session_tags": [{"Key": "team", "Value": "platform"}],
+                },
                 user_api_key_dict=self.team_admin_user,
-                existing_litellm_params=LiteLLM_Params(
-                    model="bedrock/test_model", aws_session_tags=[{"Key": "team", "Value": "genai"}]
-                ),
+                existing_litellm_params={
+                    "model": "bedrock/test_model",
+                    "aws_session_tags": [{"Key": "team", "Value": "genai"}],
+                },
             )
         assert exc_info.value.code == "403"
 
@@ -690,7 +675,7 @@ class TestModelManagementAuthChecks:
     def test_can_user_attach_credential_internal_user_fails(self):
         with pytest.raises(Exception, match="Only a proxy admin can attach a stored credential") as exc_info:
             ModelManagementAuthChecks.can_user_attach_credential(
-                litellm_params=LiteLLM_Params(model="test_model", litellm_credential_name="shared-credential"),
+                litellm_params={"model": "test_model", "litellm_credential_name": "shared-credential"},
                 user_api_key_dict=self.normal_user,
             )
         assert exc_info.value.code == "403"
@@ -699,11 +684,18 @@ class TestModelManagementAuthChecks:
 # A string field the federation rule reads (server_owned_wif_litellm_params), with a valid value of its type
 _FEDERATION_FIELD: Final = "anthropic_federation_rule_id"
 
-# A field only a proxy admin may set on a deployment, inside a mapping a reader merges into the deployment's call
+# A field only a proxy admin may set on a deployment, with the keys of a mapping a reader merges into the deployment's
+# call that carries it. `_fields_set` is the argument a pydantic constructor takes as the model's set of fields: in a
+# mapping it is one more key, and the rule still reads the credential name the mapping holds.
 _ADMIN_ONLY_FIELDS: Final = (
-    pytest.param("litellm_credential_name", "shared-credential", id="stored-credential"),
-    pytest.param("aws_session_tags", [{"Key": "team", "Value": "genai"}], id="aws-session-tags"),
-    pytest.param(_FEDERATION_FIELD, "fdrl_team_rule", id="federation-field"),
+    pytest.param("litellm_credential_name", {"litellm_credential_name": "shared-credential"}, id="stored-credential"),
+    pytest.param(
+        "litellm_credential_name",
+        {"litellm_credential_name": "shared-credential", "_fields_set": []},
+        id="stored-credential-naming-its-own-field-set",
+    ),
+    pytest.param("aws_session_tags", {"aws_session_tags": [{"Key": "team", "Value": "genai"}]}, id="aws-session-tags"),
+    pytest.param(_FEDERATION_FIELD, {_FEDERATION_FIELD: "fdrl_team_rule"}, id="federation-field"),
 )
 _ENDPOINTS: Final = "litellm.proxy.management_endpoints.model_management_endpoints"
 _PLACEMENTS: Final = ("fallback-entry", "nested-fallback-entry", "model-list", "model-list-in-entry", "any-key")
@@ -758,21 +750,21 @@ class TestEveryMappingInADeploymentsParamsGetsTheWriteRules:
         )
 
     @staticmethod
-    def _mapping(field: str, value: object) -> dict[str, object]:
-        return {"model": "openai/backup", field: value}
+    def _mapping(fields: Mapping[str, object]) -> dict[str, object]:
+        return {"model": "openai/backup", **fields}
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("placement", _PLACEMENTS)
-    @pytest.mark.parametrize(("field", "value"), _ADMIN_ONLY_FIELDS)
+    @pytest.mark.parametrize(("field", "fields"), _ADMIN_ONLY_FIELDS)
     async def test_add_new_model_refuses_an_admin_only_field_anywhere_in_the_params(
-        self, field: str, value: object, placement: str
+        self, field: str, fields: Mapping[str, object], placement: str
     ):
         from litellm.proxy._types import ProxyException
         from litellm.proxy.management_endpoints.model_management_endpoints import add_new_model
 
         mock_prisma: Final = MagicMock()
         mock_prisma.writer_db.litellm_uisettings.find_unique = AsyncMock(return_value=None)
-        extras: Final = _params_holding(self._mapping(field, value), placement)
+        extras: Final = _params_holding(self._mapping(fields), placement)
         with _write_route(mock_prisma), pytest.raises(ProxyException) as exc_info:
             await add_new_model(
                 model_params=Deployment(
@@ -788,9 +780,9 @@ class TestEveryMappingInADeploymentsParamsGetsTheWriteRules:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("placement", _PLACEMENTS)
-    @pytest.mark.parametrize(("field", "value"), _ADMIN_ONLY_FIELDS)
+    @pytest.mark.parametrize(("field", "fields"), _ADMIN_ONLY_FIELDS)
     async def test_update_model_refuses_an_admin_only_field_anywhere_in_the_params(
-        self, field: str, value: object, placement: str
+        self, field: str, fields: Mapping[str, object], placement: str
     ):
         from litellm.proxy._types import ProxyException
         from litellm.proxy.management_endpoints.model_management_endpoints import update_model
@@ -806,7 +798,7 @@ class TestEveryMappingInADeploymentsParamsGetsTheWriteRules:
         mock_prisma: Final = MagicMock()
         mock_prisma.db.litellm_proxymodeltable.find_unique = AsyncMock(return_value=existing_row)
         mock_prisma.db.litellm_proxymodeltable.update = AsyncMock()
-        extras: Final = _params_holding(self._mapping(field, value), placement)
+        extras: Final = _params_holding(self._mapping(fields), placement)
         with _write_route(mock_prisma, llm_router=None), pytest.raises(ProxyException) as exc_info:
             await update_model(
                 model_params=updateDeployment(
@@ -820,9 +812,9 @@ class TestEveryMappingInADeploymentsParamsGetsTheWriteRules:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("placement", _PLACEMENTS)
-    @pytest.mark.parametrize(("field", "value"), _ADMIN_ONLY_FIELDS)
+    @pytest.mark.parametrize(("field", "fields"), _ADMIN_ONLY_FIELDS)
     async def test_patch_model_refuses_an_admin_only_field_anywhere_in_the_params(
-        self, field: str, value: object, placement: str
+        self, field: str, fields: Mapping[str, object], placement: str
     ):
         from litellm.proxy._types import ProxyException
         from litellm.proxy.management_endpoints.model_management_endpoints import patch_model
@@ -833,7 +825,7 @@ class TestEveryMappingInADeploymentsParamsGetsTheWriteRules:
             litellm_params=LiteLLM_Params(model="openai/gpt-4o"),
             model_info={"id": model_id, "team_id": "test_team"},
         )
-        extras: Final = _params_holding(self._mapping(field, value), placement)
+        extras: Final = _params_holding(self._mapping(fields), placement)
         with (
             _write_route(MagicMock(), llm_router=MagicMock()),
             patch(f"{_ENDPOINTS}.get_db_model", new=AsyncMock(return_value=db_model)),  # test-quality-ok: row stub
@@ -853,11 +845,11 @@ class TestEveryMappingInADeploymentsParamsGetsTheWriteRules:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("placement", _PLACEMENTS)
-    @pytest.mark.parametrize(("field", "value"), _ADMIN_ONLY_FIELDS)
+    @pytest.mark.parametrize(("field", "fields"), _ADMIN_ONLY_FIELDS)
     async def test_a_proxy_admins_deployment_keeps_an_admin_only_field_anywhere_in_the_params(
-        self, field: str, value: object, placement: str
+        self, field: str, fields: Mapping[str, object], placement: str
     ):
-        params: Final = LiteLLM_Params(model="openai/gpt-4o", **_params_holding(self._mapping(field, value), placement))
+        params: Final = LiteLLM_Params(model="openai/gpt-4o", **_params_holding(self._mapping(fields), placement))
         assert await ModelManagementAuthChecks.reject_what_a_non_admin_may_not_set(
             model_params=Deployment(model_name="admin-model", litellm_params=params, model_info={"id": "admin-model"}),
             litellm_params=params,

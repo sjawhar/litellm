@@ -176,17 +176,47 @@ async def test_a_targets_stream_options_keep_the_usage_the_proxy_asked_for(monke
         pytest.param({"model": "fallback-model", "timeout": 0.01}, True, id="timeout"),
         pytest.param({"model": "fallback-model", "request_timeout": 0.01}, True, id="request-timeout"),
         pytest.param({"model": "fallback-model", "stream_timeout": 0.01}, True, id="stream-timeout"),
-        pytest.param({"model": "fallback-model"}, False, id="no-timeout"),
+        # A body's own null sets no mark, so a target's sets none either
+        pytest.param({"model": "fallback-model", "timeout": None}, False, id="null-timeout"),
+        pytest.param({"model": "fallback-model"}, None, id="no-timeout"),
     ],
 )
-def test_a_targets_own_timeout_marks_the_hop_as_the_proxy_marks_a_requests(target: dict, marked: bool):
+def test_a_targets_own_timeout_marks_the_hop_as_the_proxy_marks_a_requests(target: dict, marked: bool | None):
     """
     The proxy marks a request that sets its own timeout client_side_timeout, so the Router's cooldown reads a 408 under
-    it as the caller's timeout and not the deployment's health; a target's own timeout marks the hop the same way
+    it as the caller's timeout and not the deployment's health; a target's own timeout marks the hop the same way, and
+    a target that sets no timeout leaves the call's mark as it is
     """
     hop: Final = fallback_target_params_over_call({"model": "primary-model"}, target)
 
-    assert hop.get("client_side_timeout") is (True if marked else None)
+    assert hop.get("client_side_timeout") is marked
+
+
+@pytest.mark.parametrize(
+    ("call", "marks"),
+    [
+        # The reader's sequence: no caller timeout in the request, a target sets one, a later target clears it
+        pytest.param({"model": "primary-model"}, (True, False), id="cleared-by-a-later-target"),
+        # The request's own stream timeout is still the caller's after a target clears its plain timeout
+        pytest.param(
+            {"model": "primary-model", "stream_timeout": 5, "client_side_timeout": True},
+            (True, True),
+            id="the-requests-own-timeout-remains",
+        ),
+    ],
+)
+def test_the_timeout_mark_follows_the_timeout_in_effect_on_each_hop(call: dict, marks: tuple[bool, bool]):
+    """
+    The Router lays each target over the same call, so a mark one target set stays for the next; a later target that
+    clears the only caller timeout runs on its deployment's timeout, and the mark must not say that timeout was the
+    caller's
+    """
+    seen: list[object] = []
+    for target in ({"model": "first", "timeout": 0.01}, {"model": "second", "timeout": None}):
+        call.update(fallback_target_params_over_call(call, target))
+        seen.append(call.get("client_side_timeout"))
+
+    assert tuple(seen) == marks
 
 
 def test_process_response_headers_preserves_x_litellm_headers_when_internal():
