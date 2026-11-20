@@ -308,7 +308,11 @@ async def anthropic_messages(
     # before cache-control injection, which then runs once on the messages that go out.
     dispatched_messages, dispatched_system = prepare_native_messages(
         strip_empty_content_blocks_from_anthropic_messages(
-            messages, keep_thinking=thinking_pinned_after_drops(thinking, kwargs.get("additional_drop_params"))
+            messages,
+            keep_thinking=thinking_pinned_after_drops(
+                thinking,
+                kwargs.get("additional_drop_params"),  # pyright: ignore[reportUnknownMemberType]  # untyped **kwargs
+            ),
         ),
         system,
         kwargs,

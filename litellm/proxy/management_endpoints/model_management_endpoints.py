@@ -13,7 +13,7 @@ model/{model_id}/update - PATCH endpoint for model update.
 import asyncio
 import datetime
 import json
-from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
@@ -28,6 +28,7 @@ import litellm
 from litellm._logging import verbose_proxy_logger
 from litellm._uuid import uuid
 from litellm.constants import DEFAULT_MAX_RECURSE_DEPTH, LITELLM_PROXY_ADMIN_NAME
+from litellm.litellm_core_utils.core_helpers import is_object_mapping, is_object_sequence
 from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
 from litellm.litellm_core_utils.get_model_cost_map import GetModelCostMap
 from litellm.litellm_core_utils.ptu_pricing import (
@@ -499,7 +500,7 @@ _CLASSIFIER_CONNECTION_PATHS: Final = frozenset(
 
 def _nested_param_mappings(
     stored: Mapping[str, object] | None,
-) -> tuple[tuple[tuple[str | int, ...], dict[str, object]], ...]:
+) -> tuple[tuple[tuple[str | int, ...], Mapping[str, object]], ...]:
     """
     Every mapping reachable inside a deployment's params, under any key and inside any list, at every depth, with its
     path from the root of the params (a key for a mapping, an index for a list), read from the dict the write routes
@@ -508,10 +509,15 @@ def _nested_param_mappings(
     reason to put an admin-only field in any of them. The classifier connection is left out
     (_CLASSIFIER_CONNECTION_PATHS).
     """
-    if stored is None:
-        return ()
-    found: Final[list[tuple[tuple[str | int, ...], dict[str, object]]]] = []
-    pending: Final[list[tuple[object, tuple[str | int, ...]]]] = [(value, (key,)) for key, value in stored.items()]
+    return () if stored is None else tuple(_iter_nested_param_mappings(stored))
+
+
+def _iter_nested_param_mappings(
+    stored: Mapping[str, object],
+) -> Iterator[tuple[tuple[str | int, ...], Mapping[str, object]]]:
+    pending: Final[list[tuple[object, tuple[str | int, ...]]]] = [  # mutable-ok: the walk's own stack, never handed out
+        (value, (key,)) for key, value in stored.items()
+    ]
     while pending:
         value, path = pending.pop()
         if len(path) > DEFAULT_MAX_RECURSE_DEPTH:
@@ -523,12 +529,11 @@ def _nested_param_mappings(
             )
         if path in _CLASSIFIER_CONNECTION_PATHS:
             continue
-        if isinstance(value, Mapping):
-            found.append((path, {key: item for key, item in value.items() if isinstance(key, str)}))
+        if is_object_mapping(value):
+            yield path, {key: item for key, item in value.items() if isinstance(key, str)}
             pending.extend((item, (*path, str(key))) for key, item in value.items())
-        elif isinstance(value, (list, tuple)):
+        elif is_object_sequence(value):
             pending.extend((item, (*path, index)) for index, item in enumerate(value))
-    return tuple(found)
 
 
 def _effective_model(
@@ -2103,12 +2108,11 @@ async def _update_existing_team_model_assignment(
 
 def _canonical_session_tags(tags: object) -> tuple[tuple[str, str], ...] | None:
     """The tags as sorted (Key, Value) pairs, or None when the value is not a list of tags"""
-    if not isinstance(tags, (list, tuple)):
+    if not is_object_sequence(tags):
         return None
-    pairs: Final = [(tag.get("Key"), tag.get("Value")) for tag in tags if isinstance(tag, Mapping)]
-    if len(pairs) != len(tags) or not all(isinstance(key, str) and isinstance(value, str) for key, value in pairs):
-        return None
-    return tuple(sorted((str(key), str(value)) for key, value in pairs))
+    pairs: Final = tuple((tag.get("Key"), tag.get("Value")) for tag in tags if is_object_mapping(tag))
+    named: Final = tuple((key, value) for key, value in pairs if isinstance(key, str) and isinstance(value, str))
+    return tuple(sorted(named)) if len(named) == len(tags) else None
 
 
 class ModelManagementAuthChecks:

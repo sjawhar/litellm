@@ -1196,12 +1196,16 @@ class ChunkProcessor:
             for field, value in (
                 ("inference_geo", calculated_usage_per_chunk["inference_geo"]),
                 ("speed", calculated_usage_per_chunk["speed"]),
-                ("iterations", self._last_iterations(chunks)),
             )
             if value is not None
         }
 
         returned_usage = Usage(**returned_usage.model_dump(), **provider_pricing_fields)
+        iterations: Final = self._last_iterations(chunks)
+        if iterations is not None:
+            # Anthropic's per-attempt usage, which a fallback reply is priced from: Usage declares no such field and
+            # sets every extra one so in __init__
+            setattr(returned_usage, "iterations", iterations)  # noqa: B010  # an extra field Usage does not declare
 
         return returned_usage
 

@@ -801,13 +801,31 @@ async def _run_project_checks(
         )
 
 
+class _TokenTeamModels(Protocol):
+    @property
+    def team_models(self) -> Sequence[str]: ...
+
+
+def _token_team_models(valid_token: _TokenTeamModels) -> Sequence[str]:
+    """The team models a token records, read through a typed view: _types.py declares the field a bare list"""
+    return valid_token.team_models
+
+
+def _token_team_aliases(
+    valid_token: UserAPIKeyAuth | None,
+) -> dict[str, str] | None:  # mutable-ok: the model checks take the team's aliases as this type
+    aliases: Final = team_model_aliases_for_auth_check(valid_token) if valid_token is not None else None
+    return dict(aliases) if aliases is not None else None
+
+
 def _check_fallback_against_unread_team(*, model: str, valid_token: UserAPIKeyAuth, llm_router: Router | None) -> None:
     """
     A fallback target of a team key whose team could not be read for this request. The team models the token records
     stand in for the team, as they do for the requested model when the token vouches for its team; with none recorded
     the target cannot be checked, so the request is refused until the team can be read.
     """
-    if not valid_token.team_models:
+    team_models: Final = _token_team_models(valid_token)
+    if not team_models:
         raise ProxyException(
             message=(
                 f"Fallback models cannot be checked while Team={valid_token.team_id} cannot be read. "
@@ -820,8 +838,8 @@ def _check_fallback_against_unread_team(*, model: str, valid_token: UserAPIKeyAu
     can_object_call_model(
         model=model,
         llm_router=llm_router,
-        models=valid_token.team_models,
-        team_model_aliases=valid_token.team_model_aliases,
+        models=list(team_models),
+        team_model_aliases=_token_team_aliases(valid_token),
         team_id=valid_token.team_id,
         key_model_aliases=key_model_aliases_for_auth_check(valid_token),
         object_type="team",
@@ -837,13 +855,13 @@ def _reject_aliased_provider_fallback(
     is refused; a name without an alias is checked as Anthropic gets it.
     """
     # The alias maps the model checks consult: the key's, the team's as the token carries it, the global, the router's
-    alias_sources: Final[tuple[object, ...]] = (
+    alias_sources: Final[tuple[Mapping[str, object] | None, ...]] = (
         key_model_aliases_for_auth_check(valid_token),
-        valid_token.team_model_aliases if valid_token is not None else None,
+        team_model_aliases_for_auth_check(valid_token) if valid_token is not None else None,
         litellm.model_alias_map,
         llm_router.model_group_alias if llm_router is not None else None,
     )
-    if any(isinstance(aliases, Mapping) and model in aliases for aliases in alias_sources):
+    if any(aliases is not None and model in aliases for aliases in alias_sources):
         raise ModelAccessDeniedProxyException(
             message=model_access_denied_client_message(model=model),
             internal_message=(
@@ -883,6 +901,27 @@ def _deployment_sends_name_to_anthropic(deployment: object, name: str) -> bool:
     return provider == "anthropic" and served_model == name
 
 
+class _PatternDeployments(Protocol):
+    def get_deployments_by_pattern(self, model: str, custom_llm_provider: str | None = None) -> Sequence[object]: ...
+
+
+class _ProviderModelDeployments(Protocol):
+    def _get_deployment_by_litellm_model(self, model: str) -> Sequence[object]: ...
+
+
+def _pattern_deployments(pattern_router: _PatternDeployments, model: str) -> Sequence[object]:
+    """A wildcard router's deployments for ``model``, read through a typed view of its list of untyped dicts"""
+    return pattern_router.get_deployments_by_pattern(model=model)
+
+
+def _provider_model_deployments(llm_router: _ProviderModelDeployments, model: str) -> Sequence[object]:
+    """
+    The deployments whose provider model ``model`` is, through the router's own lookup, which serves a name with no
+    deployment of its own from them; read through a typed view of its untyped list
+    """
+    return llm_router._get_deployment_by_litellm_model(model=model)  # pyright: ignore[reportPrivateUsage]  # its lookup
+
+
 def _deployments_under_name(model: str, llm_router: Router) -> Iterator[object]:
     """
     Every deployment the router can serve ``model`` from, whichever team asks: the deployments of that name, each
@@ -895,13 +934,11 @@ def _deployments_under_name(model: str, llm_router: Router) -> Iterator[object]:
         if public_name == model:
             yield from llm_router.get_all_deployments(model_name=model, team_id=team_id)
     for pattern_router in (llm_router.pattern_router, *llm_router.team_pattern_routers.values()):
-        yield from pattern_router.get_deployments_by_pattern(model=model)
+        yield from _pattern_deployments(pattern_router, model)
     deployment_with_that_id: Final = llm_router.get_deployment(model_id=model)
     if deployment_with_that_id is not None:
         yield deployment_with_that_id.model_dump(exclude_none=True)
-    # The router serves a name with no deployment of its own from the deployments whose provider model it is, through
-    # its own lookup
-    yield from llm_router._get_deployment_by_litellm_model(model=model)  # pyright: ignore[reportPrivateUsage]  # see above
+    yield from _provider_model_deployments(llm_router, model)
 
 
 def _reject_provider_fallback_served_as_another_model(*, model: str, llm_router: Router | None) -> None:
@@ -980,7 +1017,7 @@ async def _run_fallback_model_checks(
                         model=model,
                         team_object=team_object,
                         llm_router=llm_router,
-                        team_model_aliases=(valid_token.team_model_aliases if valid_token else None),
+                        team_model_aliases=_token_team_aliases(valid_token),
                         key_model_aliases=key_model_aliases,
                     )
                 except ProxyException as team_denial:
@@ -1422,18 +1459,17 @@ async def common_checks(
         )
 
     # 2.4 A fallback target passes the same team, team member, user, project and agent model checks
-    with tracer.trace("litellm.proxy.auth.common_checks.run_fallback_model_checks"):
-        await _run_fallback_model_checks(
-            names=fallback_names,
-            team_object=team_object,
-            user_object=user_object,
-            project_object=project_object,
-            llm_router=llm_router,
-            valid_token=valid_token,
-            proxy_logging_obj=proxy_logging_obj,
-            team_membership=loaded_team_membership,
-            team_membership_loaded=team_membership_loaded,
-        )
+    await _run_fallback_model_checks(
+        names=fallback_names,
+        team_object=team_object,
+        user_object=user_object,
+        project_object=project_object,
+        llm_router=llm_router,
+        valid_token=valid_token,
+        proxy_logging_obj=proxy_logging_obj,
+        team_membership=loaded_team_membership,
+        team_membership_loaded=team_membership_loaded,
+    )
 
     # 2.3 Which model access groups authorized this request
     matched_model_access_groups: Final = await stamp_matched_model_access_groups(

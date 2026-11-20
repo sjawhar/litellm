@@ -4,7 +4,7 @@ import json
 import re
 import time
 from collections import OrderedDict
-from collections.abc import Mapping, MutableMapping, Sequence
+from collections.abc import Iterator, Mapping, MutableMapping, Sequence
 from datetime import datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
@@ -35,7 +35,7 @@ from litellm.constants import (
     X_LITELLM_DISABLE_CALLBACKS,
 )
 from litellm.integrations.custom_guardrail import without_server_streaming_classification
-from litellm.litellm_core_utils.core_helpers import is_codex_user_agent
+from litellm.litellm_core_utils.core_helpers import is_codex_user_agent, is_object_dict, is_object_mapping
 from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
 from litellm.litellm_core_utils.initialize_dynamic_callback_params import (
     TRUSTED_CALLBACK_VARS_FIELD,
@@ -737,14 +737,16 @@ def _sanitize_client_metadata(
     client_metadata_the_setup_would_change runs it on a copy of a fallback target.
     """
     for metadata_key in _CLIENT_METADATA_BUCKETS:
-        if not isinstance(user_metadata := data.get(metadata_key), dict):
+        if not is_object_dict(user_metadata := data.get(metadata_key)):
             continue
         _strip_untrusted_request_header_controls(
             user_metadata.get("headers"),
             allow_client_message_redaction_opt_out=allow_client_message_redaction_opt_out,
         )
         for field in [
-            key for key in user_metadata if key.startswith("user_api_key_") or key in _UNTRUSTED_METADATA_CONTROL_FIELDS
+            key
+            for key in user_metadata
+            if isinstance(key, str) and (key.startswith("user_api_key_") or key in _UNTRUSTED_METADATA_CONTROL_FIELDS)
         ]:
             user_metadata.pop(field, None)
     if not allow_client_pricing_override:
@@ -755,31 +757,39 @@ def _sanitize_client_metadata(
         _strip_client_message_redaction_opt_out(data)
 
 
-def _changed_paths(before: object, after: object, path: tuple[str, ...]) -> tuple[str, ...]:
-    """
-    The dotted paths at which ``after`` drops, adds or changes a value of ``before``, mapping by mapping. A value
-    ``after`` holds as the very object ``before`` holds is unchanged and is not read, so the comparison goes no deeper
-    than the copy it is given made new objects.
-    """
-    if before is after:
-        return ()
-    if not (isinstance(before, Mapping) and isinstance(after, Mapping)):
-        return () if before == after else (".".join(path),)
-    return tuple(
-        changed
-        for key in {**before, **after}
-        for changed in (
-            _changed_paths(before[key], after[key], (*path, str(key)))
-            if key in before and key in after
-            else (".".join((*path, str(key))),)
-        )
-    )
+# A side of a compared mapping that does not hold the key
+_ABSENT: Final = object()
 
 
-def _bucket_copy(bucket: Mapping[str, object]) -> dict[str, object]:
+def _changed_paths(before: object, after: object) -> Iterator[str]:
+    """
+    The dotted paths at which ``after`` drops, adds or changes a value of ``before``, mapping by mapping, in key order.
+    A value ``after`` holds as the very object ``before`` holds is unchanged and is not read, so the comparison goes no
+    deeper than the copy it is given made new objects.
+    """
+    pending: Final[list[tuple[object, object, tuple[str, ...]]]] = [  # mutable-ok: the comparison's own stack
+        (before, after, ())
+    ]
+    while pending:
+        old, new, path = pending.pop()
+        if old is new:
+            continue
+        if old is _ABSENT or new is _ABSENT:
+            yield ".".join(path)
+        elif is_object_mapping(old) and is_object_mapping(new):
+            # Pushed last key first, so the paths come out in key order
+            pending.extend(
+                (old.get(key, _ABSENT), new.get(key, _ABSENT), (*path, str(key)))
+                for key in reversed(tuple({**old, **new}))
+            )
+        elif old != new:
+            yield ".".join(path)
+
+
+def _bucket_copy(bucket: Mapping[str, object]) -> dict[str, object]:  # mutable-ok: the strips rewrite this copy
     """A bucket copied as deep as the strips change one, its own keys and those of its ``headers``, and no deeper"""
     return {
-        key: dict(value) if key == "headers" and isinstance(value, dict) else value for key, value in bucket.items()
+        key: dict(value) if key == "headers" and is_object_dict(value) else value for key, value in bucket.items()
     }
 
 
@@ -801,13 +811,15 @@ def client_metadata_the_setup_would_change(
         for name in _CLIENT_METADATA_BUCKETS
         if (value := target.get(name)) is not None
     }
-    after: Final[dict[str, object]] = {name: _bucket_copy(bucket) for name, bucket in before.items()}
+    after: Final[dict[str, object]] = {  # mutable-ok: the setup's strips rewrite this copy in place
+        name: _bucket_copy(bucket) for name, bucket in before.items()
+    }
     _strip_session_id_omitted_marker(after)
     _sanitize_client_metadata(after, allow_client_message_redaction_opt_out=False, allow_client_pricing_override=False)
     dropped_bucket: Final = (
         ("litellm_metadata",) if metadata_variable_name == "metadata" and "litellm_metadata" in target else ()
     )
-    return (*dropped_bucket, *_changed_paths(before, after, ()))
+    return (*dropped_bucket, *_changed_paths(before, after))
 
 
 def _promoted_trace_control_fields(

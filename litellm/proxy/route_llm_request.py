@@ -686,7 +686,9 @@ async def _route_request_single_attempt(  # noqa: ANN202  # returns unawaited pr
         # Anthropic, so the key/team fallback list reaches the Router under its own name
         settings_destination: Final = MappingProxyType(
             {"fallbacks": ROUTER_FALLBACKS_KWARG}
-            if llm_router is not None and route_type == "anthropic_messages" and anthropic_owns_fallbacks(data)
+            if llm_router is not None
+            and route_type == "anthropic_messages"
+            and anthropic_owns_fallbacks(data)  # pyright: ignore[reportUnknownArgumentType]  # the route's untyped body
             else {}
         )
         for key in per_request_settings:
