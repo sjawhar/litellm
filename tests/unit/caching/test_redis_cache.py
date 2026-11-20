@@ -1709,3 +1709,42 @@ async def test_get_cache_or_raise_tells_a_miss_from_an_unreachable_redis():
         await redis.cache.async_get_cache_or_raise("absent")
     with pytest.raises(RedisConnectionError):
         await redis.cache.async_set_cache_or_raise("absent", {"a": 1})
+
+
+@pytest.mark.asyncio
+async def test_set_then_delete_sets_every_key_for_its_ttl_then_deletes_in_two_round_trips():
+    """However many keys, one pipeline of the SETs and one of the DELs after it, each key in the cache's namespace."""
+    redis: Final = fake_redis_cache(namespace="gateway")
+    client: Final = redis.cache.init_async_client()
+    for name in ("a", "b", "c"):
+        await client.set(f"gateway:last_good:{name}", "entry")
+
+    with patch.object(client, "pipeline", wraps=client.pipeline) as pipeline:
+        await redis.cache.async_set_then_delete_or_raise(
+            tuple(f"last_good_tombstone:{name}" for name in "abc"), 1, 600, tuple(f"last_good:{name}" for name in "abc")
+        )
+
+    assert pipeline.call_count == 2
+    for name in "abc":
+        assert await client.get(f"gateway:last_good_tombstone:{name}") == b"1"
+        assert 599 <= await client.ttl(f"gateway:last_good_tombstone:{name}") <= 600
+        assert await client.exists(f"gateway:last_good:{name}") == 0
+
+
+@pytest.mark.asyncio
+async def test_set_then_delete_raises_and_sends_no_delete_when_redis_cannot_take_the_sets():
+    """With the server away the SET pipeline raises, and the DELs, which must follow every SET, are never sent."""
+    from redis.exceptions import ConnectionError as RedisConnectionError
+
+    redis: Final = fake_redis_cache()
+    client: Final = redis.cache.init_async_client()
+    await client.set("last_good:a", "entry")
+    redis.server.connected = False
+
+    with patch.object(client, "pipeline", wraps=client.pipeline) as pipeline, pytest.raises(RedisConnectionError):
+        await redis.cache.async_set_then_delete_or_raise(("last_good_tombstone:a",), 1, 600, ("last_good:a",))
+
+    redis.server.connected = True
+    assert pipeline.call_count == 1
+    assert await client.get("last_good:a") == b"entry"
+    assert await client.exists("last_good_tombstone:a") == 0

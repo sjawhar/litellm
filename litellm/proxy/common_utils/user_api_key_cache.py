@@ -5,7 +5,7 @@ import math
 import re
 import time
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from functools import partial
@@ -571,7 +571,7 @@ def start_last_good_reads() -> None:
 
 
 @contextmanager
-def last_good_reads_started_at(start: float | None) -> Iterator[None]:
+def last_good_reads_started_at(start: float | None) -> Generator[None, None, None]:
     """Record ``start`` as the moment this context's auth reads began, in place of any recorded one, until the block
     ends; ``None`` records none. For a test that drives the cache's ``last_good_clock``."""
     token: Final = _auth_reads_started_at.set(start)
@@ -883,13 +883,26 @@ _revoked_by_this_request: Final[  # mutable-ok: the record's dict grows as its t
 ] = ContextVar("last_good_revoked_by_this_request", default=None)
 
 
-async def _tombstone_in_redis(redis: RedisCache, cache_key: str, clock: Callable[[], float]) -> float:
-    """Write the tombstone of ``cache_key`` and drop its entry in Redis. Returns when, on ``clock``, the tombstone's SET
-    was sent, so the tombstone ends no earlier than that time plus its TTL."""
-    sent_at: Final = clock()
-    await redis.async_set_cache_or_raise(_last_good_tombstone_key(cache_key), 1, ttl=LAST_GOOD_TOMBSTONE_TTL_SECONDS)
-    _ = await redis.async_delete_cache(_last_good_redis_key(cache_key))
-    return sent_at
+# A revocation passes again over the keys whose tombstones may lapse before the write after it runs, at most this many
+# times in all, and then refuses: a Redis that takes that long cannot give the write a standing tombstone
+LAST_GOOD_REVOCATION_PASSES: Final = 3
+
+
+def _tombstones_due(cache_keys: Sequence[str], revoked: Mapping[str, float], now: float) -> tuple[str, ...]:
+    """The keys of ``cache_keys`` whose tombstone this task's record does not show standing for longer than
+    ``LAST_GOOD_LATE_STORE_MARGIN_SECONDS`` from ``now``: none sent, or one sent that long ago or more. A tombstone
+    is sent with a relative expiry, so it ends no earlier than its sending time plus
+    ``LAST_GOOD_TOMBSTONE_TTL_SECONDS``."""
+    fresh_for: Final = LAST_GOOD_TOMBSTONE_TTL_SECONDS - LAST_GOOD_LATE_STORE_MARGIN_SECONDS
+    return tuple(dict.fromkeys(key for key in cache_keys if now - revoked.get(key, -math.inf) >= fresh_for))
+
+
+def _refused_revocation(cache_keys: Sequence[str], why: str, retry: str) -> HTTPException:
+    verbose_proxy_logger.error("Refused to revoke %s: %s", ", ".join(cache_keys), why)
+    return HTTPException(
+        status_code=503,
+        detail={"error": f"The auth cache could not record this revocation, so nothing was changed. {retry}"},
+    )
 
 
 async def revoke_last_good(cache: DualCache, cache_keys: Sequence[str]) -> None:
@@ -902,14 +915,19 @@ async def revoke_last_good(cache: DualCache, cache_keys: Sequence[str]) -> None:
     expiry, where a database outage serves it. Every other update evicts after its write, best effort
     (``forget_last_good``).
 
-    A request revokes its whole set before its first write, so a key its own task revoked less than
-    ``LAST_GOOD_TOMBSTONE_TTL_SECONDS`` less ``LAST_GOOD_LATE_STORE_MARGIN_SECONDS`` ago is not sent to Redis
-    again: its tombstone still stands, and a revocation nested after that write cannot be refused. Only the Redis
-    writes are skipped: this pod's memory tombstone, and every eviction and broadcast after the write, still run."""
+    It returns only when every key's tombstone stands for more than ``LAST_GOOD_LATE_STORE_MARGIN_SECONDS``, so the
+    write the caller makes right after it runs while they all stand. A pass records the tombstones of every key not
+    already standing that long and drops their entries, in two Redis round trips however many keys
+    (``RedisCache.async_set_then_delete_or_raise``); a key whose tombstone, by when this task sent it, may lapse within
+    the margin is passed over again, so a pass that takes long is followed by another, and a key this task revoked
+    moments ago, whose tombstone still stands, costs no Redis. After ``LAST_GOOD_REVOCATION_PASSES`` passes that each
+    outlast that time the request is refused with 503, as when Redis cannot answer. Only the Redis writes are skipped
+    for a standing key: this pod's memory tombstone, and every eviction and broadcast after the write, still run."""
     store: Final = _last_good_store(cache)
     if store is None or not store.serve_last_good_entries or not cache_keys:
         return
-    if store.redis_cache is not None:
+    redis: Final = store.redis_cache
+    if redis is not None:
         task: Final = asyncio.current_task()
         kept: Final = _revoked_by_this_request.get()
         revoked: Final[dict[str, float]] = (  # mutable-ok: grows as the request revokes
@@ -917,29 +935,33 @@ async def revoke_last_good(cache: DualCache, cache_keys: Sequence[str]) -> None:
         )
         if task is not None and (kept is None or kept[1] is not revoked):
             _ = _revoked_by_this_request.set((task, revoked))
-        try:
-            for cache_key in cache_keys:
-                # Read for each key, since the Redis commands of the keys before it take time; short of the tombstone's
-                # end by the margin, so the write after the skip still runs while it stands
-                if (
-                    store.last_good_clock() - revoked.get(cache_key, -math.inf)
-                    < LAST_GOOD_TOMBSTONE_TTL_SECONDS - LAST_GOOD_LATE_STORE_MARGIN_SECONDS
-                ):
-                    continue
-                revoked[cache_key] = await _tombstone_in_redis(store.redis_cache, cache_key, store.last_good_clock)
-        except Exception as e:
-            verbose_proxy_logger.error(
-                "Refused to revoke %s: Redis could not record the revocation of their last good auth entries: %s",
-                ", ".join(cache_keys),
-                e,
+        for _ in range(LAST_GOOD_REVOCATION_PASSES):
+            due = _tombstones_due(cache_keys, revoked, store.last_good_clock())
+            if not due:
+                break
+            sent_at = store.last_good_clock()
+            try:
+                await redis.async_set_then_delete_or_raise(
+                    tuple(_last_good_tombstone_key(key) for key in due),
+                    1,
+                    LAST_GOOD_TOMBSTONE_TTL_SECONDS,
+                    tuple(_last_good_redis_key(key) for key in due),
+                )
+            except Exception as e:
+                raise _refused_revocation(
+                    cache_keys,
+                    f"Redis could not record the revocation of their last good auth entries: {e}",
+                    "Retry once Redis is reachable.",
+                ) from e
+            revoked.update(dict.fromkeys(due, sent_at))
+        if _tombstones_due(cache_keys, revoked, store.last_good_clock()):
+            raise _refused_revocation(
+                cache_keys,
+                f"each of {LAST_GOOD_REVOCATION_PASSES} passes recording it in Redis took longer than "
+                f"LAST_GOOD_TOMBSTONE_TTL_SECONDS ({LAST_GOOD_TOMBSTONE_TTL_SECONDS} s) less "
+                f"{LAST_GOOD_LATE_STORE_MARGIN_SECONDS} s, so its tombstones could lapse before the change",
+                "Recording it took longer than its tombstones last; retry it.",
             )
-            raise HTTPException(
-                status_code=503,
-                detail={
-                    "error": "The auth cache could not record this revocation, so nothing was changed. "
-                    "Retry once Redis is reachable."
-                },
-            ) from e
     for cache_key in cache_keys:
         store.last_good_memory.tombstone(cache_key, LAST_GOOD_TOMBSTONE_TTL_SECONDS)
 

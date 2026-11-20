@@ -5833,11 +5833,11 @@ async def test_key_delete_pinned_to_the_writer_revokes_both_keys_when_a_lagging_
 
 
 @pytest.mark.asyncio
-async def test_key_delete_pinned_to_the_writer_deletes_nothing_when_redis_is_lost_before_the_second_revocation(
+async def test_key_delete_pinned_to_the_writer_deletes_nothing_when_redis_is_lost_between_the_two_tombstones(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The same delete, with Redis lost once K1 is revoked and before K2's tombstone is written: K2's revocation cannot
-    be recorded, so the delete answers 503, and neither key is deleted or archived."""
+    """The same delete, with Redis lost inside the one batch that records both revocations, once K1's tombstone landed
+    and before K2's: the batch raises, so the delete answers 503, and neither key is deleted or archived."""
     from litellm.proxy.db.routing_prisma_wrapper import reads_pinned_to_writer
     from tests.unit.caching.fake_redis_cache import fake_redis_cache
 
@@ -5849,17 +5849,20 @@ async def test_key_delete_pinned_to_the_writer_deletes_nothing_when_redis_is_los
     monkeypatch.setattr(  # test-quality-ok: the proxy's database, a writer behind a lagging read replica
         "litellm.proxy.proxy_server.prisma_client", prisma_client
     )
-    lands: Final = redis.cache.async_set_cache_or_raise
+    lands: Final = redis.cache.async_set_then_delete_or_raise
+    second_tombstone: Final = f"last_good_tombstone:{tokens[1]}"
 
-    async def lose_redis_before_the_second_tombstone(
-        key: str, value: object, ttl: int | None = None, *, expire_at: int | None = None
+    async def lose_redis_between_the_tombstones(
+        set_keys: Sequence[str], value: object, ttl: int, delete_keys: Sequence[str]
     ) -> None:
-        if key == f"last_good_tombstone:{tokens[1]}":
+        if second_tombstone in set_keys:
+            # The SETs before K2's land, as a pipeline's do when its connection drops partway
+            await lands(set_keys[: set_keys.index(second_tombstone)], value, ttl, ())
             redis.server.connected = False
-        await lands(key, value, ttl=ttl, expire_at=expire_at)
+        await lands(set_keys, value, ttl, delete_keys)
 
-    monkeypatch.setattr(  # test-quality-ok: Redis is lost right before K2's tombstone is written
-        redis.cache, "async_set_cache_or_raise", lose_redis_before_the_second_tombstone
+    monkeypatch.setattr(  # test-quality-ok: Redis is lost inside the revocation's batch, right before K2's tombstone
+        redis.cache, "async_set_then_delete_or_raise", lose_redis_between_the_tombstones
     )
 
     with reads_pinned_to_writer(), pytest.raises(HTTPException) as refused:

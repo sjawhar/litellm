@@ -3,7 +3,7 @@ import hashlib
 import json
 import logging
 import math
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, Final, Literal
 
 import pytest
@@ -168,13 +168,15 @@ class _FailsSlowlyBeforeTheWrite(RedisCache):
 
 
 class _SlowWrite(RedisCache):
-    """The pod's Redis: each SET takes ``seconds`` before it lands, and the keys it SETs are recorded in order."""
+    """The pod's Redis: each write takes ``seconds`` before it lands, an entry's SET or a revocation's one batch of
+    tombstone SETs and entry DELs; the keys it SETs are recorded in order, and each batch's SETs on their own."""
 
     def __init__(self, redis: RedisCache, clock: _Clock, seconds: float) -> None:
         self._redis = redis
         self._clock = clock
         self.seconds = seconds
         self.set_keys: Final[list[str]] = []  # mutable-ok: records every SET in order
+        self.batches: Final[list[tuple[str, ...]]] = []  # mutable-ok: records each revocation batch's SETs in order
 
     async def async_get_cache_or_raise(self, key: str) -> object:
         return await self._redis.async_get_cache_or_raise(key)
@@ -189,10 +191,18 @@ class _SlowWrite(RedisCache):
     async def async_delete_cache(self, key: str) -> None:
         await self._redis.async_delete_cache(key)
 
+    async def async_set_then_delete_or_raise(
+        self, set_keys: Sequence[str], value: object, ttl: int, delete_keys: Sequence[str]
+    ) -> None:
+        self._clock.now += self.seconds
+        self.set_keys.extend(set_keys)
+        self.batches.append(tuple(set_keys))
+        await self._redis.async_set_then_delete_or_raise(set_keys, value, ttl, delete_keys)
+
 
 class _LostRightAfterASlowWrite(_SlowWrite):
-    """As ``_SlowWrite``, and the Redis server is lost right after each SET lands, until the test restores it: the
-    tombstone check after the entry's write and the undo both fail."""
+    """As ``_SlowWrite``, and the Redis server is lost right after each entry's SET lands, until the test restores it:
+    the tombstone check after the entry's write and the undo both fail."""
 
     def __init__(self, redis: RedisCache, server: FakeServer, clock: _Clock, seconds: float) -> None:
         super().__init__(redis, clock, seconds)
@@ -1343,9 +1353,10 @@ class TestLastGoodEntries:
         assert refused.value.status_code == 503
 
     @pytest.mark.asyncio
-    async def test_a_revocation_checks_its_record_when_each_key_comes_up_not_when_the_call_began(self):
-        """K was revoked earlier. A later call that revokes J then K begins 1 s inside the time its record allows, but
-        J's Redis commands take 2 s, so K's tombstone may lapse before the request's write: K goes to Redis again."""
+    async def test_a_revocation_checks_its_record_again_after_each_pass_not_only_when_the_call_began(self):
+        """K was revoked earlier. A later call that revokes J and K begins 1 s inside the time its record allows for K,
+        so its first pass sends J alone; that pass takes 2 s, so K's tombstone may lapse before the request's write:
+        the next pass sends K to Redis again."""
         clock: Final = _Clock()
         redis: Final = _SlowWrite(fake_redis_cache().cache, clock, seconds=0.0)
         cache: Final = UserApiKeyCache(redis_cache=redis, serve_last_good_entries=True, last_good_clock=clock)
@@ -1353,10 +1364,12 @@ class TestLastGoodEntries:
         clock.now += LAST_GOOD_TOMBSTONE_TTL_SECONDS - LAST_GOOD_LATE_STORE_MARGIN_SECONDS - 1
         redis.seconds = 2.0
         redis.set_keys.clear()
+        redis.batches.clear()
 
         await revoke_last_good(cache, ("hashed-j", "hashed-k"))
 
         assert redis.set_keys == ["last_good_tombstone:hashed-j", "last_good_tombstone:hashed-k"]
+        assert redis.batches == [("last_good_tombstone:hashed-j",), ("last_good_tombstone:hashed-k",)]
 
     @pytest.mark.asyncio
     async def test_a_second_auth_run_in_the_same_task_starts_with_an_empty_record_of_revoked_keys(self):
@@ -1538,3 +1551,148 @@ class TestLastGoodEntries:
         assert refused.value.status_code == 409
         assert deletes == [(f"row-{n}",) for n in range(1, LAST_GOOD_EXACT_DELETE_ROUNDS + 1)]
         assert cache.last_good_memory.tombstoned(last_read) is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "round_trips",
+        [(100.0,), (LAST_GOOD_TOMBSTONE_TTL_SECONDS - LAST_GOOD_LATE_STORE_MARGIN_SECONDS + 1.0, 0.0)],
+        ids=["every_round_trip_slow", "first_round_trip_stalls"],
+    )
+    async def test_a_revocation_returns_only_with_every_tombstone_standing_for_the_margin(
+        self, monkeypatch: pytest.MonkeyPatch, round_trips: tuple[float, ...]
+    ) -> None:
+        """Each Redis round trip of the revoking pod takes time on the driven clock. Sent key after key, the first
+        key's tombstone lapses, or is within the margin of lapsing, before the write after the revocation runs; sent
+        together, and sent again when a pass took that long, every tombstone stands for more than the margin then."""
+        clock: Final = _Clock()
+        redis: Final = fake_redis_cache()
+        cache: Final = _cache_on_driven_clocks(monkeypatch, clock, redis.cache)
+        monkeypatch.setattr(  # test-quality-ok: every Redis call of this cache passes this seam, so it can take time
+            redis.cache, "_admit_async_call", _SlowRoundTrips(clock, round_trips).admit
+        )
+        cache_keys: Final = tuple(f"hashed-key-{n}" for n in range(4))
+        left_at_write: Final[list[tuple[int, ...]]] = []  # mutable-ok: each tombstone's seconds left at the write
+
+        async def write() -> str:
+            client: Final = redis.cache.init_async_client()
+            left_at_write.append(tuple([await client.ttl(f"last_good_tombstone:{key}") for key in cache_keys]))
+            return "written"
+
+        assert await revoke_last_good_then(cache, cache_keys, write) == "written"
+        assert len(left_at_write) == 1
+        assert all(left > LAST_GOOD_LATE_STORE_MARGIN_SECONDS for left in left_at_write[0]), left_at_write
+
+    @pytest.mark.asyncio
+    async def test_a_revocation_whose_every_pass_outlasts_its_tombstones_answers_503_and_leaves_the_write_unmade(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Every Redis round trip takes longer than a tombstone lasts, so no pass can leave the tombstones standing for
+        the write: after LAST_GOOD_REVOCATION_PASSES passes the revocation refuses with 503, saying it took longer than
+        its tombstones last, and the write is not made."""
+        from fastapi import HTTPException
+
+        clock: Final = _Clock()
+        redis: Final = fake_redis_cache()
+        cache: Final = _cache_on_driven_clocks(monkeypatch, clock, redis.cache)
+        slow: Final = _SlowRoundTrips(clock, (LAST_GOOD_TOMBSTONE_TTL_SECONDS + 100.0,))
+        monkeypatch.setattr(  # test-quality-ok: every Redis call of this cache passes this seam, so it can take time
+            redis.cache, "_admit_async_call", slow.admit
+        )
+        written: Final[list[str]] = []  # mutable-ok: records the write if it runs
+
+        async def write() -> None:
+            written.append("written")
+
+        with pytest.raises(HTTPException) as refused:
+            await revoke_last_good_then(cache, ("hashed-key-0", "hashed-key-1"), write)
+
+        assert refused.value.status_code == 503
+        assert "took longer than its tombstones last" in refused.value.detail["error"]
+        assert written == []
+        from litellm.proxy.common_utils.user_api_key_cache import LAST_GOOD_REVOCATION_PASSES
+
+        # Each pass is two round trips, the tombstones' SETs and then the entries' DELs, however many keys
+        assert slow.round_trips == 2 * LAST_GOOD_REVOCATION_PASSES
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("round_trips", "keys", "stored_meanwhile"),
+        [((0.02,), 1000, False), ((0.0, 11.0, 0.0), 2, True)],
+        ids=["round_trips_of_20_ms", "a_drop_stalls"],
+    )
+    async def test_an_entry_another_pod_stores_while_a_revocation_runs_is_not_served_in_a_later_outage(
+        self, monkeypatch: pytest.MonkeyPatch, round_trips: tuple[float, ...], keys: int, stored_meanwhile: bool
+    ) -> None:
+        """With a 10 s tombstone, another pod stores the first key's entry, read from its still-existing row, 11 s into
+        the revocation; Redis is lost right after the revocation, so the eviction after the write is lost too, and comes
+        back for a database outage. Sent key after key (1,000 keys at 20 ms a round trip), the first key's tombstone
+        had lapsed by then and that entry is served in the outage. Sent together, the revocation is over long before;
+        and when a drop stalls 11 s, the pass is sent again, whose drop removes the entry stored meanwhile."""
+        monkeypatch.setattr(  # test-quality-ok: the reviewer's sequence takes a 10 s tombstone; no setting seam
+            "litellm.proxy.common_utils.user_api_key_cache.LAST_GOOD_TOMBSTONE_TTL_SECONDS", 10
+        )
+        clock: Final = _Clock()
+        redis: Final = fake_redis_cache()
+        cache: Final = _cache_on_driven_clocks(monkeypatch, clock, redis.cache)
+        other_pod: Final = _cache_on_driven_clocks(monkeypatch, clock, redis.cache)
+        first_key: Final = "hashed-key-0"
+        stored: Final[list[bool]] = []  # mutable-ok: whether the other pod's store was kept in Redis
+
+        async def another_pod_stores_the_first_key() -> None:
+            with last_good_reads_started_at(clock()):
+                await remember_last_good(other_pod, first_key, UserAPIKeyAuth(token=first_key))
+            stored.append(await redis.cache.init_async_client().exists(f"last_good:{first_key}") == 1)
+
+        monkeypatch.setattr(  # test-quality-ok: every Redis call of this cache passes this seam, so it can take time
+            redis.cache,
+            "_admit_async_call",
+            _SlowRoundTrips(clock, round_trips, events=((clock() + 11.0, another_pod_stores_the_first_key),)).admit,
+        )
+
+        async def delete_after_which_redis_is_lost() -> None:
+            redis.server.connected = False
+
+        await revoke_last_good_then(
+            cache, tuple(f"hashed-key-{n}" for n in range(keys)), delete_after_which_redis_is_lost
+        )
+        redis.server.connected = True
+        outage_pod: Final = _cache_on_driven_clocks(monkeypatch, clock, redis.cache)
+
+        assert await recall_last_good(outage_pod, first_key, UserAPIKeyAuth) is None
+        assert stored == ([True] if stored_meanwhile else [])
+
+
+class _SlowRoundTrips:
+    """The revoking pod's Redis, one round trip at a time: each call through ``RedisCache``'s circuit breaker, once
+    Redis has answered, takes the next of ``seconds`` on ``clock`` (the last one for every call after), and an event
+    whose time the clock has reached runs once, right after that call, as another pod's work done meanwhile. The
+    event's own Redis calls take no time."""
+
+    def __init__(
+        self,
+        clock: _Clock,
+        seconds: Sequence[float],
+        *,
+        events: Sequence[tuple[float, Callable[[], Awaitable[None]]]] = (),
+    ) -> None:
+        self._clock = clock
+        self._seconds = tuple(seconds)
+        self._events: Final = list(events)  # mutable-ok: each event runs once, then leaves
+        self._in_event = False
+        self.round_trips = 0
+
+    async def admit(self, call: Callable[[], Awaitable[object]]) -> object:
+        answer: Final = await call()
+        if self._in_event:
+            return answer
+        self._clock.now += self._seconds[min(self.round_trips, len(self._seconds) - 1)]
+        self.round_trips += 1
+        due: Final = [event for event in self._events if event[0] <= self._clock.now]
+        self._in_event = True
+        try:
+            for event in due:
+                self._events.remove(event)
+                await event[1]()
+        finally:
+            self._in_event = False
+        return answer

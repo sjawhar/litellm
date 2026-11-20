@@ -498,6 +498,13 @@ def _legacy_model_dict(row: _LegacyDumpable) -> Mapping[str, object]:
     return row.dict()
 
 
+class _DumpableKeyRow(Protocol):
+    """A key to archive: the database's row, which the delete paths read, or the proxy's
+    ``LiteLLM_VerificationToken``. The archive copies its columns through ``model_dump``."""
+
+    def model_dump(self) -> Mapping[str, object]: ...
+
+
 def _as_object_dict(values: Mapping[str, object]) -> Mapping[str, object]:
     return values
 
@@ -5200,7 +5207,7 @@ async def delete_verification_tokens(
 
 
 def _transform_verification_tokens_to_deleted_records(
-    keys: Sequence[LiteLLM_VerificationToken],
+    keys: Sequence[_DumpableKeyRow],
     user_api_key_dict: UserAPIKeyAuth,
     litellm_changed_by: str | None = None,
 ) -> list[dict[str, object]]:
@@ -5275,7 +5282,7 @@ async def _save_deleted_verification_token_records(
 
 
 async def persist_deleted_verification_tokens(
-    keys: Sequence[LiteLLM_VerificationToken],
+    keys: Sequence[_DumpableKeyRow],
     prisma_client: PrismaClient,
     user_api_key_dict: UserAPIKeyAuth,
     litellm_changed_by: str | None = None,

@@ -17339,8 +17339,9 @@ async def test_team_member_removal_revokes_and_deletes_a_key_created_after_its_r
 @pytest.mark.asyncio
 async def test_team_member_removal_answers_503_and_keeps_a_late_key_when_redis_is_lost_before_its_round(monkeypatch):
     """Redis is lost once the first round deleted the key the removal read, before the key created since is revoked:
-    the request answers 503 and neither archives nor deletes that key, and the refusal leaves through the
-    transaction, which a real database rolls back with the writes before it."""
+    the request answers 503 and does not delete that key. Its archive, which the round writes before the revocation
+    so that only the delete follows it, is in the transaction the refusal leaves through, which a real database rolls
+    back with the writes before it."""
     from litellm.proxy._types import TeamMemberDeleteRequest
     from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
     from tests.unit.caching.fake_redis_cache import fake_redis_cache
@@ -17367,7 +17368,7 @@ async def test_team_member_removal_answers_503_and_keeps_a_late_key_when_redis_i
         _KeyDelete(where={"token": {"in": [first_token]}}, deleted=(first_token,), tombstoned=(first_token,))
     ]
     assert key_rows.rows == [late_key]
-    assert _archived_tokens(removal.archive) == [[first_token]]
+    assert _archived_tokens(removal.archive) == [[first_token], [late_key.token]]
     removal.audit.assert_not_called()
     # The fake keeps the first round's writes; the refusal leaving through the transaction is what rolls them back
     assert removal.prisma.tx.return_value.__aexit__.await_args.args[0] is HTTPException

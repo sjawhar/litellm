@@ -1148,15 +1148,19 @@ async def _delete_organization_rows(
     cache_keys_of: Callable[[Sequence[_Row]], Sequence[str]],
     delete_read: Callable[[Sequence[_Row]], Awaitable[object]],
     delete_all: Callable[[], Awaitable[object]],
+    prepare: Callable[[Sequence[_Row]], Awaitable[object]] | None = None,
 ) -> Sequence[_Row]:
     """Delete one table's rows of an organization and return the rows deleted. While last good entries are served, only
     the rows a read found are deleted, each round right after the revocation of their entries, until a read finds none
     (``revoke_and_delete_read_rows``), so a row added to the organization after the request's first read, or between a
-    read and its delete, is revoked before its delete too. Otherwise nothing is revoked, and one delete takes every row
-    of the organization."""
+    read and its delete, is revoked before its delete too; ``prepare`` gets each chunk of a round before its
+    revocation. Otherwise nothing is revoked, ``prepare`` gets every row read, and one delete takes every row of the
+    organization."""
     if serves_last_good_entries(user_api_key_cache):
-        return await revoke_and_delete_read_rows(user_api_key_cache, read, cache_keys_of, delete_read)
+        return await revoke_and_delete_read_rows(user_api_key_cache, read, cache_keys_of, delete_read, prepare=prepare)
     rows: Final = await read()
+    if prepare is not None:
+        await prepare(rows)
     await delete_all()
     return rows
 
@@ -1220,28 +1224,28 @@ async def _delete_organization_keys(
 ) -> None:
     """Delete the organization's keys and tombstone them again now that the rows are gone. While last good entries are
     served, each round deletes right after the revocation of its keys' entries, with no Redis while the request's first
-    revocation of them stands (``_delete_organization_rows``). A key's JWT mappings go with it by cascade, so each read
-    of keys also reads the cache keys of their mappings, before those keys are deleted."""
+    revocation of them stands (``_delete_organization_rows``). A key's JWT mappings go with it by cascade, so the cache
+    keys of its mappings are read before its delete: chunk by chunk while last good entries are served, each read
+    covering one chunk's keys right before their revocation, otherwise all of them right after the keys' read."""
     key_filter: Final[_OrganizationIdFilter] = {"organization_id": organization_id}
     key_table: Final = _table(VerificationTokenRepository(prisma_client))
-    jwt_mapping_cache_keys: Final[list[str]] = []  # mutable-ok: grows by the mappings of each read's keys
+    jwt_mapping_cache_keys: Final[list[str]] = []  # mutable-ok: grows by what each read of the keys' mappings finds
 
-    async def read_keys() -> "Sequence[PrismaVerificationToken]":
-        found: Final = await key_table.find_many(where=key_filter)
+    async def read_jwt_mappings(keys: "Sequence[PrismaVerificationToken]") -> None:
         jwt_mapping_cache_keys.extend(
             await get_jwt_key_mapping_cache_keys_for_tokens(
-                hashed_tokens=tuple(key.token for key in found), prisma_client=prisma_client
+                hashed_tokens=tuple(key.token for key in keys), prisma_client=prisma_client
             )
         )
-        return found
 
     deleted_keys: Final = await _delete_organization_rows(
         user_api_key_cache,
-        read_keys,
+        partial(key_table.find_many, where=key_filter),
         lambda rows: tuple(key.token for key in rows),
         # bounded-ok: revoke_and_delete_read_rows hands each call at most IN_LIST_CHUNK_SIZE rows
         lambda rows: key_table.delete_many(where={**key_filter, "token": {"in": [key.token for key in rows]}}),
         partial(key_table.delete_many, where=key_filter),
+        prepare=read_jwt_mappings,
     )
     await delete_cache_key_objects(
         hashed_tokens=tuple(key.token for key in deleted_keys),
