@@ -1426,26 +1426,27 @@ class TestLastGoodEntries:
 
     @pytest.mark.asyncio
     async def test_an_exact_delete_whose_late_row_cannot_be_revoked_answers_503_and_leaves_it(self):
-        """With ``first`` the caller's read is used, and revoked again by the pairing; Redis is lost before the row
-        added since can be revoked, so the 503 leaves it undeleted."""
+        """The first round's row is deleted; Redis is lost before the row added since can be revoked, so the 503
+        leaves it undeleted."""
         from fastapi import HTTPException
 
         redis: Final = fake_redis_cache()
         cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=_Clock())
+        answers: Final = [("read first",), ("late",)]  # mutable-ok: each read takes the next answer
         deletes: Final[list[tuple[str, ...]]] = []  # mutable-ok: records each delete in order
 
         async def read() -> tuple[str, ...]:
-            return ("late",)
+            return answers.pop(0)
 
         async def delete(rows: Sequence[str]) -> None:
             deletes.append(tuple(rows))
             redis.server.connected = False
 
         with pytest.raises(HTTPException) as refused:
-            await revoke_and_delete_read_rows(cache, read, tuple, delete, first=("read before",))
+            await revoke_and_delete_read_rows(cache, read, tuple, delete)
 
         assert refused.value.status_code == 503
-        assert deletes == [("read before",)]
+        assert deletes == [("read first",)]
 
     @pytest.mark.asyncio
     async def test_rows_that_keep_appearing_refuse_with_409_after_the_last_round_and_stay(self):

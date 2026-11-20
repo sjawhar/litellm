@@ -958,16 +958,16 @@ async def revoke_and_delete_read_rows(
     read: Callable[[], Awaitable[Sequence[_Row]]],
     cache_keys_of: Callable[[Sequence[_Row]], Sequence[str]],
     delete: Callable[[Sequence[_Row]], Awaitable[object]],
-    *,
-    first: Sequence[_Row] | None = None,
 ) -> tuple[_Row, ...]:
     """Delete the rows ``read`` finds and only those, each round paired with the revocation of their entries
-    (``revoke_last_good_then``), then read again, until a read finds none. A row added between a read and its delete
-    is not deleted unrevoked: the next round reads, revokes and deletes it. ``first`` is a read the caller already made.
-    When the rows of ``LAST_GOOD_EXACT_DELETE_ROUNDS`` deletes are each followed by more, answers 409 with the rows of
-    the last read kept, their entries not revoked by this call. Returns every row it deleted."""
+    (``revoke_last_good_then``: ``delete`` runs right after it), then read again, until a read finds none. It starts
+    with a read of its own, never an earlier one, so a row added before it began is found too, and a row added between
+    a read and its delete is not deleted unrevoked: the next round reads, revokes and deletes it. ``read`` must see
+    what ``delete`` changes, so a caller with a read replica reads from the writer. When the rows of
+    ``LAST_GOOD_EXACT_DELETE_ROUNDS`` deletes are each followed by more, answers 409 with the rows of the last read
+    kept, their entries not revoked by this call. Returns every row it deleted."""
     deleted: Final[list[_Row]] = []  # mutable-ok: grows by the rows of each round
-    rows = first if first is not None else await read()
+    rows = await read()
     for _ in range(LAST_GOOD_EXACT_DELETE_ROUNDS):
         if not rows:
             return tuple(deleted)

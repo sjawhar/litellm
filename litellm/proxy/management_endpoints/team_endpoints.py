@@ -3656,7 +3656,11 @@ async def _team_member_delete(
             detail={"error": "Either user_id or user_email needs to be passed in"},
         )
 
-    _existing_team_row: Final = await _team_db(prisma_client).find_unique(where={"team_id": data.team_id})
+    # Its alias names the team's entries revoked below, so while those entries are kept it comes from the writer: a
+    # lagging read replica could name an alias the team no longer has
+    _existing_team_row: Final = await TeamRepository(
+        prisma_client, use_writer=serves_last_good_entries(user_api_key_cache)
+    ).table.find_unique(where={"team_id": data.team_id})
 
     if _existing_team_row is None:
         raise HTTPException(
@@ -3794,14 +3798,15 @@ async def _team_member_delete(
             await tx.litellm_verificationtoken.delete_many(where={"token": {"in": [key.token for key in keys]}})
 
         if serves_last_good_entries(user_api_key_cache):
-            # Only the keys read, and revoked above, are deleted; one created for the member in this team since is
-            # read, revoked and deleted in a next round, and keys that keep appearing refuse with 409, rolling back
+            # Only the keys read, and revoked, are deleted. The rounds start with a read of their own in this
+            # transaction (on the writer), not the earlier one, so a key created for the member in this team since,
+            # even when that read found none, is read, revoked, archived and deleted; keys that keep appearing refuse
+            # with 409, rolling the removal back
             _ = await revoke_and_delete_read_rows(
                 user_api_key_cache,
                 partial(member_tx.litellm_verificationtoken.find_many, where=member_keys_where),
                 lambda keys: tuple(key.token for key in keys),
                 archive_and_delete_keys,
-                first=keys_to_delete,
             )
         else:
             # No last good entry to revoke, so the member's keys go in one delete, as without that setting
