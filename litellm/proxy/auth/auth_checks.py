@@ -164,6 +164,7 @@ from .auth_checks_organization import (
 )
 from .auth_utils import (
     body_fallbacks_go_to_anthropic,
+    explained_fallback_name_refusal,
     get_model_from_request,
     get_request_route_template,
     key_fallback_model_names,
@@ -949,6 +950,8 @@ async def _run_fallback_model_checks(
     *,
     fallback_models: Sequence[str],
     provider_fallback_models: Sequence[str],
+    request_body: Mapping[str, object],
+    anthropic_owns_body_fallbacks: bool,
     team_object: LiteLLM_TeamTable | None,
     user_object: LiteLLM_UserTable | None,
     project_object: LiteLLM_ProjectTableCachedObj | None,
@@ -962,7 +965,8 @@ async def _run_fallback_model_checks(
     The team, team member, user, project and agent model checks common_checks() runs on the requested model, run on
     each fallback target: a target can serve the request in the requested model's place. A team key whose team could
     not be read is held to the team models its token records. ``provider_fallback_models`` are the names Anthropic
-    gets as sent; each must mean the model Anthropic serves.
+    gets as sent; each must mean the model Anthropic serves. A refusal says which names came from an entry of the
+    ``request_body``'s fallbacks that the checks read both ways.
     """
     from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
 
@@ -972,70 +976,74 @@ async def _run_fallback_model_checks(
 
     key_model_aliases: Final = key_model_aliases_for_auth_check(valid_token)
     for model in fallback_models:
-        if team_object is not None:
-            try:
-                await can_team_access_model(
+        with explained_fallback_name_refusal(
+            request_body, (model,), skip_body_fallbacks=anthropic_owns_body_fallbacks
+        ):
+            if team_object is not None:
+                try:
+                    await can_team_access_model(
+                        model=model,
+                        team_object=team_object,
+                        llm_router=llm_router,
+                        team_model_aliases=(valid_token.team_model_aliases if valid_token else None),
+                        key_model_aliases=key_model_aliases,
+                    )
+                except ProxyException as team_denial:
+                    if team_denial.type != ProxyErrorTypes.team_model_access_denied:
+                        raise
+                    if not await key_access_group_grants_model(
+                        model=model,
+                        valid_token=valid_token,
+                        team_object=team_object,
+                        llm_router=llm_router,
+                        key_model_aliases=key_model_aliases,
+                    ):
+                        raise
+                if valid_token is not None and valid_token.user_id:
+                    await check_team_member_model_access(
+                        model=model,
+                        team_object=team_object,
+                        valid_token=valid_token,
+                        llm_router=llm_router,
+                        prisma_client=prisma_client,
+                        user_api_key_cache=user_api_key_cache,
+                        proxy_logging_obj=proxy_logging_obj,
+                        team_membership=team_membership,
+                        team_membership_loaded=team_membership_loaded,
+                        key_model_aliases=key_model_aliases,
+                    )
+            else:
+                if valid_token is not None and valid_token.team_id is not None:
+                    _check_fallback_against_unread_team(model=model, valid_token=valid_token, llm_router=llm_router)
+                if user_object is not None:
+                    await can_user_call_model(
+                        model=model,
+                        llm_router=llm_router,
+                        user_object=user_object,
+                        key_model_aliases=key_model_aliases,
+                    )
+            if project_object is not None and len(project_object.models) > 0:
+                can_project_access_model(
                     model=model,
-                    team_object=team_object,
+                    project_object=project_object,
                     llm_router=llm_router,
-                    team_model_aliases=(valid_token.team_model_aliases if valid_token else None),
                     key_model_aliases=key_model_aliases,
                 )
-            except ProxyException as team_denial:
-                if team_denial.type != ProxyErrorTypes.team_model_access_denied:
-                    raise
-                if not await key_access_group_grants_model(
-                    model=model,
-                    valid_token=valid_token,
-                    team_object=team_object,
-                    llm_router=llm_router,
-                    key_model_aliases=key_model_aliases,
-                ):
-                    raise
-            if valid_token is not None and valid_token.user_id:
-                await check_team_member_model_access(
-                    model=model,
-                    team_object=team_object,
-                    valid_token=valid_token,
-                    llm_router=llm_router,
-                    prisma_client=prisma_client,
-                    user_api_key_cache=user_api_key_cache,
-                    proxy_logging_obj=proxy_logging_obj,
-                    team_membership=team_membership,
-                    team_membership_loaded=team_membership_loaded,
-                    key_model_aliases=key_model_aliases,
-                )
-        else:
-            if valid_token is not None and valid_token.team_id is not None:
-                _check_fallback_against_unread_team(model=model, valid_token=valid_token, llm_router=llm_router)
-            if user_object is not None:
-                await can_user_call_model(
-                    model=model,
-                    llm_router=llm_router,
-                    user_object=user_object,
-                    key_model_aliases=key_model_aliases,
-                )
-        if project_object is not None and len(project_object.models) > 0:
-            can_project_access_model(
-                model=model,
-                project_object=project_object,
-                llm_router=llm_router,
-                key_model_aliases=key_model_aliases,
-            )
 
     # The agent checks take every target at once, so a managed agent's access groups, read from the database on each
     # check, load once per request
     targets: Final = list(fallback_models)
-    _check_managed_agent_model_access(model=targets, valid_token=valid_token, llm_router=llm_router)
-    await _check_agent_access_group_model_access(model=targets, valid_token=valid_token, llm_router=llm_router)
-    await _check_agent_caller_model_access(
-        model=targets,
-        valid_token=valid_token,
-        llm_router=llm_router,
-        prisma_client=prisma_client,
-        user_api_key_cache=user_api_key_cache,
-        proxy_logging_obj=proxy_logging_obj,
-    )
+    with explained_fallback_name_refusal(request_body, targets, skip_body_fallbacks=anthropic_owns_body_fallbacks):
+        _check_managed_agent_model_access(model=targets, valid_token=valid_token, llm_router=llm_router)
+        await _check_agent_access_group_model_access(model=targets, valid_token=valid_token, llm_router=llm_router)
+        await _check_agent_caller_model_access(
+            model=targets,
+            valid_token=valid_token,
+            llm_router=llm_router,
+            prisma_client=prisma_client,
+            user_api_key_cache=user_api_key_cache,
+            proxy_logging_obj=proxy_logging_obj,
+        )
 
 
 def _enforce_user_param_check(general_settings: dict, request: Request, request_body: dict, route: str) -> None:
@@ -1419,13 +1427,16 @@ async def common_checks(
     # member, user, project and agent model checks. LiteLLM dispatches its own fallback lists through aliases, but
     # Anthropic gets the names in its own list as sent.
     typed_body: Final = _typed_request_body(request_body)
+    anthropic_owns_body_fallbacks: Final = body_fallbacks_go_to_anthropic(route, request, typed_body)
     router_fallback_models, provider_fallback_models = key_fallback_model_names(
-        typed_body, anthropic_owns_body_fallbacks=body_fallbacks_go_to_anthropic(route, request, typed_body)
+        typed_body, anthropic_owns_body_fallbacks=anthropic_owns_body_fallbacks
     )
     with tracer.trace("litellm.proxy.auth.common_checks.run_fallback_model_checks"):
         await _run_fallback_model_checks(
             fallback_models=tuple(dict.fromkeys((*router_fallback_models, *provider_fallback_models))),
             provider_fallback_models=provider_fallback_models,
+            request_body=typed_body,
+            anthropic_owns_body_fallbacks=anthropic_owns_body_fallbacks,
             team_object=team_object,
             user_object=user_object,
             project_object=project_object,

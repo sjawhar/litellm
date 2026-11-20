@@ -351,12 +351,15 @@ def fallback_entries_are_targets(fallbacks: Sequence[object], field: str) -> boo
 
 def _unsupported_group_map_entry(fallbacks: Sequence[object], field: str) -> str | None:
     # The Router reads a mapping of a list in the group format by its first key and iterates the value it finds there:
-    # a string would be called character by character, a mapping key by key, and an empty mapping has no key.
+    # a string would be called character by character, a mapping key by key, and an empty mapping has no key. An entry,
+    # and an entry of a group's list, that is neither a model name nor a mapping is called as neither.
     if fallback_entries_are_targets(fallbacks, field):
         return None
     for entry in fallbacks:
-        if not isinstance(entry, dict):
+        if isinstance(entry, str):
             continue
+        if not isinstance(entry, dict):
+            return f"must hold model names and mappings, got {type(entry).__name__}"
         if not entry:
             return "must not hold an empty mapping"
         if fallback_entry_is_target(entry):
@@ -366,6 +369,9 @@ def _unsupported_group_map_entry(fallbacks: Sequence[object], field: str) -> str
         for group, chain in entry.items():
             if not isinstance(chain, list):
                 return f"must map model group {group!r} to a list of model groups, got {type(chain).__name__}"
+            unsupported = tuple(type(item).__name__ for item in chain if not isinstance(item, (str, dict)))
+            if unsupported:
+                return f"must map model group {group!r} to model names and mappings, got {unsupported[0]}"
     return None
 
 
