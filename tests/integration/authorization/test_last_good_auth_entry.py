@@ -1,6 +1,8 @@
-"""R69/A79: while the database is unreachable, the gateway serves each key and team it last read from the database,
-whatever the age of its cached entry, enforces the user limits it last read for them, and refuses a caller it never
-read or that was deleted. The database and Redis each sit behind a relay the test takes down and brings back."""
+"""R69/A79: while the database is unreachable, the gateway serves each key and team it last read from the database
+until that entry expires, LAST_GOOD_ENTRY_TTL_SECONDS after the read, enforces the user limits it last read for
+them, and refuses a caller it never read or that was deleted. A narrowing update whose eviction cannot reach Redis
+leaves the old entry served until it expires. The database and Redis each sit behind a relay the test takes down and
+brings back."""
 
 import json
 import os
@@ -29,6 +31,9 @@ pytestmark = pytest.mark.timeout(600)
 MODEL: Final = "last-good-model"
 KEY_ID: Final = "integration-last-good"
 CACHE_TTL_SECONDS: Final = 2
+# A last good entry expires this long after the database read that stored it. The outage checks below run on entries
+# read before the database stopped, so they must all finish within it.
+LAST_GOOD_SECONDS: Final = 120
 # JWT sign-in is an Enterprise feature: the team-by-id and team-by-alias JWT callers run only with a license.
 # Without one, the team path is still exercised through the team key, whose auth reads its team by id.
 JWT_LICENSED: Final = bool(os.environ.get("LITELLM_LICENSE"))
@@ -130,6 +135,12 @@ def _outlive_the_cache() -> None:
     time.sleep(CACHE_TTL_SECONDS + 1)
 
 
+def _outlive_the_last_good_entries(read_by: float) -> None:
+    """Sleep until every last good entry a database read stored before ``read_by`` has expired. The entry's Redis
+    expiry is whole seconds, rounded up, hence the extra seconds; the ordinary cache lapses long before."""
+    time.sleep(max(CACHE_TTL_SECONDS + 1, read_by + LAST_GOOD_SECONDS + 2 - time.monotonic()))
+
+
 def _user_key(proxy: Gateway, *, max_budget: float | None) -> str:
     """A personal key of a new internal user, whose budget the gateway checks on every request."""
     user_id: Final = f"last-good-user-{uuid.uuid4().hex}"
@@ -165,6 +176,10 @@ def test_callers_the_gateway_last_read_are_served_while_the_database_is_stopped(
             "DATABASE_URL": relayed_database,
             "JWT_PUBLIC_KEY_URL": jwks_url,
             "PRISMA_HEALTH_WATCHDOG_ENABLED": "false",
+            "LAST_GOOD_ENTRY_TTL_SECONDS": str(LAST_GOOD_SECONDS),
+            # The breaker opens while Redis is cut; its default 60 s before it probes again would keep the gateway
+            # off Redis, where the entries live, long after the relay is restored.
+            "REDIS_CIRCUIT_BREAKER_RECOVERY_TIMEOUT": "0",
         }
         with owned_proxy(stub, tmp_path, overrides, config=_config(tmp_path, upstream.url, redis.port)) as proxy:
             by_id: Final = string_value(
@@ -188,24 +203,36 @@ def test_callers_the_gateway_last_read_are_served_while_the_database_is_stopped(
             }
             spent_user_key: Final = _user_key(proxy, max_budget=0.0)
             deleted: Final = string_value(proxy.post("/key/generate", {"models": [MODEL]})["key"])
+            unevicted: Final = string_value(proxy.post("/key/generate", {"models": [MODEL]})["key"])
+            callers: Final = {**served, "deleted": deleted, "unevicted": unevicted}
 
-            assert _statuses(proxy, {**served, "deleted": deleted}) == dict.fromkeys((*served, "deleted"), 200)
+            assert _statuses(proxy, callers) == dict.fromkeys(callers, 200)
+            read_by: Final = time.monotonic()
             assert _auth_entries(proxy, served) == dict.fromkeys(served, "fresh"), "the database answers"
             assert _over_budget(_chat(proxy, spent_user_key)), "the user's budget is spent"
             _outlive_the_cache()
             proxy.post("/key/delete", {"keys": [deleted]})
+            redis.cut()
+            # The update writes the row, then its best-effort eviction cannot reach Redis, where the old entry stays.
+            proxy.post("/key/update", {"key": unevicted, "models": ["some-other-model"]})
             database.cut()
 
+            assert _statuses(proxy, served) == dict.fromkeys(served, 200), "the database and Redis are stopped"
+
+            redis.restore()
+            _outlive_the_cache()
             assert _auth_entries(proxy, served) == dict.fromkeys(served, "last_good"), "the database is stopped"
+            assert _auth_entries(proxy, {"unevicted": unevicted}) == {"unevicted": "last_good"}, (
+                "the update could not evict the entry from Redis, so the old models are served until it expires"
+            )
             assert _over_budget(_chat(proxy, spent_user_key)), "the user's budget holds while the database is stopped"
             refused: Final = _statuses(proxy, {"deleted": deleted, "never_read": f"sk-{uuid.uuid4().hex}"})
             assert all(str(outcome).split()[0] in ("401", "503") for outcome in refused.values()), refused
 
-            redis.cut()
-            _outlive_the_cache()
-            assert _statuses(proxy, served) == dict.fromkeys(served, 200), "the database and Redis are stopped"
+            _outlive_the_last_good_entries(read_by)
+            expired: Final = _chat(proxy, unevicted)
+            assert expired.status_code == 503, f"the old entry expired: {_outcome(expired)}"
 
-            redis.restore()
             database.restore()
             narrowed: Final = {"key": served["key"], "models": ["some-other-model"]}
             eventually(
@@ -214,6 +241,7 @@ def test_callers_the_gateway_last_read_are_served_while_the_database_is_stopped(
                 seconds=90,
             )
             assert _chat(proxy, served["key"]).status_code in (401, 403), "the database answered again"
+            assert _chat(proxy, unevicted).status_code in (401, 403), "the update that lost its eviction wrote the row"
             _outlive_the_cache()
             database.cut()
             assert _chat(proxy, served["key"]).status_code in (401, 403), "the refreshed entry is the one served"
