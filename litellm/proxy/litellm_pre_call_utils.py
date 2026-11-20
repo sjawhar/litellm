@@ -717,7 +717,7 @@ def _strip_client_litellm_params(
 # The router merges a dict fallback target into the call's parameters when it falls back to it (``kwargs.update`` in
 # ``run_async_fallback``), after this setup ran on the request root: the router-owned fields and a ``litellm_params``
 # would come back, and a metadata bucket would replace the request's own, identity stamp included. A target keeps
-# its other keys.
+# its other keys; a dict inside a list under one of them (a message, say) is stripped the same way.
 _FALLBACK_TARGET_CLIENT_FIELDS: Final = ROUTER_OWNED_REQUEST_FIELDS | {
     _CLIENT_LITELLM_PARAMS_FIELD,
     "metadata",
@@ -740,10 +740,13 @@ def _strip_overrides_from_fallback_list(field: str, targets: object, depth: int)
     """Strip every dict that is an element of ``targets``, or of a list reachable from it through nested lists and
     the list values of those dicts, whatever its keys: the router resolves these shapes in more than one way but only
     ever merges a list element. A dict held as a dict value is a target's own payload (a tool schema, say) and stays.
-    A group map loses a group named like one of the stripped fields, which is no model group anyone routes."""
+    A model group named like one of the stripped fields can no longer key a group map in a request body: the strip
+    removes that key and does not try to tell such a group from the field."""
     if not isinstance(targets, list):
         return
-    if depth > 2 * litellm.ROUTER_MAX_FALLBACKS:  # the bound is_request_body_safe puts on fallback nesting
+    # The same number is_request_body_safe allows for fallback nesting, but this counts every list level (a list in a
+    # list, a message's content), so it can refuse a body that check accepted.
+    if depth > 2 * litellm.ROUTER_MAX_FALLBACKS:
         raise HTTPException(
             status_code=400,
             detail={
