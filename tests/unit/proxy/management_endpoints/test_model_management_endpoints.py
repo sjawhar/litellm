@@ -696,6 +696,198 @@ class TestModelManagementAuthChecks:
         assert exc_info.value.code == "403"
 
 
+def _federation_field() -> str:
+    from litellm.types.utils import server_owned_wif_litellm_params
+
+    return server_owned_wif_litellm_params[0]
+
+
+# A field only a proxy admin may set on a deployment, inside a fallback entry the deployment's call merges
+_ADMIN_ONLY_ENTRY_FIELDS: Final = (
+    pytest.param("litellm_credential_name", "shared-credential", id="stored-credential"),
+    pytest.param("aws_session_tags", [{"Key": "team", "Value": "genai"}], id="aws-session-tags"),
+    pytest.param(None, "federated-value", id="federation-field"),
+)
+_ENDPOINTS: Final = "litellm.proxy.management_endpoints.model_management_endpoints"
+
+
+def _fallbacks_holding(entry: Mapping[str, object], depth: str) -> list[object]:
+    """The deployment's fallback list with ``entry`` in it, or in the own `fallbacks` of an entry in it"""
+    return [dict(entry)] if depth == "entry" else [{"model": "openai/backup", "fallbacks": [dict(entry)]}]
+
+
+@contextlib.contextmanager
+def _write_route(prisma_client: object, **globals_: object) -> Iterator[None]:
+    """The proxy server globals a write route reads, and its prior auth check, which needs a live DB"""
+    settings: Final = {"prisma_client": prisma_client, "store_model_in_db": True, "premium_user": True, **globals_}
+    with contextlib.ExitStack() as stack:
+        for name, value in settings.items():
+            stack.enter_context(patch(f"litellm.proxy.proxy_server.{name}", value))  # test-quality-ok: route globals
+        stack.enter_context(
+            patch(  # test-quality-ok: the prior auth check needs a live DB; only the field rules are under test
+                f"{_ENDPOINTS}.ModelManagementAuthChecks.can_user_make_model_call", new=AsyncMock(return_value=None)
+            )
+        )
+        yield
+
+
+class TestDeploymentFallbackEntriesGetTheWriteRules:
+    """
+    litellm's own fallback loop merges each entry of a deployment's `fallbacks` into the deployment's call, so an entry
+    may set no more than the deployment's own params: a team admin is refused there what it is refused on the params
+    """
+
+    def setup_method(self):
+        self.admin_user = UserAPIKeyAuth(user_id="test_admin", user_role=LitellmUserRoles.PROXY_ADMIN)
+        self.team_admin_user = UserAPIKeyAuth(
+            user_id="test_user", team_id="test_team", user_role=LitellmUserRoles.INTERNAL_USER
+        )
+
+    @staticmethod
+    def _entry(field: str | None, value: object) -> dict[str, object]:
+        return {"model": "openai/backup", (field or _federation_field()): value}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("depth", ["entry", "nested-entry"])
+    @pytest.mark.parametrize(("field", "value"), _ADMIN_ONLY_ENTRY_FIELDS)
+    async def test_add_new_model_refuses_an_admin_only_field_in_a_fallback_entry(
+        self, field: str | None, value: object, depth: str
+    ):
+        from litellm.proxy._types import ProxyException
+        from litellm.proxy.management_endpoints.model_management_endpoints import add_new_model
+
+        mock_prisma: Final = MagicMock()
+        mock_prisma.writer_db.litellm_uisettings.find_unique = AsyncMock(return_value=None)
+        fallbacks: Final = _fallbacks_holding(self._entry(field, value), depth)
+        with _write_route(mock_prisma), pytest.raises(ProxyException) as exc_info:
+            await add_new_model(
+                model_params=Deployment(
+                    model_name="team-model",
+                    litellm_params=LiteLLM_Params(model="openai/gpt-4o", fallbacks=fallbacks),
+                    model_info={"id": "fallback-entry-create-test", "team_id": "test_team"},
+                ),
+                user_api_key_dict=self.team_admin_user,
+            )
+        assert exc_info.value.code == "403"
+        assert exc_info.value.param == (field or _federation_field())
+        mock_prisma.db.litellm_proxymodeltable.create.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("depth", ["entry", "nested-entry"])
+    @pytest.mark.parametrize(("field", "value"), _ADMIN_ONLY_ENTRY_FIELDS)
+    async def test_update_model_refuses_an_admin_only_field_in_a_fallback_entry(
+        self, field: str | None, value: object, depth: str
+    ):
+        from litellm.proxy._types import ProxyException
+        from litellm.proxy.management_endpoints.model_management_endpoints import update_model
+
+        model_id: Final = "fallback-entry-put-test"
+        existing: Final = Deployment(
+            model_name="team-model",
+            litellm_params=LiteLLM_Params(model="openai/gpt-4o"),
+            model_info={"id": model_id, "team_id": "test_team"},
+        )
+        existing_row: Final = MagicMock()
+        existing_row.model_dump.return_value = existing.model_dump()
+        mock_prisma: Final = MagicMock()
+        mock_prisma.db.litellm_proxymodeltable.find_unique = AsyncMock(return_value=existing_row)
+        mock_prisma.db.litellm_proxymodeltable.update = AsyncMock()
+        fallbacks: Final = _fallbacks_holding(self._entry(field, value), depth)
+        with _write_route(mock_prisma, llm_router=None), pytest.raises(ProxyException) as exc_info:
+            await update_model(
+                model_params=updateDeployment(
+                    litellm_params=updateLiteLLMParams(fallbacks=fallbacks), model_info=ModelInfo(id=model_id)
+                ),
+                user_api_key_dict=self.team_admin_user,
+            )
+        assert exc_info.value.code == "403"
+        assert exc_info.value.param == (field or _federation_field())
+        mock_prisma.db.litellm_proxymodeltable.update.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("depth", ["entry", "nested-entry"])
+    @pytest.mark.parametrize(("field", "value"), _ADMIN_ONLY_ENTRY_FIELDS)
+    async def test_patch_model_refuses_an_admin_only_field_in_a_fallback_entry(
+        self, field: str | None, value: object, depth: str
+    ):
+        from litellm.proxy._types import ProxyException
+        from litellm.proxy.management_endpoints.model_management_endpoints import patch_model
+
+        model_id: Final = "fallback-entry-patch-test"
+        db_model: Final = Deployment(
+            model_name="team-model",
+            litellm_params=LiteLLM_Params(model="openai/gpt-4o"),
+            model_info={"id": model_id, "team_id": "test_team"},
+        )
+        fallbacks: Final = _fallbacks_holding(self._entry(field, value), depth)
+        with (
+            _write_route(MagicMock(), llm_router=MagicMock()),
+            patch(f"{_ENDPOINTS}.get_db_model", new=AsyncMock(return_value=db_model)),  # test-quality-ok: row stub
+            patch(  # test-quality-ok: asserts the DB write is never reached on rejection
+                f"{_ENDPOINTS}._update_team_model_in_db", new=AsyncMock()
+            ) as mock_update,
+            pytest.raises(ProxyException) as exc_info,
+        ):
+            await patch_model(
+                model_id=model_id,
+                patch_data=updateDeployment(litellm_params=updateLiteLLMParams(fallbacks=fallbacks)),
+                user_api_key_dict=self.team_admin_user,
+            )
+        assert exc_info.value.code == "403"
+        assert exc_info.value.param == (field or _federation_field())
+        mock_update.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("field", "value"), _ADMIN_ONLY_ENTRY_FIELDS)
+    async def test_a_proxy_admins_deployment_keeps_an_admin_only_field_in_a_fallback_entry(
+        self, field: str | None, value: object
+    ):
+        params: Final = LiteLLM_Params(
+            model="openai/gpt-4o", fallbacks=_fallbacks_holding(self._entry(field, value), "nested-entry")
+        )
+        assert await ModelManagementAuthChecks.reject_what_a_non_admin_may_not_set(
+            model_params=Deployment(model_name="admin-model", litellm_params=params, model_info={"id": "admin-model"}),
+            litellm_params=params,
+            user_api_key_dict=self.admin_user,
+            prisma_client=MagicMock(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_team_admins_deployment_keeps_a_plain_fallback_list(self):
+        """An entry's own model, endpoint and key are what the writer may set on the deployment itself"""
+        backup_key: Final = "-".join(("backup", "key"))
+        params: Final = LiteLLM_Params(
+            model="openai/gpt-4o",
+            fallbacks=[
+                "openai/gpt-4o-mini",
+                {"model": "openai/backup", "api_base": "https://backup.example.test", "api_key": backup_key},
+            ],
+        )
+        assert await ModelManagementAuthChecks.reject_what_a_non_admin_may_not_set(
+            model_params=Deployment(
+                model_name="team-model", litellm_params=params, model_info={"id": "team-model", "team_id": "test_team"}
+            ),
+            litellm_params=params,
+            user_api_key_dict=self.team_admin_user,
+            prisma_client=MagicMock(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_unchanged_fallback_entry_of_the_stored_deployment_passes(self):
+        """Re-sending the entries a proxy admin stored is not setting them, as re-sending an unchanged field is not"""
+        stored_entry: Final = {"model": "openai/backup", "litellm_credential_name": "shared-credential"}
+        stored: Final = LiteLLM_Params(model="openai/gpt-4o", fallbacks=[stored_entry])
+        assert await ModelManagementAuthChecks.reject_what_a_non_admin_may_not_set(
+            model_params=Deployment(
+                model_name="team-model", litellm_params=stored, model_info={"id": "team-model", "team_id": "test_team"}
+            ),
+            litellm_params=stored,
+            user_api_key_dict=self.team_admin_user,
+            prisma_client=MagicMock(),
+            existing_litellm_params=stored,
+        )
+
+
 class MockModelTable:
     def __init__(self, model_aliases: Dict[str, str], include: Optional[dict] = None):
         for alias, model in model_aliases.items():
