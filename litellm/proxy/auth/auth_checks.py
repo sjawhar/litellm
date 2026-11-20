@@ -5303,6 +5303,7 @@ async def _org_granted_models(
     prisma_client: PrismaClient,
     user_api_key_cache: UserApiKeyCache,
     proxy_logging_obj: ProxyLogging,
+    budgets_enforced: bool = False,
 ) -> Sequence[str]:
     """The org allowlist reached through the key, or through its team when the key names no org."""
     org_id: Final = valid_token.org_id or (team_object.organization_id if team_object is not None else None)
@@ -5317,8 +5318,11 @@ async def _org_granted_models(
             proxy_logging_obj=proxy_logging_obj,
         )
     except LastGoodEntryMissing:
-        # A budgeted group serves the model and only the org can say whether it grants it
-        raise
+        # A budgeted group serves the model and only the org can say whether it grants it; with budget checks
+        # skipped, the groups the other levels grant are still attributed
+        if budgets_enforced:
+            raise
+        return ()
     except Exception as e:  # noqa: BLE001  # fail-safe: attribution degrades to "no org grant", it must never break auth
         verbose_proxy_logger.debug("access group attribution: org lookup failed: %s", e)
         return ()
@@ -5334,6 +5338,7 @@ async def _granted_model_lists(
     proxy_logging_obj: ProxyLogging,
     team_membership: LiteLLM_TeamMembership | None = None,
     team_membership_loaded: bool = False,
+    budgets_enforced: bool = False,
 ) -> tuple[Sequence[str], ...]:
     """One model allowlist per level that participates in authorizing the request."""
     return (
@@ -5355,6 +5360,7 @@ async def _granted_model_lists(
             prisma_client=prisma_client,
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
+            budgets_enforced=budgets_enforced,
         ),
     )
 
@@ -5443,6 +5449,7 @@ async def collect_matched_model_access_groups(
     proxy_logging_obj: ProxyLogging,
     team_membership: LiteLLM_TeamMembership | None = None,
     team_membership_loaded: bool = False,
+    budgets_enforced: bool = False,
 ) -> tuple[str, ...]:
     """
     The budgeted model access groups that authorized this request, sorted and deduplicated.
@@ -5459,6 +5466,9 @@ async def collect_matched_model_access_groups(
     The whole walk is gated on the budget registry, because collecting every match costs a full scan
     of each allowlist where the plain access check stops at the first hit. An empty registry means no
     group carries a budget, so there is nothing to attribute and no work worth doing.
+
+    An org with no last good entry in an outage raises ``LastGoodEntryMissing`` with ``budgets_enforced``;
+    without, it grants nothing and the other levels' matches stand, as for any other failed org lookup.
     """
     if model is None or valid_token is None or llm_router is None or prisma_client is None:
         return ()
@@ -5490,6 +5500,7 @@ async def collect_matched_model_access_groups(
             proxy_logging_obj=proxy_logging_obj,
             team_membership=team_membership,
             team_membership_loaded=team_membership_loaded,
+            budgets_enforced=budgets_enforced,
         )
         for granted_model in granted_models
     )
@@ -5527,6 +5538,7 @@ async def stamp_matched_model_access_groups(
             proxy_logging_obj=proxy_logging_obj,
             team_membership=team_membership,
             team_membership_loaded=team_membership_loaded,
+            budgets_enforced=budgets_enforced,
         )
     except LastGoodEntryMissing:
         if budgets_enforced:
