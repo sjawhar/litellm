@@ -3310,7 +3310,7 @@ class MCPRequestHandler:
             link: Final = object_permission_id or USER_NO_MCP_PERMISSION_SENTINEL
             if user_scope.served:
                 # Not in Redis: memory refills from Redis with a fresh time, so the link could outlive the user's entry
-                keep_last_good_served_copy(user_api_key_cache, cache_key, link)
+                keep_last_good_served_copy(user_api_key_cache, cache_key, link, user_scope)
             else:
                 await user_api_key_cache.async_set_cache(
                     key=cache_key, value=link, ttl=get_management_object_ttl(user_api_key_cache)

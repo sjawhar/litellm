@@ -2302,3 +2302,31 @@ async def test_a_second_auth_run_600_s_after_the_first_in_one_context_keeps_its_
     )
     moved[0] += 1
     assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
+
+
+@pytest.mark.asyncio
+async def test_the_admission_membership_read_records_its_own_start_where_none_is_inherited():
+    """The admission membership read is not deadline-bounded, so it records the start of its read itself: called where
+    no start was recorded, the row it returns is still kept as the member's last good entry."""
+    from types import SimpleNamespace
+
+    from litellm.models.team_membership import LiteLLM_TeamMembership
+    from litellm.proxy.auth.user_api_key_auth import _read_team_membership
+    from litellm.proxy.common_utils.user_api_key_cache import (
+        UserApiKeyCache,
+        last_good_reads_started_at,
+        recall_last_good,
+        team_membership_auth_cache_key,
+    )
+
+    row: Final = LiteLLM_TeamMembership(user_id="u1", team_id="t1")
+    prisma: Final = SimpleNamespace(
+        db=SimpleNamespace(litellm_teammembership=SimpleNamespace(find_first=AsyncMock(return_value=row)))
+    )
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+
+    with last_good_reads_started_at(None):
+        await _read_team_membership(prisma, cache, team_id="t1", user_id="u1")  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+
+    cache_key: Final = team_membership_auth_cache_key(team_id="t1", user_id="u1")
+    assert await recall_last_good(cache, cache_key, LiteLLM_TeamMembership) == row

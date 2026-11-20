@@ -361,6 +361,20 @@ async def test_team_row_the_prefetch_read_is_served_while_the_database_is_unreac
 
 
 @pytest.mark.asyncio
+async def test_the_prefetch_query_records_its_own_start_where_none_is_inherited():
+    """The prefetch query is not deadline-bounded, so it records the start of its reads itself: called where no start
+    was recorded, the rows it returns are still kept as last good entries rather than refused for an unknown expiry."""
+    from litellm.proxy.common_utils.user_api_key_cache import last_good_reads_started_at, recall_last_good
+
+    cache = UserApiKeyCache(in_memory_cache=InMemoryCache(), serve_last_good_entries=True)
+    with last_good_reads_started_at(None):
+        await prefetch_auth_objects(refs=_refs(), user_api_key_cache=cache, prisma_client=_prisma())
+
+    team = await recall_last_good(cache, f"team_id:{TEAM_ID}", LiteLLM_TeamTableCachedObj)
+    assert team is not None and team.team_id == TEAM_ID
+
+
+@pytest.mark.asyncio
 async def test_user_and_organization_rows_the_prefetch_read_are_served_while_the_database_is_unreachable():
     """The prefetch is also the database read for a key's user and organization, whose limits every request is
     checked against: without their last good entries a stopped database refuses the key or drops those limits."""
