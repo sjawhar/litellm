@@ -339,11 +339,31 @@ def _router_fallbacks_key(kwargs: Mapping[str, object], anthropic_messages_call:
     )
 
 
+def _group_mapped_to_a_non_list(fallbacks: Sequence[object], field: str) -> str | None:
+    # The Router calls a `fallbacks` list of targets as is. It reads any other entry that is not a target as a group map
+    # and iterates the value it finds there: a string would be called character by character, a mapping key by key.
+    if field == "fallbacks" and check_non_standard_fallback_format(fallbacks):
+        return None
+    for entry in fallbacks:
+        if isinstance(entry, dict) and not fallback_entry_is_target(entry):
+            for group, chain in entry.items():
+                if not isinstance(chain, list):
+                    return f"must map model group {group!r} to a list of model groups, got {type(chain).__name__}"
+    return None
+
+
 def reject_non_list_litellm_fallbacks(fallbacks: object, model: object, *, field: str = "fallbacks") -> None:
-    """LiteLLM fallback fields hold lists of model groups."""
-    if fallbacks is not None and not isinstance(fallbacks, list):
+    """LiteLLM fallback fields hold lists of model groups, and a group map in one maps each group to such a list."""
+    if fallbacks is None:
+        return
+    problem: Final = (
+        f"must be a list of model groups, got {type(fallbacks).__name__}"
+        if not isinstance(fallbacks, list)
+        else _group_mapped_to_a_non_list(fallbacks, field)
+    )
+    if problem is not None:
         raise litellm.BadRequestError(
-            message=f"LiteLLM {field} must be a list of model groups, got {type(fallbacks).__name__}",
+            message=f"LiteLLM {field} {problem}",
             model=model if isinstance(model, str) else "",
             llm_provider="",
         )
@@ -589,6 +609,15 @@ def get_fallback_model_group_for_lookup_groups(
     return next((result for result in results if result[0] is not None), (None, None))
 
 
+def fallback_entry_is_target(entry: Mapping[str, object]) -> bool:
+    """
+    A fallback entry that names a string ``model`` is one target, whatever the order of its keys, never a model group
+    mapped to the fallbacks under it. The Router's fallback resolution and the proxy's fallback checks both read an
+    entry by this, so they agree on which entries are targets.
+    """
+    return isinstance(entry.get("model"), str)
+
+
 def get_fallback_model_group(fallbacks: list[Any], model_group: str) -> tuple[list[str] | None, int | None]:
     """
     Returns:
@@ -600,15 +629,19 @@ def get_fallback_model_group(fallbacks: list[Any], model_group: str) -> tuple[li
     - stripped model group match
     - provider-prefixed model group match
     - generic fallback
+
+    An entry that names a string model is a target, not a group map, so it matches no group here.
     """
     generic_fallback_idx: int | None = None
     stripped_model_fallback: list[str] | None = None
     fallback_model_group: list[str] | None = None
-    fallback_keys: Final = tuple(next(iter(item)) for item in fallbacks if isinstance(item, dict) and item)
+    fallback_keys: Final = tuple(
+        next(iter(item)) for item in fallbacks if isinstance(item, dict) and item and not fallback_entry_is_target(item)
+    )
     prefixed_model_group: Final = _provider_prefixed_model_group(model_group, fallback_keys)
     ## check for specific model group-specific fallbacks
     for idx, item in enumerate(fallbacks):
-        if isinstance(item, dict):
+        if isinstance(item, dict) and not fallback_entry_is_target(item):
             fallback_key = next(iter(item))
             if fallback_key == model_group:  # check exact match
                 fallback_model_group = item[model_group]

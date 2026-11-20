@@ -34,6 +34,7 @@ from litellm.router_utils.fallback_event_handlers import (
     mid_stream_retry_kwargs,
     record_pre_routing_selection,
     record_retry_attempt,
+    reject_non_list_litellm_fallbacks,
     routed_deployment_id,
     run_async_fallback,
 )
@@ -1423,6 +1424,37 @@ def test_get_fallback_model_group_matches_provider_prefixed_key():
     fallback_model_group, _ = get_fallback_model_group(fallbacks=fallbacks, model_group="gpt-4o")
 
     assert fallback_model_group == ["claude-3-haiku"]
+
+
+def test_get_fallback_model_group_reads_an_entry_that_names_a_model_as_a_target():
+    """An entry with a string ``model`` is a target in any key order, so none of its keys names a group; a ``model``
+    that maps to a list still maps the group named ``model``."""
+    named_target: Final = {"requested": ["forbidden"], "model": "other"}
+    generic_named_target: Final = {"*": ["forbidden"], "model": "other"}
+
+    assert get_fallback_model_group(fallbacks=[named_target], model_group="requested") == (None, None)
+    assert get_fallback_model_group(fallbacks=[generic_named_target], model_group="requested") == (None, None)
+    assert get_fallback_model_group(fallbacks=[{"model": ["a", "b"]}], model_group="model") == (["a", "b"], None)
+
+
+@pytest.mark.parametrize("field", ["fallbacks", "context_window_fallbacks", "content_policy_fallbacks"])
+@pytest.mark.parametrize("chain", ["abc", {"other": []}, 1], ids=["string", "mapping", "number"])
+def test_reject_non_list_litellm_fallbacks_refuses_a_group_mapped_to_a_non_list(field: str, chain: object):
+    with pytest.raises(litellm.BadRequestError, match=f"{field} must map model group 'requested' to a list"):
+        reject_non_list_litellm_fallbacks(["other", {"requested": chain}], "requested", field=field)
+
+
+@pytest.mark.parametrize("field", ["fallbacks", "context_window_fallbacks", "content_policy_fallbacks"])
+def test_reject_non_list_litellm_fallbacks_keeps_group_maps_of_lists_and_targets(field: str):
+    """A string, a group mapped to a list (`model` and `*` included) and a target with scalar params all pass"""
+    fallbacks: Final = ["other", {"requested": ["other"]}, {"*": [{"model": "other"}]}, {"model": ["other"]}]
+    reject_non_list_litellm_fallbacks([*fallbacks, {"model": "other", "n": 1}], "requested", field=field)
+
+
+def test_reject_non_list_litellm_fallbacks_reads_no_group_map_in_a_list_of_targets():
+    """The Router calls a `fallbacks` list of targets as is, so an entry there without a model is an override"""
+    reject_non_list_litellm_fallbacks([{"model": "other"}, {"timeout": 5}], "requested")
+
 
 
 def test_get_fallback_model_group_exact_match_beats_prefixed_match():

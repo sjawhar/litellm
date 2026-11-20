@@ -92,6 +92,12 @@ def test_fallback_model_names_nested_deployment_fallbacks():
     ]
 
 
+def test_fallback_model_names_target_and_group_named_model_shapes():
+    """An entry with a string ``model`` is one target in any key order; ``{"model": [...]}`` maps a group named so."""
+    assert _fallback_model_names([{"requested": ["forbidden"], "model": "other"}]) == ["other"]
+    assert _fallback_model_names([{"model": ["gpt-4", "claude-3"]}]) == ["gpt-4", "claude-3"]
+
+
 def test_fallback_model_names_empty_or_none():
     assert _fallback_model_names(None) == []
     assert _fallback_model_names([]) == []
@@ -1013,6 +1019,142 @@ async def test_a_fallback_the_upstream_error_triggers_never_reaches_a_model_the_
 
     assert result.response.status_code in (401, 403), result.response.text
     assert result.calls["forbidden"] == 0
+
+
+# The upstream error each LiteLLM fallback field falls back on; `fallbacks` takes any error
+_FALLBACK_FIELD_ERRORS: Final = (
+    pytest.param(
+        "context_window_fallbacks",
+        (400, "invalid_request_error", "prompt is too long: 300000 tokens > 200000 maximum"),
+        id="context-window",
+    ),
+    pytest.param(
+        "content_policy_fallbacks",
+        (400, "invalid_request_error", "Output blocked by content filtering policy"),
+        id="content-policy",
+    ),
+    pytest.param("fallbacks", (500, "api_error", "x"), id="fallbacks"),
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("field", "requested_error"), _FALLBACK_FIELD_ERRORS)
+@pytest.mark.parametrize("placement", ["body", "router-settings-override"])
+@pytest.mark.parametrize(
+    "nested_target",
+    [
+        pytest.param(MappingProxyType({"model": "forbidden"}), id="model-the-key-may-not-call"),
+        pytest.param(MappingProxyType({"model": "other", "mock_response": "served by a mock"}), id="mock-param"),
+    ],
+)
+async def test_a_fallback_entry_that_names_a_model_is_never_read_as_a_model_group(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    requested_error: tuple[int, str, str],
+    placement: str,
+    nested_target: Mapping[str, object],
+) -> None:
+    """
+    The entry names the model `other`, so the fallback checks read it as one target and never read the target nested
+    under its first key. The Router reads it the same way, never as the requested group mapped to that target.
+    """
+    entry: Final = {"requested": [dict(nested_target)], "model": "other"}
+    # A string in `fallbacks` keeps the list in the form the Router resolves by group, and serves from `other`
+    entries: Final = ["other", entry] if field == "fallbacks" else [entry]
+    body: Final = {field: entries} if placement == "body" else {"router_settings_override": {field: entries}}
+    result: Final = await _Gateway(monkeypatch, requested_error).send(body)
+
+    # The error fields resolve only groups, so there the request ends in the requested deployment's own error
+    served_by_other: Final = field == "fallbacks"
+    assert result.response.status_code == (200 if served_by_other else requested_error[0]), result.response.text
+    assert "served by a mock" not in result.response.text
+    assert result.calls == {"requested": 1, "other": int(served_by_other), "forbidden": 0, "attacker": 0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "requested_error", "fallbacks"),
+    [
+        pytest.param("fallbacks", (500, "api_error", "x"), ["other"], id="list-of-strings"),
+        pytest.param("fallbacks", (500, "api_error", "x"), [{"model": "other", "max_tokens": 5}], id="list-of-targets"),
+        pytest.param(
+            "fallbacks",
+            (500, "api_error", "x"),
+            [{"max_tokens": 5, "messages": [{"content": "hi", "role": "user"}], "model": "other"}],
+            id="target-with-sorted-keys",
+        ),
+        pytest.param(
+            "fallbacks",
+            (500, "api_error", "x"),
+            [{"stop": ["\n\nHuman:"], "modalities": ["text"], "model": "other"}],
+            id="target-with-string-lists-before-its-model",
+        ),
+        pytest.param("fallbacks", (500, "api_error", "x"), [{"requested": ["other"]}], id="group-map"),
+        pytest.param(
+            "fallbacks", (500, "api_error", "x"), [{"requested": [{"model": "other"}]}], id="group-map-of-targets"
+        ),
+        pytest.param(
+            "context_window_fallbacks",
+            (400, "invalid_request_error", "prompt is too long: 300000 tokens > 200000 maximum"),
+            [{"requested": ["other"]}],
+            id="context-window-group-map",
+        ),
+        pytest.param(
+            "content_policy_fallbacks",
+            (400, "invalid_request_error", "Output blocked by content filtering policy"),
+            [{"requested": ["other"]}],
+            id="content-policy-group-map",
+        ),
+    ],
+)
+async def test_a_documented_fallback_shape_still_serves_the_request(
+    monkeypatch: pytest.MonkeyPatch, field: str, requested_error: tuple[int, str, str], fallbacks: Sequence[object]
+) -> None:
+    result: Final = await _Gateway(monkeypatch, requested_error).send({field: list(fallbacks)})
+
+    assert result.response.status_code == 200, result.response.text
+    assert result.calls == {"requested": 1, "other": 1, "forbidden": 0, "attacker": 0}
+
+
+@pytest.mark.asyncio
+async def test_a_group_named_model_still_falls_back_through_its_group_map(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`{"model": [...]}` names no model: its `model` is a list, so it maps the group named `model` to its fallbacks"""
+    group_named_model: Final = {
+        "model_name": "model",
+        "litellm_params": {"model": "anthropic/model", "api_key": _DEPLOYMENT_KEY, "api_base": _REQUESTED_HOST},
+    }
+    result: Final = await _Gateway(monkeypatch).send(
+        {"model": "model", "fallbacks": [{"model": ["other"]}]},
+        key_models=("model", "other"),
+        extra_deployments=[group_named_model],
+    )
+
+    assert result.response.status_code == 200, result.response.text
+    assert result.calls == {"requested": 1, "other": 1, "forbidden": 0, "attacker": 0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("field", "requested_error"), _FALLBACK_FIELD_ERRORS)
+@pytest.mark.parametrize("placement", ["body", "router-settings-override"])
+@pytest.mark.parametrize(
+    "chain", [pytest.param("abc", id="string"), pytest.param(MappingProxyType({"other": []}), id="mapping")]
+)
+async def test_a_group_mapped_to_a_non_list_is_refused_before_any_call(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    requested_error: tuple[int, str, str],
+    placement: str,
+    chain: str | Mapping[str, object],
+) -> None:
+    """The Router iterates a group's value: a string calls each character as a model, which no fallback check reads"""
+    entries: Final = [{"requested": chain if isinstance(chain, str) else dict(chain)}]
+    body: Final = {field: entries} if placement == "body" else {"router_settings_override": {field: entries}}
+    result: Final = await _Gateway(monkeypatch, requested_error).send(body)
+
+    assert result.response.status_code == 400, result.response.text
+    assert f"LiteLLM {field} must map model group 'requested' to a list of model groups" in result.response.text
+    assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+
 
 
 # A fallback target outside the team's models, in LiteLLM's own list and in Anthropic's list under the beta
