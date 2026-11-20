@@ -1228,6 +1228,13 @@ class _EndUserRows:
             await release.wait()
         return restricted
 
+    async def delete_many(self, where: dict[str, dict[str, list[str]]]) -> int:
+        self._answer()
+        doomed: Final = [user_id for user_id in self.rows if user_id in where["user_id"]["in"]]
+        for user_id in doomed:
+            del self.rows[user_id]
+        return len(doomed)
+
 
 class _BudgetRows:
     """The budget table a customer update writes."""
@@ -1271,6 +1278,23 @@ async def test_customer_block_answers_503_and_writes_nothing_when_redis_cannot_r
         await block_user(data=BlockUsers(user_ids=["c1"]))
 
     assert (refused.value.status_code, rows.rows["c1"].blocked) == (503, False)
+
+
+@pytest.mark.asyncio
+async def test_customer_delete_answers_503_and_deletes_nothing_when_redis_cannot_record_it(monkeypatch):
+    """A deleted customer falls back to the default end-user budget and leaves the restricted registry, so its entries
+    are revoked before the delete: a Redis that cannot record that refuses the delete and the customer stays."""
+    from litellm.proxy.management_endpoints.customer_endpoints import DeleteCustomerRequest, delete_end_user
+
+    redis: Final = fake_redis_cache()
+    redis.server.connected = False
+    rows: Final = _EndUserRows(LiteLLM_EndUserTable(user_id="c1", blocked=True))
+    _serve_end_user_rows(monkeypatch, rows, UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True))
+
+    with pytest.raises(ProxyException) as refused:
+        await delete_end_user(data=DeleteCustomerRequest(user_ids=["c1"]), user_api_key_dict=_ADMIN)
+
+    assert (str(refused.value.code), sorted(rows.rows)) == ("503", ["c1"])
 
 
 @pytest.mark.asyncio

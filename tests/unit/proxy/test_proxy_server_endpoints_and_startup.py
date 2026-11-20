@@ -15188,6 +15188,61 @@ async def test_load_config_serve_last_good_auth_entries_turns_on_the_last_good_s
     assert (await recall_last_good(cache, "hashed-token", UserAPIKeyAuth) is not None) is kept
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("entry_seconds", "cache_seconds", "kept", "notice"),
+    [
+        (0, 60, False, ("ERROR", "turned off: LAST_GOOD_ENTRY_TTL_SECONDS=0,")),
+        (-1, 60, False, ("ERROR", "turned off: LAST_GOOD_ENTRY_TTL_SECONDS=-1,")),
+        (30, 60, True, ("WARNING", "LAST_GOOD_ENTRY_TTL_SECONDS=30 is below user_api_key_cache_ttl=60.0,")),
+        (30, None, True, ("WARNING", "LAST_GOOD_ENTRY_TTL_SECONDS=30 is below user_api_key_cache_ttl=60,")),
+        (None, None, True, None),
+    ],
+    ids=["zero", "negative", "below_user_api_key_cache_ttl", "below_the_default_cache_ttl", "default"],
+)
+async def test_load_config_checks_the_last_good_entry_expiry(
+    tmp_path,
+    monkeypatch,
+    caplog,
+    entry_seconds: int | None,
+    cache_seconds: int | None,
+    kept: bool,
+    notice: tuple[str, str] | None,
+):
+    """0 or less leaves no entry to serve, so the setting starts off with an error naming the value. An expiry below
+    the effective user_api_key_cache_ttl (60 s when unset) only warns, naming both: callers in steady use then lose
+    their entry between database reads. The default 600 s stays on without a word."""
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from litellm.proxy.proxy_server import ProxyConfig
+
+    if entry_seconds is None:
+        assert proxy_server_module.LAST_GOOD_ENTRY_TTL_SECONDS == 600
+    else:
+        monkeypatch.setattr(proxy_server_module, "LAST_GOOD_ENTRY_TTL_SECONDS", entry_seconds)
+    cache_ttl: Final = {} if cache_seconds is None else {"user_api_key_cache_ttl": cache_seconds}
+    config_file: Final = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump({"general_settings": {"serve_last_good_auth_entries": True, **cache_ttl}}))
+    cache: Final = UserApiKeyCache()
+    monkeypatch.setattr(proxy_server_module, "user_api_key_cache", cache)
+    monkeypatch.setattr(proxy_server_module, "general_settings", {}, raising=False)
+    caplog.set_level(logging.WARNING, logger="LiteLLM Proxy")
+
+    await ProxyConfig().load_config(router=None, config_file_path=str(config_file))
+
+    assert cache.serve_last_good_entries is kept
+    notices: Final = [
+        (r.levelname, r.getMessage()) for r in caplog.records if "LAST_GOOD_ENTRY_TTL_SECONDS=" in r.getMessage()
+    ]
+    if notice is None:
+        assert notices == []
+    else:
+        assert len(notices) == 1
+        assert notices[0][0] == notice[0]
+        assert notice[1] in notices[0][1]
+        if notice[0] == "WARNING":
+            assert "callers in steady use lose their last good entry between database reads" in notices[0][1]
+
+
 def test_docs_redoc_openapi_are_reachable_by_default():
     """
     LIT-6745: the interactive/machine-readable docs surfaces are on by

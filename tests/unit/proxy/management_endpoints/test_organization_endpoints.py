@@ -1702,8 +1702,8 @@ async def test_an_organization_nothing_evicted_is_served_while_the_database_is_s
 @pytest.mark.asyncio
 @_SERVING
 async def test_v1_update_evicts_the_organization_and_its_last_good_entries(monkeypatch, serving: bool):
-    """Auth reads the organization cache-first, and its last good entry never expires: an update that leaves either
-    in place keeps enforcing the old limits, during a database outage for ever."""
+    """Auth reads the organization cache-first, and its last good entry lasts until it expires: an update that leaves
+    either in place keeps enforcing the old limits, during a database outage until the entry expires."""
     from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
     from litellm.proxy.management_endpoints import organization_endpoints
     from litellm.proxy.utils import jsonify_object
@@ -1791,3 +1791,40 @@ async def test_delete_organization_evicts_the_organization_and_its_last_good_ent
     )
 
     assert not any((await _org_served_while_the_database_is_stopped(cache, reads, "org-doomed")).values())
+
+
+@pytest.mark.asyncio
+async def test_delete_organization_answers_503_and_deletes_nothing_when_redis_cannot_record_it(monkeypatch):
+    """The organization's own entries are revoked with its teams' and keys' before the first delete, so a Redis that
+    cannot record the revocation refuses the delete with nothing deleted, even for an organization with no team and
+    no key."""
+    from litellm.proxy._types import DeleteOrganizationRequest, LitellmUserRoles, UserAPIKeyAuth
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from litellm.proxy.management_endpoints.organization_endpoints import delete_organization
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis: Final = fake_redis_cache()
+    redis.server.connected = False
+    prisma_client: Final = AsyncMock()
+    prisma_client.db.litellm_teamtable.find_many = AsyncMock(return_value=[])
+    prisma_client.db.litellm_verificationtoken.find_many = AsyncMock(return_value=[])
+    prisma_client.db.litellm_jwtkeymapping = CascadingJWTMappingTable([])
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", prisma_client)
+    monkeypatch.setattr(
+        "litellm.proxy.proxy_server.user_api_key_cache",
+        UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True),
+    )
+    monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", None)
+    admin_key: Final = "sk-admin"
+
+    with pytest.raises(HTTPException) as refused:
+        await delete_organization(
+            data=DeleteOrganizationRequest(organization_ids=["org-doomed"]),
+            user_api_key_dict=UserAPIKeyAuth(api_key=admin_key, user_role=LitellmUserRoles.PROXY_ADMIN),
+        )
+
+    assert refused.value.status_code == 503
+    prisma_client.db.litellm_teamtable.delete_many.assert_not_awaited()
+    prisma_client.db.litellm_organizationmembership.delete_many.assert_not_awaited()
+    prisma_client.db.litellm_verificationtoken.delete_many.assert_not_awaited()
+    prisma_client.db.litellm_organizationtable.delete.assert_not_awaited()

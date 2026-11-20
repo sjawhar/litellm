@@ -12579,8 +12579,9 @@ async def test_team_member_key_duration_only_update_preserves_stored_metadata(ki
 @pytest.mark.asyncio
 @pytest.mark.parametrize("team_member_budget", [5.0, None], ids=["set", "clear"])
 async def test_team_member_budget_change_drops_the_members_last_good_membership_entries(team_member_budget):
-    """Each member's membership carries the team member budget, and its last good entry never expires, so setting
-    or clearing that budget must evict every member's membership, or a database outage enforces the old budget."""
+    """Each member's membership carries the team member budget, and its last good entry lasts until it expires, so
+    setting or clearing that budget must evict every member's membership, or a database outage until then enforces
+    the old budget."""
     from litellm.proxy._types import LiteLLM_BudgetTable, LiteLLM_TeamMembership
     from litellm.proxy.common_utils.user_api_key_cache import (
         UserApiKeyCache,
@@ -14053,6 +14054,7 @@ async def test_team_member_role_change_drops_the_teams_cached_and_last_good_entr
         team_table=LiteLLM_TeamTableCachedObj.model_validate(snapshot.model_dump()),
         user_api_key_cache=cache,
         proxy_logging_obj=None,
+        keep_last_good=True,
     )
     mock_prisma_client = MagicMock()
     mock_prisma_client.db.litellm_teamtable.find_unique = AsyncMock(return_value=team_row)
@@ -16985,6 +16987,7 @@ async def test_team_block_and_unblock_drop_the_cached_team_and_its_last_good_ent
         team_table=LiteLLM_TeamTableCachedObj.model_validate(team.model_dump()),
         user_api_key_cache=cache,
         proxy_logging_obj=None,
+        keep_last_good=True,
     )
     monkeypatch.setattr(
         "litellm.proxy.proxy_server.prisma_client", SimpleNamespace(db=SimpleNamespace(litellm_teamtable=_BlockableTeamRows(team)))
@@ -17067,3 +17070,113 @@ async def test_refresh_cached_team_overwrites_the_last_good_entry_and_tells_ever
     ]
     assert [json.loads(message["data"])["cache_key"] for message in published] == ["team_id:t1"]
     await pubsub.aclose()
+
+
+def _unreachable_redis_cache(*, serve_last_good_entries: bool):
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis: Final = fake_redis_cache()
+    redis.server.connected = False
+    return UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=serve_last_good_entries)
+
+
+@pytest.mark.asyncio
+async def test_delete_team_answers_503_and_writes_nothing_when_redis_cannot_record_it(
+    monkeypatch, disable_audit_logging_for_mocked_team
+):
+    """The deleted-team archive is the delete's first write, so the revocation of the team and its keys comes before
+    it: a Redis that cannot record the revocation refuses the delete with the team, its keys and the archive as they
+    were."""
+    from litellm.proxy._types import DeleteTeamRequest, LiteLLM_VerificationToken
+
+    team: Final = LiteLLM_TeamTable(team_id="team-doomed", team_alias="doomed-team")
+    doomed_key_hash: Final = "hashed-doomed-key"
+    team_key: Final = LiteLLM_VerificationToken(token=doomed_key_hash, team_id="team-doomed")
+    mock_prisma_client: Final = AsyncMock()
+    mock_prisma_client.db.litellm_teamtable.find_unique = AsyncMock(return_value=team)
+    mock_prisma_client.db.litellm_verificationtoken.find_many = AsyncMock(return_value=[team_key])
+    mock_prisma_client.db.litellm_jwtkeymapping = CascadingJWTMappingTable([])
+    mock_prisma_client.db.litellm_deletedteamtable.create_many = AsyncMock()
+    mock_prisma_client.db.litellm_deletedverificationtoken.create_many = AsyncMock()
+    mock_prisma_client.delete_data = AsyncMock()
+    _wire_team_delete_tx(mock_prisma_client)
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", mock_prisma_client)
+    monkeypatch.setattr(
+        "litellm.proxy.proxy_server.user_api_key_cache", _unreachable_redis_cache(serve_last_good_entries=True)
+    )
+    monkeypatch.setattr("litellm.proxy.proxy_server.create_audit_log_for_update", AsyncMock())
+    monkeypatch.setattr("litellm.proxy.proxy_server.litellm_proxy_admin_name", "admin")
+
+    with pytest.raises(HTTPException) as refused:
+        await delete_team(
+            data=DeleteTeamRequest(team_ids=["team-doomed"]),
+            http_request=MagicMock(),
+            user_api_key_dict=UserAPIKeyAuth(user_id="admin-user", user_role=LitellmUserRoles.PROXY_ADMIN.value),
+            litellm_changed_by="admin-user",
+        )
+
+    assert refused.value.status_code == 503
+    mock_prisma_client.db.litellm_deletedteamtable.create_many.assert_not_awaited()
+    mock_prisma_client.db.litellm_deletedverificationtoken.create_many.assert_not_awaited()
+    mock_prisma_client.delete_data.assert_not_awaited()
+    mock_prisma_client.db.litellm_teamtable.delete_many.assert_not_awaited()
+
+
+def _wire_member_removal(monkeypatch, cache):
+    """/team/member_delete of member-1, who holds no key in team-1; the roster, user row, membership and key writes
+    are mocks the endpoint's transaction hands out."""
+    team_row: Final = LiteLLM_TeamTable(
+        team_id="team-1",
+        team_alias="lanes",
+        members_with_roles=[Member(user_id="member-1", role="user"), Member(user_id="admin-user", role="admin")],
+    )
+    prisma: Final = MagicMock()
+    prisma.db.litellm_teamtable.find_unique = AsyncMock(return_value=team_row)
+    prisma.db.litellm_teamtable.update = AsyncMock(return_value=team_row)
+    prisma.db.litellm_usertable.find_many = AsyncMock(
+        return_value=[LiteLLM_UserTable(user_id="member-1", teams=["team-1"])]
+    )
+    prisma.db.litellm_usertable.update = AsyncMock()
+    prisma.db.litellm_teammembership.delete_many = AsyncMock()
+    prisma.db.litellm_verificationtoken.find_many = AsyncMock(return_value=[])
+    prisma.db.litellm_verificationtoken.delete_many = AsyncMock()
+    _wire_member_delete_tx(prisma)
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", prisma)
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
+    return prisma
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("serves_last_good", [True, False], ids=["serving", "not_serving"])
+async def test_team_member_removal_answers_503_and_writes_nothing_when_redis_cannot_record_the_revocation(
+    monkeypatch, serves_last_good: bool
+):
+    """The team's entry lists the member on its roster, the user's entry lists the team and the membership's entry
+    carries the member's limits, so a removal Redis cannot revoke them for is refused with 503 before any write, even
+    when the member holds no key; with last good entries off it writes as before."""
+    from litellm.proxy._types import TeamMemberDeleteRequest
+
+    prisma: Final = _wire_member_removal(
+        monkeypatch, _unreachable_redis_cache(serve_last_good_entries=serves_last_good)
+    )
+    writes: Final = (
+        prisma.db.litellm_teamtable.update,
+        prisma.db.litellm_usertable.update,
+        prisma.db.litellm_teammembership.delete_many,
+        prisma.db.litellm_verificationtoken.delete_many,
+    )
+    request: Final = TeamMemberDeleteRequest(team_id="team-1", user_id="member-1")
+    admin: Final = UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN, user_id="admin-user")
+
+    if not serves_last_good:
+        await team_member_delete(data=request, user_api_key_dict=admin)
+        for write in writes:
+            write.assert_awaited_once()
+        return
+    with pytest.raises(HTTPException) as refused:
+        await team_member_delete(data=request, user_api_key_dict=admin)
+
+    assert refused.value.status_code == 503
+    for write in writes:
+        write.assert_not_awaited()

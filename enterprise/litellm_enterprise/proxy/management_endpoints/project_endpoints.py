@@ -952,8 +952,6 @@ async def delete_project(
                 detail={"error": "Only admins can delete projects"},
             )
 
-        deleted_projects: list[prisma_models.LiteLLM_ProjectTable | None] = []
-
         for project_id in data.project_ids:
             # Check if project exists
             existing_project = await _project_table(prisma_client).find_unique(where={"project_id": project_id})
@@ -979,6 +977,14 @@ async def delete_project(
                     param="project_ids",
                 )
 
+        # Every project's entry is revoked before the first delete, so a Redis that cannot record the revocation
+        # refuses the request with nothing deleted
+        await revoke_last_good(
+            user_api_key_cache, tuple(project_cache_key(project_id) for project_id in data.project_ids)
+        )
+
+        deleted_projects: list[prisma_models.LiteLLM_ProjectTable | None] = []
+        for project_id in data.project_ids:
             # Delete the project
             deleted_project: (
                 prisma_models.LiteLLM_ProjectTable | None

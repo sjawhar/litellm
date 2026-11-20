@@ -837,7 +837,7 @@ async def delete_end_user(
     See below for all params 
     ```
     """
-    from litellm.proxy.proxy_server import prisma_client
+    from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
 
     try:
         if prisma_client is None:
@@ -860,6 +860,9 @@ async def delete_end_user(
                     param="user_ids",
                 )
 
+            # A deleted customer falls back to the default end-user budget and leaves the restricted registry, so its
+            # entries are revoked before the delete, as for a block
+            await revoke_last_good(user_api_key_cache, _end_user_cache_keys(data.user_ids))
             # All users exist, proceed with deletion
             response: Final = await _typed_table(EndUserRepository(prisma_client)).delete_many(
                 where={"user_id": {"in": data.user_ids}}

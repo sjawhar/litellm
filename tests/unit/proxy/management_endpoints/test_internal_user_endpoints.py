@@ -4928,6 +4928,60 @@ async def test_delete_user_evicts_cached_user_rows(mocker: MockerFixture) -> Non
     broadcast.assert_awaited_once_with(cache_key=deleted.user_id)
 
 
+@pytest.mark.asyncio
+async def test_delete_user_answers_503_and_writes_nothing_when_redis_cannot_record_it(mocker: MockerFixture) -> None:
+    """A deleted user's entry carries its teams, and the team's entry lists it on the roster, so both are revoked with
+    the user's keys and memberships before the first write: a Redis that cannot record that refuses /user/delete with
+    nothing written, even for a user holding no key."""
+    from litellm.proxy._types import DeleteUserRequest, LiteLLM_TeamTable, LiteLLM_UserTable, Member
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from litellm.proxy.management_endpoints.internal_user_endpoints import delete_user
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    doomed: Final = LiteLLM_UserTable(user_id="user-gone", user_email="gone@example.test", teams=["team-1"])
+    team: Final = LiteLLM_TeamTable(
+        team_id="team-1", team_alias="lanes", members_with_roles=[Member(user_id="user-gone", role="user")]
+    )
+    prisma_client: Final = mocker.MagicMock()
+    prisma_client.db.litellm_usertable.find_unique = mocker.AsyncMock(return_value=doomed)
+    prisma_client.db.litellm_teamtable.find_many = mocker.AsyncMock(return_value=[team])
+    prisma_client.db.litellm_verificationtoken.find_many = mocker.AsyncMock(return_value=[])
+    prisma_client.db.litellm_jwtkeymapping.find_many = mocker.AsyncMock(return_value=[])
+    prisma_client.db.litellm_teamtable.update = mocker.AsyncMock()
+    for table in ("verificationtoken", "invitationlink", "organizationmembership", "teammembership", "usertable"):
+        getattr(prisma_client.db, f"litellm_{table}").delete_many = mocker.AsyncMock(return_value=0)
+    writes: Final = (
+        prisma_client.db.litellm_teamtable.update,
+        prisma_client.db.litellm_verificationtoken.delete_many,
+        prisma_client.db.litellm_invitationlink.delete_many,
+        prisma_client.db.litellm_organizationmembership.delete_many,
+        prisma_client.db.litellm_teammembership.delete_many,
+        prisma_client.db.litellm_usertable.delete_many,
+    )
+    mocker.patch(  # test-quality-ok: substitute the database dependency
+        "litellm.proxy.proxy_server.prisma_client", prisma_client
+    )
+    redis: Final = fake_redis_cache()
+    redis.server.connected = False
+    mocker.patch(  # test-quality-ok: a real cache over an unreachable Redis
+        "litellm.proxy.proxy_server.user_api_key_cache",
+        UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True),
+    )
+    mocker.patch(  # test-quality-ok: delete_user reads it off proxy_server at call time
+        "litellm.proxy.proxy_server.proxy_logging_obj", None
+    )
+
+    with pytest.raises(HTTPException) as refused:
+        await delete_user(
+            data=DeleteUserRequest(user_ids=[doomed.user_id]),
+            user_api_key_dict=UserAPIKeyAuth(user_id="proxy-admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+        )
+
+    assert refused.value.status_code == 503
+    for write in writes:
+        write.assert_not_awaited()
+
+
 _DB_OUTAGE_503_BODY: Final = {
     "error": {
         "message": "Service Unavailable, the authentication database is temporarily unreachable. Please retry shortly.",

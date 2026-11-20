@@ -2031,7 +2031,7 @@ class TestLastGoodEntryWhileTheDatabaseIsUnreachable:
     @pytest.mark.asyncio
     async def test_rotated_out_key_read_in_its_grace_period_is_not_kept_under_the_old_hash(self):
         """During a regenerate grace period the old hash reads back the new key's row. Keeping that under the old
-        hash, with no expiry, would let a later outage admit the old key after its grace period ended."""
+        hash, until it expires, would let a later outage admit the old key after its grace period ended."""
         database = _Database()
         database.keys["old-hash"] = UserAPIKeyAuth(token="new-hash", models=["claude-opus-5-5"])
         cache = _serving_cache()

@@ -3162,7 +3162,11 @@ async def cache_team_object(
     team_table: LiteLLM_TeamTableCachedObj,
     user_api_key_cache: UserApiKeyCache,
     proxy_logging_obj: ProxyLogging | None,
+    *,
+    keep_last_good: bool,
 ) -> None:
+    """``keep_last_good`` is True when the database just returned ``team_table``, by a read or as the row a write
+    returned, and False for a team patched in the cache, which must not restart its last good entry's expiry."""
     ## CACHE REFRESH TIME!
     team_table.last_refreshed_at = time.time()
 
@@ -3182,7 +3186,8 @@ async def cache_team_object(
         proxy_logging_obj=proxy_logging_obj,
         model_type=LiteLLM_TeamTableCachedObj,
     )
-    await remember_last_good(user_api_key_cache, key, team_table)
+    if keep_last_good:
+        await remember_last_good(user_api_key_cache, key, team_table)
 
     # Invalidate the alias-keyed cache so the JWT auth path with
     # `team_alias_jwt_field` (which reads via `get_team_object_by_alias`)
@@ -3659,6 +3664,7 @@ async def _get_team_object_from_user_api_key_cache(
         team_table=_response,
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
+        keep_last_good=True,
     )
 
     # save to db access time
@@ -3965,6 +3971,7 @@ async def get_team_object_by_alias(
             team_table=team_obj,
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
+            keep_last_good=True,
         )
         await _cache_management_object(
             key=cache_key,

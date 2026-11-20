@@ -2727,14 +2727,22 @@ def _resolve_token_to_update(data: UpdateKeyRequest, existing_key_row: LiteLLM_V
     return existing_key_row.token
 
 
-async def _revoke_key_if_blocking(
-    data: UpdateKeyRequest, existing_key_row: LiteLLM_VerificationToken, user_api_key_cache: UserApiKeyCache
-) -> None:
-    if data.blocked is True:
+async def _revoke_key_if_update_ends_it(
+    data: UpdateKeyRequest,
+    non_default_values: Mapping[str, object],
+    existing_key_row: LiteLLM_VerificationToken,
+    user_api_key_cache: UserApiKeyCache,
+) -> bool:
+    """A block, or an expiry moved to now or earlier, ends the key as a delete does: its last good entry is revoked
+    before the first write, and the eviction after the write tombstones it again. Returns whether the update ends it."""
+    expires: Final = non_default_values.get("expires")
+    ends_key: Final = data.blocked is True or (isinstance(expires, datetime) and expires <= datetime.now(timezone.utc))
+    if ends_key:
         await revoke_last_good(
             user_api_key_cache,
             (hash_token_if_needed(_resolve_token_to_update(data=data, existing_key_row=existing_key_row)),),
         )
+    return ends_key
 
 
 async def _process_single_key_update(
@@ -2898,7 +2906,9 @@ async def _process_single_key_update(
             detail={"error": "Database not connected"},
         )
 
-    await _revoke_key_if_blocking(key_request, existing_key_row, user_api_key_cache)
+    ends_key: Final = await _revoke_key_if_update_ends_it(
+        key_request, non_default_values, existing_key_row, user_api_key_cache
+    )
     update_values: Final = await _handle_update_object_permission(
         data_json=non_default_values,
         existing_key_row=existing_key_row,
@@ -2922,7 +2932,7 @@ async def _process_single_key_update(
         hashed_token=hash_token_if_needed(key_request.key),
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
-        revoked=key_request.blocked is True,
+        revoked=ends_key,
     )
 
     # After the key's own cache entry is dropped, so a failure here cannot leave the key
@@ -3576,8 +3586,9 @@ async def update_key_fn(
         if prisma_client is None:
             raise Exception("Not connected to DB!")
 
-        if data.blocked is True:
-            await revoke_last_good(user_api_key_cache, (hash_token_if_needed(key),))
+        ends_key: Final = await _revoke_key_if_update_ends_it(
+            data, non_default_values, existing_key_row, user_api_key_cache
+        )
         update_values: Final = await _handle_update_object_permission(
             data_json=non_default_values,
             existing_key_row=existing_key_row,
@@ -3610,7 +3621,7 @@ async def update_key_fn(
             hashed_token=hash_token_if_needed(key),
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
-            revoked=data.blocked is True,
+            revoked=ends_key,
         )
 
         # After the key's own cache entry is dropped, so a failure here cannot leave the key

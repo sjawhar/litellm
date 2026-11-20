@@ -1256,6 +1256,7 @@ async def test_team_update_redis():
             team_table=LiteLLM_TeamTableCachedObj(team_id="1234"),
             user_api_key_cache=DualCache(redis_cache=redis_cache),
             proxy_logging_obj=proxy_logging_obj,
+            keep_last_good=True,
         )
 
         mock_client.assert_called()

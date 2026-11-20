@@ -17,6 +17,7 @@ import json
 import traceback
 from collections.abc import Awaitable, Mapping, Sequence
 from datetime import datetime, timezone
+from itertools import chain
 from types import MappingProxyType
 from typing import Any, Final, Literal, Protocol, cast, overload
 
@@ -38,6 +39,7 @@ from litellm.proxy.auth.auth_checks import (
     get_jwt_key_mapping_cache_keys_for_tokens,
     get_team_object,
     get_user_object,
+    team_cache_keys,
 )
 from litellm.proxy.auth.auth_utils import enforce_batch_limits_are_admin_only
 from litellm.proxy.auth.password_policy import (
@@ -51,6 +53,8 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     AUTH_OBJECTS_TARGET,
     object_permission_cache_key,
     revoke_last_good,
+    serves_last_good_entries,
+    team_membership_auth_cache_key,
     user_object_permission_id_cache_key,
 )
 from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
@@ -2495,7 +2499,8 @@ async def delete_user(
                 continue
             target_org_ids_by_user.setdefault(m.user_id, set()).add(m.organization_id)
 
-    # check that all teams passed exist
+    # check that all users passed exist
+    user_rows: Final[list[prisma_models.LiteLLM_UserTable]] = []
     for user_id in data.user_ids:
         user_row = await UserRepository(prisma_client).table.find_unique(where={"user_id": user_id})
 
@@ -2521,15 +2526,33 @@ async def delete_user(
                         )
                     },
                 )
+        user_rows.append(user_row)
 
-        await revoke_last_good(
-            user_api_key_cache,
-            tuple(
-                key.token
-                for key in await _verification_token_table(prisma_client).find_many(where={"user_id": user_id})
+    key_filter: Final[_UserIdInFilter] = {"user_id": {"in": data.user_ids}}
+    keys_to_delete: Final = await _verification_token_table(prisma_client).find_many(where=key_filter)
+    # The users' entries, their keys', and the entries of the teams and memberships they leave are revoked before the
+    # first write; the teams are read for their aliases only while last good entries are served
+    left_team_ids: Final = sorted({team_id for user_row in user_rows for team_id in user_row.teams})
+    left_teams: Final = (
+        await TeamRepository(prisma_client).table.find_many(where={"team_id": {"in": left_team_ids}})
+        if left_team_ids and serves_last_good_entries(user_api_key_cache)
+        else ()
+    )
+    await revoke_last_good(
+        user_api_key_cache,
+        (
+            *data.user_ids,
+            *(key.token for key in keys_to_delete),
+            *chain.from_iterable(team_cache_keys(team.team_id, team.team_alias) for team in left_teams),
+            *(
+                team_membership_auth_cache_key(team_id=team_id, user_id=user_row.user_id)
+                for user_row in user_rows
+                for team_id in user_row.teams
             ),
-        )
+        ),
+    )
 
+    for user_row in user_rows:
         # we do this after the first for loop, since first for loop is for validation. we only want this inserted after validation passes
         if is_audit_logging_enabled():
             # make an audit log for each team deleted
@@ -2547,7 +2570,7 @@ async def delete_user(
                         ),
                         changed_by_api_key=user_api_key_dict.api_key,
                         table_name=LitellmTableNames.USER_TABLE_NAME,
-                        object_id=user_id,
+                        object_id=user_row.user_id,
                         action="deleted",
                         updated_values="{}",
                         before_value=_user_row,
@@ -2585,12 +2608,11 @@ async def delete_user(
                 team_alias=team_alias,
                 user_api_key_cache=user_api_key_cache,
                 proxy_logging_obj=proxy_logging_obj,
+                revoked=True,
             )
     # End of Audit logging
 
     ## DELETE ASSOCIATED KEYS
-    key_filter: Final[_UserIdInFilter] = {"user_id": {"in": data.user_ids}}
-    keys_to_delete: Final = await _verification_token_table(prisma_client).find_many(where=key_filter)
     hashed_tokens_to_delete: Final = tuple(key.token for key in keys_to_delete)
     jwt_mapping_cache_keys: Final = await get_jwt_key_mapping_cache_keys_for_tokens(
         hashed_tokens=hashed_tokens_to_delete,

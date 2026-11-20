@@ -2946,7 +2946,7 @@ class ConfigGeneralSettings(LiteLLMPydanticObjectBase):
         description=(
             "keep the entry each database read returns for the keys, teams, memberships, users, projects, "
             "organizations, customers, tags, model access groups, budgets and global proxy spend a request is checked "
-            "against, in Redis with no expiry and in each worker's memory, and serve it while the database is "
+            "against, in Redis and in each worker's memory until it expires, and serve it while the database is "
             "unreachable, so a database failover does not refuse callers that were just served. A key or team the "
             "database reported missing, or that was deleted or blocked, is still refused, and a request whose limits "
             "have no entry is refused with 503, whatever allow_requests_on_db_unavailable says. While this is on, "
@@ -2961,7 +2961,20 @@ class ConfigGeneralSettings(LiteLLMPydanticObjectBase):
             "the same value as metadata.user_api_key_auth_entries. Creating a customer that is blocked or has a "
             "budget, models, a region, a default model or an object permission, or an update that sets any of them, "
             "also answers 503 and changes nothing when Redis cannot record the revocation of the customer's entry "
-            "and of the registry of restricted customers"
+            "and of the registry of restricted customers. Each entry expires LAST_GOOD_ENTRY_TTL_SECONDS (600 by "
+            "default) after the database read that produced it, in Redis and in each worker's memory alike: only a "
+            "database read sets or restores that time, and serving the entry in an outage never extends it. Only "
+            "these revocations are strict, answering 503 and changing nothing when Redis cannot record them: deleting "
+            "or blocking a key, team, user, organization, project or customer, the revocations of the registry of "
+            "restricted customers, regenerating or rotating a key (for its old token), moving a key's expires to now "
+            "or earlier, removing a team member, and deactivating or deleting a user through SCIM. Every other update "
+            "drops the entries it changes after its write, best effort, so for up to LAST_GOOD_ENTRY_TTL_SECONDS a "
+            "narrowed key, team or other object nobody used since its update, whose eviction was lost, can be served "
+            "with its old models or limits in an outage; a deployment that sets the expiry to, say, 30 days accepts "
+            "that this can last up to 30 days. A value below user_api_key_cache_ttl (60 s when unset) ends the "
+            "entries of callers in steady use between database reads, and start-up warns about it, so set "
+            "LAST_GOOD_ENTRY_TTL_SECONDS above user_api_key_cache_ttl plus the longest database outage to ride out; "
+            "0 or less turns this setting off at start-up with an error"
         ),
     )
     max_request_size_mb: int | None = Field(

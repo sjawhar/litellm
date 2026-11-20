@@ -6395,3 +6395,148 @@ async def test_process_group_patch_operations_rejects_pathless_op_it_cannot_appl
         )
 
     assert exc.value.status_code == 400
+
+
+_SCIM_USER_ID: Final = "scim-leaver"
+_SCIM_MODULE: Final = "litellm.proxy.management_endpoints.scim.scim_v2"
+
+
+def _active_scim_user() -> LiteLLM_UserTable:
+    return LiteLLM_UserTable(user_id=_SCIM_USER_ID, teams=["team-1"], metadata={"scim_active": True})
+
+
+def _scim_user_with_a_key(mocker: MockerFixture, *, serves_last_good: bool) -> MagicMock:
+    """An active SCIM user on team-1's roster holding one unblocked key, behind an unreachable Redis with last good
+    entries served or not. Every write is a mock the test can check."""
+    from litellm.proxy._types import LiteLLM_VerificationToken
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    key_hash: Final = "hashed-scim-key"
+    team: Final = LiteLLM_TeamTable(
+        team_id="team-1",
+        team_alias="lanes",
+        members=[_SCIM_USER_ID],
+        members_with_roles=[Member(user_id=_SCIM_USER_ID, role="user")],
+    )
+    prisma: Final = mocker.MagicMock()
+    prisma.db.litellm_teamtable.find_unique = AsyncMock(return_value=team)
+    prisma.db.litellm_teamtable.update = AsyncMock()
+    prisma.db.litellm_usertable.update = AsyncMock(return_value=_active_scim_user())
+    prisma.db.litellm_usertable.delete = AsyncMock()
+    prisma.db.litellm_verificationtoken.find_many = AsyncMock(
+        return_value=[LiteLLM_VerificationToken(token=key_hash, user_id=_SCIM_USER_ID)]
+    )
+    prisma.db.litellm_verificationtoken.update = AsyncMock()
+    redis: Final = fake_redis_cache()
+    redis.server.connected = False
+    mocker.patch(  # test-quality-ok: a real cache over an unreachable Redis
+        "litellm.proxy.proxy_server.user_api_key_cache",
+        UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=serves_last_good),
+    )
+    mocker.patch(  # test-quality-ok: endpoint collaborators are module-level, not injectable
+        f"{_SCIM_MODULE}._get_prisma_client_or_raise_exception", AsyncMock(return_value=prisma)
+    )
+    mocker.patch(  # test-quality-ok: endpoint collaborators are module-level, not injectable
+        f"{_SCIM_MODULE}._check_user_exists", AsyncMock(return_value=_active_scim_user())
+    )
+    mocker.patch(  # test-quality-ok: endpoint collaborators are module-level, not injectable
+        f"{_SCIM_MODULE}.ScimTransformations.transform_litellm_user_to_scim_user",
+        AsyncMock(
+            return_value=SCIMUser(
+                schemas=["urn:ietf:params:scim:schemas:core:2.0:User"], id=_SCIM_USER_ID, userName=_SCIM_USER_ID
+            )
+        ),
+    )
+    return prisma
+
+
+def _deactivation_patch() -> SCIMPatchOp:
+    return SCIMPatchOp(
+        schemas=["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        Operations=[SCIMPatchOperation(op="replace", path="active", value=False)],
+    )
+
+
+@pytest.mark.asyncio
+async def test_scim_put_deactivation_answers_503_and_writes_nothing_when_redis_cannot_record_it(mocker):
+    """Auth refuses an inactive user from its entry and the deactivation blocks the user's keys, so both are revoked
+    before the first write: a Redis that cannot record that refuses the PUT with nothing written."""
+    prisma: Final = _scim_user_with_a_key(mocker, serves_last_good=True)
+    membership_changes: Final = mocker.patch(  # test-quality-ok: the roster writes are module-level, not injectable
+        f"{_SCIM_MODULE}._handle_team_membership_changes", AsyncMock()
+    )
+    deactivated: Final = SCIMUser(
+        schemas=["urn:ietf:params:scim:schemas:core:2.0:User"],
+        userName=_SCIM_USER_ID,
+        name=SCIMUserName(familyName="Leaver", givenName="Scim"),
+        emails=[SCIMUserEmail(value="leaver@example.com")],
+        active=False,
+    )
+
+    with pytest.raises(ProxyException) as refused:
+        await update_user(user_id=_SCIM_USER_ID, user=deactivated)
+
+    assert str(refused.value.code) == "503"
+    membership_changes.assert_not_awaited()
+    prisma.db.litellm_usertable.update.assert_not_awaited()
+    prisma.db.litellm_verificationtoken.update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_scim_patch_deactivation_answers_503_and_writes_nothing_when_redis_cannot_record_it(mocker):
+    """The PATCH form of a deactivation revokes the same entries before its first write."""
+    prisma: Final = _scim_user_with_a_key(mocker, serves_last_good=True)
+    membership_changes: Final = mocker.patch(  # test-quality-ok: the roster writes are module-level, not injectable
+        f"{_SCIM_MODULE}._handle_team_membership_changes", AsyncMock()
+    )
+
+    with pytest.raises(ProxyException) as refused:
+        await patch_user(user_id=_SCIM_USER_ID, patch_ops=_deactivation_patch())
+
+    assert str(refused.value.code) == "503"
+    membership_changes.assert_not_awaited()
+    prisma.db.litellm_usertable.update.assert_not_awaited()
+    prisma.db.litellm_verificationtoken.update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_scim_patch_deactivation_reads_no_key_and_writes_while_redis_is_down_with_last_good_entries_off(mocker):
+    """With last good entries off nothing is revoked, so a deactivation makes no extra key read and Redis being down
+    does not stop it."""
+    prisma: Final = _scim_user_with_a_key(mocker, serves_last_good=False)
+    mocker.patch(  # test-quality-ok: the roster writes are module-level, not injectable
+        f"{_SCIM_MODULE}._handle_team_membership_changes", AsyncMock()
+    )
+    set_keys_blocked: Final = mocker.patch(  # test-quality-ok: the key block is module-level, not injectable
+        f"{_SCIM_MODULE}._set_user_keys_blocked", AsyncMock(return_value=1)
+    )
+
+    await patch_user(user_id=_SCIM_USER_ID, patch_ops=_deactivation_patch())
+
+    prisma.db.litellm_usertable.update.assert_awaited_once()
+    set_keys_blocked.assert_awaited_once_with(user_id=_SCIM_USER_ID, blocked=True)
+    prisma.db.litellm_verificationtoken.find_many.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_scim_user_delete_answers_503_and_writes_nothing_when_redis_cannot_record_it(mocker):
+    """A deleted user's entry, its keys', the entries of the teams whose roster names it and its memberships are
+    revoked before the first write, so a Redis that cannot record that refuses the DELETE with nothing written."""
+    prisma: Final = _scim_user_with_a_key(mocker, serves_last_good=True)
+    member_delete: Final = mocker.patch(  # test-quality-ok: the roster writes are module-level, not injectable
+        f"{_SCIM_MODULE}.team_member_delete", AsyncMock()
+    )
+    referencing_rows: Final = mocker.patch(  # test-quality-ok: the row cleanup is module-level, not injectable
+        f"{_SCIM_MODULE}._delete_rows_referencing_user", AsyncMock()
+    )
+
+    with pytest.raises(ProxyException) as refused:
+        await delete_user(user_id=_SCIM_USER_ID)
+
+    assert str(refused.value.code) == "503"
+    prisma.db.litellm_teamtable.update.assert_not_awaited()
+    member_delete.assert_not_awaited()
+    prisma.db.litellm_verificationtoken.update.assert_not_awaited()
+    referencing_rows.assert_not_awaited()
+    prisma.db.litellm_usertable.delete.assert_not_awaited()

@@ -11192,6 +11192,38 @@ async def test_block_key_allowed_for_proxy_admin(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_block_key_refuses_and_leaves_the_key_unblocked_when_redis_cannot_record_it(monkeypatch):
+    """A block Redis cannot record would leave the unblocked key where a later database outage serves it, so with last
+    good entries on /key/block answers 503 before the key row changes."""
+    from litellm.proxy._types import BlockKeyRequest
+    from litellm.proxy.management_endpoints.key_management_endpoints import block_key
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    mock_prisma_client, _ = _setup_block_unblock_mocks(monkeypatch)
+    redis: Final = fake_redis_cache()
+    redis.server.connected = False
+    monkeypatch.setattr(
+        "litellm.proxy.proxy_server.user_api_key_cache",
+        UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True),
+    )
+    raw_key: Final = "sk-test123456789"
+    admin_key: Final = "sk-admin"
+
+    with pytest.raises(HTTPException) as refused:
+        await block_key(
+            data=BlockKeyRequest(key=raw_key),
+            http_request=MagicMock(),
+            user_api_key_dict=UserAPIKeyAuth(
+                user_role=LitellmUserRoles.PROXY_ADMIN, api_key=admin_key, user_id="admin_user"
+            ),
+            litellm_changed_by=None,
+        )
+
+    assert refused.value.status_code == 503
+    mock_prisma_client.db.litellm_verificationtoken.update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_block_key_allowed_for_team_admin(monkeypatch):
     """Team admins should be able to block keys belonging to their team."""
     from litellm.proxy._types import BlockKeyRequest
@@ -11651,6 +11683,45 @@ async def test_update_key_to_blocked_refuses_and_writes_nothing_when_redis_canno
 
     assert str(refused.value.code) == "503"
     mock_prisma_client.update_data.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_update_key_moving_expires_to_now_refuses_and_writes_nothing_when_redis_cannot_record_it(monkeypatch):
+    """A duration of 0s moves the key's expiry to now, which ends the key as a block does: with last good entries on
+    and Redis unable to record the revocation, /key/update answers 503 before any row changes."""
+    from litellm.proxy.management_endpoints.key_management_endpoints import update_key_fn
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    test_hashed_token: Final = "e2e2e2e2" * 8
+    admin_key: Final = "sk-admin"
+    existing_key: Final = LiteLLM_VerificationToken(token=test_hashed_token, user_id="admin", models=[])
+    mock_prisma_client: Final = AsyncMock()
+    mock_prisma_client.get_data = AsyncMock(return_value=existing_key)
+    mock_prisma_client.db.litellm_verificationtoken.find_unique = AsyncMock(return_value=existing_key)
+    redis: Final = fake_redis_cache()
+    redis.server.connected = False
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", mock_prisma_client)
+    monkeypatch.setattr(
+        "litellm.proxy.proxy_server.user_api_key_cache",
+        UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True),
+    )
+    monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", MagicMock())
+    monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", None)
+    monkeypatch.setattr("litellm.proxy.proxy_server.premium_user", True)
+
+    with pytest.raises(ProxyException) as refused:
+        await update_key_fn(
+            request=MagicMock(query_params={}),
+            data=UpdateKeyRequest(key=test_hashed_token, duration="0s"),
+            user_api_key_dict=UserAPIKeyAuth(
+                user_role=LitellmUserRoles.PROXY_ADMIN, api_key=admin_key, user_id="admin"
+            ),
+            litellm_changed_by=None,
+        )
+
+    assert str(refused.value.code) == "503"
+    mock_prisma_client.update_data.assert_not_awaited()
+    mock_prisma_client.db.litellm_verificationtoken.update.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -14907,6 +14978,75 @@ async def test_process_single_key_update_to_blocked_refuses_when_redis_cannot_re
 
     assert refused.value.status_code == 503
     mock_prisma_client.update_data.assert_not_awaited()
+
+
+def _key_expiry_database(token_hash: str) -> AsyncMock:
+    updated_key: Final = LiteLLM_VerificationToken(token=token_hash, user_id="admin-user")
+    prisma_client: Final = AsyncMock()
+    prisma_client.update_data = AsyncMock(return_value={"data": updated_key})
+    return prisma_client
+
+
+async def _move_key_expiry_while_redis_is_down(prisma_client: AsyncMock, token_hash: str, duration: str) -> AsyncMock:
+    """The path /key/bulk_update and /team/key/bulk_update take, with last good entries served and Redis unreachable.
+    Returns the key's eviction after the write."""
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    module: Final = "litellm.proxy.management_endpoints.key_management_endpoints"
+    admin_key: Final = "sk-admin"
+    admin: Final = UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN, api_key=admin_key, user_id="admin-user")
+    redis: Final = fake_redis_cache()
+    redis.server.connected = False
+    with (
+        patch(  # test-quality-ok: a proxy admin passes the team member check, which reads the team from the database
+            f"{module}.TeamMemberPermissionChecks.can_team_member_execute_key_management_endpoint", return_value=None
+        ),
+        patch(  # test-quality-ok: observe whether the eviction after the write tombstones the key
+            f"{module}.delete_cache_key_object", new_callable=AsyncMock
+        ) as evict,
+        patch(  # test-quality-ok: the audit hook runs in a task this test does not wait for
+            f"{module}.KeyManagementEventHooks.async_key_updated_hook", new_callable=AsyncMock
+        ),
+    ):
+        await _process_single_key_update(
+            update_key_request=UpdateKeyRequest(key=token_hash, duration=duration),
+            user_api_key_dict=admin,
+            litellm_changed_by=None,
+            prisma_client=prisma_client,
+            user_api_key_cache=UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True),
+            proxy_logging_obj=MagicMock(),
+            llm_router=MagicMock(),
+            existing_key_row=LiteLLM_VerificationToken(token=token_hash, user_id="admin-user", models=[]),
+        )
+    return evict
+
+
+@pytest.mark.asyncio
+async def test_process_single_key_update_moving_expires_to_now_refuses_when_redis_cannot_record_it():
+    """An expiry moved to now ends the key as a block does, on the bulk update routes too: with last good entries on
+    and Redis unable to record the revocation, the update answers 503 and writes nothing."""
+    token_hash: Final = "e0e0e0e0" * 8
+    prisma_client: Final = _key_expiry_database(token_hash)
+
+    with pytest.raises(HTTPException) as refused:
+        await _move_key_expiry_while_redis_is_down(prisma_client, token_hash, duration="0s")
+
+    assert refused.value.status_code == 503
+    prisma_client.update_data.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_process_single_key_update_moving_expires_into_the_future_writes_while_redis_is_down():
+    """A later expiry ends nothing: it is evicted after the write, best effort, and Redis being down does not stop
+    it."""
+    token_hash: Final = "e1e1e1e1" * 8
+    prisma_client: Final = _key_expiry_database(token_hash)
+
+    evict: Final = await _move_key_expiry_while_redis_is_down(prisma_client, token_hash, duration="30d")
+
+    written: Final = prisma_client.update_data.await_args.kwargs["data"]
+    assert written["expires"] > datetime.now(timezone.utc) + timedelta(days=29)
+    assert evict.await_args.kwargs["revoked"] is False
 
 
 @pytest.mark.asyncio

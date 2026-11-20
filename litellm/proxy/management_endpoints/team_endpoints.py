@@ -499,6 +499,7 @@ async def refresh_cached_team(
         team_table=team_table,
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
+        keep_last_good=True,
     )
     alias_keys: Final = (f"team_alias:{team_table.team_alias}",) if team_table.team_alias else ()
     for cache_key in (f"team_id:{team_row.team_id}", *alias_keys):
@@ -3739,7 +3740,20 @@ async def _team_member_delete(
             hashed_tokens=tuple(key.token for key in keys_to_delete),
             prisma_client=prisma_client,
         )
-        await revoke_last_good(user_api_key_cache, tuple(key.token for key in keys_to_delete))
+        # The roster rides on the team's entry, the team on each user's entry and the member limits on each
+        # membership's, so all of them are revoked before the first write, as the deleted keys are
+        await revoke_last_good(
+            user_api_key_cache,
+            (
+                *(team_cache_keys(data.team_id, existing_team_row.team_alias) if removed_team_members else ()),
+                *(user.user_id for user in stale_user_rows),
+                *(
+                    team_membership_auth_cache_key(team_id=data.team_id, user_id=user_id)
+                    for user_id in sorted(user_ids_to_delete)
+                ),
+                *(key.token for key in keys_to_delete),
+            ),
+        )
 
         if removed_team_members:
             await _team_tx_db(tx).update(
@@ -3789,6 +3803,7 @@ async def _team_member_delete(
         team_alias=existing_team_row.team_alias,
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
+        revoked=bool(removed_team_members),
     )
     await delete_cache_key_objects(
         hashed_tokens=tuple(key.token for key in keys_to_delete),
@@ -4433,6 +4448,20 @@ async def delete_team(
 
         team_rows.append(team_row_pydantic)
 
+    # The deleted-team archive below is the first write, so the teams and their keys are revoked before it
+    keys_to_delete: Final = await _tokens_db(prisma_client).find_many(where={"team_id": {"in": data.team_ids}})
+    jwt_mapping_cache_keys: Final = await get_jwt_key_mapping_cache_keys_for_tokens(
+        hashed_tokens=tuple(key.token for key in keys_to_delete),
+        prisma_client=prisma_client,
+    )
+    await revoke_last_good(
+        user_api_key_cache,
+        (
+            *chain.from_iterable(team_cache_keys(team.team_id, team.team_alias) for team in team_rows),
+            *(key.token for key in keys_to_delete),
+        ),
+    )
+
     await _persist_deleted_team_records(
         teams=team_rows,
         prisma_client=prisma_client,
@@ -4476,23 +4505,8 @@ async def delete_team(
     # End of Audit logging
 
     ## DELETE ASSOCIATED KEYS
-    # Fetch keys before deletion to persist them
     from litellm.proxy.management_endpoints.key_management_endpoints import (
         persist_deleted_verification_tokens,
-    )
-
-    keys_to_delete: Final = await _tokens_db(prisma_client).find_many(where={"team_id": {"in": data.team_ids}})
-    jwt_mapping_cache_keys: Final = await get_jwt_key_mapping_cache_keys_for_tokens(
-        hashed_tokens=tuple(key.token for key in keys_to_delete),
-        prisma_client=prisma_client,
-    )
-
-    await revoke_last_good(
-        user_api_key_cache,
-        (
-            *chain.from_iterable(team_cache_keys(team.team_id, team.team_alias) for team in team_rows),
-            *(key.token for key in keys_to_delete),
-        ),
     )
 
     if keys_to_delete:

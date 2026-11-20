@@ -1028,12 +1028,13 @@ async def test_update_project_succeeds_when_cache_eviction_fails(monkeypatch):
 
 
 class _ProjectRows:
-    """One project row the update endpoint writes and auth reads. While ``stopped`` every read fails the way an
-    unreachable Postgres does; ``pause_next_read`` holds the next read once it has the row."""
+    """One project row the update and delete endpoints write and auth reads. While ``stopped`` every read fails the
+    way an unreachable Postgres does; ``pause_next_read`` holds the next read once it has the row."""
 
     def __init__(self, project_id: str) -> None:
         self.project_id = project_id
         self.blocked = False
+        self.deleted = False
         self.stopped = False
         self.read_held = asyncio.Event()
         self._release: asyncio.Event | None = None
@@ -1061,6 +1062,10 @@ class _ProjectRows:
 
     async def update(self, where: Mapping[str, object], data: Mapping[str, object], include: object = None):
         self.blocked = bool(data.get("blocked", self.blocked))
+        return self._row()
+
+    async def delete(self, where: Mapping[str, object]) -> mock.MagicMock:
+        self.deleted = True
         return self._row()
 
 
@@ -1095,6 +1100,32 @@ async def test_project_block_answers_503_and_writes_nothing_when_redis_cannot_re
         await _block_project(rows.project_id)
 
     assert (str(refused.value.code), rows.blocked) == ("503", False)
+
+
+@pytest.mark.asyncio
+async def test_project_delete_answers_503_and_deletes_nothing_when_redis_cannot_record_it(monkeypatch):
+    """A deleted project's entry is revoked before the delete, so a Redis that cannot record the revocation refuses
+    the delete and the project stays."""
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis: Final = fake_redis_cache()
+    redis.server.connected = False
+    rows: Final = _ProjectRows(f"project-{uuid.uuid4()}")
+    prisma: Final = _serve_project_rows(
+        monkeypatch, rows, UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True)
+    )
+    prisma.db.litellm_verificationtoken.find_many = mock.AsyncMock(return_value=[])
+
+    with pytest.raises(ProxyException) as refused:
+        await delete_project(
+            data=DeleteProjectRequest(project_ids=[rows.project_id]),
+            http_request=Request(scope={"type": "http"}),
+            user_api_key_dict=UserAPIKeyAuth(
+                user_role=LitellmUserRoles.PROXY_ADMIN, api_key=MASTER_KEY, user_id="1234"
+            ),
+        )
+
+    assert (str(refused.value.code), rows.deleted) == ("503", False)
 
 
 @pytest.mark.asyncio

@@ -96,8 +96,8 @@ async def test_new_budget_success(client_and_mocks):
 async def test_update_budget_drops_the_last_good_entries_of_everything_on_it(client_and_mocks, monkeypatch):
     """Keys, memberships, organizations, projects, customers, tags and model access groups carry their budget row, a
     key also carries its organization's and its team membership's, and the default customer and team-member budgets
-    are cached by id. A last good entry never expires, so a changed budget must evict all of them, or a database
-    outage enforces the old limits."""
+    are cached by id. A last good entry lasts until it expires, so a changed budget must evict all of them, or a
+    database outage until then enforces the old limits."""
     from litellm.proxy._types import LiteLLM_BudgetTable
     from litellm.proxy.common_utils.user_api_key_cache import (
         UserApiKeyCache,
@@ -176,7 +176,7 @@ async def test_update_budget_drops_the_last_good_entries_of_everything_on_it(cli
 @pytest.mark.asyncio
 async def test_update_budget_evicts_the_other_holders_when_one_table_cannot_be_read(client_and_mocks, monkeypatch):
     """A budget update reads seven tables. One of them failing must not leave the keys on the budget serving their
-    old limits from a last good entry that never expires."""
+    old limits from a last good entry until it expires."""
     from litellm.proxy._types import LiteLLM_BudgetTable
     from litellm.proxy.common_utils.user_api_key_cache import (
         UserApiKeyCache,

@@ -199,6 +199,10 @@ class _OrganizationIdFilter(TypedDict):
     organization_id: ReadOnly[str]
 
 
+class _OrganizationIdInFilter(TypedDict):
+    organization_id: ReadOnly[Mapping[str, Sequence[str]]]
+
+
 class _ObjectPermissionTxClient(Protocol):
     async def upsert(
         self, where: Mapping[str, object], data: Mapping[str, object]
@@ -1068,6 +1072,20 @@ async def delete_organization(
             detail={"error": "Only proxy admins can delete organizations"},
         )
 
+    # The organizations' entries, their teams' and their keys' are revoked before the first delete, so a Redis that
+    # cannot record the revocation refuses the request with nothing deleted
+    orgs_filter: Final[_OrganizationIdInFilter] = {"organization_id": {"in": data.organization_ids}}
+    teams: Final = await _table(TeamRepository(prisma_client)).find_many(where=orgs_filter)
+    keys: Final = await _table(VerificationTokenRepository(prisma_client)).find_many(where=orgs_filter)
+    await revoke_last_good(
+        user_api_key_cache,
+        (
+            *chain.from_iterable(organization_cache_keys(organization_id) for organization_id in data.organization_ids),
+            *chain.from_iterable(team_cache_keys(team.team_id, team.team_alias) for team in teams),
+            *(key.token for key in keys),
+        ),
+    )
+
     deleted_orgs: Final = []
     for organization_id in data.organization_ids:
         await _delete_organization_teams(
@@ -1110,18 +1128,10 @@ async def _delete_organization_teams(
     user_api_key_cache: UserApiKeyCache,
     proxy_logging_obj: ProxyLogging | None,
 ) -> None:
-    """Delete the organization's teams after recording the revocation of their last good entries and those of the
-    organization's keys, so neither outlives the delete in a store that never expires."""
+    """Delete the organization's teams, whose last good entries the request revoked before its first delete, and
+    tombstone them again now that the rows are gone."""
     org_filter: Final[_OrganizationIdFilter] = {"organization_id": organization_id}
     teams: Final = await _table(TeamRepository(prisma_client)).find_many(where=org_filter)
-    keys: Final = await _table(VerificationTokenRepository(prisma_client)).find_many(where=org_filter)
-    await revoke_last_good(
-        user_api_key_cache,
-        (
-            *chain.from_iterable(team_cache_keys(team.team_id, team.team_alias) for team in teams),
-            *(key.token for key in keys),
-        ),
-    )
     await _table(TeamRepository(prisma_client)).delete_many(where=org_filter)
     for team in teams:
         await delete_cache_team_object(
