@@ -593,7 +593,8 @@ class _FallbackRead:
     read lies above it, so a walk is linear in the entries. ``budget`` caps the entries of all the lists, each counted
     once however many ways it is read, and the walk's entry visits at _VISITS_PER_BUDGETED_ENTRY per entry of it;
     None leaves both uncounted. What the walk reaches in the way ``enforced`` reads it is refused at once past either;
-    ``every`` tallies all it reaches, for a walk whose targets turn out to make every way enforced.
+    ``every`` tallies all it reaches, for a walk whose targets turn out to make every way enforced. A branch read only
+    in a way ``enforced`` does not read waits in ``deferred`` until the walk has read everything ``enforced`` reads.
     """
 
     reading: FallbackReading
@@ -602,10 +603,11 @@ class _FallbackRead:
     read: set[tuple[object, ...]]  # mutable-ok: one walk's own record of what it read, never handed out
     enforced_tally: _FallbackTally
     every_tally: _FallbackTally
+    deferred: list[Iterator[FallbackEntry | FallbackListRead]]  # mutable-ok: the walk's own queue of tried branches
 
     @classmethod
     def start(cls, reading: FallbackReading, budget: int | None, enforced: FallbackReading) -> "_FallbackRead":
-        return cls(reading, budget, enforced, set(), _FallbackTally(set()), _FallbackTally(set()))
+        return cls(reading, budget, enforced, set(), _FallbackTally(set()), _FallbackTally(set()), [])
 
     def first_read(self, way: tuple[object, ...]) -> bool:
         if way in self.read:
@@ -613,11 +615,22 @@ class _FallbackRead:
         self.read.add(way)
         return True
 
+    def enforces(self, *, widest: bool, via: bool) -> bool:
+        """Whether the reading the request is checked in reads what the walk reaches in this way"""
+        return _read_in(self.enforced, widest=widest, via=via)
+
+    def drained(self, events: Iterator[FallbackEntry | FallbackListRead]) -> Iterator[FallbackEntry | FallbackListRead]:
+        """The walk's events: everything the checked reading reads first, then each branch it deferred"""
+        yield from events
+        # Iterating a list reads the items appended while it runs, so a branch a deferred one defers is read too
+        for branch in self.deferred:
+            yield from branch
+
     def count(self, container: object, entries: int, field: str | None, *, widest: bool, via: bool) -> None:
         if self.budget is None:
             return
         self.every_tally.add_entries(container, entries, self.budget, field)
-        if _read_in(self.enforced, widest=widest, via=via):
+        if self.enforces(widest=widest, via=via):
             refusal: Final = self.enforced_tally.add_entries(container, entries, self.budget, field)
             if refusal is not None:
                 raise refusal
@@ -634,7 +647,7 @@ class _FallbackRead:
         """One entry the walk reaches, counted as a visit before it is read"""
         if self.budget is not None:
             self.every_tally.add_visit(self.budget)
-            if _read_in(self.enforced, widest=widest, via=via):
+            if self.enforces(widest=widest, via=via):
                 refusal: Final = self.enforced_tally.add_visit(self.budget)
                 if refusal is not None:
                     raise refusal
@@ -683,19 +696,20 @@ def walk_fallback_lists(
     enforce it too: it counts toward the budget, and is refused past it, only once the walk shows they do. Until then
     nothing bounds it but the memo, one visit per node per way of reading it, which keeps it linear in the body for a
     parsed JSON body, a tree.
+
+    The walk reads everything the checked reading reads before any branch it only tries (_FallbackRead.drained), so a
+    body over the budget in the checked reading is refused within that reading's visits, which the visit cap bounds,
+    on every route and header state: the tried reading is walked only once the checked one has passed. When the tried
+    reading then shows both readings apply, its entries are charged as the checked reading's are.
     """
     if not anthropic_messages_call:
-        return _recorded(
-            iter_body_fallback_entries(
-                body, _FallbackRead.start(FallbackReading.LITELLM, budget, FallbackReading.LITELLM)
-            ),
-            FallbackReading.LITELLM,
-        )
+        litellm_walk: Final = _FallbackRead.start(FallbackReading.LITELLM, budget, FallbackReading.LITELLM)
+        return _recorded(litellm_walk.drained(iter_body_fallback_entries(body, litellm_walk)), FallbackReading.LITELLM)
     request_beta: Final = provider_owns_fallbacks_field(carriers, anthropic_messages_call=True)
     walk: Final = _FallbackRead.start(
         FallbackReading.BOTH, budget, FallbackReading.ANTHROPIC if request_beta else FallbackReading.LITELLM
     )
-    both_ways: Final = _recorded(iter_body_fallback_entries(body, walk), FallbackReading.BOTH)
+    both_ways: Final = _recorded(walk.drained(iter_body_fallback_entries(body, walk)), FallbackReading.BOTH)
     if both_ways.error is not None:
         # The checks refuse the lists; nothing is known of their hops until then
         return both_ways
@@ -717,7 +731,8 @@ def walk_fallback_lists(
 
 def walk_fallback_list(value: object, field: str, reading: FallbackReading) -> FallbackWalk:
     """One walk of the fallback list ``field`` holds, its targets' own ``fallbacks`` read as ``reading`` says"""
-    return _recorded(iter_fallback_entries(value, field, _FallbackRead.start(reading, None, reading)), reading)
+    walk: Final = _FallbackRead.start(reading, None, reading)
+    return _recorded(walk.drained(iter_fallback_entries(value, field, walk)), reading)
 
 
 def _list_readings(
@@ -885,7 +900,8 @@ def iter_body_fallback_entries(
     The entries of every fallback list a request body carries, the request's own or a target's merged into the call:
     its fallback fields, those of its router_settings_override, and the models its context_window_fallback_dict swaps
     in. Its own ``fallbacks`` is read as the walk's reading says: Anthropic's, read in the widest way, LiteLLM's, or
-    both. A body the walk read before in the same way yields nothing again.
+    both. A way of reading it that the request is not checked in waits in the walk's ``deferred``. A body the walk
+    read before in the same way yields nothing again.
     """
     if not walk.first_read(("body", id(body), depth, widest_reading, group, via_litellm_fallbacks)):
         return
@@ -902,7 +918,7 @@ def iter_body_fallback_entries(
                 widest_reading=widest_reading,
                 via_litellm_fallbacks=via_litellm_fallbacks,
             ):
-                yield from iter_fallback_entries(
+                branch = iter_fallback_entries(
                     value,
                     field,
                     walk,
@@ -911,6 +927,11 @@ def iter_body_fallback_entries(
                     group=group,
                     via_litellm_fallbacks=via,
                 )
+                if walk.enforces(widest=anthropic_list, via=via):
+                    yield from branch
+                else:
+                    # Only tried: read once everything the checked reading reads has passed
+                    walk.deferred.append(branch)
     context_window_swaps: Final = body.get(CONTEXT_WINDOW_FALLBACK_DICT_FIELD)
     if _is_mapping(context_window_swaps):
         # Each value is the model the client wrapper swaps in, so the values are a list of targets

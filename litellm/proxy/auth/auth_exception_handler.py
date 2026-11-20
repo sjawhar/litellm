@@ -166,9 +166,13 @@ class UserAPIKeyAuthExceptionHandler:
         )
 
         # The fallback identity carries none of the checks a model in Anthropic's own fallbacks needs, so such a request
-        # gets the error as with the setting off
+        # gets the error as with the setting off. The fallback lists are walked only for a database error, the one this
+        # recovers, so a request refused for anything else is not walked a second time.
         if (
-            not request_names_provider_fallback_models(request_data, route, request)
+            (
+                not PrismaDBExceptionHandler.is_database_connection_error(e)
+                or not request_names_provider_fallback_models(request_data, route, request)
+            )
             and PrismaDBExceptionHandler.should_allow_request_on_db_unavailable()
             and PrismaDBExceptionHandler.is_database_connection_error(e)
         ):
