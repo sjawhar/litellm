@@ -38,7 +38,7 @@ from litellm.router_utils.clientside_credential_handler import (
     reject_fallback_target_credentials,
     reject_fallback_target_routing,
 )
-from litellm.router_utils.fallback_event_handlers import ROUTER_FALLBACKS_KWARG
+from litellm.router_utils.fallback_event_handlers import ROUTER_FALLBACKS_KWARG, fallback_entry_is_target
 from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     LITELLM_PASS_THROUGH_ENDPOINT_MARKER,
 )
@@ -575,7 +575,7 @@ def _iter_fallback_targets(value: object, depth: int) -> Iterator[str | Mapping[
             values = tuple(item.values())
             if not (values and all(isinstance(v, list) for v in values)):
                 yield item
-            if isinstance(item.get("model"), str):
+            if fallback_entry_is_target(item):
                 for field in _FALLBACK_FIELDS:
                     yield from _iter_fallback_targets(item.get(field), depth + 1)
             else:
