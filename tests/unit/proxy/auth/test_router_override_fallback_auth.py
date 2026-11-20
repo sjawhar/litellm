@@ -106,6 +106,37 @@ def test_fallback_model_names_read_a_parameter_only_entry_as_a_target():
     assert _fallback_model_names([{"gpt-3.5-turbo": ["gpt-4", stop]}]) == ["gpt-4"]
 
 
+def test_fallback_model_names_read_a_targets_model_switching_fields_as_a_bodys():
+    """A target's context-window swap and its own router_settings_override name models as the body's do."""
+    swap: Final = {"model": "gpt-4", "context_window_fallback_dict": {"gpt-4": "gpt-4-32k"}}
+    override: Final = {"model": "gpt-4", "router_settings_override": {"fallbacks": ["o1"]}}
+    assert _fallback_model_names([swap]) == ["gpt-4", "gpt-4-32k"]
+    assert _fallback_model_names([{"primary": [override]}]) == ["gpt-4", "o1"]
+
+
+@pytest.mark.parametrize("anthropic_owns", [False, True], ids=["litellm-fallbacks", "anthropic-fallbacks"])
+def test_a_nested_list_as_a_fallback_entry_is_refused_in_either_reading(anthropic_owns: bool):
+    from litellm.proxy.auth.auth_utils import key_fallback_model_names
+
+    with pytest.raises(ValueError, match="a fallback list entry must be a model name or a mapping, got list"):
+        key_fallback_model_names({"fallbacks": [["other"]]}, anthropic_owns_body_fallbacks=anthropic_owns)
+
+
+def test_a_targets_model_list_is_refused_as_the_bodys_is_even_with_client_side_credentials():
+    """litellm.acompletion picks its deployment from a model_list, which the body may never carry"""
+    from litellm.proxy.auth.auth_utils import is_request_body_safe
+
+    target: Final = {"model": "primary", "model_list": [{"model_name": "primary", "litellm_params": {"model": "x"}}]}
+    with pytest.raises(ValueError, match="model_list is not allowed"):
+        is_request_body_safe(
+            {"model": "primary", "fallbacks": [target]},
+            {"allow_client_side_credentials": True},
+            _router_without_fallback_group(),
+            "primary",
+        )
+
+
+
 def test_fallback_model_names_empty_or_none():
     assert _fallback_model_names(None) == []
     assert _fallback_model_names([]) == []
@@ -1327,6 +1358,11 @@ def test_a_param_the_body_check_refuses_in_a_targets_nested_config_is_refused(fi
 
 
 _CONTEXT_WINDOW_ERROR: Final = (400, "invalid_request_error", "prompt is too long: 300000 tokens > 200000 maximum")
+# What a refusal adds for an entry the fallback checks read both as a model group map and as a parameter override
+_READ_BOTH_WAYS_NOTE: Final = (
+    "The fallbacks entry {entry} names no model, so it was checked both as a model group the Router maps to its "
+    "fallbacks and as a parameter override litellm's own fallback loop merges into the call."
+)
 
 
 @pytest.mark.asyncio
@@ -1374,14 +1410,99 @@ async def test_a_saved_settings_target_with_tags_in_its_metadata_is_still_served
     assert result.calls == {"requested": 1, "other": 1, "forbidden": 0, "attacker": 0}
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("swap_to", "served"),
+    [pytest.param("forbidden", False, id="model-the-key-may-not-call"), pytest.param("requested", True, id="allowed")],
+)
+async def test_a_targets_context_window_swap_on_a_router_hop_is_checked_as_the_bodys(
+    monkeypatch: pytest.MonkeyPatch, swap_to: str, served: bool
+) -> None:
+    """The Router's hop leaves the swap unread, but the target is checked as a body is: a forbidden swap is refused"""
+    target: Final = {"model": "other", "context_window_fallback_dict": {"other": swap_to}}
+    result: Final = await _Gateway(monkeypatch, _CONTEXT_WINDOW_ERROR).send(
+        {"context_window_fallbacks": [{"requested": [target]}]}
+    )
+
+    if served:
+        assert result.response.status_code == 200, result.response.text
+        assert result.calls == {"requested": 1, "other": 1, "forbidden": 0, "attacker": 0}
+        return
+    assert result.response.status_code in (401, 403), result.response.text
+    assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+
+
+@pytest.mark.asyncio
+async def test_a_targets_own_fallbacks_under_the_beta_get_the_refusals_of_anthropics_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Under the beta a hop sends the target's `fallbacks` to Anthropic, so a name there with an alias is refused"""
+    target: Final = {"model": "other", "fallbacks": [{"model": _ALIASED_PROVIDER_FALLBACK}]}
+    result: Final = await _Gateway(monkeypatch, _CONTEXT_WINDOW_ERROR).send(
+        {"context_window_fallbacks": [{"requested": [target]}]},
+        beta=True,
+        router_aliases={_ALIASED_PROVIDER_FALLBACK: "other"},
+    )
+
+    assert result.response.status_code == 403, result.response.text
+    assert "key_model_access_denied" in result.response.text
+    assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+
+
+@pytest.mark.asyncio
+async def test_a_model_group_refused_as_a_parameter_override_says_it_was_read_both_ways(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A group named `api_base` is a model group to the Router and a refused parameter to litellm's own loop"""
+    group_named_api_base: Final = {
+        "model_name": "api_base",
+        "litellm_params": {"model": "anthropic/api_base", "api_key": _DEPLOYMENT_KEY, "api_base": _REQUESTED_HOST},
+    }
+    result: Final = await _Gateway(monkeypatch).send(
+        {"model": "api_base", "fallbacks": [{"api_base": ["other"]}]},
+        key_models=("api_base", "other"),
+        extra_deployments=[group_named_api_base],
+    )
+
+    assert result.response.status_code in (400, 401), result.response.text
+    assert "api_base is not allowed in request body" in result.response.text
+    assert _READ_BOTH_WAYS_NOTE.format(entry="'api_base'") in result.response.text
+    assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("field", "requested_error"), _FALLBACK_FIELD_ERRORS)
+@pytest.mark.parametrize("source", ["body", "router-settings-override", "key", "team"])
+async def test_a_nested_list_as_a_fallback_entry_is_refused_before_any_call(
+    monkeypatch: pytest.MonkeyPatch, field: str, requested_error: tuple[int, str, str], source: str
+) -> None:
+    settings: Final = {field: [["other"]]}
+    body_fields: Final = {"body": settings, "router-settings-override": {"router_settings_override": settings}}
+    result: Final = await _Gateway(monkeypatch, requested_error).send(
+        body_fields.get(source, {}),
+        key_router_settings=settings if source == "key" else None,
+        team_router_settings=settings if source == "team" else None,
+    )
+
+    assert result.response.status_code in (400, 401), result.response.text
+    assert "a fallback list entry must be a model name or a mapping, got list" in result.response.text
+    assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+
+
+
 async def _chat_served_by_litellm(
-    monkeypatch: pytest.MonkeyPatch, fallbacks: Sequence[object], *, router: bool
+    monkeypatch: pytest.MonkeyPatch,
+    fallbacks: Sequence[object],
+    *,
+    router: bool,
+    key_models: tuple[str, ...] = (),
+    requested_error: tuple[int, str] = (500, "x"),
 ) -> tuple["httpx.Response", tuple[str, ...]]:
     """
     /v1/chat/completions on a proxy where no Router serves `openai/requested`: one started for that model with no
     Router, or a Router that passes models it does not list through to litellm. Either way litellm.acompletion's own
-    fallback loop reads the body's `fallbacks`. The upstream fails `requested` unless a fallback set its temperature;
-    returns the response and the model of each upstream call.
+    fallback loop reads the body's `fallbacks`. The upstream fails `requested` with `requested_error` unless a fallback
+    set its temperature; returns the response and the model of each upstream call.
     """
     import httpx
     import respx
@@ -1405,7 +1526,10 @@ async def _chat_served_by_litellm(
     await cache.async_set_cache(
         key=hash_token(_CALLER_KEY),
         value=UserAPIKeyAuth(
-            api_key=_CALLER_KEY, token=hash_token(_CALLER_KEY), user_role=LitellmUserRoles.INTERNAL_USER
+            api_key=_CALLER_KEY,
+            token=hash_token(_CALLER_KEY),
+            user_role=LitellmUserRoles.INTERNAL_USER,
+            models=list(key_models),
         ),
     )
     for name, value in {
@@ -1429,7 +1553,8 @@ async def _chat_served_by_litellm(
         sent = json.loads(request.read())
         called.append(sent["model"])
         if sent["model"] == "requested" and "temperature" not in sent:
-            return httpx.Response(500, json={"error": {"message": "x", "type": "api_error"}})
+            status, error_message = requested_error
+            return httpx.Response(status, json={"error": {"message": error_message, "type": "invalid_request_error"}})
         message: Final = {"role": "assistant", "content": "served"}
         return httpx.Response(
             200,
@@ -1502,6 +1627,46 @@ async def test_a_documented_fallback_shape_is_still_served_where_no_router_serve
     assert "served" in response.text
     assert called[0] == "requested"
 
+
+@pytest.mark.asyncio
+async def test_a_targets_context_window_swap_on_the_direct_path_names_a_checked_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    litellm.acompletion's own fallback loop merges the target, and on a context-window error the completion wrapper
+    calls the model the target's context_window_fallback_dict names, so that model is checked as the body's would be
+    """
+    swap: Final = {"openai/requested": "openai/forbidden"}
+    target: Final = {"model": "openai/requested", "context_window_fallback_dict": swap}
+    response, called = await _chat_served_by_litellm(
+        monkeypatch,
+        [target],
+        router=True,
+        key_models=("openai/requested",),
+        requested_error=(400, "This model's maximum context length is 8192 tokens."),
+    )
+
+    assert response.status_code in (401, 403), response.text
+    assert "'openai/forbidden'" in response.text
+    assert called == ()
+
+
+@pytest.mark.asyncio
+async def test_a_parameter_override_refused_as_a_model_group_says_it_was_read_both_ways(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`{"stop": ["END"]}` beside a name is a group map to the Router and an override to litellm's own loop"""
+    response, called = await _chat_served_by_litellm(
+        monkeypatch,
+        ["openai/other", {"stop": ["END"]}],
+        router=True,
+        key_models=("openai/requested", "openai/other"),
+    )
+
+    assert response.status_code in (401, 403), response.text
+    assert "'END'" in response.text
+    assert _READ_BOTH_WAYS_NOTE.format(entry="'stop'") in response.text
+    assert called == ()
 
 
 # A fallback target outside the team's models, in LiteLLM's own list and in Anthropic's list under the beta

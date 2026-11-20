@@ -95,6 +95,7 @@ from litellm.proxy.auth.auth_object_prefetch import (
 from litellm.proxy.auth.auth_utils import (
     abbreviate_api_key,
     body_fallbacks_go_to_anthropic,
+    explained_fallback_name_refusal,
     get_end_user_id_from_request_body,
     get_model_from_request,
     get_request_route,
@@ -3837,8 +3838,9 @@ async def enforce_key_and_fallback_model_access(
 
     # Fallback targets are checked for an all-team-models key too: can_key_call_model reads the team's models. The
     # team, member, user, project and agent checks of every fallback target run in common_checks.
+    anthropic_owns_body_fallbacks: Final = body_fallbacks_go_to_anthropic(route, request, request_data)
     fallback_names, anthropic_fallback_names = key_fallback_model_names(
-        request_data, anthropic_owns_body_fallbacks=body_fallbacks_go_to_anthropic(route, request, request_data)
+        request_data, anthropic_owns_body_fallbacks=anthropic_owns_body_fallbacks
     )
     # Refused before any check on them, as in common_checks, so no error a request can be recovered from comes first
     deny_ambiguous_provider_fallbacks(
@@ -3846,17 +3848,20 @@ async def enforce_key_and_fallback_model_access(
     )
 
     for _name in fallback_names:
-        await can_key_call_model(
-            model=_name,
-            llm_model_list=llm_model_list,
-            valid_token=valid_token,
-            llm_router=llm_router,
-        )
-        await is_valid_fallback_model(
-            model=_name,
-            llm_router=llm_router,
-            user_model=None,
-        )
+        with explained_fallback_name_refusal(
+            request_data, (_name,), skip_body_fallbacks=anthropic_owns_body_fallbacks
+        ):
+            await can_key_call_model(
+                model=_name,
+                llm_model_list=llm_model_list,
+                valid_token=valid_token,
+                llm_router=llm_router,
+            )
+            await is_valid_fallback_model(
+                model=_name,
+                llm_router=llm_router,
+                user_model=None,
+            )
 
     # Anthropic serves its own fallback models, so they need the key's model access but no Router group. A name there
     # that is an alias, or that the router serves from another model, is refused above, so this check reads each name
@@ -3896,7 +3901,8 @@ async def enforce_router_settings_fallback_access(
     if not target_names or valid_token.config != {}:
         return
     for _name in target_names:
-        await can_key_call_model(model=_name, llm_model_list=None, valid_token=valid_token, llm_router=llm_router)
+        with explained_fallback_name_refusal(settings_request, (_name,), skip_body_fallbacks=False):
+            await can_key_call_model(model=_name, llm_model_list=None, valid_token=valid_token, llm_router=llm_router)
 
 
 _enforce_key_and_fallback_model_access: Final = enforce_key_and_fallback_model_access

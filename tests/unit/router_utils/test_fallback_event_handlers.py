@@ -1537,6 +1537,24 @@ def test_reject_non_list_litellm_fallbacks_refuses_an_empty_mapping_among_group_
         reject_non_list_litellm_fallbacks(["other", {}], "requested", field=field)
 
 
+@pytest.mark.parametrize("field", ["fallbacks", "context_window_fallbacks", "content_policy_fallbacks"])
+@pytest.mark.parametrize(
+    ("fallbacks", "message"),
+    [
+        pytest.param([["other"]], "must hold model names and mappings, got list", id="entry"),
+        pytest.param(
+            [{"requested": [["other"]]}],
+            "must map model group 'requested' to model names and mappings, got list",
+            id="entry-of-a-group-list",
+        ),
+    ],
+)
+def test_reject_non_list_litellm_fallbacks_refuses_a_nested_list(field: str, fallbacks: list, message: str):
+    """Every reader takes an entry for a model name or a mapping, so a nested list would fail after the first call"""
+    with pytest.raises(litellm.BadRequestError, match=f"{field} {message}"):
+        reject_non_list_litellm_fallbacks(fallbacks, "requested", field=field)
+
+
 def test_reject_non_list_litellm_fallbacks_reads_no_group_map_in_a_list_of_targets():
     """The Router calls a `fallbacks` list of targets as is, so an entry there without a model is an override"""
     reject_non_list_litellm_fallbacks([{"model": "other"}, {"timeout": 5}, {"stop": ["END"]}, {}], "requested")

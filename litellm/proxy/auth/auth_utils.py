@@ -2,7 +2,9 @@ import importlib.util
 import os
 import re
 import sys
-from collections.abc import Collection, Iterable, Iterator, Mapping
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import lru_cache
 from logging import Logger
 from typing import Any, Final, Protocol
@@ -564,13 +566,28 @@ def _iter_fallback_field_values(
         yield None, list(context_window_swaps.values())
 
 
+@dataclass(frozen=True, slots=True)
+class _FallbackEntry:
+    """
+    One target of a fallback list. ``group`` is the key of the model group map the target is or stands under in a
+    ``fallbacks`` list in the Router's group format, a map the Router reads as that group's fallbacks while
+    litellm.acompletion's own fallback loop, which serves a request no Router serves, merges it into the call as a
+    parameter override. ``is_group_map`` marks the map itself.
+    """
+
+    target: str | Mapping[str, object]
+    group: str | None = None
+    is_group_map: bool = False
+
+
 def _iter_fallback_targets(
-    value: object, depth: int, field: str | None, *, widest_reading: bool = False
-) -> Iterator[str | Mapping[str, object]]:
+    value: object, depth: int, field: str | None, *, widest_reading: bool = False, group: str | None = None
+) -> Iterator[_FallbackEntry]:
     """
     The targets in one fallback list, read as the Router reads it: ``field`` is the fallback field whose value the list
-    is, and None marks a list of targets, such as the one a model group is mapped to. Every mapping of the list is
-    yielded, a model group map too, so its keys get the target checks for a reader that merges it into the call.
+    is, and None marks a list of targets, such as the one a model group is mapped to. A target's own model-switching
+    fields are read as a body's. A ``fallbacks`` list in the group format is read both ways: a model group map there is
+    also yielded for the target checks, and its names are tagged with its key, which ``group`` carries down.
     ``widest_reading`` reads every mapping without a string ``model`` as a group map, at every level, for a list whose
     names no LiteLLM reader calls, so a name in any shape a caller sends gets the checks.
     """
@@ -578,30 +595,47 @@ def _iter_fallback_targets(
         raise ValueError("Rejected Request: fallback nesting exceeds the allowed validation depth.")
     if _is_mapping(value):
         # The Router iterates a fallback list, and iterating a mapping walks its keys, so each key is a target
-        yield from (key for key in value if isinstance(key, str))
+        yield from (_FallbackEntry(key, group) for key in value if isinstance(key, str))
         for target_list in value.values():
-            yield from _iter_fallback_targets(target_list, depth + 1, None, widest_reading=widest_reading)
+            yield from _iter_fallback_targets(target_list, depth + 1, None, widest_reading=widest_reading, group=group)
         return
     if not isinstance(value, list):
         return
     entries_are_targets: Final = not widest_reading and (field is None or fallback_entries_are_targets(value, field))
+    read_both_ways: Final = field == "fallbacks" and not widest_reading and not entries_are_targets
     for item in value:
         if isinstance(item, str):
-            yield item
-        elif isinstance(item, Mapping) and (entries_are_targets or fallback_entry_is_target(item)):
-            # Merged into the call with or without a model, so its keys are parameters; only its own fallback fields
-            # hold targets
-            yield item
-            for nested_field in _FALLBACK_FIELDS:
+            yield _FallbackEntry(item, group)
+        elif not isinstance(item, Mapping):
+            # Every reader takes an entry for a model name or a mapping, so a nested list is called as neither
+            raise ValueError(
+                f"Rejected Request: a fallback list entry must be a model name or a mapping, got {type(item).__name__}."
+            )
+        elif entries_are_targets or fallback_entry_is_target(item):
+            # Merged into the call with or without a model, so its keys are parameters, and the fields through which
+            # the call it lands in picks another model are read as the request body's
+            yield _FallbackEntry(item, group)
+            for nested_field, nested in _iter_fallback_field_values(item, skip_body_fallbacks=False):
                 yield from _iter_fallback_targets(
-                    item.get(nested_field), depth + 1, nested_field, widest_reading=widest_reading
+                    nested, depth + 1, nested_field, widest_reading=widest_reading, group=group
                 )
-        elif isinstance(item, Mapping):
-            # A model group mapped to the targets the Router calls once that group fails. litellm.acompletion's own
-            # fallback loop, which serves a request no Router serves, merges the mapping itself into the call instead.
-            yield item
+        else:
+            # A model group mapped to the targets the Router calls once that group fails. In `fallbacks`,
+            # litellm.acompletion's own fallback loop merges the mapping itself into the call instead.
+            item_group: Final = ", ".join(str(key) for key in item) if read_both_ways and group is None else group
+            if read_both_ways:
+                yield _FallbackEntry(item, item_group, is_group_map=True)
             for target_list in item.values():
-                yield from _iter_fallback_targets(target_list, depth + 1, None, widest_reading=widest_reading)
+                yield from _iter_fallback_targets(
+                    target_list, depth + 1, None, widest_reading=widest_reading, group=item_group
+                )
+
+
+def _iter_request_fallback_entries(
+    request_body: Mapping[str, object], *, skip_body_fallbacks: bool = False
+) -> Iterator[_FallbackEntry]:
+    for field, value in _iter_fallback_field_values(request_body, skip_body_fallbacks):
+        yield from _iter_fallback_targets(value, 0, field)
 
 
 def iter_request_fallback_targets(
@@ -611,8 +645,8 @@ def iter_request_fallback_targets(
     The targets of every LiteLLM fallback list the request carries. ``skip_body_fallbacks`` leaves out the body's
     ``fallbacks``, for a request whose field is Anthropic's server-side fallback list instead.
     """
-    for field, value in _iter_fallback_field_values(request_body, skip_body_fallbacks):
-        yield from _iter_fallback_targets(value, 0, field)
+    entries: Final = _iter_request_fallback_entries(request_body, skip_body_fallbacks=skip_body_fallbacks)
+    return (entry.target for entry in entries)
 
 
 def fallback_target_model_name(target: object) -> str | None:
@@ -649,18 +683,81 @@ def key_fallback_model_names(
     request_body: Mapping[str, object], *, anthropic_owns_body_fallbacks: bool
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """
-    The models every LiteLLM fallback list names, and the models the body's ``fallbacks`` names when it is Anthropic's
-    server-side fallback list instead. Anthropic reads only the ``model`` of each entry, so its list is read in the
-    widest way: a name in any other shape is checked too.
+    The models every LiteLLM fallback list names, and the models Anthropic's server-side fallback list names when the
+    body's ``fallbacks`` is one: that field, and the ``fallbacks`` of every target a hop merges into the call. Anthropic
+    reads only the ``model`` of each entry, so these lists are read in the widest way: a name in any other shape is
+    checked too.
     """
-    return (
-        _target_model_names(
-            iter_request_fallback_targets(request_body, skip_body_fallbacks=anthropic_owns_body_fallbacks)
-        ),
-        _target_model_names(_iter_fallback_targets(request_body.get("fallbacks"), 0, "fallbacks", widest_reading=True))
-        if anthropic_owns_body_fallbacks
-        else (),
+    litellm_entries: Final = tuple(
+        _iter_request_fallback_entries(request_body, skip_body_fallbacks=anthropic_owns_body_fallbacks)
     )
+    provider_lists: Final = (
+        (
+            request_body.get("fallbacks"),
+            *(
+                entry.target.get("fallbacks")
+                for entry in litellm_entries
+                if isinstance(entry.target, Mapping) and not entry.is_group_map
+            ),
+        )
+        if anthropic_owns_body_fallbacks
+        else ()
+    )
+    return (
+        _target_model_names(entry.target for entry in litellm_entries),
+        _target_model_names(
+            entry.target
+            for provider_list in provider_lists
+            for entry in _iter_fallback_targets(provider_list, 0, "fallbacks", widest_reading=True)
+        ),
+    )
+
+
+def _read_both_ways_note(groups: Sequence[str]) -> str:
+    named: Final = ", ".join(repr(group) for group in groups)
+    subject: Final = (
+        f"entry {named} names no model, so it was"
+        if len(groups) == 1
+        else f"entries {named} name no model, so they were"
+    )
+    return (
+        f"The fallbacks {subject} checked both as a model group the Router maps to its fallbacks and as a parameter "
+        "override litellm's own fallback loop merges into the call."
+    )
+
+
+@contextmanager
+def explained_fallback_name_refusal(
+    request_body: Mapping[str, object], names: Sequence[str], *, skip_body_fallbacks: bool
+) -> Iterator[None]:
+    """
+    Around a check of fallback ``names``: a refusal it raises also says which of them the request names in a model
+    group map of a ``fallbacks`` list, an entry the checks read both ways, so the caller knows the name may have been
+    meant as a parameter's value
+    """
+    try:
+        yield
+    except (ProxyException, HTTPException) as refusal:
+        wanted: Final = frozenset(names)
+        groups: Final = tuple(
+            dict.fromkeys(
+                entry.group
+                for entry in _iter_request_fallback_entries(request_body, skip_body_fallbacks=skip_body_fallbacks)
+                if entry.group is not None
+                and not entry.is_group_map
+                and fallback_target_model_name(entry.target) in wanted
+            )
+        )
+        if groups and isinstance(refusal, ProxyException):
+            refusal.message = f"{refusal.message} {_read_both_ways_note(groups)}"  # rebind-ok: the refusal it raised
+        elif groups and isinstance(refusal.detail, str):
+            refusal.detail = f"{refusal.detail} {_read_both_ways_note(groups)}"  # rebind-ok: the refusal it raised
+        elif groups and isinstance(refusal.detail, Mapping) and isinstance(refusal.detail.get("error"), str):
+            refusal.detail = {  # rebind-ok: the refusal it raised
+                **refusal.detail,
+                "error": f"{refusal.detail['error']} {_read_both_ways_note(groups)}",
+            }
+        raise
 
 
 def request_names_provider_fallback_models(
@@ -737,26 +834,33 @@ def is_request_body_safe(
     ``litellm_embedding_config.api_base`` (VERIA-6) without exposing a
     recursion-depth DoS surface.
     """
-    if "model_list" in request_body:
-        raise ValueError("Rejected Request: model_list is not allowed in the request body.")
     manages_deployments: Final = route_manages_deployments(route)
     allows_client_credentials: Final[bool] = general_settings.get("allow_client_side_credentials") is True
     _reject_non_list_error_fallbacks(request_body)
     _check_banned_params_in_body(
         request_body, general_settings, llm_router, model, manages_deployments=manages_deployments
     )
-    for target in iter_request_fallback_targets(request_body):
+    for entry in _iter_request_fallback_entries(request_body):
+        target = entry.target
         if isinstance(target, Mapping):
-            # The hop merges the target into the call, so the config and metadata it nests reach the call as the body's
-            _check_banned_params_in_body(
-                target, general_settings, llm_router, model, manages_deployments=manages_deployments
-            )
-            _reject_fallback_target_credentials(target, allows_client_credentials)
-            target_model = target.get("model")
-            if isinstance(target_model, str):
-                _reject_url_valued_fallback_target(target_model)
-        else:
-            _reject_url_valued_fallback_target(target)
+            try:
+                # The hop merges the target into the call, so what it carries reaches the call as the body's does
+                _check_banned_params_in_body(
+                    target, general_settings, llm_router, model, manages_deployments=manages_deployments
+                )
+                _reject_fallback_target_credentials(target, allows_client_credentials)
+            except ValueError as refusal:
+                if entry.is_group_map and entry.group is not None:
+                    raise ValueError(f"{refusal} {_read_both_ways_note((entry.group,))}") from refusal
+                raise
+        name = fallback_target_model_name(target)
+        if name is not None:
+            try:
+                _reject_url_valued_fallback_target(name)
+            except ValueError as refusal:
+                if entry.group is not None:
+                    raise ValueError(f"{refusal} {_read_both_ways_note((entry.group,))}") from refusal
+                raise
     return True
 
 
@@ -768,7 +872,12 @@ def _check_banned_params_in_body(
     *,
     manages_deployments: bool,
 ) -> None:
-    """The banned-param checks of one request body: its root, the config and metadata it nests and its litellm_params"""
+    """
+    The banned-param checks of one request body, the request's own or a fallback target's: its root, the config and
+    metadata it nests and its litellm_params
+    """
+    if "model_list" in body:
+        raise ValueError("Rejected Request: model_list is not allowed in the request body.")
     _check_banned_params(body, general_settings, llm_router, model, manages_deployments=manages_deployments)
     for nested_key in _NESTED_CONFIG_KEYS:
         nested = _coerce_metadata_to_dict(body.get(nested_key))
