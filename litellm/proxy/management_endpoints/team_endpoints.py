@@ -17,7 +17,7 @@ import traceback
 from collections.abc import Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from itertools import chain
 from types import MappingProxyType
@@ -410,6 +410,19 @@ class _TeamDeleteTx(AccessGroupSyncTx, Protocol):
 
     @property
     def litellm_teammembership(self) -> "TableActions[prisma_models.LiteLLM_TeamMembership]": ...
+
+
+class _TeamKeysTx(Protocol):
+    """The table `/team/delete` reads and deletes the teams' keys on, round by round, while last good entries are
+    served: the reads see what the deletes change, on the writer."""
+
+    @property
+    def litellm_verificationtoken(self) -> "TableActions[prisma_models.LiteLLM_VerificationToken]": ...
+
+
+# Each round archives and deletes all the keys it read of every team deleted, which a large team outlasts in the
+# default transaction time
+_TEAM_KEYS_DELETE_TX_TIMEOUT: Final = timedelta(seconds=60)
 
 
 _STRIP_DELETED_TEAM_FROM_USERS_SQL: Final = """
@@ -3656,11 +3669,7 @@ async def _team_member_delete(
             detail={"error": "Either user_id or user_email needs to be passed in"},
         )
 
-    # Its alias names the team's entries revoked below, so while those entries are kept it comes from the writer: a
-    # lagging read replica could name an alias the team no longer has
-    _existing_team_row: Final = await TeamRepository(
-        prisma_client, use_writer=serves_last_good_entries(user_api_key_cache)
-    ).table.find_unique(where={"team_id": data.team_id})
+    _existing_team_row: Final = await _team_db(prisma_client).find_unique(where={"team_id": data.team_id})
 
     if _existing_team_row is None:
         raise HTTPException(
@@ -4472,11 +4481,8 @@ async def delete_team(
         team_rows.append(team_row_pydantic)
 
     # The deleted-team archive below is the first write, so the teams and their keys are revoked before it
-    keys_to_delete: Final = await _tokens_db(prisma_client).find_many(where={"team_id": {"in": data.team_ids}})
-    jwt_mapping_cache_keys: Final = await get_jwt_key_mapping_cache_keys_for_tokens(
-        hashed_tokens=tuple(key.token for key in keys_to_delete),
-        prisma_client=prisma_client,
-    )
+    team_keys_where: Final[_TeamIdInFilter] = {"team_id": {"in": data.team_ids}}
+    keys_to_delete: Final = await _tokens_db(prisma_client).find_many(where=team_keys_where)
     await revoke_last_good(
         user_api_key_cache,
         (
@@ -4532,25 +4538,57 @@ async def delete_team(
         persist_deleted_verification_tokens,
     )
 
-    if keys_to_delete:
-        await persist_deleted_verification_tokens(
-            keys=keys_to_delete,
-            prisma_client=prisma_client,
-            user_api_key_dict=user_api_key_dict,
-            litellm_changed_by=litellm_changed_by,
+    jwt_mapping_cache_keys: Final[list[str]] = []  # mutable-ok: each deleted key's mappings, read before it goes
+    deleted_keys: Final["list[prisma_models.LiteLLM_VerificationToken]"] = []  # mutable-ok: grows by round
+
+    async def archive_keys(keys: "Sequence[prisma_models.LiteLLM_VerificationToken]", tx: "Prisma | None") -> None:
+        # The mapping rows go with their key, so their cache keys are read first
+        jwt_mapping_cache_keys.extend(
+            await get_jwt_key_mapping_cache_keys_for_tokens(
+                hashed_tokens=tuple(key.token for key in keys), prisma_client=prisma_client
+            )
         )
+        if keys:
+            await persist_deleted_verification_tokens(
+                keys=keys,
+                prisma_client=prisma_client,
+                user_api_key_dict=user_api_key_dict,
+                litellm_changed_by=litellm_changed_by,
+                tx=tx,
+            )
+        deleted_keys.extend(keys)
 
-    await prisma_client.delete_data(team_id_list=data.team_ids, table_name="key")
+    if serves_last_good_entries(user_api_key_cache):
+        # Only the keys a round read, and revoked right before, are deleted: a key created for one of these teams
+        # since the read above is read, revoked, archived and deleted in a round of its own, and keys that keep
+        # appearing refuse with 409, rolling back every round's archive and delete
+        async with prisma_client.tx(timeout=_TEAM_KEYS_DELETE_TX_TIMEOUT) as tx:
+            key_tx: Final[_TeamKeysTx] = tx
 
-    if keys_to_delete:
+            async def archive_and_delete_keys(keys: "Sequence[prisma_models.LiteLLM_VerificationToken]") -> None:
+                await archive_keys(keys, tx)
+                await key_tx.litellm_verificationtoken.delete_many(where={"token": {"in": [key.token for key in keys]}})
+
+            _ = await revoke_and_delete_read_rows(
+                user_api_key_cache,
+                partial(key_tx.litellm_verificationtoken.find_many, where=team_keys_where),
+                lambda keys: tuple(key.token for key in keys),
+                archive_and_delete_keys,
+            )
+    else:
+        # No last good entry to revoke, so the teams' keys go in one delete, as without that setting
+        await archive_keys(keys_to_delete, None)
+        await prisma_client.delete_data(team_id_list=data.team_ids, table_name="key")
+
+    if deleted_keys:
         KeyManagementEventHooks.create_key_deleted_audit_logs(
-            keys_being_deleted=keys_to_delete,
+            keys_being_deleted=deleted_keys,
             user_api_key_dict=user_api_key_dict,
             litellm_changed_by=litellm_changed_by,
         )
 
     await _invalidate_deleted_key_cache(
-        keys=keys_to_delete,
+        keys=deleted_keys,
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
     )

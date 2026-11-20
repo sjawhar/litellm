@@ -1,20 +1,24 @@
 import asyncio
 import copy
 import json
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 import pytest
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from litellm.proxy._types import LiteLLM_TeamTable, LitellmTableNames, LitellmUserRoles, Member, UserAPIKeyAuth
 from litellm.proxy.auth.auth_checks import jwt_key_mapping_cache_key
-from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, team_membership_auth_cache_key
+from litellm.proxy.db.routing_prisma_wrapper import RoutingPrismaWrapper
 from litellm.proxy.list_api.common import ManagementProblem
 from litellm.proxy.management_helpers.bulk_user_deletion import bulk_delete_users, bulk_remove_team_members
 from litellm.types.proxy.management_endpoints.internal_user_endpoints import BulkDeleteUserRequest
 from litellm.types.proxy.management_endpoints.team_endpoints import BulkTeamMemberDeleteRequest, TeamMemberRef
+
+if TYPE_CHECKING:
+    from tests.unit.caching.fake_redis_cache import FakeRedisCache
 
 ADMIN: Final = UserAPIKeyAuth(user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN, api_key="sk-admin")
 INTERNAL: Final = UserAPIKeyAuth(user_id="someone", user_role=LitellmUserRoles.INTERNAL_USER)
@@ -51,7 +55,8 @@ def _matches(row: Mapping[str, object], where: Mapping[str, object]) -> bool:
 
 
 class _Rows:
-    """A list-backed Prisma table supporting the `in`/equality/OR filters the helper issues."""
+    """A list-backed Prisma table supporting the `in`/equality/OR filters the helper issues. It has `create` because a
+    `RoutingPrismaWrapper` routes reads only for a table that has `find_many` and `create`."""
 
     def __init__(self, rows: Sequence[Mapping[str, object]] = ()) -> None:
         self.rows: list[dict[str, object]] = [dict(r) for r in rows]
@@ -67,6 +72,10 @@ class _Rows:
     async def create_many(self, data: Sequence[Mapping[str, object]]) -> int:
         self.rows.extend(dict(r) for r in data)
         return len(data)
+
+    async def create(self, data: Mapping[str, object]) -> _Record:
+        self.rows.append(dict(data))
+        return _Record.model_validate(dict(data))
 
 
 class _UserTable:
@@ -88,6 +97,11 @@ class _UserTable:
             del self.rows[uid]
         return len(doomed)
 
+    async def create(self, data: Mapping[str, object]) -> _UserRow:
+        row = _UserRow.model_validate(dict(data))
+        self.rows[row.user_id] = row
+        return row
+
 
 class _TeamTable:
     def __init__(self, teams: Sequence[LiteLLM_TeamTable]) -> None:
@@ -104,6 +118,11 @@ class _TeamTable:
         self.update_calls += 1
         team = self.rows[where["team_id"]]
         team.members_with_roles = [Member(**m) for m in json.loads(data["members_with_roles"])]
+        return team
+
+    async def create(self, data: Mapping[str, object]) -> LiteLLM_TeamTable:
+        team = LiteLLM_TeamTable.model_validate(dict(data))
+        self.rows[team.team_id] = team
         return team
 
 
@@ -229,7 +248,7 @@ def _cache_with_jwt_mapping_keys(*cache_keys: str) -> UserApiKeyCache:
 
 
 async def _delete(
-    prisma: _FakePrisma,
+    prisma: "_FakePrisma | _ReplicatedPrisma",
     user_ids: Sequence[str],
     caller: UserAPIKeyAuth = ADMIN,
     cache: UserApiKeyCache | None = None,
@@ -903,3 +922,96 @@ async def test_bulk_user_delete_fails_the_row_and_deletes_nothing_when_redis_can
     assert [(r.user_id, r.success) for r in results] == [("u1", False)]
     assert results[0].error is not None and "could not record this revocation" in results[0].error
     assert sorted(prisma.db.litellm_usertable.rows) == ["keep", "u1"]
+
+
+def _tombstones_standing_in(redis: "FakeRedisCache") -> Callable[[Sequence[str]], Awaitable[tuple[str, ...]]]:
+    async def tombstoned(cache_keys: Sequence[str]) -> tuple[str, ...]:
+        client: Final = redis.cache.init_async_client()
+        return tuple([key for key in cache_keys if await client.exists(f"last_good_tombstone:{key}") == 1])
+
+    return tombstoned
+
+
+class _TombstonedRows(_Rows):
+    """Rows whose every delete records the cache keys of the rows it removes, with those of them that had a tombstone in
+    Redis as it ran. ``tombstoned`` is a plain function, which a transaction's snapshot copies by reference."""
+
+    def __init__(
+        self,
+        rows: Sequence[Mapping[str, object]],
+        cache_key_of: Callable[[Mapping[str, object]], str],
+        tombstoned: Callable[[Sequence[str]], Awaitable[tuple[str, ...]]],
+    ) -> None:
+        super().__init__(rows)
+        self._cache_key_of = cache_key_of
+        self._tombstoned = tombstoned
+        self.deletes: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+
+    async def delete_many(self, where: Mapping[str, object]) -> int:
+        cache_keys: Final = tuple(self._cache_key_of(r) for r in self.rows if _matches(r, where))
+        self.deletes.append((cache_keys, await self._tombstoned(cache_keys)))
+        return await super().delete_many(where)
+
+
+class _ReplicatedPrisma:
+    """A client with ``DATABASE_URL_READ_REPLICA`` set: ``db`` sends reads to ``replica`` unless the context is pinned
+    to the writer, and writes and transactions go to ``writer``."""
+
+    def __init__(self, writer: _FakePrisma, replica: _FakePrisma) -> None:
+        self.db = RoutingPrismaWrapper(
+            writer=writer.db,  # pyright: ignore[reportArgumentType]  # a fake database stands in for PrismaWrapper
+            reader=replica.db,  # pyright: ignore[reportArgumentType]  # a fake database stands in for PrismaWrapper
+        )
+        self.writer_db = writer.db
+        self.tx = writer.tx
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("serves_last_good", [True, False], ids=["serving_pinned", "not_serving"])
+async def test_bulk_user_delete_revokes_the_memberships_a_lagging_replica_lacks_before_deleting_them(
+    serves_last_good: bool,
+) -> None:
+    """The replica lags behind u1 joining t1 and taking a membership of t2, a team since deleted: its u1 row names no
+    team, t1's roster there lacks u1, and it has neither membership. While last good entries are served auth pins the
+    request's reads to the writer (``reads_pinned_to_writer`` stands for it here), so the batch takes u1 off t1, and
+    every membership and key delete runs with the tombstones of what it removes standing in Redis, the t2 membership's
+    too, though no roster or user row names t2. With the setting off nothing is pinned: the users and memberships are
+    read from the replica, so no team is rewritten, and the deletes by user id remove u1's key and memberships,
+    revoking nothing."""
+    from litellm.proxy.db.routing_prisma_wrapper import reads_pinned_to_writer
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis: Final = fake_redis_cache()
+    tombstoned: Final = _tombstones_standing_in(redis)
+    memberships: Final = _TombstonedRows(
+        [{"team_id": "t1", "user_id": "u1"}, {"team_id": "t1", "user_id": "keep"}, {"team_id": "t2", "user_id": "u1"}],
+        lambda row: team_membership_auth_cache_key(team_id=str(row["team_id"]), user_id=str(row["user_id"])),
+        tombstoned,
+    )
+    keys: Final = _TombstonedRows(
+        [{"token": "k1", "user_id": "u1", "team_id": "t1"}], lambda row: str(row["token"]), tombstoned
+    )
+    writer: Final = _FakePrisma(users=[_user("u1", "t1"), _user("keep", "t1")], teams=[_team("t1", "u1", "keep")])
+    writer.db.litellm_teammembership = memberships
+    writer.db.litellm_verificationtoken = keys
+    replica: Final = _FakePrisma(
+        users=[_user("u1"), _user("keep", "t1")], teams=[_team("t1", "keep")], memberships=[("t1", "keep")]
+    )
+    cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=serves_last_good)
+
+    with reads_pinned_to_writer(serves_last_good):
+        results: Final = await _delete(_ReplicatedPrisma(writer, replica), ["u1"], cache=cache)
+
+    in_t1: Final = team_membership_auth_cache_key(team_id="t1", user_id="u1")
+    in_t2: Final = team_membership_auth_cache_key(team_id="t2", user_id="u1")
+    assert (memberships.rows, keys.rows) == ([{"team_id": "t1", "user_id": "keep"}], [])
+    assert set(writer.db.litellm_usertable.rows) == {"keep"}
+    if serves_last_good:
+        assert [(r.success, r.teams_removed) for r in results] == [(True, ("t1",))]
+        assert _roster(writer, "t1") == ["keep"]
+        assert memberships.deletes == [((in_t1,), (in_t1,)), ((in_t2,), (in_t2,))]
+        assert keys.deletes == [(("k1",), ("k1",))]
+        return
+    assert [(r.success, r.teams_removed) for r in results] == [(True, ())]
+    assert _roster(writer, "t1") == ["u1", "keep"]
+    assert (memberships.deletes, keys.deletes) == ([((in_t1, in_t2), ())], [(("k1",), ())])

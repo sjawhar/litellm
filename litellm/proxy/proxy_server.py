@@ -18239,6 +18239,10 @@ async def claim_onboarding_link(data: InvitationClaim, request: Request):
     This route can only update user password.
     """
     global prisma_client, master_key, general_settings
+    from litellm.proxy.db.routing_prisma_wrapper import pin_reads_to_writer
+
+    # A public route, outside user_api_key_auth, whose password write revokes the user's UI session keys strictly
+    pin_reads_to_writer(user_api_key_cache.serve_last_good_entries)
     ### VALIDATE INVITE LINK ###
     if prisma_client is None:
         raise HTTPException(

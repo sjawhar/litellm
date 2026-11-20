@@ -5,7 +5,9 @@ otherwise PrismaClient uses the writer-only PrismaWrapper directly.
 """
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Final
 
@@ -33,6 +35,26 @@ _MODEL_READ_METHODS: Final = frozenset(
 
 # Top-level Prisma client methods that read from the database.
 _TOP_LEVEL_READ_METHODS: Final = frozenset({"query_first", "query_raw"})
+
+# Whether this context's reads go to the writer: set for a request whose writes can end access while last good entries
+# are served, so the rows that pick what it revokes come from where its writes land, not a lagging read replica
+_reads_pinned_to_writer: Final[ContextVar[bool]] = ContextVar("prisma_reads_pinned_to_writer", default=False)
+
+
+def pin_reads_to_writer(pinned: bool) -> None:
+    """Send this context's reads, and those of every task it creates, to the writer, or back to the routing default.
+    Set where a request's auth begins, and by a job that runs outside a request."""
+    _ = _reads_pinned_to_writer.set(pinned)
+
+
+@contextmanager
+def reads_pinned_to_writer(pinned: bool = True) -> Iterator[None]:
+    """``pin_reads_to_writer`` for the length of a block, then the earlier choice again."""
+    token: Final = _reads_pinned_to_writer.set(pinned)
+    try:
+        yield
+    finally:
+        _reads_pinned_to_writer.reset(token)
 
 
 class _RoutedActions:
@@ -141,7 +163,7 @@ class RoutingPrismaWrapper:
         consult this rather than `writer`, and `__getattr__` routes through it
         so the two cannot drift apart.
         """
-        return self._writer if self._reader_unavailable else self._reader
+        return self._reader if self._should_use_reader() else self._writer
 
     @property
     def reader_unavailable(self) -> bool:
@@ -161,7 +183,11 @@ class RoutingPrismaWrapper:
         self._writer_unavailable = False
 
     def _should_use_reader(self) -> bool:
-        return not self._reader_unavailable
+        """The one choice of reader or writer for a read. A context pinned to the writer reads from it while it is up;
+        while it is degraded the pin yields to the reader, as ``WriterPinnedClient`` does, since writes fail then."""
+        if self._reader_unavailable:
+            return False
+        return not (_reads_pinned_to_writer.get() and not self._writer_unavailable)
 
     @staticmethod
     async def _try_connect(client: PrismaWrapper, timeout: int | timedelta | None = None) -> Exception | None:

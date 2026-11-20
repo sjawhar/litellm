@@ -13,6 +13,7 @@ import json
 from collections.abc import Awaitable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
+from functools import partial
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
@@ -36,7 +37,9 @@ from litellm.proxy.auth.auth_checks import (
 from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_broadcast
 from litellm.proxy.common_utils.user_api_key_cache import (
     UserApiKeyCache,
+    revoke_and_delete_read_rows,
     revoke_last_good,
+    serves_last_good_entries,
     team_membership_auth_cache_key,
 )
 from litellm.proxy.hooks.key_management_event_hooks import KeyManagementEventHooks
@@ -216,12 +219,14 @@ def _error_message(exc: BaseException) -> str:
 
 
 def _revocation_refused(refused: HTTPException) -> ManagementProblem:
-    """The routes answer any other exception with a generic 500; a refused revocation must stay a 503."""
+    """The routes answer any other exception with a generic 500; a refused revocation keeps its status: 503 when Redis
+    could not record it, 409 when keys kept being added while they were deleted."""
+    conflict: Final = refused.status_code == 409
     return ManagementProblem(
         ProblemDetail(
-            type=f"{PROBLEM_TYPE_BASE}service-unavailable",
-            title="Service unavailable",
-            status=503,
+            type=f"{PROBLEM_TYPE_BASE}{'conflict' if conflict else 'service-unavailable'}",
+            title="Conflict" if conflict else "Service unavailable",
+            status=409 if conflict else 503,
             detail=_error_message(refused),
         )
     )
@@ -235,6 +240,56 @@ async def _bounded(awaitables: Iterable[Awaitable[object]]) -> tuple[object | Ba
             return await awaitable
 
     return tuple(await asyncio.gather(*(run(a) for a in awaitables), return_exceptions=True))
+
+
+async def _delete_keys(
+    prisma_client: PrismaClient,
+    tx: "Prisma",
+    read: Sequence["prisma_models.LiteLLM_VerificationToken"],
+    where: Mapping[str, object],
+    user_api_key_dict: UserAPIKeyAuth,
+    litellm_changed_by: str | None,
+    user_api_key_cache: UserApiKeyCache,
+) -> _DeletedKeys:
+    """Archive and delete the keys ``where`` names, their JWT mappings read first since those rows go with them.
+
+    While last good entries are served only the keys read, and revoked, are deleted, round by round from a read of its
+    own in ``tx`` (``revoke_and_delete_read_rows``): a key committed since ``read`` is revoked before it goes, and keys
+    that keep appearing refuse with 409, rolling the transaction back. Otherwise ``read`` are the keys, and one delete
+    by ``where`` removes them, as without that setting."""
+    jwt_mapping_cache_keys: Final[list[str]] = []  # mutable-ok: each deleted key's mappings, read before it goes
+    deleted: Final[list["prisma_models.LiteLLM_VerificationToken"]] = []  # mutable-ok: grows by round
+
+    async def archive_and_delete(
+        keys: Sequence["prisma_models.LiteLLM_VerificationToken"], keys_where: Mapping[str, object]
+    ) -> None:
+        jwt_mapping_cache_keys.extend(
+            await get_jwt_key_mapping_cache_keys_for_tokens(
+                hashed_tokens=tuple(k.token for k in keys), prisma_client=prisma_client
+            )
+        )
+        if not keys:
+            return
+        await persist_deleted_verification_tokens(
+            keys=keys,  # pyright: ignore[reportArgumentType]  # the generated row has the same columns
+            prisma_client=prisma_client,
+            user_api_key_dict=user_api_key_dict,
+            litellm_changed_by=litellm_changed_by,
+            tx=tx,
+        )
+        await _token_tx_db(tx).delete_many(where=keys_where)
+        deleted.extend(keys)
+
+    if serves_last_good_entries(user_api_key_cache):
+        _ = await revoke_and_delete_read_rows(
+            user_api_key_cache,
+            partial(_token_tx_db(tx).find_many, where=where),
+            lambda keys: tuple(k.token for k in keys),
+            lambda keys: archive_and_delete(keys, _in_filter("token", (k.token for k in keys))),
+        )
+    else:
+        await archive_and_delete(read, where)
+    return _DeletedKeys(keys=tuple(deleted), jwt_mapping_cache_keys=tuple(jwt_mapping_cache_keys))
 
 
 async def _remove_members_from_team(
@@ -274,11 +329,8 @@ async def _remove_members_from_team(
         for i, r in enumerate(requests)
         if any(_addresses_member(m, r) for m in removed_members) or any(_addresses_user(u, r) for u in stale_rows)
     )
-    keys: Final = await _token_tx_db(tx).find_many(where=_team_users_filter(team_id, cleanup_ids))
-    jwt_mapping_cache_keys: Final = await get_jwt_key_mapping_cache_keys_for_tokens(
-        hashed_tokens=tuple(k.token for k in keys),
-        prisma_client=prisma_client,
-    )
+    cleaned_in_team: Final = _team_users_filter(team_id, cleanup_ids)
+    keys: Final = await _token_tx_db(tx).find_many(where=cleaned_in_team)
     # The roster rides on the team's entry, the team on each user's entry and the member limits on each membership's,
     # so all of them are revoked before the first write, as the deleted keys are
     try:
@@ -302,16 +354,13 @@ async def _remove_members_from_team(
     for row in stale_rows:
         teams_data: _TeamsData = {"teams": {"set": tuple(t for t in row.teams if t != team_id)}}
         await _user_tx_db(tx).update(where=_eq_filter("user_id", row.user_id), data=teams_data)
-    await _membership_tx_db(tx).delete_many(where=_team_users_filter(team_id, cleanup_ids))
-    if keys:
-        await persist_deleted_verification_tokens(
-            keys=keys,  # pyright: ignore[reportArgumentType]  # generated row model carries the same columns as LiteLLM_VerificationToken
-            prisma_client=prisma_client,
-            user_api_key_dict=user_api_key_dict,
-            litellm_changed_by=None,
-            tx=tx,
+    await _membership_tx_db(tx).delete_many(where=cleaned_in_team)
+    try:
+        deleted_keys: Final = await _delete_keys(
+            prisma_client, tx, keys, cleaned_in_team, user_api_key_dict, None, user_api_key_cache
         )
-        await _token_tx_db(tx).delete_many(where=_team_users_filter(team_id, cleanup_ids))
+    except HTTPException as refused:
+        raise _revocation_refused(refused) from refused
 
     return _TeamRemoval(
         team=LiteLLM_TeamTable(
@@ -320,8 +369,8 @@ async def _remove_members_from_team(
         ),
         removed=cleanup_ids,
         matched=matched,
-        deleted_keys=tuple(keys),
-        jwt_mapping_cache_keys=jwt_mapping_cache_keys,
+        deleted_keys=deleted_keys.keys,
+        jwt_mapping_cache_keys=deleted_keys.jwt_mapping_cache_keys,
     )
 
 
@@ -433,22 +482,13 @@ async def _delete_user_rows(
     litellm_changed_by: str | None,
     user_api_key_cache: UserApiKeyCache,
 ) -> _DeletedKeys:
-    keys: Final = await _token_tx_db(tx).find_many(where=_in_filter("user_id", user_ids))
-    jwt_mapping_cache_keys: Final = await get_jwt_key_mapping_cache_keys_for_tokens(
-        hashed_tokens=tuple(k.token for k in keys),
-        prisma_client=prisma_client,
-    )
+    of_users: Final = _in_filter("user_id", user_ids)
+    keys: Final = await _token_tx_db(tx).find_many(where=of_users)
     # A deleted user's entry goes with its keys' entries, before the first write
     await revoke_last_good(user_api_key_cache, (*sorted(user_ids), *(k.token for k in keys)))
-    if keys:
-        await persist_deleted_verification_tokens(
-            keys=keys,  # pyright: ignore[reportArgumentType]  # generated row model carries the same columns as LiteLLM_VerificationToken
-            prisma_client=prisma_client,
-            user_api_key_dict=user_api_key_dict,
-            litellm_changed_by=litellm_changed_by,
-            tx=tx,
-        )
-        await _token_tx_db(tx).delete_many(where=_in_filter("user_id", user_ids))
+    deleted_keys: Final = await _delete_keys(
+        prisma_client, tx, keys, of_users, user_api_key_dict, litellm_changed_by, user_api_key_cache
+    )
     await _invitation_tx_db(tx).delete_many(
         where=_any_filter(
             _in_filter("user_id", user_ids),
@@ -456,10 +496,24 @@ async def _delete_user_rows(
             _in_filter("updated_by", user_ids),
         )
     )
-    await _org_membership_tx_db(tx).delete_many(where=_in_filter("user_id", user_ids))
-    await _membership_tx_db(tx).delete_many(where=_in_filter("user_id", user_ids))
-    await _user_tx_db(tx).delete_many(where=_in_filter("user_id", user_ids))
-    return _DeletedKeys(keys=tuple(keys), jwt_mapping_cache_keys=jwt_mapping_cache_keys)
+    await _org_membership_tx_db(tx).delete_many(where=of_users)
+    memberships: Final = _membership_tx_db(tx)
+    if serves_last_good_entries(user_api_key_cache):
+        # Each membership has its own entry, so only the memberships read, and revoked, are deleted, round by round:
+        # one the team rewrites above left, as when neither the roster nor the user's row names its team, or one
+        # committed since, is revoked before it goes
+        _ = await revoke_and_delete_read_rows(
+            user_api_key_cache,
+            partial(memberships.find_many, where=of_users),
+            lambda rows: tuple(team_membership_auth_cache_key(team_id=r.team_id, user_id=r.user_id) for r in rows),
+            lambda rows: memberships.delete_many(
+                where=_any_filter(*(_team_users_filter(r.team_id, (r.user_id,)) for r in rows))
+            ),
+        )
+    else:
+        await memberships.delete_many(where=of_users)
+    await _user_tx_db(tx).delete_many(where=of_users)
+    return deleted_keys
 
 
 async def _delete_users_tx(

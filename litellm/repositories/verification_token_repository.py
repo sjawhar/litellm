@@ -57,9 +57,6 @@ class _PrismaClientView(Protocol):
     @property
     def db(self) -> _PrismaVerificationTokenDb: ...
 
-    @property
-    def writer_db(self) -> _PrismaVerificationTokenDb: ...
-
 
 _JSON_ENCODED_TOKEN_FIELDS: Final = (
     "aliases",
@@ -77,14 +74,10 @@ _JSON_ENCODED_TOKEN_FIELDS: Final = (
 class VerificationTokenRepository(BaseRepository[LiteLLM_VerificationToken]):
     """Repository for verification token (API key) database operations."""
 
-    def __init__(self, prisma_client: object, *, use_writer: bool = False) -> None:
-        super().__init__(prisma_client)
-        self._use_writer = use_writer
-
     @property
     def _db(self) -> _PrismaVerificationTokenDb:
         client: Final[_PrismaClientView] = self.prisma_client
-        return client.writer_db if self._use_writer else client.db
+        return client.db
 
     @property
     def table(self) -> TableActions["PrismaVerificationToken"]:
