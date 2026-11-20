@@ -747,10 +747,126 @@ async def test_a_served_fallback_keeps_the_requests_own_identity_not_one_its_dic
     }
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fallback_field", "primary_error"),
+    [
+        ("context_window_fallbacks", litellm.ContextWindowExceededError),
+        ("content_policy_fallbacks", litellm.ContentPolicyViolationError),
+    ],
+    ids=["context-window", "content-policy"],
+)
+async def test_a_target_under_a_mixed_fallback_wrapper_cannot_count_cool_or_add_usage_to_a_deployment_it_names(
+    fallback_field, primary_error
+):
+    """The context-window and content-policy resolvers read a fallback dict by its first key, so a wrapper that also
+    has a ``model`` still hands the router the targets under that key. The primary fails its context-window check
+    before any provider call, or its provider refuses the content; the backup then answers a retryable error, which
+    counts against, cools and adds usage to the backup deployment the router chose, never to the deployment the
+    nested target's ``litellm_params`` names."""
+    context_window_case = fallback_field == "context_window_fallbacks"
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "primary",
+                "litellm_params": (
+                    {"model": "openai/gpt-4.1", "api_key": "sk-test"}
+                    if context_window_case
+                    else {
+                        "model": "azure/content-filtered-model",
+                        "api_key": "sk-test",
+                        "mock_response": "Exception: content_filter_policy",
+                    }
+                ),
+                "model_info": {"id": "primary-a", **({"max_input_tokens": 1} if context_window_case else {})},
+            },
+            *(
+                {
+                    "model_name": "backup",
+                    "litellm_params": {"model": model, "api_key": "sk-test", "mock_response": "litellm.RateLimitError"},
+                    "model_info": {"id": deployment_id},
+                }
+                for deployment_id, model in (
+                    ("chosen-a", "anthropic/claude-sonnet-4-5"),
+                    ("chosen-b", "anthropic/claude-3-5-haiku-20241022"),
+                )
+            ),
+            *(
+                {
+                    "model_name": "other",
+                    "litellm_params": {"model": model, "api_key": "sk-test"},
+                    "model_info": {"id": deployment_id},
+                }
+                for deployment_id, model in (
+                    ("body-named", "anthropic/claude-3-opus-20240229"),
+                    ("body-named-sibling", "anthropic/claude-3-haiku-20240307"),
+                )
+            ),
+        ],
+        enable_pre_call_checks=context_window_case,
+        cooldown_time=13,
+        num_retries=0,
+    )
+    data = await add_litellm_data_to_request(
+        data={
+            "model": "primary",
+            "messages": [{"role": "user", "content": "hello"}],
+            fallback_field: [
+                {
+                    "primary": [
+                        {
+                            "model": "backup",
+                            "litellm_params": {
+                                "model_info": {"id": "body-named"},
+                                "cooldown_time": 86400,
+                                "metadata": {"model_group": "other", "deployment": "anthropic/claude-3-opus-20240229"},
+                            },
+                        }
+                    ],
+                    "model": "ignored",
+                }
+            ],
+        },
+        request=_make_request_mock(),
+        user_api_key_dict=_user_api_key_auth(),
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    with pytest.raises(primary_error):
+        await router.acompletion(**data)
+    pending = asyncio.all_tasks() - {asyncio.current_task()}
+    await asyncio.gather(*pending, return_exceptions=True)
+
+    deployment_ids = ("chosen-a", "chosen-b", "body-named", "body-named-sibling")
+    counters = _deployment_counters(router, deployment_ids)
+    chosen = next(
+        (deployment_id for deployment_id in ("chosen-a", "chosen-b") if counters["failures"][deployment_id]), None
+    )
+    assert counters == {
+        "failures": {deployment_id: int(deployment_id == chosen) for deployment_id in deployment_ids},
+        "cooldowns": {chosen: 13},
+        "rpm_usage": [chosen],
+    }
+
+
+_CALLER_OVERRIDE_FIELDS = ("model_info", "cooldown_time", "litellm_params", "metadata", "litellm_metadata")
+
+
 def _target_with_caller_overrides() -> dict[str, object]:
     return {
         "model": "backup",
         "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {"type": "object", "properties": {"metadata": {"type": "string"}}},
+                },
+            }
+        ],
         "model_info": {"id": "victim"},
         "cooldown_time": 86400,
         "litellm_params": {"model_info": {"id": "victim"}},
@@ -785,12 +901,55 @@ def _target_with_caller_overrides() -> dict[str, object]:
             {"fallbacks": [{"model": "outer", "fallbacks": ["backup-string", _target_with_caller_overrides()]}]},
             ("fallbacks", 0, "fallbacks"),
         ),
+        (
+            {
+                "context_window_fallbacks": [
+                    {"gpt-4": ["backup-string", _target_with_caller_overrides()], "model": "ignored"}
+                ]
+            },
+            ("context_window_fallbacks", 0, "gpt-4"),
+        ),
+        (
+            {
+                "fallbacks": [
+                    {
+                        "gpt-4": [
+                            {
+                                "model": "outer",
+                                "content_policy_fallbacks": [
+                                    {
+                                        "outer": [
+                                            {
+                                                "model": "inner",
+                                                "fallbacks": ["backup-string", _target_with_caller_overrides()],
+                                            }
+                                        ],
+                                        "model": "ignored",
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                ]
+            },
+            ("fallbacks", 0, "gpt-4", 0, "content_policy_fallbacks", 0, "outer", 0, "fallbacks"),
+        ),
     ],
-    ids=["target-list", "group-map", "context-window", "content-policy", "router-settings-override", "nested"],
+    ids=[
+        "target-list",
+        "group-map",
+        "context-window",
+        "content-policy",
+        "router-settings-override",
+        "nested",
+        "mixed-wrapper",
+        "three-levels",
+    ],
 )
 async def test_add_litellm_data_to_request_strips_caller_overrides_from_every_dict_fallback_target(body, path):
-    """Every dict fallback target a body supplies, in each shape the router reads, loses the router-owned fields, a
-    ``litellm_params`` and both metadata buckets; its other keys and every string target stay as sent."""
+    """Every dict a body supplies under a fallback field, in each shape the router reads and at any nesting, loses
+    the router-owned fields, a ``litellm_params`` and both metadata buckets. Its other keys, a dict held as one of
+    their values (a tool schema here) and every string target stay as sent."""
     updated = await add_litellm_data_to_request(
         data={"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}], **copy.deepcopy(body)},
         request=_make_request_mock(),
@@ -803,8 +962,35 @@ async def test_add_litellm_data_to_request_strips_caller_overrides_from_every_di
     targets: object = updated
     for step in path:
         targets = targets[step]
-    assert targets == ["backup-string", {"model": "backup", "messages": [{"role": "user", "content": "hi"}]}]
+    assert targets == [
+        "backup-string",
+        {
+            key: value
+            for key, value in _target_with_caller_overrides().items()
+            if key not in _CALLER_OVERRIDE_FIELDS
+        },
+    ]
 
+
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_refuses_fallbacks_nested_past_the_body_check_bound():
+    """The strip descends no deeper than the nesting the body check allows, so a body cannot drive it deep."""
+    from fastapi import HTTPException
+
+    nested: object = ["backup"]
+    for _ in range(2 * litellm.ROUTER_MAX_FALLBACKS + 1):
+        nested = [nested]
+
+    with pytest.raises(HTTPException) as refused:
+        await add_litellm_data_to_request(
+            data={"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}], "fallbacks": nested},
+            request=_make_request_mock(),
+            user_api_key_dict=_user_api_key_auth(),
+            proxy_config=MagicMock(),
+            general_settings={},
+            version="test-version",
+        )
+    assert refused.value.status_code == 400
 
 
 @pytest.mark.asyncio

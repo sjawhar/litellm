@@ -61,7 +61,7 @@ from litellm.proxy._types import (
     TeamCallbackMetadata,
     UserAPIKeyAuth,
 )
-from litellm.proxy.auth.auth_utils import get_request_route, iter_request_fallback_targets
+from litellm.proxy.auth.auth_utils import get_request_route
 from litellm.proxy.auth.route_checks import RouteChecks
 from litellm.proxy.common_utils.callback_utils import (
     decrypt_callback_vars,
@@ -723,18 +723,44 @@ _FALLBACK_TARGET_CLIENT_FIELDS: Final = ROUTER_OWNED_REQUEST_FIELDS | {
     "metadata",
     "litellm_metadata",
 }
+_CLIENT_FALLBACK_FIELDS: Final = ("fallbacks", "context_window_fallbacks", "content_policy_fallbacks")
 
 
 def _strip_fallback_target_overrides(
     data: dict[str, object],  # mutable-ok: strips in place on the request body the pre-call pipeline threads through
 ) -> None:
     """Drop the fields a dict fallback target in the client's request body would merge over the call's own."""
-    for target in iter_request_fallback_targets(data):
-        if not isinstance(target, dict):
-            continue
-        for field in _FALLBACK_TARGET_CLIENT_FIELDS & target.keys():
-            target.pop(field)
-            verbose_proxy_logger.debug("Stripped client-supplied field from a fallback target: %s", field)
+    for source in (data, data.get("router_settings_override")):
+        if isinstance(source, dict):
+            for field in _CLIENT_FALLBACK_FIELDS:
+                _strip_overrides_from_fallback_list(field, source.get(field), depth=0)
+
+
+def _strip_overrides_from_fallback_list(field: str, targets: object, depth: int) -> None:
+    """Strip every dict that is an element of ``targets``, or of a list reachable from it through nested lists and
+    the list values of those dicts, whatever its keys: the router resolves these shapes in more than one way but only
+    ever merges a list element. A dict held as a dict value is a target's own payload (a tool schema, say) and stays.
+    A group map loses a group named like one of the stripped fields, which is no model group anyone routes."""
+    if not isinstance(targets, list):
+        return
+    if depth > 2 * litellm.ROUTER_MAX_FALLBACKS:  # the bound is_request_body_safe puts on fallback nesting
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "invalid_request",
+                "param": field,
+                "message": "Rejected Request: fallback nesting exceeds the allowed validation depth.",
+            },
+        )
+    for item in targets:
+        if isinstance(item, dict):
+            for key in _FALLBACK_TARGET_CLIENT_FIELDS & item.keys():
+                item.pop(key)
+                verbose_proxy_logger.debug("Stripped client-supplied field from a fallback target: %s", key)
+            for value in item.values():
+                _strip_overrides_from_fallback_list(field, value, depth + 1)
+        else:
+            _strip_overrides_from_fallback_list(field, item, depth + 1)
 
 
 def get_metadata_variable_name(request: Request) -> str:
