@@ -2217,7 +2217,6 @@ class ProxyBaseLLMRequestProcessing:
         # group -- model-level guardrails, per-model budgets and rate limits,
         # the logging object -- sees the group that will actually serve.
         if llm_router is not None and proxy_config is not None:
-            from litellm.proxy.auth.auth_utils import GENERAL_SETTINGS_VIEW
             from litellm.proxy.auth.user_api_key_auth import enforce_router_settings_fallback_access
             from litellm.proxy.proxy_server import prisma_client
 
@@ -2237,7 +2236,8 @@ class ProxyBaseLLMRequestProcessing:
                         self.data  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # untyped body
                     ),
                     valid_token=user_api_key_dict,
-                    general_settings=GENERAL_SETTINGS_VIEW.validate_python(general_settings),
+                    # The proxy's settings dict as loaded, read by setting name only: not copied, not validated
+                    general_settings=general_settings,  # pyright: ignore[reportUnknownArgumentType]  # see above
                     llm_router=llm_router,
                     request=request,
                 )

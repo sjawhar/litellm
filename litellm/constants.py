@@ -20,10 +20,11 @@ DEFAULT_HEALTH_CHECK_PROMPT: Final = str(os.getenv("DEFAULT_HEALTH_CHECK_PROMPT"
 AZURE_DEFAULT_RESPONSES_API_VERSION: Final = str(os.getenv("AZURE_DEFAULT_RESPONSES_API_VERSION", "preview"))
 AZURE_OPENAI_AUDIO_PROVIDERS: Final = frozenset({"azure", "azure_ai"})
 ROUTER_MAX_FALLBACKS: Final = int(os.getenv("ROUTER_MAX_FALLBACKS", 5))
-# The entries a request's fallback lists may hold in all, each counted once across every list and depth: the proxy
-# refuses more with 400 before it reads them. Each entry is a model a hop may call, one after another, so a request
-# means a handful; the largest shape, a Router-format map of model groups, holds an entry per group and per fallback,
-# and 1,000 holds 250 groups with three fallbacks each. The fallback walk caps nesting at 2 * ROUTER_MAX_FALLBACKS.
+# The entries a request's fallback lists may hold in all, in the reading the request is checked in, each counted once
+# across every list and depth: the proxy refuses more with 400 before it reads them. Each entry is a model a hop may
+# call, one after another, so a request means a handful; the largest shape, a Router-format map of model groups, holds
+# an entry per group and per fallback, and 1,000 holds 250 groups with three fallbacks each. The fallback walk caps
+# nesting at 2 * ROUTER_MAX_FALLBACKS, and its entry visits at 16 per entry of this budget.
 MAX_FALLBACK_LIST_ENTRIES: Final = 1000
 ROUTER_FALLBACK_ERROR_DETAIL_MAX_CHARS: Final = 2000
 RUNTIME_UPDATABLE_ROUTER_SETTINGS: Final[frozenset[str]] = frozenset(
