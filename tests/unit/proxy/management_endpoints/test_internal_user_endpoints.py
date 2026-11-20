@@ -5550,6 +5550,77 @@ async def test_delete_user_revokes_the_user_again_before_its_ending_writes_once_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("loses_redis", [False, True], ids=["redis_up", "redis_lost"])
+async def test_delete_user_revokes_the_user_again_before_its_row_delete_once_a_membership_round_outlasts_the_tombstone(
+    mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch, loses_redis: bool
+) -> None:
+    """The user's tombstone, recorded by the revocation before the first write, still stands at the organization
+    membership delete, so that delete's revocation skips the user; then the round deleting the user's team membership
+    takes the tombstone time and a second, and the tombstone lapses. The user delete revokes the user again right
+    before it, so the tombstone stands in Redis when it runs. With Redis lost once that round's delete lands, that
+    revocation cannot reach Redis: the request answers 503 with the user row kept."""
+    from litellm.models.team_membership import LiteLLM_TeamMembership
+    from litellm.proxy._types import DeleteUserRequest
+    from litellm.proxy.management_endpoints.internal_user_endpoints import delete_user
+    from tests.unit.caching.fake_redis_cache import drive_fake_redis_time, fake_redis_cache
+
+    clock: Final = _DrivenClock()
+    drive_fake_redis_time(monkeypatch, clock.wall)
+    redis: Final = fake_redis_cache()
+    prisma_client, _ = _leaving_user(mocker, redis, clock, ("team-1",))
+    memberships: Final = [  # mutable-ok: the round's delete empties it
+        LiteLLM_TeamMembership(user_id=_LEAVER, team_id="team-1")
+    ]
+    seen: Final[list[tuple[str, bool, bool]]] = []  # mutable-ok: the user in Redis at each ending write
+    record_membership_delete: Final = _recording_in_redis(redis, _LEAVER, "team membership delete", seen)
+    record_membership_deleted: Final = _recording_in_redis(redis, _LEAVER, "team membership deleted", seen)
+
+    async def slow_membership_delete(*_args: object, **_kwargs: object) -> object:
+        await record_membership_delete()
+        clock.now += LAST_GOOD_TOMBSTONE_TTL_SECONDS + 1
+        await record_membership_deleted()
+        memberships.clear()
+        if loses_redis:
+            redis.server.connected = False
+        return DEFAULT
+
+    prisma_client.db.litellm_teammembership.find_many.side_effect = lambda **_where: list(memberships)
+    prisma_client.db.litellm_teammembership.delete_many.side_effect = slow_membership_delete
+    prisma_client.db.litellm_organizationmembership.delete_many.side_effect = _recording_in_redis(
+        redis, _LEAVER, "organization membership delete", seen
+    )
+    prisma_client.db.litellm_usertable.delete_many.side_effect = _recording_in_redis(
+        redis, _LEAVER, "user delete", seen
+    )
+    deleting: Final = delete_user(
+        data=DeleteUserRequest(user_ids=[_LEAVER]),
+        user_api_key_dict=UserAPIKeyAuth(user_id="proxy-admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+    )
+
+    # Standing at the organization membership delete, the user's tombstone lapsed during the team membership's
+    before_the_user_delete: Final = (
+        ("organization membership delete", True, False),
+        ("team membership delete", True, False),
+        ("team membership deleted", False, False),
+    )
+    if not loses_redis:
+        await deleting
+        assert seen == [*before_the_user_delete, ("user delete", True, False)]
+        return
+    with pytest.raises(HTTPException) as refused:
+        await deleting
+    assert (refused.value.status_code, refused.value.detail) == (
+        503,
+        {
+            "error": "The auth cache could not record this revocation, so nothing was changed. "
+            "Retry once Redis is reachable."
+        },
+    )
+    assert seen == list(before_the_user_delete)
+    prisma_client.db.litellm_usertable.delete_many.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loses_redis", [False, True], ids=["redis_up", "redis_lost"])
 async def test_delete_user_reads_a_key_rounds_jwt_mappings_before_the_rounds_revocation(
     mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch, loses_redis: bool
 ) -> None:

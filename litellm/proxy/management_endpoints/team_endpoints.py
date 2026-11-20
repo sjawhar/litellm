@@ -413,14 +413,6 @@ class _TeamDeleteTx(AccessGroupSyncTx, Protocol):
     def litellm_teammembership(self) -> "TableActions[prisma_models.LiteLLM_TeamMembership]": ...
 
 
-class _TeamKeysTx(Protocol):
-    """The table `/team/delete` reads and deletes the teams' keys on, round by round, while last good entries are
-    served: the reads see what the deletes change, on the writer."""
-
-    @property
-    def litellm_verificationtoken(self) -> "TableActions[prisma_models.LiteLLM_VerificationToken]": ...
-
-
 # Each round archives and deletes all the keys it read of every team deleted, which a large team outlasts in the
 # default transaction time
 _TEAM_KEYS_DELETE_TX_TIMEOUT: Final = timedelta(seconds=60)
@@ -440,6 +432,12 @@ def _team_db(prisma_client: PrismaClient | None) -> "TableActions[prisma_models.
 def _team_tx_db(tx: "Prisma") -> "TableActions[prisma_models.LiteLLM_TeamTable]":
     return cast(  # cast-ok: generated actions type Json columns as str; TableActions widens inputs to Mapping
         "TableActions[prisma_models.LiteLLM_TeamTable]", tx.litellm_teamtable
+    )
+
+
+def _tokens_tx_db(tx: "Prisma") -> "TableActions[prisma_models.LiteLLM_VerificationToken]":
+    return cast(  # cast-ok: generated actions type their filters as TypedDicts; TableActions widens them to Mapping
+        "TableActions[prisma_models.LiteLLM_VerificationToken]", tx.litellm_verificationtoken
     )
 
 
@@ -3682,7 +3680,7 @@ async def _revoke_and_delete_keys_in_rounds(
         persist_deleted_verification_tokens,
     )
 
-    key_tx: Final[_TeamKeysTx] = tx
+    keys_db: Final = _tokens_tx_db(tx)
     jwt_mapping_cache_keys: Final[list[str]] = []  # mutable-ok: grows by each chunk's mappings, read before it goes
 
     async def read_mappings_and_archive_keys(keys: "Sequence[prisma_models.LiteLLM_VerificationToken]") -> None:
@@ -3701,11 +3699,11 @@ async def _revoke_and_delete_keys_in_rounds(
 
     async def delete_keys(keys: "Sequence[prisma_models.LiteLLM_VerificationToken]") -> None:
         # bounded-ok: revoke_and_delete_read_rows hands each call at most IN_LIST_CHUNK_SIZE rows
-        await key_tx.litellm_verificationtoken.delete_many(where={"token": {"in": [key.token for key in keys]}})
+        await keys_db.delete_many(where={"token": {"in": [key.token for key in keys]}})
 
     deleted: Final = await revoke_and_delete_read_rows(
         user_api_key_cache,
-        partial(key_tx.litellm_verificationtoken.find_many, where=keys_where),
+        partial(keys_db.find_many, where=keys_where),
         lambda keys: tuple(key.token for key in keys),
         delete_keys,
         prepare=read_mappings_and_archive_keys,
@@ -3741,7 +3739,6 @@ async def _delete_team_member_keys(
             litellm_changed_by=None,
         )
     # No last good entry to revoke, so the member's keys go in one delete, as without that setting
-    member_tx: Final[_MemberDeleteTx] = tx
     if removes_users:
         if keys_read:
             from litellm.proxy.management_endpoints.key_management_endpoints import (
@@ -3756,9 +3753,8 @@ async def _delete_team_member_keys(
                 tx=tx,
             )
 
-        await member_tx.litellm_verificationtoken.delete_many(where=member_keys_where)
+        await _tokens_tx_db(tx).delete_many(where=member_keys_where)
     return _DeletedKeys(rows=tuple(keys_read), jwt_mapping_cache_keys=tuple(mappings_of_keys_read))
-
 
 
 async def _team_member_delete(

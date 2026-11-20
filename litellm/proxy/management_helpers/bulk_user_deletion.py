@@ -274,7 +274,7 @@ async def _delete_keys(
 
     async def archive(keys: Sequence["prisma_models.LiteLLM_VerificationToken"]) -> None:
         await persist_deleted_verification_tokens(
-            keys=keys,  # pyright: ignore[reportArgumentType]  # the generated row has the same columns
+            keys=keys,
             prisma_client=prisma_client,
             user_api_key_dict=user_api_key_dict,
             litellm_changed_by=litellm_changed_by,

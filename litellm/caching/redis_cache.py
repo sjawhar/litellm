@@ -2021,6 +2021,29 @@ class RedisCache(BaseCache):
         )
 
     @_redis_circuit_breaker_guard
+    async def async_set_then_delete_or_raise(
+        self, set_keys: Sequence[str], value: object, ttl: int, delete_keys: Sequence[str]
+    ) -> None:
+        """SET each of ``set_keys`` to ``value`` for ``ttl`` seconds (SET EX), then DEL each of ``delete_keys``, raising
+        when Redis cannot take a command. Two round trips however many keys: one pipeline of the SETs, and once every
+        SET is acknowledged, one pipeline of the DELs. A cluster's pipeline sends each node its share at the same time,
+        so a single pipeline could run a DEL on its node before a SET on another; the second pipeline keeps every DEL
+        after every SET on any deployment. When the first pipeline raises, some SETs may have landed and no DEL is sent;
+        when the second raises, every SET landed and some DELs may have."""
+        client: Final = self._async_commands()
+        payload: Final = json.dumps(value)
+        async with client.pipeline(transaction=False) as pipe:
+            for key in set_keys:
+                _ = pipe.set(self.check_and_fix_namespace(key=key), payload, ex=ttl)
+            _ = await pipe.execute()
+        if not delete_keys:
+            return
+        async with client.pipeline(transaction=False) as pipe:
+            for key in delete_keys:
+                _ = pipe.delete(self.check_and_fix_namespace(key=key))
+            _ = await pipe.execute()
+
+    @_redis_circuit_breaker_guard
     async def async_server_version(self) -> str:
         """The ``redis_version`` the server reports in INFO; raises when Redis cannot answer or reports none. A cluster
         client asks one node (redis-py sends INFO to its default node)."""

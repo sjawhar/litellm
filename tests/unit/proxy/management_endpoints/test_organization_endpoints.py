@@ -2142,6 +2142,86 @@ async def test_delete_organization_revokes_a_child_added_between_a_read_and_its_
     assert members.deleted_while_served == []
 
 
+class _JWTMappingTableNotingReads(CascadingJWTMappingTable):
+    """The mapping table, with the tokens each read asks for noted in ``reads``, in order."""
+
+    def __init__(self, rows: Sequence[JWTMappingRow]) -> None:
+        super().__init__(rows)
+        self.reads: Final[list[tuple[str, ...]]] = []  # mutable-ok: one entry per read, in order
+
+    async def find_many(self, where: Mapping[str, Mapping[str, Sequence[str]]]) -> list[JWTMappingRow]:
+        self.reads.append(tuple(where["token"]["in"]))
+        return await super().find_many(where)
+
+
+@pytest.mark.asyncio
+async def test_delete_organization_reads_the_jwt_mappings_of_its_keys_one_chunk_at_a_time(monkeypatch):
+    """While last good entries are served, the keys' JWT mappings are read chunk by chunk, right before each chunk's
+    revocation, so no mapping read's ``in`` list holds more than one chunk's tokens; every mapping is still evicted
+    once the keys are gone."""
+    from functools import partial
+
+    from litellm.proxy._types import (
+        DeleteOrganizationRequest,
+        LitellmUserRoles,
+        UserAPIKeyAuth,
+    )
+    from litellm.proxy.auth.auth_checks import jwt_key_mapping_cache_key
+    from litellm.proxy.common_utils.user_api_key_cache import (
+        UserApiKeyCache,
+        remember_last_good,
+        revoke_and_delete_read_rows,
+    )
+    from litellm.proxy.management_endpoints.organization_endpoints import delete_organization
+
+    tokens: Final = tuple(f"hashed-org-key-{n}" for n in range(5))
+    doomed_mapping_keys: Final = tuple(jwt_key_mapping_cache_key("sub", f"svc-{token}", None) for token in tokens)
+    kept_mapping_key: Final = jwt_key_mapping_cache_key("sub", "other-account", None)
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    for token in tokens:
+        await remember_last_good(cache, token, UserAPIKeyAuth(token=token))
+    for cache_key in (*doomed_mapping_keys, kept_mapping_key):
+        cache.set_cache(key=cache_key, value={"retained": True})
+    keys: Final = _Rows(
+        # The key rows the endpoint reads are the database's, with their organization_id column, which the proxy's
+        # LiteLLM_VerificationToken does not carry (it has org_id)
+        tuple(SimpleNamespace(token=token, organization_id="org-doomed") for token in tokens),
+        served=_served_by(cache, lambda key: key.token, UserAPIKeyAuth),
+    )
+    jwt_table: Final = _JWTMappingTableNotingReads(
+        (
+            *(JWTMappingRow(token, "sub", f"svc-{token}") for token in tokens),
+            JWTMappingRow("hashed-other-key", "sub", "other-account"),
+        )
+    )
+    database: Final = SimpleNamespace(
+        db=SimpleNamespace(
+            litellm_teamtable=_Rows(()),
+            litellm_verificationtoken=keys,
+            litellm_organizationmembership=_Rows(()),
+            litellm_jwtkeymapping=jwt_table,
+            litellm_organizationtable=_deleted_organization_table(),
+        )
+    )
+    _org_endpoints_use(monkeypatch, database, cache)
+    # Chunks of two, so five keys make three chunks without writing 5,001 rows
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.organization_endpoints.revoke_and_delete_read_rows",
+        partial(revoke_and_delete_read_rows, chunk_size=2),
+    )
+
+    await delete_organization(
+        data=DeleteOrganizationRequest(organization_ids=["org-doomed"]),
+        user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN),
+    )
+
+    assert jwt_table.reads == [tokens[:2], tokens[2:4], tokens[4:]]
+    assert all(cache.get_cache(key=cache_key) is None for cache_key in doomed_mapping_keys)
+    assert cache.get_cache(key=kept_mapping_key) == {"retained": True}
+    assert keys.rows == ()
+    assert keys.deleted_while_served == []
+
+
 @pytest.mark.asyncio
 async def test_organization_member_delete_by_email_pinned_to_the_writer_removes_the_user_the_writer_maps_it_to(
     monkeypatch,
@@ -2306,7 +2386,6 @@ def _two_organizations_the_first_outlasting(
     from litellm.proxy._types import (
         LiteLLM_OrganizationMembershipTable,
         LiteLLM_TeamTable,
-        LiteLLM_VerificationToken,
     )
     from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
     from tests.unit.caching.fake_redis_cache import fake_redis_cache
@@ -2315,7 +2394,9 @@ def _two_organizations_the_first_outlasting(
     redis: Final = fake_redis_cache()
     joined: Final = datetime(2026, 1, 1, tzinfo=timezone.utc)
     teams: Final = _Rows((LiteLLM_TeamTable(team_id="t-first", organization_id=_FIRST_ORG),))
-    keys: Final = _Rows((LiteLLM_VerificationToken(token="hashed-first-key", organization_id=_FIRST_ORG),))
+    # The key row the endpoint reads is the database's, with its organization_id column, which the proxy's
+    # LiteLLM_VerificationToken does not carry (it has org_id)
+    keys: Final = _Rows((SimpleNamespace(token="hashed-first-key", organization_id=_FIRST_ORG),))
     members: Final = _Rows(
         (
             LiteLLM_OrganizationMembershipTable(

@@ -15412,6 +15412,57 @@ async def test_startup_checks_the_redis_version_of_the_database_coordination_red
     ]
 
 
+@pytest.mark.asyncio
+async def test_last_good_redis_version_check_reads_no_version_through_a_plain_dual_cache(monkeypatch):
+    """Only a ``UserApiKeyCache`` keeps last good entries, so a plain ``DualCache``, even with a Redis attached, keeps
+    no Redis copy that needs SET EXAT: the check is True and sends no INFO, where Redis 6.0.16 would fail it."""
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis: Final = fake_redis_cache()
+    server_version: Final = AsyncMock(return_value="6.0.16")
+    monkeypatch.setattr(redis.cache, "async_server_version", server_version)
+
+    ok: Final = await proxy_server_module._last_good_redis_version_ok(
+        DualCache(redis_cache=redis.cache)  # pyright: ignore[reportArgumentType]  # its read takes any DualCache
+    )
+
+    assert (ok, server_version.await_count) == (True, 0)
+
+
+@pytest.mark.asyncio
+async def test_startup_attaches_the_database_coordination_redis_to_a_plain_dual_cache_reading_no_version(caplog):
+    """A plain ``DualCache`` as the auth cache keeps no last good entries, so the coordination Redis saved in the
+    database is attached to it with no INFO read and no version line, where Redis 6.0.16 would turn a
+    ``UserApiKeyCache``'s setting off."""
+    cache: Final = DualCache()
+    server_version: Final = AsyncMock(return_value="6.0.16")
+    caplog.set_level(logging.WARNING, logger="LiteLLM Proxy")
+    with (
+        _patched_coordination_redis_module_state(
+            spend_cache=DualCache(), config_cache=types.SimpleNamespace(redis_cache=None)
+        ),
+        patch.object(
+            proxy_server_module, "user_api_key_cache", cache
+        ),  # test-quality-ok: the attach writes this module global; no injection seam
+        patch.object(
+            RedisCache, "async_server_version", server_version
+        ),  # test-quality-ok: records an INFO read on the coordination Redis stand-in, which subclasses RedisCache
+        patch.object(
+            proxy_server_module,
+            "get_persisted_coordination_redis_settings",
+            AsyncMock(return_value={"host": "db-host", "port": 6381}),
+        ),  # test-quality-ok: the row the admin UI saves; no database in this unit test
+    ):
+        result: Final = await proxy_server_module.ProxyStartupEvent.init_coordination_redis_from_db(
+            litellm_settings={"enable_redis_auth_cache": True},
+            llm_router=None,
+        )
+
+    assert isinstance(result, _EnvBuiltRedisCache)
+    assert (cache.redis_cache is result, server_version.await_count) == (True, 0)
+    assert [r.getMessage() for r in caplog.records if "SET EXAT" in r.getMessage()] == []
+
+
 def test_docs_redoc_openapi_are_reachable_by_default():
     """
     LIT-6745: the interactive/machine-readable docs surfaces are on by

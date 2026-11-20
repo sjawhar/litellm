@@ -5,7 +5,7 @@ otherwise PrismaClient uses the writer-only PrismaWrapper directly.
 """
 
 import os
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import timedelta
@@ -48,7 +48,7 @@ def pin_reads_to_writer(pinned: bool) -> None:
 
 
 @contextmanager
-def reads_pinned_to_writer(pinned: bool = True) -> Iterator[None]:
+def reads_pinned_to_writer(pinned: bool = True) -> Generator[None, None, None]:
     """``pin_reads_to_writer`` for the length of a block, then the earlier choice again."""
     token: Final = _reads_pinned_to_writer.set(pinned)
     try:

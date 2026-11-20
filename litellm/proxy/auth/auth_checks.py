@@ -3379,12 +3379,12 @@ async def invalidate_team_member_spend_state(
 
 
 async def _evict_team_member_keys(user_id: str, team_id: str, user_api_key_cache: UserApiKeyCache) -> None:
-    """A key's own entry carries its team member's spend and rate limits as of its last read, so a member change
-    evicts that member's keys in the team, last good entries included. Best effort, like every eviction after a
-    committed write."""
+    """A key's last good entry carries its team member's spend and rate limits as of its last read, so while last good
+    entries are served a member change evicts that member's keys in the team. Without that setting a member change
+    reads and evicts no key, as before it. Best effort, like every eviction after a committed write."""
     from litellm.proxy.proxy_server import prisma_client, proxy_logging_obj
 
-    if prisma_client is None:
+    if prisma_client is None or not serves_last_good_entries(user_api_key_cache):
         return
     try:
         member_keys: Final = await VerificationTokenRepository(prisma_client).table.find_many(
