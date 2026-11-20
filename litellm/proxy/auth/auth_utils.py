@@ -262,8 +262,6 @@ def _allow_model_level_clientside_configurable_parameters(
 reject_server_owned_wif_params = _reject_server_owned_wif_params
 
 _CREDENTIAL_VALUES: Final = TypeAdapter(dict[str, object])
-# The proxy's general_settings as the body checks read it: a dict keyed by setting name, whose values they only read
-GENERAL_SETTINGS_VIEW: Final = TypeAdapter(dict[str, object])
 
 
 def reject_federated_credential_reference(body: Mapping[str, object]) -> None:
@@ -550,7 +548,9 @@ def request_fallback_walk(route: str, request: Request | None, request_body: Map
     One walk of every fallback list a request carries, read as the Router gets the call: an anthropic_messages call on
     /v1/messages, whose header carriers are the body's, with the provider_specific_header the proxy builds from the
     request's Anthropic headers in place of the body's (add_provider_specific_headers_to_request). The lists may hold
-    MAX_FALLBACK_LIST_ENTRIES entries in all; the walk refuses more with a 400 before it reads them.
+    MAX_FALLBACK_LIST_ENTRIES entries in all in the reading the request is checked in; the walk refuses more with a 400
+    before it reads them. A reading only tried, to see whether a target's headers enforce it too, counts toward it
+    only once they do (walk_fallback_lists).
     """
     messages_call: Final = route.endswith("/v1/messages")
     header_lines: Final = tuple(
@@ -782,14 +782,16 @@ def _proxy_pinned_call_params() -> frozenset[str]:
     """
     from litellm.proxy import proxy_server
 
-    pins: Final = (
-        ("temperature", proxy_server.user_temperature),
-        ("max_tokens", proxy_server.user_max_tokens),
-        ("api_base", proxy_server.user_api_base),
-        ("request_timeout", proxy_server.user_request_timeout),
-        ("user", litellm.overwrite_user_with_key_hash is True),
+    # proxy_server leaves these command-line globals undeclared, so they are read by name, as the setup reads them:
+    # it writes each one that is set
+    set_on_the_command_line: Final = frozenset(
+        name
+        for name in ("temperature", "max_tokens", "api_base", "request_timeout")
+        if bool(getattr(proxy_server, f"user_{name}", None))
     )
-    return frozenset(name for name, pinned in pins if pinned)
+    return set_on_the_command_line | (
+        frozenset({"user"}) if litellm.overwrite_user_with_key_hash is True else frozenset()
+    )
 
 
 def _reject_setup_stripped_fields(target: Mapping[str, object], metadata_variable_name: str) -> None:
@@ -936,7 +938,8 @@ def is_request_body_safe(
     """
     check_request_body(
         request_body,  # pyright: ignore[reportUnknownArgumentType]  # the callers' untyped request body
-        GENERAL_SETTINGS_VIEW.validate_python(general_settings),
+        # The proxy's settings dict as loaded, which the checks read by setting name only: not copied, not validated
+        general_settings,  # pyright: ignore[reportUnknownArgumentType]  # see above
         llm_router,
         model,
         route=route,

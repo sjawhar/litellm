@@ -935,8 +935,9 @@ def _caller_timeouts_in_effect(
     return (*kept, *(name for name in touched if target[name] is not None))
 
 
-def caller_timeouts_left(marked: object, replaced: str) -> tuple[str, ...]:
-    """The caller's timeouts a request's mark names, once a timeout the administrator set replaced ``replaced``"""
-    return tuple(
-        name for name in (marked if is_object_tuple(marked) else ()) if isinstance(name, str) and name != replaced
-    )
+def caller_timeouts_left(marked: object, replaced: str) -> tuple[object, ...]:
+    """
+    The caller's timeouts a request's mark names, once a timeout the administrator set replaced ``replaced``: every
+    member of the mark but that name, as the setup recorded it
+    """
+    return tuple(name for name in (marked if is_object_tuple(marked) else ()) if name != replaced)

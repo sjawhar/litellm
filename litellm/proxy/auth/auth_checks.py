@@ -811,10 +811,19 @@ def _token_team_models(valid_token: _TokenTeamModels) -> Sequence[str]:
     return valid_token.team_models
 
 
+class _TokenTeamAliases(Protocol):
+    @property
+    def team_model_aliases(self) -> Mapping[str, str] | None: ...
+
+
 def _token_team_aliases(
-    valid_token: UserAPIKeyAuth | None,
+    valid_token: _TokenTeamAliases | None,
 ) -> dict[str, str] | None:  # mutable-ok: the model checks take the team's aliases as this type
-    aliases: Final = team_model_aliases_for_auth_check(valid_token) if valid_token is not None else None
+    """
+    The team's model aliases as the token records them, every entry kept as the base's model checks read them, through a
+    typed view: _types.py declares the field a bare dict
+    """
+    aliases: Final = valid_token.team_model_aliases if valid_token is not None else None
     return dict(aliases) if aliases is not None else None
 
 
@@ -857,7 +866,7 @@ def _reject_aliased_provider_fallback(
     # The alias maps the model checks consult: the key's, the team's as the token carries it, the global, the router's
     alias_sources: Final[tuple[Mapping[str, object] | None, ...]] = (
         key_model_aliases_for_auth_check(valid_token),
-        team_model_aliases_for_auth_check(valid_token) if valid_token is not None else None,
+        _token_team_aliases(valid_token),
         litellm.model_alias_map,
         llm_router.model_group_alias if llm_router is not None else None,
     )

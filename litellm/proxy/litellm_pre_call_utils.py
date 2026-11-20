@@ -788,9 +788,7 @@ def _changed_paths(before: object, after: object) -> Iterator[str]:
 
 def _bucket_copy(bucket: Mapping[str, object]) -> dict[str, object]:  # mutable-ok: the strips rewrite this copy
     """A bucket copied as deep as the strips change one, its own keys and those of its ``headers``, and no deeper"""
-    return {
-        key: dict(value) if key == "headers" and is_object_dict(value) else value for key, value in bucket.items()
-    }
+    return {key: dict(value) if key == "headers" and is_object_dict(value) else value for key, value in bucket.items()}
 
 
 def client_metadata_the_setup_would_change(

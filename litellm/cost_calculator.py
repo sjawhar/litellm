@@ -1514,11 +1514,11 @@ def _sum_attempt_costs(
         return total_cost
     first: Final = breakdowns[0]
     summed_margin_total: Final = _summed_breakdown(breakdowns, "margin_total_amount")
-    _store_cost_breakdown_in_logging_obj(
-        litellm_logging_obj,
-        prompt_tokens_cost_usd_dollar=_summed_breakdown(breakdowns, "input_cost") or 0.0,
-        completion_tokens_cost_usd_dollar=_summed_breakdown(breakdowns, "output_cost") or 0.0,
-        total_cost_usd_dollar=total_cost,
+    # set_cost_breakdown's additional_costs is an untyped dict, which makes the method's type partly unknown
+    litellm_logging_obj.set_cost_breakdown(  # pyright: ignore[reportUnknownMemberType]  # see above
+        input_cost=_summed_breakdown(breakdowns, "input_cost") or 0.0,
+        output_cost=_summed_breakdown(breakdowns, "output_cost") or 0.0,
+        total_cost=total_cost,
         cost_for_built_in_tools_cost_usd_dollar=_summed_breakdown(breakdowns, "tool_usage_cost") or 0.0,
         original_cost=_summed_breakdown(breakdowns, "original_cost"),
         discount_percent=first.get("discount_percent"),

@@ -443,9 +443,16 @@ class FallbackReading(Enum):
 
 class FallbackBudgetError(FallbackListShapeError):
     """
-    Fallback lists that hold more entries in all than their budget, refused when the walk reaches the list that passes
-    it, before it reads that list's entries
+    Fallback lists that hold more entries in all than their budget, or whose walk would visit their entries more than
+    _VISITS_PER_BUDGETED_ENTRY times per entry of the budget, in the reading the request is checked in: refused when
+    the walk reaches the list or the visit that passes it
     """
+
+
+# The entry visits a walk may make per entry of its budget. A walk reads each list once per way of reading it, a few
+# ways in a parsed JSON body (the review's nested shape reads each entry at most 5 times); only a list shared by many
+# model groups, which a Python caller can build and JSON cannot encode, comes near it.
+_VISITS_PER_BUDGETED_ENTRY: Final = 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -475,13 +482,23 @@ class FallbackListRead:
     via_litellm_fallbacks: bool = False
 
 
+def _read_in(reading: FallbackReading, *, widest: bool, via: bool) -> bool:
+    """
+    Whether a walk that reads every ``fallbacks`` field both ways reads what it reaches in the way ``widest`` and
+    ``via`` mark under ``reading`` too: LiteLLM reads no list in the widest way, and Anthropic's reading takes no
+    ``fallbacks`` field as LiteLLM's on the way down
+    """
+    if reading is FallbackReading.LITELLM:
+        return not widest
+    if reading is FallbackReading.ANTHROPIC:
+        return not via
+    return True
+
+
 def _in_reading(event: FallbackEntry | FallbackListRead, reading: FallbackReading) -> bool:
     """Whether a walk that reads every ``fallbacks`` field both ways reaches ``event`` under ``reading`` too"""
-    if reading is FallbackReading.LITELLM:
-        return isinstance(event, FallbackListRead) or not event.anthropic
-    if reading is FallbackReading.ANTHROPIC:
-        return not event.via_litellm_fallbacks
-    return True
+    widest: Final = False if isinstance(event, FallbackListRead) else event.anthropic
+    return _read_in(reading, widest=widest, via=event.via_litellm_fallbacks)
 
 
 @dataclass(frozen=True, slots=True)
@@ -530,19 +547,65 @@ class FallbackWalk:
 
 
 @dataclass(slots=True)
+class _FallbackTally:
+    """
+    The entries and the entry visits one reading of a walk has reached: each list's entries once, however many ways
+    the reading reads it, and every visit. ``refusal`` is the first limit the tally passed.
+    """
+
+    counted: set[int]  # mutable-ok: the tally's own record of the lists it counted, never handed out
+    entries: int = 0
+    visits: int = 0
+    refusal: FallbackBudgetError | None = None
+
+    def add_entries(
+        self, container: object, entries: int, budget: int, field: str | None
+    ) -> FallbackBudgetError | None:
+        if id(container) not in self.counted:
+            self.counted.add(id(container))
+            self.entries += entries
+        return self._passed(budget, field)
+
+    def add_visit(self, budget: int) -> FallbackBudgetError | None:
+        self.visits += 1
+        return self._passed(budget, None)
+
+    def _passed(self, budget: int, field: str | None) -> FallbackBudgetError | None:
+        if self.refusal is None and self.entries > budget:
+            self.refusal = FallbackBudgetError(
+                f"Rejected Request: the fallback lists hold more than {budget} entries in all.", field
+            )
+        elif self.refusal is None and self.visits > _VISITS_PER_BUDGETED_ENTRY * budget:
+            self.refusal = FallbackBudgetError(
+                f"Rejected Request: reading the fallback lists takes more than "
+                f"{_VISITS_PER_BUDGETED_ENTRY * budget} entry visits; a list shared by many model groups is read once "
+                "for each.",
+                field,
+            )
+        return self.refusal
+
+
+@dataclass(slots=True)
 class _FallbackRead:
     """
     The state of one walk. It reads each list, and each mapping merged into the call, once per way of reading it: the
     field it is read as, its depth, whose list it is, the group key above it, and whether a both-ways ``fallbacks``
-    read lies above it. A walk is so linear in the entries. ``budget`` caps the entries of all the lists, each counted
-    once however many ways it is read; None leaves them uncounted.
+    read lies above it, so a walk is linear in the entries. ``budget`` caps the entries of all the lists, each counted
+    once however many ways it is read, and the walk's entry visits at _VISITS_PER_BUDGETED_ENTRY per entry of it;
+    None leaves both uncounted. What the walk reaches in the way ``enforced`` reads it is refused at once past either;
+    ``every`` tallies all it reaches, for a walk whose targets turn out to make every way enforced.
     """
 
     reading: FallbackReading
     budget: int | None
+    enforced: FallbackReading
     read: set[tuple[object, ...]]  # mutable-ok: one walk's own record of what it read, never handed out
-    counted: set[int]  # mutable-ok: one walk's own record of the lists it counted, never handed out
-    entries: int = 0
+    enforced_tally: _FallbackTally
+    every_tally: _FallbackTally
+
+    @classmethod
+    def start(cls, reading: FallbackReading, budget: int | None, enforced: FallbackReading) -> "_FallbackRead":
+        return cls(reading, budget, enforced, set(), _FallbackTally(set()), _FallbackTally(set()))
 
     def first_read(self, way: tuple[object, ...]) -> bool:
         if way in self.read:
@@ -550,15 +613,32 @@ class _FallbackRead:
         self.read.add(way)
         return True
 
-    def count(self, container: object, entries: int, field: str | None) -> None:
-        if id(container) in self.counted:
+    def count(self, container: object, entries: int, field: str | None, *, widest: bool, via: bool) -> None:
+        if self.budget is None:
             return
-        self.counted.add(id(container))
-        self.entries += entries
-        if self.budget is not None and self.entries > self.budget:
-            raise FallbackBudgetError(
-                f"Rejected Request: the fallback lists hold more than {self.budget} entries in all.", field
-            )
+        self.every_tally.add_entries(container, entries, self.budget, field)
+        if _read_in(self.enforced, widest=widest, via=via):
+            refusal: Final = self.enforced_tally.add_entries(container, entries, self.budget, field)
+            if refusal is not None:
+                raise refusal
+
+    def entry(
+        self,
+        target: str | Mapping[str, object],
+        group: str | None,
+        *,
+        is_group_map: bool = False,
+        widest: bool,
+        via: bool,
+    ) -> FallbackEntry:
+        """One entry the walk reaches, counted as a visit before it is read"""
+        if self.budget is not None:
+            self.every_tally.add_visit(self.budget)
+            if _read_in(self.enforced, widest=widest, via=via):
+                refusal: Final = self.enforced_tally.add_visit(self.budget)
+                if refusal is not None:
+                    raise refusal
+        return FallbackEntry(target, group, is_group_map, widest, via)
 
 
 def _until_shape_error(
@@ -595,22 +675,30 @@ def walk_fallback_lists(
     beta. A target that carries a header field replaces the call's on its hop and the Router keeps it on later hops, so
     when any target carries one and any hop can carry the beta, the order of hops decides and every ``fallbacks`` field
     is read both ways. An anthropic_messages call's walk reads both ways from the start, decides the reading from the
-    targets it reached, and keeps what that reading reaches: one walk serves the reading and every check. ``budget``
-    caps the entries of all the lists.
+    targets it reached, and keeps what that reading reaches: one walk serves the reading and every check.
+
+    ``budget`` caps the entries and the entry visits of the reading the request is checked in. The request's carriers
+    alone enforce one reading, Anthropic's with the beta and LiteLLM's without it, so what the walk reaches in that
+    reading is refused at once past the budget. The other reading is only tried, to learn whether a target's carriers
+    enforce it too: it counts toward the budget, and is refused past it, only once the walk shows they do. Until then
+    nothing bounds it but the memo, one visit per node per way of reading it, which keeps it linear in the body for a
+    parsed JSON body, a tree.
     """
     if not anthropic_messages_call:
         return _recorded(
-            iter_body_fallback_entries(body, _FallbackRead(FallbackReading.LITELLM, budget, set(), set())),
+            iter_body_fallback_entries(
+                body, _FallbackRead.start(FallbackReading.LITELLM, budget, FallbackReading.LITELLM)
+            ),
             FallbackReading.LITELLM,
         )
-    both_ways: Final = _recorded(
-        iter_body_fallback_entries(body, _FallbackRead(FallbackReading.BOTH, budget, set(), set())),
-        FallbackReading.BOTH,
+    request_beta: Final = provider_owns_fallbacks_field(carriers, anthropic_messages_call=True)
+    walk: Final = _FallbackRead.start(
+        FallbackReading.BOTH, budget, FallbackReading.ANTHROPIC if request_beta else FallbackReading.LITELLM
     )
+    both_ways: Final = _recorded(iter_body_fallback_entries(body, walk), FallbackReading.BOTH)
     if both_ways.error is not None:
         # The checks refuse the lists; nothing is known of their hops until then
         return both_ways
-    request_beta: Final = provider_owns_fallbacks_field(carriers, anthropic_messages_call=True)
     carrying: Final = tuple(
         entry.target
         for entry in both_ways.entries
@@ -622,12 +710,14 @@ def walk_fallback_lists(
         if not carrying
         else (FallbackReading.BOTH if request_beta or target_beta else FallbackReading.LITELLM)
     )
+    if reading is FallbackReading.BOTH and walk.every_tally.refusal is not None:
+        raise walk.every_tally.refusal
     return FallbackWalk(reading, tuple(event for event in both_ways.events if _in_reading(event, reading)))
 
 
 def walk_fallback_list(value: object, field: str, reading: FallbackReading) -> FallbackWalk:
     """One walk of the fallback list ``field`` holds, its targets' own ``fallbacks`` read as ``reading`` says"""
-    return _recorded(iter_fallback_entries(value, field, _FallbackRead(reading, None, set(), set())), reading)
+    return _recorded(iter_fallback_entries(value, field, _FallbackRead.start(reading, None, reading)), reading)
 
 
 def _list_readings(
@@ -672,11 +762,11 @@ def iter_fallback_entries(
     if field is not None and not widest_reading:
         yield FallbackListRead(value, field, via_litellm_fallbacks)
     if _is_mapping(value):
-        walk.count(value, len(value), field)
+        walk.count(value, len(value), field, widest=widest_reading, via=via_litellm_fallbacks)
         # The Router iterates a fallback list, and iterating a mapping walks its keys, so each key is a target
         for key in value:
             if isinstance(key, str):
-                yield FallbackEntry(key, group, anthropic=widest_reading, via_litellm_fallbacks=via_litellm_fallbacks)
+                yield walk.entry(key, group, widest=widest_reading, via=via_litellm_fallbacks)
         for target_list in value.values():
             yield from iter_fallback_entries(
                 target_list,
@@ -688,7 +778,7 @@ def iter_fallback_entries(
                 via_litellm_fallbacks=via_litellm_fallbacks,
             )
     elif is_object_list(value):
-        walk.count(value, len(value), field)
+        walk.count(value, len(value), field, widest=widest_reading, via=via_litellm_fallbacks)
         yield from _iter_list_entries(
             value,
             field,
@@ -714,7 +804,7 @@ def _iter_list_entries(
     read_both_ways: Final = field == "fallbacks" and not widest_reading and not entries_are_targets
     for item in items:
         if isinstance(item, str):
-            yield FallbackEntry(item, group, anthropic=widest_reading, via_litellm_fallbacks=via_litellm_fallbacks)
+            yield walk.entry(item, group, widest=widest_reading, via=via_litellm_fallbacks)
         elif not _is_entry_mapping(item):
             # Every reader takes an entry for a model name or a mapping, so a nested list is called as neither
             raise FallbackListShapeError(
@@ -771,7 +861,7 @@ def iter_merged_target(
     then iter_body_fallback_entries reads every list through which the call it lands in picks another model, the
     mapping's own ``fallbacks`` as Anthropic's or LiteLLM's by the walk's reading.
     """
-    yield FallbackEntry(target, group, is_group_map, widest_reading, via_litellm_fallbacks)
+    yield walk.entry(target, group, is_group_map=is_group_map, widest=widest_reading, via=via_litellm_fallbacks)
     yield from iter_body_fallback_entries(
         target,
         walk,
@@ -824,7 +914,13 @@ def iter_body_fallback_entries(
     context_window_swaps: Final = body.get(CONTEXT_WINDOW_FALLBACK_DICT_FIELD)
     if _is_mapping(context_window_swaps):
         # Each value is the model the client wrapper swaps in, so the values are a list of targets
-        walk.count(context_window_swaps, len(context_window_swaps), CONTEXT_WINDOW_FALLBACK_DICT_FIELD)
+        walk.count(
+            context_window_swaps,
+            len(context_window_swaps),
+            CONTEXT_WINDOW_FALLBACK_DICT_FIELD,
+            widest=widest_reading,
+            via=via_litellm_fallbacks,
+        )
         yield from _iter_list_entries(
             tuple(context_window_swaps.values()),
             None,

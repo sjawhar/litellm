@@ -684,12 +684,11 @@ async def _route_request_single_attempt(  # noqa: ANN202  # returns unawaited pr
 
         # A /v1/messages request whose anthropic-beta header opts into server-side fallback sends its `fallbacks` to
         # Anthropic, so the key/team fallback list reaches the Router under its own name
+        server_side: Final = route_type == "anthropic_messages" and anthropic_owns_fallbacks(
+            data  # pyright: ignore[reportUnknownArgumentType]  # the route's untyped body
+        )
         settings_destination: Final = MappingProxyType(
-            {"fallbacks": ROUTER_FALLBACKS_KWARG}
-            if llm_router is not None
-            and route_type == "anthropic_messages"
-            and anthropic_owns_fallbacks(data)  # pyright: ignore[reportUnknownArgumentType]  # the route's untyped body
-            else {}
+            {"fallbacks": ROUTER_FALLBACKS_KWARG} if llm_router is not None and server_side else {}
         )
         for key in per_request_settings:
             if override_settings.get(key) is not None and settings_destination.get(key, key) not in data:
