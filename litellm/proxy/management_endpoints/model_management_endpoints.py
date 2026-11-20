@@ -138,6 +138,12 @@ from litellm.router_utils.auto_router_model_naming import (
     validate_strategy_router_model_write,
 )
 from litellm.router_utils.auto_router_tuning_baseline import is_mutable_tuned_candidate, tuning_quota_violation
+from litellm.router_utils.fallback_event_handlers import (
+    FallbackCall,
+    FallbackListShapeError,
+    FallbackReading,
+    iter_body_fallback_entries,
+)
 from litellm.types.llms.base import LiteLLMBaseModel
 from litellm.types.llms.bedrock import AwsSessionTag
 from litellm.types.proxy.management_endpoints.model_management_endpoints import (
@@ -479,6 +485,48 @@ def _decrypted_litellm_params(litellm_params: GenericLiteLLMParams) -> Mapping[s
             for name, value in dumped.items()
         }
     )
+
+
+def _deployment_fallback_entries(
+    litellm_params: GenericLiteLLMParams | None, *, refuse_malformed: bool
+) -> tuple[Mapping[str, object], ...]:
+    """
+    Every mapping a reader merges into a deployment's call from its own fallback lists, at every depth: litellm's own
+    fallback loop reads the deployment's `fallbacks` and merges each mapping into the call. Read as the request's
+    checks read a body, every fallback field and every mapping read both ways, so no mapping in any shape is missed.
+    """
+    if litellm_params is None:
+        return ()
+    try:
+        return tuple(
+            entry.target
+            for entry in iter_body_fallback_entries(
+                litellm_params.model_dump(exclude_none=True), FallbackCall(model="", reading=FallbackReading.BOTH)
+            )
+            if not isinstance(entry.target, str)
+        )
+    except FallbackListShapeError as shape_error:
+        if not refuse_malformed:
+            return ()
+        raise ProxyException(
+            message=f"litellm_params holds a fallback list no reader can call: {shape_error}",
+            type=ProxyErrorTypes.bad_request_error.value,
+            code=status.HTTP_400_BAD_REQUEST,
+            param=shape_error.param,
+        ) from shape_error
+
+
+def _fallback_entry_params(entry: Mapping[str, object]) -> updateLiteLLMParams:
+    """A fallback entry as the params it sets on the call it is merged into"""
+    try:
+        return updateLiteLLMParams.model_validate(dict(entry))
+    except ValidationError as invalid:
+        raise ProxyException(
+            message=f"A fallback entry in litellm_params is not valid params: {invalid}",
+            type=ProxyErrorTypes.bad_request_error.value,
+            code=status.HTTP_400_BAD_REQUEST,
+            param="fallbacks",
+        ) from invalid
 
 
 def _effective_model(
@@ -1259,19 +1307,15 @@ async def patch_model(
                 param="blocked",
             )
 
-        ModelManagementAuthChecks.can_user_attach_credential(
+        await ModelManagementAuthChecks.reject_what_a_non_admin_may_not_set(
+            model_params=db_model,
             litellm_params=patch_data.litellm_params,
             user_api_key_dict=user_api_key_dict,
+            prisma_client=prisma_client,
             existing_litellm_params=db_model.litellm_params,
             null_detaches=True,
         )
         await _raise_on_invalid_credential_name(patch_data.litellm_params, db_model.litellm_params, prisma_client)
-
-        ModelManagementAuthChecks.can_user_set_aws_session_tags(
-            litellm_params=patch_data.litellm_params,
-            user_api_key_dict=user_api_key_dict,
-            existing_litellm_params=db_model.litellm_params,
-        )
 
         _raise_on_strategy_router_write_violation(
             incoming_params=patch_data.litellm_params,
@@ -2208,6 +2252,58 @@ class ModelManagementAuthChecks:
             )
 
     @staticmethod
+    async def reject_what_a_non_admin_may_not_set(
+        *,
+        model_params: Deployment,
+        litellm_params: GenericLiteLLMParams | None,
+        user_api_key_dict: UserAPIKeyAuth,
+        prisma_client: PrismaClient,
+        existing_litellm_params: GenericLiteLLMParams | None = None,
+        null_detaches: bool = False,
+    ) -> Literal[True]:
+        """
+        What a non-proxy-admin may not set on a deployment, decided for its own litellm_params and for every fallback
+        entry in them, at every depth, by the same rules: litellm's own fallback loop merges an entry into the
+        deployment's call, so an entry may set no more than the params may. Each field keeps its one rule, with its
+        status, message and exceptions: a stored credential (can_user_attach_credential), aws_session_tags
+        (can_user_set_aws_session_tags), and a federation field or a federated deployment's destination
+        (_reject_non_admin_wif_write, which can_user_make_model_call already ran on the params). An entry the stored
+        deployment already carries unchanged passes, as an unchanged field does. ``model_params`` is the deployment
+        the write lands on, the stored one on an update.
+        """
+        ModelManagementAuthChecks.can_user_attach_credential(
+            litellm_params=litellm_params,
+            user_api_key_dict=user_api_key_dict,
+            existing_litellm_params=existing_litellm_params,
+            null_detaches=null_detaches,
+        )
+        ModelManagementAuthChecks.can_user_set_aws_session_tags(
+            litellm_params=litellm_params,
+            user_api_key_dict=user_api_key_dict,
+            existing_litellm_params=existing_litellm_params,
+        )
+        if user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN:
+            return True
+        stored_entries: Final = _deployment_fallback_entries(existing_litellm_params, refuse_malformed=False)
+        for entry in _deployment_fallback_entries(litellm_params, refuse_malformed=True):
+            if entry in stored_entries:
+                continue
+            entry_params = _fallback_entry_params(entry)
+            ModelManagementAuthChecks.can_user_attach_credential(
+                litellm_params=entry_params, user_api_key_dict=user_api_key_dict
+            )
+            ModelManagementAuthChecks.can_user_set_aws_session_tags(
+                litellm_params=entry_params, user_api_key_dict=user_api_key_dict
+            )
+            await ModelManagementAuthChecks._reject_non_admin_wif_write(
+                model_params=model_params,
+                incoming_params=entry,
+                user_api_key_dict=user_api_key_dict,
+                prisma_client=prisma_client,
+            )
+        return True
+
+    @staticmethod
     async def can_user_make_model_call(
         model_params: Deployment,
         user_api_key_dict: UserAPIKeyAuth,
@@ -2561,14 +2657,11 @@ async def add_new_model(
 
         _reject_non_admin_blocked_flag_on_create(model_params.blocked, user_api_key_dict)
 
-        ModelManagementAuthChecks.can_user_attach_credential(
+        await ModelManagementAuthChecks.reject_what_a_non_admin_may_not_set(
+            model_params=model_params,
             litellm_params=model_params.litellm_params,
             user_api_key_dict=user_api_key_dict,
-        )
-
-        ModelManagementAuthChecks.can_user_set_aws_session_tags(
-            litellm_params=model_params.litellm_params,
-            user_api_key_dict=user_api_key_dict,
+            prisma_client=prisma_client,
         )
 
         _raise_on_strategy_router_write_violation(
@@ -2764,15 +2857,11 @@ async def update_model(
         )
         member_write: Final = write_authorization if isinstance(write_authorization, MemberAutoRouterWrite) else None
 
-        ModelManagementAuthChecks.can_user_attach_credential(
+        await ModelManagementAuthChecks.reject_what_a_non_admin_may_not_set(
+            model_params=deployment,
             litellm_params=model_params.litellm_params,
             user_api_key_dict=user_api_key_dict,
-            existing_litellm_params=deployment.litellm_params,
-        )
-
-        ModelManagementAuthChecks.can_user_set_aws_session_tags(
-            litellm_params=model_params.litellm_params,
-            user_api_key_dict=user_api_key_dict,
+            prisma_client=prisma_client,
             existing_litellm_params=deployment.litellm_params,
         )
 
