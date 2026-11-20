@@ -303,26 +303,16 @@ async def _get_prisma_client_or_raise_exception():
     return prisma_client
 
 
-async def _check_user_exists(user_id: str, *, use_writer: bool = False) -> LiteLLM_UserTable:
-    """Check if user exists and return user, raise 404 if not found. ``use_writer`` reads it from the writer."""
+async def _check_user_exists(user_id: str) -> LiteLLM_UserTable:
+    """Check if user exists and return user, raise 404 if not found."""
     prisma_client: Final = await _get_prisma_client_or_raise_exception()
 
-    user: Final = await _table(UserRepository(prisma_client, use_writer=use_writer)).find_unique(
-        where={"user_id": user_id}
-    )
+    user: Final = await _table(UserRepository(prisma_client)).find_unique(where={"user_id": user_id})
 
     if not user:
         raise HTTPException(status_code=404, detail={"error": f"User not found with ID: {user_id}"})
 
     return user
-
-
-def _ending_reads_use_writer() -> bool:
-    """While last good entries are served, a read whose rows pick what a strict revocation and its write cover goes to
-    the writer: a lagging read replica could hide a row the write then ends unrevoked, or show one already gone."""
-    from litellm.proxy.proxy_server import user_api_key_cache
-
-    return serves_last_good_entries(user_api_key_cache)
 
 
 async def _check_team_exists(team_id: str) -> LiteLLM_TeamTable:
@@ -1057,13 +1047,11 @@ async def _revoke_scim_user(
     left: Final = sorted(set(left_team_ids))
     if not (ends_user or left) or not serves_last_good_entries(user_api_key_cache):
         return None
-    # From the writer: these rows pick what is revoked, and a lagging read replica could miss one
     found: Final = [
-        await _table(TeamRepository(prisma_client, use_writer=True)).find_unique(where={"team_id": team_id})
-        for team_id in left
+        await _table(TeamRepository(prisma_client)).find_unique(where={"team_id": team_id}) for team_id in left
     ]
     teams: Final = tuple(LiteLLM_TeamTable.model_validate(team.model_dump()) for team in found if team)
-    keys: Final = _table(VerificationTokenRepository(prisma_client, use_writer=True))
+    keys: Final = _table(VerificationTokenRepository(prisma_client))
     to_block: Final = await keys.find_many(where=_unblocked_keys_filter(user_id)) if ends_user else None
     in_left_teams: Final = await keys.find_many(where={"user_id": user_id, "team_id": {"in": left}}) if left else ()
     rosters_naming_user: Final = (
@@ -1108,7 +1096,7 @@ async def _set_user_keys_blocked(
         # Current rows, so the merge below keeps an edit made since; no key outside the preflight's is read
         revoked_tokens: Final = [key_row.token for key_row in revoked_keys]
         affected_keys = (
-            await _table(VerificationTokenRepository(prisma_client, use_writer=True)).find_many(
+            await _table(VerificationTokenRepository(prisma_client)).find_many(
                 where={**_unblocked_keys_filter(user_id), "token": {"in": revoked_tokens}}
             )
             if revoked_tokens
@@ -1190,12 +1178,10 @@ async def _delete_rows_referencing_user(prisma_client: PrismaClient, *, user_id:
         (user_id,),
         partial(_table(OrganizationMembershipRepository(prisma_client)).delete_many, where={"user_id": user_id}),
     )
+    team_memberships: Final = _table(TeamMembershipRepository(prisma_client))
     if not serves_last_good_entries(user_api_key_cache):
-        await _table(TeamMembershipRepository(prisma_client)).delete_many(where={"user_id": user_id})
+        await team_memberships.delete_many(where={"user_id": user_id})
         return
-    # Read on the writer, which the deletes go to: a lagging read replica could hide a membership, left then as an
-    # orphan never revoked, or show deleted ones until the rounds refuse with 409
-    team_memberships: Final = _table(TeamMembershipRepository(prisma_client, use_writer=True))
     await revoke_and_delete_read_rows(
         user_api_key_cache,
         partial(team_memberships.find_many, where={"user_id": user_id}),
@@ -1882,8 +1868,7 @@ async def update_user(
 
     try:
         prisma_client: Final = await _get_prisma_client_or_raise_exception()
-        # Its active state and teams pick what the request revokes, so they are read where they are written
-        existing_user: Final = await _check_user_exists(user_id, use_writer=_ending_reads_use_writer())
+        existing_user: Final = await _check_user_exists(user_id)
 
         prev_active: Final = _user_scim_active(existing_user)
 
@@ -1977,16 +1962,12 @@ async def delete_user(
     verbose_proxy_logger.debug("SCIM DELETE USER request for user_id=%s", user_id)
     try:
         prisma_client: Final = await _get_prisma_client_or_raise_exception()
-        # Its teams, and each team's roster and alias, pick what the request revokes, so they are read where written
-        on_writer: Final = _ending_reads_use_writer()
-        existing_user: Final = await _check_user_exists(user_id, use_writer=on_writer)
+        existing_user: Final = await _check_user_exists(user_id)
 
         # Get teams user belongs to
         found_teams: Final = tuple(
             [
-                await _table(TeamRepository(prisma_client, use_writer=on_writer)).find_unique(
-                    where={"team_id": team_id}
-                )
+                await _table(TeamRepository(prisma_client)).find_unique(where={"team_id": team_id})
                 for team_id in existing_user.teams or []
             ]
         )
@@ -2504,8 +2485,7 @@ async def patch_user(
 
     try:
         prisma_client: Final = await _get_prisma_client_or_raise_exception()
-        # Its active state and teams pick what the request revokes, so they are read where they are written
-        existing_user: Final = await _check_user_exists(user_id, use_writer=_ending_reads_use_writer())
+        existing_user: Final = await _check_user_exists(user_id)
 
         prev_active: Final = _user_scim_active(existing_user)
 

@@ -163,6 +163,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
 from litellm.proxy.db.db_lookup_gate import bounded_db_lookup
 from litellm.proxy.db.db_span import db_span
 from litellm.proxy.db.exception_handler import LastGoodEntryMissing, PrismaDBExceptionHandler
+from litellm.proxy.db.routing_prisma_wrapper import pin_reads_to_writer
 from litellm.proxy.litellm_pre_call_utils import LiteLLMProxyRequestSetup
 from litellm.proxy.spend_tracking.carried_budget_state import carry_team_and_user_budget_state
 from litellm.proxy.spend_tracking.spend_counter_batch import (
@@ -3597,6 +3598,39 @@ def _seed_request_destinations(user_api_key_dict: UserAPIKeyAuth, request: Reque
         verbose_proxy_logger.debug("OTel V2: tenant destination resolution failed: %s", exc)
 
 
+# Route families whose writes can end access: deleting, blocking, deactivating or narrowing a key, team, user,
+# organization, project, customer, agent, UI session or JWT key mapping
+_ACCESS_ENDING_ROUTE_PREFIXES: Final = (
+    "/key/",
+    "/team/",
+    "/user/",
+    "/organization/",
+    "/v2/organization/",
+    "/project/",
+    "/customer/",
+    "/end_user/",
+    "/scim/v2/",
+    "/jwt/key/mapping/",
+    "/management/v1/",
+    "/v1/agents",
+    "/session/",
+)
+_READ_ONLY_METHODS: Final = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def _request_can_end_access(request: Request) -> bool:
+    """While last good entries are served, a write to a management route that can end access reads from the writer,
+    so a lagging read replica cannot pick what it revokes."""
+    from litellm.proxy.proxy_server import user_api_key_cache
+
+    return (
+        user_api_key_cache.serve_last_good_entries
+        # A request whose method cannot be read counts as a write, so it reads the writer
+        and RouteChecks.get_request_method(request=request) not in _READ_ONLY_METHODS
+        and get_request_route(request=request).startswith(_ACCESS_ENDING_ROUTE_PREFIXES)
+    )
+
+
 @tracer.wrap()
 async def user_api_key_auth(
     request: Request,
@@ -3614,6 +3648,8 @@ async def user_api_key_auth(
     # Every auth read and last good store of this request, and of every task it creates, counts from here; set anew even
     # when the context holds a start, so an earlier request's start never reaches these reads
     start_last_good_reads()
+    # Its reads, from here on and in every task it creates, go to the writer when it can end access; set anew as well
+    pin_reads_to_writer(_request_can_end_access(request))
 
     # Create the SERVER span and stash it on request.state BEFORE reading the
     # body. _read_request_body can raise ProxyException for malformed JSON;

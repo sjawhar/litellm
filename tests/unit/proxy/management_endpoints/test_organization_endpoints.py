@@ -1,18 +1,23 @@
 import asyncio
 import json
+from collections.abc import Awaitable, Callable, Sequence
 from types import MappingProxyType, SimpleNamespace
-from typing import Final, Mapping, Optional, cast
+from typing import TYPE_CHECKING, Final, Mapping, Optional, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from pydantic import BaseModel
 
 from litellm._uuid import uuid
 from tests.unit.proxy.management_endpoints.jwt_key_mapping_doubles import (
     CascadingJWTMappingTable,
     JWTMappingRow,
 )
+
+if TYPE_CHECKING:
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 
 
 @pytest.mark.asyncio
@@ -1519,6 +1524,101 @@ def test_organization_routes_reach_their_handler_with_enterprise_license(monkeyp
     )
 
 
+def _column_matches(value: object, condition: object) -> bool:
+    if isinstance(condition, Mapping):
+        allowed: Final = condition.get("in")
+        return isinstance(allowed, (list, tuple)) and value in allowed
+    return value == condition
+
+
+def _row_matches(row: object, where: Mapping[str, object]) -> bool:
+    """Prisma's equality and ``in`` filters, the only ones these endpoints send to the tables below."""
+    return all(_column_matches(getattr(row, column), condition) for column, condition in where.items())
+
+
+class _Rows:
+    """One table as one database holds it: the writer, or a read replica lagging behind it. Each delete notes the rows
+    it takes whose last good entry ``served`` still finds, and the first one can be preceded by a row arriving, as one a
+    concurrent request writes between a read and that delete does."""
+
+    def __init__(
+        self,
+        rows: Sequence[object],
+        *,
+        served: Callable[[object], Awaitable[bool]] | None = None,
+        arrives_before_first_delete: object | None = None,
+    ) -> None:
+        self.rows: tuple[object, ...] = tuple(rows)
+        self.deleted_while_served: list[object] = []
+        self._served = served
+        self._arriving = arrives_before_first_delete
+
+    async def find_many(self, where: Mapping[str, object]) -> list[object]:
+        return [row for row in self.rows if _row_matches(row, where)]
+
+    async def find_unique(self, where: Mapping[str, object]) -> object | None:
+        return next(iter(await self.find_many(where)), None)
+
+    async def delete_many(self, where: Mapping[str, object]) -> int:
+        if self._arriving is not None:
+            self.rows = (*self.rows, self._arriving)
+            self._arriving = None
+        doomed: Final = await self.find_many(where)
+        if self._served is not None:
+            self.deleted_while_served.extend([row for row in doomed if await self._served(row)])
+        self.rows = tuple(row for row in self.rows if row not in doomed)
+        return len(doomed)
+
+    async def delete(self, where: Mapping[str, Mapping[str, object]]) -> object | None:
+        """A delete by one compound unique key, such as a membership's ``user_id_organization_id``."""
+        unique: Final = next(iter(where.values()))
+        doomed: Final = await self.find_unique(unique)
+        await self.delete_many(unique)
+        return doomed
+
+    async def create(self, data: Mapping[str, object]) -> object:
+        raise AssertionError(f"these tests create no row, yet got {data}")
+
+
+def _served_by(
+    cache: "UserApiKeyCache", cache_key_of: Callable[[object], str], model: type[BaseModel]
+) -> Callable[[object], Awaitable[bool]]:
+    """Whether a row's last good entry is still served: not yet revoked."""
+    from litellm.proxy.common_utils.user_api_key_cache import recall_last_good
+
+    async def served(row: object) -> bool:
+        return await recall_last_good(cache, cache_key_of(row), model) is not None
+
+    return served
+
+
+def _routed_database(writer: Mapping[str, object], replica: Mapping[str, object]) -> SimpleNamespace:
+    """A ``PrismaClient`` with ``DATABASE_URL_READ_REPLICA`` set: ``db`` sends writes to the writer, which ``writer_db``
+    is, and reads to the replica unless the context's reads are pinned to the writer."""
+    from litellm.proxy.db.prisma_client import PrismaWrapper
+    from litellm.proxy.db.routing_prisma_wrapper import RoutingPrismaWrapper
+
+    writer_db: Final = PrismaWrapper(original_prisma=SimpleNamespace(**writer), iam_token_db_auth=False)
+    replica_db: Final = PrismaWrapper(original_prisma=SimpleNamespace(**replica), iam_token_db_auth=False)
+    return SimpleNamespace(db=RoutingPrismaWrapper(writer=writer_db, reader=replica_db), writer_db=writer_db)
+
+
+def _org_endpoints_use(monkeypatch: pytest.MonkeyPatch, prisma_client: object, cache: "UserApiKeyCache") -> None:
+    """The proxy globals the organization endpoints read their license, database and auth cache from."""
+    for name, value in (
+        ("premium_user", True),
+        ("prisma_client", prisma_client),
+        ("user_api_key_cache", cache),
+        ("proxy_logging_obj", None),
+    ):
+        # test-quality-ok: the endpoints import these from proxy_server when called; no parameter carries them
+        monkeypatch.setattr(f"litellm.proxy.proxy_server.{name}", value, raising=False)
+
+
+def _deleted_organization_table() -> SimpleNamespace:
+    return SimpleNamespace(delete=AsyncMock(return_value=SimpleNamespace(organization_id="org-doomed")))
+
+
 @pytest.mark.asyncio
 async def test_delete_organization_evicts_the_cache_of_the_keys_it_deletes(monkeypatch):
     """/organization/delete bulk-deletes the org's keys without going through /key/delete, so the
@@ -1589,10 +1689,11 @@ async def test_delete_organization_drops_the_last_good_entries_of_the_teams_it_d
     await remember_last_good(cache, "team_id:t-org", LiteLLM_TeamTableCachedObj(team_id="t-org", team_alias="org-lane"))
     await remember_last_good(cache, "team_alias:org-lane", LiteLLM_TeamTableCachedObj(team_id="t-org"))
     prisma_client: Final = AsyncMock()
-    prisma_client.db.litellm_teamtable.find_many = AsyncMock(
-        return_value=[SimpleNamespace(team_id="t-org", team_alias="org-lane")]
+    prisma_client.db.litellm_teamtable = _Rows(
+        (SimpleNamespace(team_id="t-org", team_alias="org-lane", organization_id="org-doomed"),)
     )
     prisma_client.db.litellm_verificationtoken.find_many = AsyncMock(return_value=[])
+    prisma_client.db.litellm_organizationmembership.find_many = AsyncMock(return_value=[])
     prisma_client.db.litellm_jwtkeymapping = CascadingJWTMappingTable([])
     prisma_client.db.litellm_organizationtable.delete = AsyncMock(return_value=MagicMock())
     monkeypatch.setattr("litellm.proxy.proxy_server.premium_user", True, raising=False)
@@ -1780,6 +1881,7 @@ async def test_delete_organization_evicts_the_organization_and_its_last_good_ent
     prisma_client: Final = AsyncMock()
     prisma_client.db.litellm_teamtable.find_many = AsyncMock(return_value=[])
     prisma_client.db.litellm_verificationtoken.find_many = AsyncMock(return_value=[])
+    prisma_client.db.litellm_organizationmembership.find_many = AsyncMock(return_value=[])
     prisma_client.db.litellm_jwtkeymapping = CascadingJWTMappingTable([])
     prisma_client.db.litellm_organizationtable.delete = AsyncMock(return_value=MagicMock())
     monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", prisma_client)
@@ -1925,3 +2027,167 @@ async def test_organization_member_role_change_drops_the_users_last_good_entry(m
 
     prisma_client.db.litellm_organizationmembership.update.assert_awaited_once()
     assert await recall_last_good(cache, "member-1", LiteLLM_UserTable) is None
+
+
+@pytest.mark.asyncio
+async def test_delete_organization_pinned_to_the_writer_revokes_the_children_a_lagging_replica_lacks(monkeypatch):
+    """With a read replica, auth pins the delete's reads to the writer, so a team, key or member that the writer has
+    and a lagging replica lacks is revoked before the delete that takes it, like the ones both have."""
+    from litellm.models.team import LiteLLM_TeamTableCachedObj
+    from litellm.proxy._types import DeleteOrganizationRequest, LiteLLM_UserTable, LitellmUserRoles, UserAPIKeyAuth
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, remember_last_good
+    from litellm.proxy.db.routing_prisma_wrapper import reads_pinned_to_writer
+    from litellm.proxy.management_endpoints.organization_endpoints import delete_organization
+
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    await remember_last_good(cache, "team_id:t-new", LiteLLM_TeamTableCachedObj(team_id="t-new"))
+    await remember_last_good(cache, "hashed-new-key", UserAPIKeyAuth(token="hashed-new-key"))
+    await remember_last_good(cache, "new-member", LiteLLM_UserTable(user_id="new-member"))
+    old_team: Final = SimpleNamespace(team_id="t-old", team_alias=None, organization_id="org-doomed")
+    old_key: Final = SimpleNamespace(token="hashed-old-key", organization_id="org-doomed")
+    old_member: Final = SimpleNamespace(user_id="old-member", organization_id="org-doomed")
+    teams: Final = _Rows(
+        (old_team, SimpleNamespace(team_id="t-new", team_alias=None, organization_id="org-doomed")),
+        served=_served_by(cache, lambda team: f"team_id:{team.team_id}", LiteLLM_TeamTableCachedObj),
+    )
+    keys: Final = _Rows(
+        (old_key, SimpleNamespace(token="hashed-new-key", organization_id="org-doomed")),
+        served=_served_by(cache, lambda key: key.token, UserAPIKeyAuth),
+    )
+    members: Final = _Rows(
+        (old_member, SimpleNamespace(user_id="new-member", organization_id="org-doomed")),
+        served=_served_by(cache, lambda member: member.user_id, LiteLLM_UserTable),
+    )
+    unrouted: Final = {
+        "litellm_jwtkeymapping": CascadingJWTMappingTable([]),
+        "litellm_organizationtable": _deleted_organization_table(),
+    }
+    database: Final = _routed_database(
+        {
+            "litellm_teamtable": teams,
+            "litellm_verificationtoken": keys,
+            "litellm_organizationmembership": members,
+            **unrouted,
+        },
+        {
+            "litellm_teamtable": _Rows((old_team,)),
+            "litellm_verificationtoken": _Rows((old_key,)),
+            "litellm_organizationmembership": _Rows((old_member,)),
+            **unrouted,
+        },
+    )
+    _org_endpoints_use(monkeypatch, database, cache)
+
+    with reads_pinned_to_writer():
+        await delete_organization(
+            data=DeleteOrganizationRequest(organization_ids=["org-doomed"]),
+            user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN),
+        )
+
+    assert (teams.rows, keys.rows, members.rows) == ((), (), ())
+    assert teams.deleted_while_served == []
+    assert keys.deleted_while_served == []
+    assert members.deleted_while_served == []
+
+
+@pytest.mark.asyncio
+async def test_delete_organization_revokes_a_child_added_between_a_read_and_its_delete(monkeypatch):
+    """A team, key or membership added to the organization between a read and the delete that would take it is not
+    deleted unrevoked: each delete takes only the rows read and revoked, and the next read finds the new one."""
+    from litellm.models.team import LiteLLM_TeamTableCachedObj
+    from litellm.proxy._types import DeleteOrganizationRequest, LiteLLM_UserTable, LitellmUserRoles, UserAPIKeyAuth
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, remember_last_good
+    from litellm.proxy.management_endpoints.organization_endpoints import delete_organization
+
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    await remember_last_good(cache, "team_id:t-late", LiteLLM_TeamTableCachedObj(team_id="t-late"))
+    await remember_last_good(cache, "hashed-late-key", UserAPIKeyAuth(token="hashed-late-key"))
+    await remember_last_good(cache, "late-member", LiteLLM_UserTable(user_id="late-member"))
+    teams: Final = _Rows(
+        (SimpleNamespace(team_id="t-org", team_alias=None, organization_id="org-doomed"),),
+        served=_served_by(cache, lambda team: f"team_id:{team.team_id}", LiteLLM_TeamTableCachedObj),
+        arrives_before_first_delete=SimpleNamespace(team_id="t-late", team_alias=None, organization_id="org-doomed"),
+    )
+    keys: Final = _Rows(
+        (SimpleNamespace(token="hashed-org-key", organization_id="org-doomed"),),
+        served=_served_by(cache, lambda key: key.token, UserAPIKeyAuth),
+        arrives_before_first_delete=SimpleNamespace(token="hashed-late-key", organization_id="org-doomed"),
+    )
+    members: Final = _Rows(
+        (SimpleNamespace(user_id="org-member", organization_id="org-doomed"),),
+        served=_served_by(cache, lambda member: member.user_id, LiteLLM_UserTable),
+        arrives_before_first_delete=SimpleNamespace(user_id="late-member", organization_id="org-doomed"),
+    )
+    database: Final = SimpleNamespace(
+        db=SimpleNamespace(
+            litellm_teamtable=teams,
+            litellm_verificationtoken=keys,
+            litellm_organizationmembership=members,
+            litellm_jwtkeymapping=CascadingJWTMappingTable([]),
+            litellm_organizationtable=_deleted_organization_table(),
+        )
+    )
+    _org_endpoints_use(monkeypatch, database, cache)
+
+    await delete_organization(
+        data=DeleteOrganizationRequest(organization_ids=["org-doomed"]),
+        user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN),
+    )
+
+    assert (teams.rows, keys.rows, members.rows) == ((), (), ())
+    assert teams.deleted_while_served == []
+    assert keys.deleted_while_served == []
+    assert members.deleted_while_served == []
+
+
+@pytest.mark.asyncio
+async def test_organization_member_delete_by_email_pinned_to_the_writer_removes_the_user_the_writer_maps_it_to(
+    monkeypatch,
+):
+    """The email is resolved where the removal writes: a lagging replica that still maps it to the user who held it
+    before would revoke and remove that user instead, leaving the current holder's membership and entry in place."""
+    from litellm.proxy._types import (
+        LiteLLM_UserTable,
+        LitellmUserRoles,
+        OrganizationMemberDeleteRequest,
+        UserAPIKeyAuth,
+    )
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, recall_last_good, remember_last_good
+    from litellm.proxy.db.routing_prisma_wrapper import reads_pinned_to_writer
+    from litellm.proxy.management_endpoints.organization_endpoints import organization_member_delete
+
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    await remember_last_good(cache, "u-current", LiteLLM_UserTable(user_id="u-current"))
+    await remember_last_good(cache, "u-former", LiteLLM_UserTable(user_id="u-former"))
+    memberships: Final = _Rows(
+        (
+            SimpleNamespace(user_id="u-current", organization_id="org-1"),
+            SimpleNamespace(user_id="u-former", organization_id="org-1"),
+        )
+    )
+    database: Final = _routed_database(
+        {
+            "litellm_usertable": _Rows(
+                (
+                    LiteLLM_UserTable(user_id="u-current", user_email="member@example.com"),
+                    LiteLLM_UserTable(user_id="u-former", user_email="former@example.com"),
+                )
+            ),
+            "litellm_organizationmembership": memberships,
+        },
+        {
+            "litellm_usertable": _Rows((LiteLLM_UserTable(user_id="u-former", user_email="member@example.com"),)),
+            "litellm_organizationmembership": memberships,
+        },
+    )
+    _org_endpoints_use(monkeypatch, database, cache)
+
+    with reads_pinned_to_writer():
+        await organization_member_delete(
+            data=OrganizationMemberDeleteRequest(organization_id="org-1", user_email="member@example.com"),
+            user_api_key_dict=UserAPIKeyAuth(user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+        )
+
+    assert [membership.user_id for membership in memberships.rows] == ["u-former"]
+    assert await recall_last_good(cache, "u-current", LiteLLM_UserTable) is None
+    assert await recall_last_good(cache, "u-former", LiteLLM_UserTable) is not None

@@ -5092,9 +5092,13 @@ async def delete_verification_tokens(
                             status_code=status.HTTP_403_FORBIDDEN,
                             detail={"error": "You are not authorized to delete this key"},
                         )
-            await revoke_last_good(
-                user_api_key_cache, tuple(key.token for key in authorized_keys if key.token is not None)
+            # The admin delete below matches every requested token, found by the read or not, so it revokes them all
+            revoked_tokens: Final = (
+                tuple(hashed_tokens)
+                if user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN.value
+                else tuple(key.token for key in authorized_keys if key.token is not None)
             )
+            await revoke_last_good(user_api_key_cache, revoked_tokens)
             await persist_deleted_verification_tokens(
                 keys=authorized_keys,
                 prisma_client=prisma_client,

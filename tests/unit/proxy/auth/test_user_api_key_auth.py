@@ -2331,3 +2331,98 @@ async def test_the_admission_membership_read_records_its_own_start_where_none_is
 
     cache_key: Final = team_membership_auth_cache_key(team_id="t1", user_id="u1")
     assert await recall_last_good(cache, cache_key, LiteLLM_TeamMembership) == row
+
+
+def _serve_master_key_calls(monkeypatch: pytest.MonkeyPatch, *, serve_last_good_entries: bool) -> None:
+    """Auth on the master key path, which reads no database, with last good entries served or not."""
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+
+    cache: Final = UserApiKeyCache(serve_last_good_entries=serve_last_good_entries)
+    monkeypatch.setattr(  # test-quality-ok: auth reads the setting off this module global; no injection seam
+        litellm.proxy.proxy_server, "user_api_key_cache", cache
+    )
+    monkeypatch.setattr(  # test-quality-ok: auth reads the master key off this module global; no injection seam
+        litellm.proxy.proxy_server, "master_key", MASTER_KEY
+    )
+    monkeypatch.setattr(  # test-quality-ok: auth reads the database off this module global; no injection seam
+        litellm.proxy.proxy_server, "prisma_client", None
+    )
+
+
+async def _master_key_auth(method: str, route: str) -> None:
+    """One ``user_api_key_auth`` run with the master key, for a request with an empty body."""
+
+    async def empty_body() -> bytes:
+        return b"{}"
+
+    request: Final = FastAPIRequest(scope={"type": "http", "method": method, "path": route, "headers": []})
+    request._url = URL(url=route)
+    request.body = empty_body  # pyright: ignore[reportAttributeAccessIssue]  # the test sends no ASGI body
+    await user_api_key_auth(request=request, api_key="Bearer " + MASTER_KEY)
+
+
+def _reads_go_to_the_reader() -> bool:
+    """Whether a routed client sends this context's reads to the read replica rather than the writer."""
+    from litellm.proxy.db.prisma_client import PrismaWrapper
+    from litellm.proxy.db.routing_prisma_wrapper import RoutingPrismaWrapper
+
+    routing: Final = RoutingPrismaWrapper(
+        writer=PrismaWrapper(original_prisma=MagicMock(name="writer_prisma")),
+        reader=PrismaWrapper(original_prisma=MagicMock(name="reader_prisma")),
+    )
+    return routing._should_use_reader()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "route"),
+    [("POST", "/key/delete"), ("DELETE", "/scim/v2/Users/u1"), ("POST", "/organization/member_delete")],
+)
+async def test_auth_pins_the_reads_of_a_write_that_can_end_access_to_the_writer(
+    monkeypatch: pytest.MonkeyPatch, method: str, route: str
+):
+    """While last good entries are served, auth of a write to a route that can end access pins the request's reads,
+    and those of every task it starts, to the writer, so a lagging read replica cannot pick what the write revokes."""
+    _serve_master_key_calls(monkeypatch, serve_last_good_entries=True)
+
+    await _master_key_auth(method, route)
+
+    assert _reads_go_to_the_reader() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "route", "serve_last_good_entries"),
+    [
+        ("GET", "/key/info", True),
+        ("POST", "/chat/completions", True),
+        ("POST", "/key/delete", False),
+        ("DELETE", "/scim/v2/Users/u1", False),
+        ("POST", "/organization/member_delete", False),
+    ],
+)
+async def test_auth_keeps_reads_on_the_reader_for_a_request_that_cannot_end_access_or_with_the_setting_off(
+    monkeypatch: pytest.MonkeyPatch, method: str, route: str, serve_last_good_entries: bool
+):
+    """A read of a management route, an inference call, and any request while last good entries are not served read
+    from the reader after auth, even in a context an earlier pin left on the writer, since auth sets the pin anew."""
+    from litellm.proxy.db.routing_prisma_wrapper import reads_pinned_to_writer
+
+    _serve_master_key_calls(monkeypatch, serve_last_good_entries=serve_last_good_entries)
+
+    with reads_pinned_to_writer():
+        await _master_key_auth(method, route)
+        assert _reads_go_to_the_reader() is True
+
+
+@pytest.mark.asyncio
+async def test_a_second_auth_run_in_one_context_sets_the_writer_pin_anew(monkeypatch: pytest.MonkeyPatch):
+    """A context that outlives one request can run auth again: a run for a key delete pins its reads to the writer,
+    and a later run for an inference call in the same context sends them back to the reader."""
+    _serve_master_key_calls(monkeypatch, serve_last_good_entries=True)
+
+    await _master_key_auth("POST", "/key/delete")
+    assert _reads_go_to_the_reader() is False
+
+    await _master_key_auth("POST", "/chat/completions")
+    assert _reads_go_to_the_reader() is True

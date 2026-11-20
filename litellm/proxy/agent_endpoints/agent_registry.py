@@ -3,6 +3,7 @@ import hashlib
 import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import datetime, timezone
+from functools import partial
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, NamedTuple, Protocol, TypedDict
 
@@ -423,8 +424,12 @@ class GrantMigrationResult(NamedTuple):
 
 
 async def _retire_identity_managed_agent(tx: "Prisma", agent_id: str) -> tuple[str, ...]:
-    """Record the retired identity and delete the agent's keys, after recording the revocation of their last good
-    entries, which refuses the whole transaction with 503 when Redis cannot take it. Returns the deleted tokens."""
+    """Record the retired identity and delete the agent's keys, in one transaction. Returns the deleted tokens.
+
+    While last good entries are served, only the keys a read found are deleted, each round right after the revocation
+    of their entries, until a read finds none (``revoke_and_delete_read_rows``): a key given to the agent between a
+    read and its delete is revoked before its delete too. Redis failing to record a revocation (503), or keys that keep
+    appearing (409), refuse the whole transaction."""
     from prisma.types import (
         LiteLLM_RetiredAgentCreateInput,
         LiteLLM_RetiredAgentUpsertInput,
@@ -432,18 +437,29 @@ async def _retire_identity_managed_agent(tx: "Prisma", agent_id: str) -> tuple[s
         LiteLLM_VerificationTokenWhereInput,
     )
 
-    from litellm.proxy.common_utils.user_api_key_cache import revoke_last_good
+    from litellm.proxy.common_utils.user_api_key_cache import revoke_and_delete_read_rows, serves_last_good_entries
     from litellm.proxy.proxy_server import user_api_key_cache
 
     keys_where: Final[LiteLLM_VerificationTokenWhereInput] = {"agent_id": agent_id}
-    tokens: Final = tuple(key.token for key in await tx.litellm_verificationtoken.find_many(where=keys_where))
-    await revoke_last_good(user_api_key_cache, tokens)
     history_where: Final[LiteLLM_RetiredAgentWhereUniqueInput] = {"original_agent_id": agent_id}
     history_create: Final = LiteLLM_RetiredAgentCreateInput(original_agent_id=agent_id)
     history_data: Final[LiteLLM_RetiredAgentUpsertInput] = {"create": history_create, "update": {}}
+    # The history row ends nothing a last good entry holds, and a refused round rolls it back with the transaction
     await tx.litellm_retiredagent.upsert(where=history_where, data=history_data)
-    await tx.litellm_verificationtoken.delete_many(where=keys_where)
-    return tokens
+    if not serves_last_good_entries(user_api_key_cache):
+        # No last good entry to revoke, so the agent's keys go in one delete, as without that setting
+        tokens: Final = tuple(key.token for key in await tx.litellm_verificationtoken.find_many(where=keys_where))
+        await tx.litellm_verificationtoken.delete_many(where=keys_where)
+        return tokens
+    deleted_keys: Final = await revoke_and_delete_read_rows(
+        user_api_key_cache,
+        partial(tx.litellm_verificationtoken.find_many, where=keys_where),
+        lambda keys: tuple(key.token for key in keys),
+        lambda keys: tx.litellm_verificationtoken.delete_many(
+            where={"agent_id": agent_id, "token": {"in": [key.token for key in keys]}}
+        ),
+    )
+    return tuple(key.token for key in deleted_keys)
 
 
 async def _evict_deleted_agent_keys(tokens: Sequence[str]) -> None:

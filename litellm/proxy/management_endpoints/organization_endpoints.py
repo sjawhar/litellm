@@ -13,7 +13,8 @@ Endpoints for /organization operations
 
 #### ORGANIZATION MANAGEMENT ####
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from functools import partial
 from itertools import chain
 from types import MappingProxyType
 from typing import (
@@ -22,6 +23,7 @@ from typing import (
     Final,
     NamedTuple,
     Protocol,
+    TypeVar,
     cast,  # noqa: TID251  # prisma types Json columns as fields.Json but reads back plain python values
     overload,
 )
@@ -46,7 +48,12 @@ from litellm.proxy.auth.auth_checks import (
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_broadcast
 from litellm.proxy.common_utils.timezone_utils import get_budget_reset_time
-from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, revoke_last_good
+from litellm.proxy.common_utils.user_api_key_cache import (
+    UserApiKeyCache,
+    revoke_and_delete_read_rows,
+    revoke_last_good,
+    serves_last_good_entries,
+)
 from litellm.proxy.management_endpoints.budget_management_endpoints import (
     evict_budget_holders,
     new_budget,
@@ -117,6 +124,8 @@ async def _enterprise_license_required(
 
 
 router: Final = APIRouter(dependencies=[Depends(_enterprise_license_required)])
+
+_Row = TypeVar("_Row")
 
 
 class _ObjectPermissionRow(Protocol):
@@ -1072,17 +1081,20 @@ async def delete_organization(
             detail={"error": "Only proxy admins can delete organizations"},
         )
 
-    # The organizations' entries, their teams' and their keys' are revoked before the first delete, so a Redis that
-    # cannot record the revocation refuses the request with nothing deleted
+    # The organizations' entries, their teams', their keys' and their members' (a member's entry carries its
+    # organization memberships) are revoked before the first delete, so a Redis that cannot record the revocation
+    # refuses the request with nothing deleted
     orgs_filter: Final[_OrganizationIdInFilter] = {"organization_id": {"in": data.organization_ids}}
     teams: Final = await _table(TeamRepository(prisma_client)).find_many(where=orgs_filter)
     keys: Final = await _table(VerificationTokenRepository(prisma_client)).find_many(where=orgs_filter)
+    members: Final = await _table(OrganizationMembershipRepository(prisma_client)).find_many(where=orgs_filter)
     await revoke_last_good(
         user_api_key_cache,
         (
             *chain.from_iterable(organization_cache_keys(organization_id) for organization_id in data.organization_ids),
             *chain.from_iterable(team_cache_keys(team.team_id, team.team_alias) for team in teams),
             *(key.token for key in keys),
+            *(member.user_id for member in members),
         ),
     )
 
@@ -1094,9 +1106,8 @@ async def delete_organization(
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
         )
-        # delete all members in the organization
-        await _table(OrganizationMembershipRepository(prisma_client)).delete_many(
-            where={"organization_id": organization_id}
+        await _delete_organization_members(
+            organization_id=organization_id, prisma_client=prisma_client, user_api_key_cache=user_api_key_cache
         )
         await _delete_organization_keys(
             organization_id=organization_id,
@@ -1122,17 +1133,42 @@ async def delete_organization(
     return deleted_orgs
 
 
+async def _delete_organization_rows(
+    user_api_key_cache: UserApiKeyCache,
+    read: Callable[[], Awaitable[Sequence[_Row]]],
+    cache_keys_of: Callable[[Sequence[_Row]], Sequence[str]],
+    delete_read: Callable[[Sequence[_Row]], Awaitable[object]],
+    delete_all: Callable[[], Awaitable[object]],
+) -> Sequence[_Row]:
+    """Delete one table's rows of an organization and return the rows deleted. While last good entries are served, only
+    the rows a read found are deleted, each round right after the revocation of their entries, until a read finds none
+    (``revoke_and_delete_read_rows``), so a row added to the organization after the request's first read, or between a
+    read and its delete, is revoked before its delete too. Otherwise nothing is revoked, and one delete takes every row
+    of the organization."""
+    if serves_last_good_entries(user_api_key_cache):
+        return await revoke_and_delete_read_rows(user_api_key_cache, read, cache_keys_of, delete_read)
+    rows: Final = await read()
+    await delete_all()
+    return rows
+
+
 async def _delete_organization_teams(
     organization_id: str,
     prisma_client: PrismaClient,
     user_api_key_cache: UserApiKeyCache,
     proxy_logging_obj: ProxyLogging | None,
 ) -> None:
-    """Delete the organization's teams, whose last good entries the request revoked before its first delete, and
-    tombstone them again now that the rows are gone."""
+    """Delete the organization's teams, revoked with the request's first revocation or, for a team added since, in the
+    round that deletes it, and tombstone them again now that the rows are gone."""
     org_filter: Final[_OrganizationIdFilter] = {"organization_id": organization_id}
-    teams: Final = await _table(TeamRepository(prisma_client)).find_many(where=org_filter)
-    await _table(TeamRepository(prisma_client)).delete_many(where=org_filter)
+    team_table: Final = _table(TeamRepository(prisma_client))
+    teams: Final = await _delete_organization_rows(
+        user_api_key_cache,
+        partial(team_table.find_many, where=org_filter),
+        lambda rows: tuple(chain.from_iterable(team_cache_keys(team.team_id, team.team_alias) for team in rows)),
+        lambda rows: team_table.delete_many(where={**org_filter, "team_id": {"in": [team.team_id for team in rows]}}),
+        partial(team_table.delete_many, where=org_filter),
+    )
     for team in teams:
         await delete_cache_team_object(
             team_id=team.team_id,
@@ -1143,22 +1179,58 @@ async def _delete_organization_teams(
         )
 
 
+async def _delete_organization_members(
+    organization_id: str, prisma_client: PrismaClient, user_api_key_cache: UserApiKeyCache
+) -> None:
+    """Delete the organization's memberships. A member's entry carries its organization memberships, which the org
+    admin route checks read, so it is revoked before its membership's delete and evicted once the row is gone."""
+    org_filter: Final[_OrganizationIdFilter] = {"organization_id": organization_id}
+    membership_table: Final = _table(OrganizationMembershipRepository(prisma_client))
+    members: Final = await _delete_organization_rows(
+        user_api_key_cache,
+        partial(membership_table.find_many, where=org_filter),
+        lambda rows: tuple(member.user_id for member in rows),
+        lambda rows: membership_table.delete_many(
+            where={**org_filter, "user_id": {"in": [member.user_id for member in rows]}}
+        ),
+        partial(membership_table.delete_many, where=org_filter),
+    )
+    await evict_and_broadcast(
+        cache_keys=tuple(member.user_id for member in members), user_api_key_cache=user_api_key_cache
+    )
+
+
 async def _delete_organization_keys(
     organization_id: str,
     prisma_client: PrismaClient,
     user_api_key_cache: UserApiKeyCache,
     proxy_logging_obj: ProxyLogging | None,
 ) -> None:
+    """Delete the organization's keys, revoked with the request's first revocation or, for a key added since, in the
+    round that deletes it, and tombstone them again now that the rows are gone. A key's JWT mappings go with it by
+    cascade, so each read of keys also reads the cache keys of their mappings, before those keys are deleted."""
     key_filter: Final[_OrganizationIdFilter] = {"organization_id": organization_id}
-    keys_to_delete: Final = await _table(VerificationTokenRepository(prisma_client)).find_many(where=key_filter)
-    hashed_tokens_to_delete: Final = tuple(key.token for key in keys_to_delete)
-    jwt_mapping_cache_keys: Final = await get_jwt_key_mapping_cache_keys_for_tokens(
-        hashed_tokens=hashed_tokens_to_delete,
-        prisma_client=prisma_client,
+    key_table: Final = _table(VerificationTokenRepository(prisma_client))
+    jwt_mapping_cache_keys: Final[list[str]] = []  # mutable-ok: grows by the mappings of each read's keys
+
+    async def read_keys() -> "Sequence[PrismaVerificationToken]":
+        found: Final = await key_table.find_many(where=key_filter)
+        jwt_mapping_cache_keys.extend(
+            await get_jwt_key_mapping_cache_keys_for_tokens(
+                hashed_tokens=tuple(key.token for key in found), prisma_client=prisma_client
+            )
+        )
+        return found
+
+    deleted_keys: Final = await _delete_organization_rows(
+        user_api_key_cache,
+        read_keys,
+        lambda rows: tuple(key.token for key in rows),
+        lambda rows: key_table.delete_many(where={**key_filter, "token": {"in": [key.token for key in rows]}}),
+        partial(key_table.delete_many, where=key_filter),
     )
-    await _table(VerificationTokenRepository(prisma_client)).delete_many(where=key_filter)
     await delete_cache_key_objects(
-        hashed_tokens=hashed_tokens_to_delete,
+        hashed_tokens=tuple(key.token for key in deleted_keys),
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
         revoked=True,

@@ -1,4 +1,4 @@
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import ExitStack
 from typing import Final
 from types import SimpleNamespace
@@ -85,6 +85,7 @@ from litellm.types.proxy.management_endpoints.key_management_endpoints import (
     BulkUpdateKeyResponse,
     CustomKeyPolicyRequest,
 )
+from tests.unit.caching.fake_redis_cache import FakeRedisCache
 
 client = TestClient(app)
 
@@ -5692,6 +5693,260 @@ async def test_delete_verification_tokens_refuses_and_changes_nothing_when_redis
     assert refused.value.status_code == 503
     mock_prisma_client.delete_data.assert_not_awaited()
     mock_prisma_client.db.litellm_deletedverificationtoken.create_many.assert_not_awaited()
+
+
+def _key_row_matches(row: LiteLLM_VerificationToken, where: Mapping[str, object]) -> bool:
+    """Prisma's ``where`` for the filters a key delete and a key update by alias read keys with."""
+    tokens: Final = where.get("token")
+    excluded: Final = where.get("NOT")
+    return (
+        (not isinstance(tokens, Mapping) or row.token in tokens["in"])
+        and ("key_alias" not in where or row.key_alias == where["key_alias"])
+        and (not isinstance(excluded, Mapping) or row.token != excluded["token"])
+    )
+
+
+class _KeyTable:
+    """One database's key rows, reached as prisma's per-model actions are, so the routed client of a read replica sends
+    its reads here or to the other database. ``created_after_read`` rows are created right after the first read
+    answered, so that read misses them. Each delete records the keys it deleted and those whose tombstone stood in Redis
+    as it ran; each update, its key and whether that key's tombstone stood."""
+
+    def __init__(
+        self,
+        redis: FakeRedisCache,
+        rows: Sequence[LiteLLM_VerificationToken],
+        *,
+        created_after_read: Sequence[LiteLLM_VerificationToken] = (),
+    ) -> None:
+        self.redis = redis
+        self.rows = list(rows)
+        self.created_after_read = created_after_read
+        self.reads = 0
+        self.deletes: list[tuple[tuple[str | None, ...], tuple[str | None, ...]]] = []
+        self.updates: list[tuple[str, bool]] = []
+
+    def _read(self, where: Mapping[str, object]) -> list[LiteLLM_VerificationToken]:
+        self.reads += 1
+        found: Final = [row for row in self.rows if _key_row_matches(row, where)]
+        if self.reads == 1:
+            self.rows.extend(self.created_after_read)
+        return found
+
+    async def find_many(self, where: Mapping[str, object], **_options: object) -> list[LiteLLM_VerificationToken]:
+        return self._read(where)
+
+    async def find_first(self, where: Mapping[str, object]) -> LiteLLM_VerificationToken | None:
+        return next(iter(self._read(where)), None)
+
+    async def create(self, **_data: object) -> None:
+        raise AssertionError("no key is created")
+
+    async def _tombstoned(self, tokens: Sequence[str | None]) -> tuple[str | None, ...]:
+        client: Final = self.redis.cache.init_async_client()
+        return tuple(
+            [
+                token
+                for token in tokens
+                if self.redis.server.connected and await client.exists(f"last_good_tombstone:{token}") == 1
+            ]
+        )
+
+    async def delete_many(self, where: Mapping[str, Mapping[str, Sequence[str]]]) -> int:
+        deleted: Final = tuple(row.token for row in self.rows if row.token in where["token"]["in"])
+        self.deletes.append((deleted, await self._tombstoned(deleted)))
+        self.rows = [row for row in self.rows if row.token not in deleted]
+        return len(deleted)
+
+    async def update(self, where: Mapping[str, str], **_changes: object) -> LiteLLM_VerificationToken:
+        self.updates.append((where["token"], await self._tombstoned((where["token"],)) == (where["token"],)))
+        return next(row for row in self.rows if row.token == where["token"])
+
+
+def _routed_key_database(writer_keys: _KeyTable, replica_keys: _KeyTable) -> AsyncMock:
+    """A ``PrismaClient`` with a read replica: ``db`` is the real routing client, which sends key reads to
+    ``replica_keys`` unless the context pins them to the writer, and every write to ``writer_keys``; ``writer_db`` is
+    the writer. A replica that does not lag is ``writer_keys`` itself. ``delete_data`` and ``update_data`` write keys
+    through ``db`` with the ``where`` the real ones use."""
+    from litellm.proxy.db.prisma_client import PrismaWrapper
+    from litellm.proxy.db.routing_prisma_wrapper import RoutingPrismaWrapper
+
+    writer_prisma: Final = AsyncMock(name="writer_prisma")
+    writer_prisma.litellm_verificationtoken = writer_keys
+    writer_prisma.litellm_jwtkeymapping = _CascadingJWTMappingTable([])
+    replica_prisma: Final = AsyncMock(name="replica_prisma")
+    replica_prisma.litellm_verificationtoken = replica_keys
+    writer: Final = PrismaWrapper(original_prisma=writer_prisma, iam_token_db_auth=False)
+    routed: Final = RoutingPrismaWrapper(
+        writer=writer, reader=PrismaWrapper(original_prisma=replica_prisma, iam_token_db_auth=False)
+    )
+
+    async def delete_data(tokens: Sequence[str]) -> dict[str, int]:
+        return {"deleted_keys": await routed.litellm_verificationtoken.delete_many(where={"token": {"in": tokens}})}
+
+    async def update_data(token: str, data: Mapping[str, object]) -> dict[str, object]:
+        row: Final = await routed.litellm_verificationtoken.update(where={"token": token}, data=data)
+        return {"token": token, "data": row.model_dump()}
+
+    prisma_client: Final = AsyncMock()
+    prisma_client.db = routed
+    prisma_client.writer_db = writer
+    prisma_client.delete_data = AsyncMock(side_effect=delete_data)
+    prisma_client.update_data = AsyncMock(side_effect=update_data)
+    return prisma_client
+
+
+@pytest.mark.asyncio
+async def test_key_delete_pinned_to_the_writer_revokes_both_keys_when_a_lagging_replica_shows_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An admin deletes K1 and K2: the writer holds both, a lagging read replica only K1. With last good entries on,
+    auth pins the request's reads to the writer, so the delete reads both keys where it deletes them and revokes both,
+    each tombstone standing in Redis when the delete runs; the replica is not read."""
+    from litellm.proxy.db.routing_prisma_wrapper import reads_pinned_to_writer
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis: Final = fake_redis_cache()
+    tokens: Final = ("a1" * 32, "b2" * 32)
+    keys: Final = tuple(LiteLLM_VerificationToken(token=token, user_id="user-1") for token in tokens)
+    writer_keys: Final = _KeyTable(redis, keys)
+    replica_keys: Final = _KeyTable(redis, keys[:1])
+    monkeypatch.setattr(  # test-quality-ok: the proxy's database, a writer behind a lagging read replica
+        "litellm.proxy.proxy_server.prisma_client", _routed_key_database(writer_keys, replica_keys)
+    )
+
+    with reads_pinned_to_writer():
+        await delete_verification_tokens(
+            tokens=list(tokens),
+            user_api_key_cache=UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True),
+            user_api_key_dict=UserAPIKeyAuth(user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN.value),
+        )
+
+    assert writer_keys.deletes == [(tokens, tokens)]
+    assert writer_keys.rows == []
+    assert replica_keys.reads == 0
+
+
+@pytest.mark.asyncio
+async def test_key_delete_pinned_to_the_writer_deletes_nothing_when_redis_is_lost_before_the_second_revocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same delete, with Redis lost once K1 is revoked and before K2's tombstone is written: K2's revocation cannot
+    be recorded, so the delete answers 503, and neither key is deleted or archived."""
+    from litellm.proxy.db.routing_prisma_wrapper import reads_pinned_to_writer
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis: Final = fake_redis_cache()
+    tokens: Final = ("a1" * 32, "b2" * 32)
+    keys: Final = tuple(LiteLLM_VerificationToken(token=token, user_id="user-1") for token in tokens)
+    writer_keys: Final = _KeyTable(redis, keys)
+    prisma_client: Final = _routed_key_database(writer_keys, _KeyTable(redis, keys[:1]))
+    monkeypatch.setattr(  # test-quality-ok: the proxy's database, a writer behind a lagging read replica
+        "litellm.proxy.proxy_server.prisma_client", prisma_client
+    )
+    lands: Final = redis.cache.async_set_cache_or_raise
+
+    async def lose_redis_before_the_second_tombstone(
+        key: str, value: object, ttl: int | None = None, *, expire_at: int | None = None
+    ) -> None:
+        if key == f"last_good_tombstone:{tokens[1]}":
+            redis.server.connected = False
+        await lands(key, value, ttl=ttl, expire_at=expire_at)
+
+    monkeypatch.setattr(  # test-quality-ok: Redis is lost right before K2's tombstone is written
+        redis.cache, "async_set_cache_or_raise", lose_redis_before_the_second_tombstone
+    )
+
+    with reads_pinned_to_writer(), pytest.raises(HTTPException) as refused:
+        await delete_verification_tokens(
+            tokens=list(tokens),
+            user_api_key_cache=UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True),
+            user_api_key_dict=UserAPIKeyAuth(user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN.value),
+        )
+
+    assert refused.value.status_code == 503
+    assert writer_keys.deletes == []
+    assert writer_keys.rows == list(keys)
+    prisma_client.writer_db.litellm_deletedverificationtoken.create_many.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_admin_key_delete_revokes_a_requested_key_its_read_did_not_find(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The admin delete matches every requested token, not only the keys its read found. A key created with the second
+    requested token right after the read is deleted too, so it is revoked as well: both tombstones stand in Redis when
+    the delete runs."""
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    redis: Final = fake_redis_cache()
+    tokens: Final = ("e5" * 32, "f6" * 32)
+    keys: Final = tuple(LiteLLM_VerificationToken(token=token, user_id="user-1") for token in tokens)
+    key_rows: Final = _KeyTable(redis, keys[:1], created_after_read=keys[1:])
+    monkeypatch.setattr(  # test-quality-ok: the proxy's database, whose read misses a key created right after it
+        "litellm.proxy.proxy_server.prisma_client", _routed_key_database(key_rows, key_rows)
+    )
+
+    await delete_verification_tokens(
+        tokens=list(tokens),
+        user_api_key_cache=UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True),
+        user_api_key_dict=UserAPIKeyAuth(user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN.value),
+    )
+
+    assert key_rows.deletes == [(tokens, tokens)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("serves_last_good_entries", [True, False])
+async def test_key_update_by_alias_reads_the_alias_from_the_writer_only_while_last_good_entries_are_served(
+    monkeypatch: pytest.MonkeyPatch, serves_last_good_entries: bool
+) -> None:
+    """A lagging read replica still gives the alias ``lane`` to a key's old token, while on the writer it names the new
+    key. With last good entries on, auth pins a /key/update to the writer, so blocking the key by its alias revokes and
+    blocks the key the writer names, its tombstone standing when the update runs; with them off nothing is pinned, and
+    the alias is read from the replica as before."""
+    from litellm.proxy.db.routing_prisma_wrapper import reads_pinned_to_writer
+    from litellm.proxy.management_endpoints.key_management_endpoints import update_key_fn
+    from tests.unit.caching.fake_redis_cache import fake_redis_cache
+
+    module: Final = "litellm.proxy.management_endpoints.key_management_endpoints"
+    redis: Final = fake_redis_cache()
+    old_token: Final = "c3" * 32
+    new_token: Final = "d4" * 32
+    writer_keys: Final = _KeyTable(
+        redis,
+        (
+            LiteLLM_VerificationToken(token=old_token, key_alias="lane-retired", user_id="admin-user"),
+            LiteLLM_VerificationToken(token=new_token, key_alias="lane", user_id="admin-user"),
+        ),
+    )
+    replica_keys: Final = _KeyTable(
+        redis, (LiteLLM_VerificationToken(token=old_token, key_alias="lane", user_id="admin-user"),)
+    )
+    _setup_update_key_mocks(monkeypatch, _routed_key_database(writer_keys, replica_keys))
+    monkeypatch.setattr(  # test-quality-ok: the proxy's key cache, serving last good entries or not
+        "litellm.proxy.proxy_server.user_api_key_cache",
+        UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=serves_last_good_entries),
+    )
+
+    with (
+        patch(  # test-quality-ok: the eviction after the write is not what this test observes
+            f"{module}.delete_cache_key_object", new_callable=AsyncMock
+        ),
+        patch(  # test-quality-ok: the audit hook runs in a task this test does not wait for
+            f"{module}.KeyManagementEventHooks.async_key_updated_hook", new_callable=AsyncMock
+        ),
+        reads_pinned_to_writer(serves_last_good_entries),
+    ):
+        response: Final = await update_key_fn(
+            request=MagicMock(),
+            data=UpdateKeyRequest(key_alias="lane", blocked=True),
+            user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN, user_id="admin-user"),
+            litellm_changed_by=None,
+        )
+
+    blocked_token: Final = new_token if serves_last_good_entries else old_token
+    assert response["key"] == blocked_token
+    assert writer_keys.updates == [(blocked_token, serves_last_good_entries)]
+    assert (replica_keys if serves_last_good_entries else writer_keys).reads == 0
 
 
 @pytest.mark.asyncio
