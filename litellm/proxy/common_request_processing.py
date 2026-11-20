@@ -2365,6 +2365,7 @@ class ProxyBaseLLMRequestProcessing:
         llm_router: Router | None,
     ) -> tuple[dict, LiteLLMLoggingObj]:
         from litellm.proxy.common_utils.proxy_rate_limit_error import ProxyRateLimitError
+        from litellm.router_utils.fallback_event_handlers import reject_non_list_litellm_fallbacks
 
         configured_fallbacks: Final = (
             self._configured_fallbacks(llm_router=llm_router, user_api_key_dict=user_api_key_dict)
@@ -2395,12 +2396,15 @@ class ProxyBaseLLMRequestProcessing:
             original_model: Final = rate_limited_data.get("model")
             if (
                 pristine is None
+                or llm_router is None
                 or not configured_fallbacks
                 or rate_limited_data.get("disable_fallbacks")
                 or not isinstance(original_model, str)
             ):
                 raise
 
+            # The configured list reaches no Router refusal when the request sends its own `fallbacks`
+            reject_non_list_litellm_fallbacks(configured_fallbacks, original_model)
             fallback_models: Final = self._resolve_fallback_models(
                 model=original_model,
                 fallbacks=configured_fallbacks,
@@ -2415,7 +2419,10 @@ class ProxyBaseLLMRequestProcessing:
             )
             try:
                 for fallback_model in fallback_models:
-                    if fallback_model == original_model:
+                    # This failover rewrites the request's model name, so it takes only a name
+                    if not isinstance(fallback_model, str) or fallback_model == original_model:
+                        continue
+                    if not await self._fallback_model_allowed(fallback_model, llm_router, user_api_key_dict):
                         continue
                     self.data = independent_snapshot(pristine)
                     self.data["model"] = fallback_model
@@ -2445,6 +2452,20 @@ class ProxyBaseLLMRequestProcessing:
 
             self.data = rate_limited_data
             raise original_exc
+
+    @staticmethod
+    async def _fallback_model_allowed(model: str, llm_router: Router, user_api_key_dict: UserAPIKeyAuth) -> bool:
+        """The check a router fallback hop runs on its target, for the key the hop's request carries"""
+        from litellm.proxy.auth.fallback_model_access import router_fallback_access_check
+
+        allowed: Final = await router_fallback_access_check(
+            model=model,
+            request_kwargs=MappingProxyType({"metadata": {"user_api_key_auth": user_api_key_dict}}),
+            llm_router=llm_router,
+        )
+        if not allowed:
+            verbose_proxy_logger.info("Skipping fallback to model=%s: caller is not authorized to call it", model)
+        return allowed
 
     @staticmethod
     def _configured_fallbacks(llm_router: Router, user_api_key_dict: UserAPIKeyAuth) -> list | None:

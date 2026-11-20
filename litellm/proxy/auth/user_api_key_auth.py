@@ -3838,7 +3838,7 @@ async def enforce_key_and_fallback_model_access(
     # Fallback targets are checked for an all-team-models key too: can_key_call_model reads the team's models. The
     # team, member, user, project and agent checks of every fallback target run in common_checks.
     fallback_names, anthropic_fallback_names = key_fallback_model_names(
-        request_data, anthropic_owns_body_fallbacks=body_fallbacks_go_to_anthropic(route, request)
+        request_data, anthropic_owns_body_fallbacks=body_fallbacks_go_to_anthropic(route, request, request_data)
     )
     # Refused before any check on them, as in common_checks, so no error a request can be recovered from comes first
     deny_ambiguous_provider_fallbacks(

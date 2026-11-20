@@ -215,6 +215,10 @@ async def _acancel_batch(*args: object, **kwargs: object) -> NoReturn:
     raise AssertionError("only used for its __name__")
 
 
+async def _ageneric_api_call_with_fallbacks_helper(*args: object, **kwargs: object) -> NoReturn:
+    raise AssertionError("only used for its __name__: the Router stamps litellm_metadata for it")
+
+
 async def _acompletion(*args: object, **kwargs: object) -> NoReturn:
     raise AssertionError("only used for its __name__")
 
@@ -1252,6 +1256,67 @@ async def test_run_async_fallback_preserves_original_model_group_on_nested_fallb
     assert metadata["original_model_group"] == "primary-model"
 
 
+# The call's metadata bucket for each original function: litellm_metadata for a generic call such as /v1/messages
+_CALL_BUCKETS: Final = (
+    pytest.param(None, "metadata", id="metadata-call"),
+    pytest.param(_ageneric_api_call_with_fallbacks_helper, "litellm_metadata", id="litellm-metadata-call"),
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("original_function", "call_bucket"), _CALL_BUCKETS)
+@pytest.mark.parametrize("added", [{}, None, {"user_api_key_hash": "forged"}], ids=["empty", "none", "forged"])
+async def test_a_dict_targets_metadata_keeps_every_key_the_call_holds(
+    original_function: object, call_bucket: str, added: object
+):
+    """A target's metadata only adds keys to the call's, so the hop keeps the identity the call was stamped with"""
+    router = RecordingRouter()
+
+    await run_async_fallback(
+        litellm_router=router,
+        fallback_model_group=[{"model": "fallback-model", call_bucket: added}],
+        original_model_group="primary-model",
+        original_exception=RuntimeError("original failed"),
+        max_fallbacks=3,
+        fallback_depth=0,
+        original_function=original_function,
+        **{call_bucket: {"user_api_key_hash": "caller-hash", "tags": ["call-tag"]}},
+    )
+
+    metadata = router.received_kwargs[call_bucket]
+    assert metadata["user_api_key_hash"] == "caller-hash"
+    assert metadata["tags"] == ["call-tag"]
+    assert metadata["model_group"] == "fallback-model"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("original_function", "call_bucket"), _CALL_BUCKETS)
+@pytest.mark.parametrize("target_bucket", ["metadata", "litellm_metadata"])
+async def test_a_dict_targets_metadata_adds_its_own_keys_but_no_identity(
+    original_function: object, call_bucket: str, target_bucket: str
+):
+    """Whichever bucket a reader checks first, an identity key in a target's metadata never stands in for the call's"""
+    router = RecordingRouter()
+
+    await run_async_fallback(
+        litellm_router=router,
+        fallback_model_group=[
+            {"model": "fallback-model", target_bucket: {"added": "by-target", "user_api_key_auth": {"models": []}}}
+        ],
+        original_model_group="primary-model",
+        original_exception=RuntimeError("original failed"),
+        max_fallbacks=3,
+        fallback_depth=0,
+        original_function=original_function,
+        **{call_bucket: {"user_api_key_hash": "caller-hash"}},
+    )
+
+    assert router.received_kwargs[target_bucket]["added"] == "by-target"
+    assert "user_api_key_auth" not in router.received_kwargs[target_bucket]
+    assert router.received_kwargs[call_bucket]["user_api_key_hash"] == "caller-hash"
+
+
+
 class TestPreRoutingSelectionCarriesToFallbacks:
     """#38832: a complexity/auto router picks a tier behind the router name, but fallback
     lookup kept using the router name, so the tier's configured chain never ran."""
@@ -1438,23 +1503,43 @@ def test_get_fallback_model_group_reads_an_entry_that_names_a_model_as_a_target(
 
 
 @pytest.mark.parametrize("field", ["fallbacks", "context_window_fallbacks", "content_policy_fallbacks"])
-@pytest.mark.parametrize("chain", ["abc", {"other": []}, 1], ids=["string", "mapping", "number"])
+@pytest.mark.parametrize("chain", ["abc", {"other": []}, 1, None], ids=["string", "mapping", "number", "none"])
 def test_reject_non_list_litellm_fallbacks_refuses_a_group_mapped_to_a_non_list(field: str, chain: object):
     with pytest.raises(litellm.BadRequestError, match=f"{field} must map model group 'requested' to a list"):
         reject_non_list_litellm_fallbacks(["other", {"requested": chain}], "requested", field=field)
 
 
 @pytest.mark.parametrize("field", ["fallbacks", "context_window_fallbacks", "content_policy_fallbacks"])
-def test_reject_non_list_litellm_fallbacks_keeps_group_maps_of_lists_and_targets(field: str):
-    """A string, a group mapped to a list (`model` and `*` included) and a target with scalar params all pass"""
-    fallbacks: Final = ["other", {"requested": ["other"]}, {"*": [{"model": "other"}]}, {"model": ["other"]}]
-    reject_non_list_litellm_fallbacks([*fallbacks, {"model": "other", "n": 1}], "requested", field=field)
+def test_reject_non_list_litellm_fallbacks_keeps_group_maps_of_lists(field: str):
+    """A string and a group mapped to a list (`model` and `*` included) pass in every field"""
+    reject_non_list_litellm_fallbacks(
+        ["other", {"requested": ["other"]}, {"*": [{"model": "other"}]}, {"model": ["other"]}], "requested", field=field
+    )
+
+
+@pytest.mark.parametrize("field", ["context_window_fallbacks", "content_policy_fallbacks"])
+@pytest.mark.parametrize("target", [{"requested": ["other"], "model": "other"}, {"model": "other", "n": 1}])
+def test_reject_non_list_litellm_fallbacks_refuses_a_target_in_an_error_field(field: str, target: dict):
+    """These two fields only map model groups to their fallbacks, so a target there would match no group"""
+    with pytest.raises(litellm.BadRequestError, match=f"{field} maps model groups to their fallbacks"):
+        reject_non_list_litellm_fallbacks(["other", target], "requested", field=field)
+
+
+def test_reject_non_list_litellm_fallbacks_keeps_a_target_beside_a_string_in_fallbacks():
+    """The Router skips it there, as it skips every target in a `fallbacks` list it resolves by group"""
+    reject_non_list_litellm_fallbacks(["other", {"model": "other", "n": 1}], "requested")
+
+
+@pytest.mark.parametrize("field", ["fallbacks", "context_window_fallbacks", "content_policy_fallbacks"])
+def test_reject_non_list_litellm_fallbacks_refuses_an_empty_mapping_among_group_maps(field: str):
+    """The Router reads a group map by its first key, which an empty mapping does not have"""
+    with pytest.raises(litellm.BadRequestError, match=f"{field} must not hold an empty mapping"):
+        reject_non_list_litellm_fallbacks(["other", {}], "requested", field=field)
 
 
 def test_reject_non_list_litellm_fallbacks_reads_no_group_map_in_a_list_of_targets():
     """The Router calls a `fallbacks` list of targets as is, so an entry there without a model is an override"""
-    reject_non_list_litellm_fallbacks([{"model": "other"}, {"timeout": 5}], "requested")
-
+    reject_non_list_litellm_fallbacks([{"model": "other"}, {"timeout": 5}, {"stop": ["END"]}, {}], "requested")
 
 
 def test_get_fallback_model_group_exact_match_beats_prefixed_match():
