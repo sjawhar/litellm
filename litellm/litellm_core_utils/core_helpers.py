@@ -847,8 +847,9 @@ IDENTITY_METADATA_KEY_PREFIX: Final = "user_api_key_"
 # The call params the proxy fills with its own keys beside the caller's: the metadata buckets, and stream_options, where
 # it sets include_usage to track the stream's spend
 _CALL_MERGED_PARAMS: Final = ("metadata", "litellm_metadata", "stream_options")
-# The timeouts a call may set for itself; the proxy marks a request that sets one client_side_timeout, so the Router's
-# cooldown reads a 408 under it as the caller's timeout, not the deployment's health
+# The timeouts a call may set for itself; the proxy marks a request with the names of those its caller set
+# (client_side_timeout), so the Router's cooldown reads a 408 under them as the caller's timeout, not the deployment's
+# health
 _CALLER_TIMEOUT_PARAMS: Final = ("timeout", "request_timeout", "stream_timeout")
 
 
@@ -861,7 +862,7 @@ def fallback_target_params_over_call(
     to the call's: a key the call holds keeps the call's value, and no ``user_api_key_*`` identity key comes from the
     target, so every reader of the hop's metadata, whichever bucket it reads first, finds the identity the call was
     stamped with, and the hop's stream reports the usage the proxy asked for. A target that sets a timeout of its own,
-    null included, decides the hop's ``client_side_timeout`` (_caller_timeout_in_effect).
+    null included, decides the hop's ``client_side_timeout`` (_caller_timeouts_in_effect).
     """
     params: Final = dict(target)
     for name in _CALL_MERGED_PARAMS:
@@ -882,20 +883,23 @@ def fallback_target_params_over_call(
         }
     touched: Final = tuple(name for name in _CALLER_TIMEOUT_PARAMS if name in target)
     if touched:
-        params["client_side_timeout"] = _caller_timeout_in_effect(call_kwargs, target, touched)
+        params["client_side_timeout"] = _caller_timeouts_in_effect(call_kwargs, target, touched)
     return params
 
 
-def _caller_timeout_in_effect(
+def _caller_timeouts_in_effect(
     call_kwargs: Mapping[str, object], target: Mapping[str, object], touched: tuple[str, ...]
-) -> bool:
+) -> tuple[str, ...]:
     """
-    Whether a timeout the caller set is in effect on the hop, as the proxy decides it for a request: a non-null timeout
-    of the target's own, or one the call keeps that was the caller's, which the call's own mark says. A null sets none,
-    so a target that clears the only caller timeout clears the mark, and the hop's deployment timeout is the
-    deployment's again for the Router's cooldown.
+    The names of the hop's timeouts the caller set, as the proxy records them for a request: the target's own
+    non-null ones, and those the call's mark names that the target leaves and the call still holds. A null sets none,
+    and a timeout the administrator set is in no mark, so a hop whose only timeout left is the deployment's or the
+    administrator's is unmarked and its 408 counts for the Router's cooldown.
     """
-    if any(target[name] is not None for name in touched):
-        return True
-    kept: Final = (name for name in _CALLER_TIMEOUT_PARAMS if name not in touched)
-    return bool(call_kwargs.get("client_side_timeout")) and any(call_kwargs.get(name) is not None for name in kept)
+    marked: Final = call_kwargs.get("client_side_timeout")
+    kept: Final = tuple(
+        name
+        for name in (marked if isinstance(marked, tuple) else ())
+        if name not in touched and call_kwargs.get(name) is not None
+    )
+    return (*kept, *(name for name in touched if target[name] is not None))

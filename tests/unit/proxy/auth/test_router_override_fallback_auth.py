@@ -1737,8 +1737,13 @@ async def test_a_targets_metadata_goes_through_the_setups_own_sanitizer(
     import litellm
 
     monkeypatch.setattr(litellm, "turn_off_message_logging", True)
+    # A 400 from the primary: the OpenAI client retries a 500 twice within one attempt, which would call it three times
     response, called = await _chat_served_by_litellm(
-        monkeypatch, [copy.deepcopy(dict(target))], router=True, key_models=("openai/requested", "openai/other")
+        monkeypatch,
+        [copy.deepcopy(dict(target))],
+        router=True,
+        key_models=("openai/requested", "openai/other"),
+        requested_error=(400, "x"),
     )
 
     if refused_path is None:
@@ -1812,8 +1817,12 @@ async def test_the_setup_and_the_target_check_change_the_same_metadata(
 ) -> None:
     """
     The same bucket through the request setup, as a body's `metadata` on a route that keeps it, and through the target
-    check: what the setup drops is what the check names. The setup must run the one sanitizer the check runs, so a strip
-    added to the setup alone, or a check that stops calling it, fails here.
+    check's helper: what the setup drops is what the helper names, and the setup runs the one sanitizer the helper
+    runs, so a strip added to the setup alone fails here. This compares the helper directly; that the entry check
+    calls it is proved at the entry by test_the_entry_check_runs_the_shared_sanitizer_on_a_target, and by the requests
+    through authentication that only the sanitizer refuses:
+    test_a_targets_metadata_goes_through_the_setups_own_sanitizer,
+    test_on_a_route_that_keeps_both_buckets_a_target_still_gets_the_sanitizer and the table's `metadata.headers` row.
     """
     from unittest.mock import MagicMock as _MagicMock
 
@@ -1856,13 +1865,60 @@ async def test_the_setup_and_the_target_check_change_the_same_metadata(
     assert frozenset(named) == _dropped_paths(metadata, data.get("metadata"), ("metadata",))
 
 
+def test_the_entry_check_runs_the_shared_sanitizer_on_a_target(monkeypatch: pytest.MonkeyPatch):
+    """The entry check hands a target's buckets to the setup's own sanitizer, and refuses what it would change"""
+    from litellm.proxy import litellm_pre_call_utils as setup
+    from litellm.proxy.auth.auth_utils import is_request_body_safe
 
-# ── A fallback target is never validated less than a request body ────────────
+    sanitizer: Final = setup._sanitize_client_metadata  # pyright: ignore[reportPrivateUsage]  # the shared sanitizer
+    sanitized: Final[list[dict[str, object]]] = []
+
+    def recorded(data: dict[str, object], **opt_ins: bool) -> None:
+        sanitized.append(copy.deepcopy(data))
+        sanitizer(data, **opt_ins)
+
+    monkeypatch.setattr(setup, "_sanitize_client_metadata", recorded)
+    metadata: Final = {**copy.deepcopy(dict(_REDACTION_OPT_OUT_HEADERS)), "note": "kept"}
+    target: Final = {"model": "primary", "metadata": metadata}
+    body: Final = {"model": "primary", "fallbacks": [copy.deepcopy(target)]}
+
+    with pytest.raises(ValueError, match="metadata.headers.litellm-disable-message-redaction"):
+        is_request_body_safe(body, {}, _router_without_fallback_group(), "primary", route="/v1/messages")
+    # Only the target's metadata buckets reach the sanitizer, as they stand in the target
+    assert sanitized == [{"metadata": metadata}]
+
+
+@pytest.mark.parametrize("refused", [False, True], ids=["nothing-to-strip", "a-header-control-beside-it"])
+def test_a_target_bucket_nested_past_the_recursion_limit_is_checked_without_a_crash(refused: bool):
+    """
+    The target check copies a bucket only as deep as the setup's strips change it, so a value nested deeper than
+    Python's recursion limit is neither copied nor compared, and the check answers as it does for a flat bucket
+    """
+    from litellm.proxy.auth.auth_utils import is_request_body_safe
+
+    deep: dict[str, object] = {}
+    for _ in range(sys.getrecursionlimit() * 2):
+        deep = {"nested": deep}
+    metadata: Final = {"note": deep, **(copy.deepcopy(dict(_REDACTION_OPT_OUT_HEADERS)) if refused else {})}
+    body: Final = {"model": "primary", "fallbacks": [{"model": "primary", "metadata": metadata}]}
+    router: Final = _router_without_fallback_group()
+
+    if not refused:
+        assert is_request_body_safe(body, {}, router, "primary", route="/v1/messages") is True
+        return
+    with pytest.raises(ValueError, match="metadata.headers.litellm-disable-message-redaction"):
+        is_request_body_safe(body, {}, router, "primary", route="/v1/messages")
+
+
+# ── A fallback target passes every field, model and credential check a request body passes ──
 #
 # Each row is a key, and the outcome of a /v1/messages body that carries it at its root against the outcome of one
 # whose fallback target carries it: in a list of targets, in the list a model group maps to, and in a parameter-only
-# mapping. Whatever a body's root refuses, checks or strips, a target refuses: no key is accepted in a target that a
-# body is refused for. SAME rows get the body's outcome; CLAIM rows are what this pull request's claim refuses in a
+# mapping. Whatever the entry check, the request setup's stamps and strips, and the model, credential, endpoint and
+# routing checks refuse or strip at a body's root, a target refuses: no key is accepted in a target that a body is
+# refused for. Content guardrails and pre-call hooks are not covered: they read the body's own fields alone, and a
+# target's own messages, input, prompt, system and tools reach the model without them.
+# SAME rows get the body's outcome; CLAIM rows are what this pull request's claim refuses in a
 # target (credential, endpoint, routing and mock-response parameters), which a body's root may carry; STRIPPED rows are
 # keys the request setup drops from a body's root, which a target merged into the call on a hop may not bring back;
 # STAMPED rows are keys the setup writes over a body's own value, which a target on a hop would replace.
@@ -2005,9 +2061,15 @@ def _target_placements(row: _Row) -> tuple[tuple[str, list[object]], ...]:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("row", _TARGET_TABLE, ids=lambda row: row.key)
-async def test_a_fallback_target_is_never_validated_less_than_a_request_body(
+async def test_a_fallback_target_passes_every_field_model_and_credential_check_a_request_body_passes(
     monkeypatch: pytest.MonkeyPatch, row: _Row
 ) -> None:
+    """
+    Each row's key at a body's root and on a target, by where the target stands: whatever the entry check, the
+    request setup's stamps and strips, and the model, credential, endpoint and routing checks refuse in a body, they
+    refuse in a target. Content guardrails and pre-call hooks are not in this property: they read the body's own
+    fields alone, so a target's own messages, input, prompt, system and tools reach the model without them.
+    """
     in_body: Final = await _Gateway(monkeypatch).send({row.key: copy.deepcopy(row.value)})
     if row.rule is _Rule.SAME or row.refused:
         assert _refused(in_body) is row.refused, in_body.response.text

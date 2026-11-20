@@ -560,10 +560,11 @@ def iter_fallback_entries(
     """
     The entries of one fallback list, read as its reader reads it: ``field`` is the fallback field whose value the list
     is, and None marks a list of targets, such as the one a model group is mapped to. Every mapping merged into the
-    call is read as a request body is, by iter_merged_target. A ``fallbacks`` list in the group format is read both
-    ways: a model group map there is also merged as a parameter override, and its names are tagged with its key, which
-    ``group`` carries down. ``widest_reading`` reads every mapping without a string ``model`` as a group map, at every
-    level, for a list Anthropic reads, whose names no LiteLLM reader calls, so a name in any shape gets the checks.
+    call gets the reader's checks and has its fallback lists read as a request body's are, by iter_merged_target. A
+    ``fallbacks`` list in the group format is read both ways: a model group map there is also merged as a parameter
+    override, and its names are tagged with its key, which ``group`` carries down. ``widest_reading`` reads every
+    mapping without a string ``model`` as a group map, at every level, for a list Anthropic reads, whose names no
+    LiteLLM reader calls, so a name in any shape gets the checks.
     """
     if depth > 2 * litellm.ROUTER_MAX_FALLBACKS:
         raise FallbackListShapeError("Rejected Request: fallback nesting exceeds the allowed validation depth.", field)
@@ -628,9 +629,10 @@ def iter_merged_target(
     is_group_map: bool = False,
 ) -> Iterator[FallbackEntry]:
     """
-    One mapping a reader merges into ``call``, read as a request body is: the reader's checks see the mapping, then
-    iter_body_fallback_entries reads every list through which the call it lands in picks another model, in the call
-    the merge leaves, so the mapping's own ``fallbacks`` is Anthropic's or LiteLLM's by the carriers the merge leaves.
+    One mapping a reader merges into ``call``, its fallback lists read as a request body's are: the reader's checks
+    see the mapping, then iter_body_fallback_entries reads every list through which the call it lands in picks another
+    model, in the call the merge leaves, so the mapping's own ``fallbacks`` is Anthropic's or LiteLLM's by the carriers
+    the merge leaves.
     """
     yield _checked(FallbackEntry(target, call, group, is_group_map, widest_reading), checks)
     yield from iter_body_fallback_entries(

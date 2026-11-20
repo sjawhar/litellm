@@ -1373,7 +1373,7 @@ async def test_add_litellm_data_to_request_marks_body_timeout_as_client_side(tim
         version="test-version",
     )
 
-    assert updated["client_side_timeout"] is True
+    assert updated["client_side_timeout"] == (timeout_field,)
 
 
 @pytest.mark.asyncio
@@ -1439,7 +1439,7 @@ async def test_client_side_timeout_marker_never_reaches_the_provider():
         general_settings={},
         version="test-version",
     )
-    assert updated["client_side_timeout"] is True
+    assert updated["client_side_timeout"] == ("timeout",)
 
     converse_response = MagicMock()
     converse_response.status_code = 200

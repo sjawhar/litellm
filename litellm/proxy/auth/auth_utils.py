@@ -833,10 +833,13 @@ class _BodyCheckSettings:
 
 def _check_fallback_entry(settings: _BodyCheckSettings, entry: FallbackEntry) -> None:
     """
-    The one check of a fallback entry, from every source and in every branch, never less than a request body's. A
-    mapping is merged into the call, so it gets the body's banned-param check, with the opt-in of the model it lands
-    on; it may keep no key the request setup drops from a body; and it carries none of the credential, endpoint,
-    routing and mock params no fallback target may carry. A name, and a mapping's model and file_id, may not be a URL.
+    The one check of a fallback entry, from every source and in every branch. A target gets every check of fields,
+    models and credentials a request body gets: a mapping is merged into the call, so it gets the body's banned-param
+    check, with the opt-in of the model it lands on; it may keep no key the request setup drops from or writes over in
+    a body; and it carries none of the credential, endpoint, routing, Router-owned and mock params no fallback target
+    may carry. A name, and a mapping's model and file_id, may not be a URL. Content guardrails and pre-call hooks read
+    the body's own fields alone, so a target's own messages, input, prompt, system and tools reach the model without
+    them; this check does not cover that.
     """
     target: Final = entry.target
     if not isinstance(target, str):
