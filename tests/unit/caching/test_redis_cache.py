@@ -11,7 +11,7 @@ import pytest
 import litellm
 from litellm._service_logger import ServiceLogging
 from litellm.caching.redis_cache import RedisCache, RedisCircuitBreakerOpenError
-from tests.unit.caching.fake_redis_cache import drive_fake_redis_time, fake_redis_cache
+from tests.unit.caching.fake_redis_cache import ScriptedPipelines, drive_fake_redis_time, fake_redis_cache
 
 
 @pytest.fixture
@@ -1748,3 +1748,57 @@ async def test_set_then_delete_raises_and_sends_no_delete_when_redis_cannot_take
     assert pipeline.call_count == 1
     assert await client.get("last_good:a") == b"entry"
     assert await client.exists("last_good_tombstone:a") == 0
+
+
+@pytest.mark.asyncio
+async def test_set_then_delete_raises_a_refused_set_once_the_server_ran_the_others_and_sends_no_delete(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The server refuses one SET of the pipeline and runs the others, as Redis does in a pipeline that is not a
+    transaction; ``execute()`` raises the refusal once every answer is in, and the DELs, which must follow every SET,
+    are never sent."""
+    from redis.exceptions import ResponseError
+
+    redis: Final = fake_redis_cache()
+    client: Final = redis.cache.init_async_client()
+    for name in "abc":
+        await client.set(f"last_good:{name}", "entry")
+    pipelines: Final = ScriptedPipelines(monkeypatch, redis.cache, refused_sets=frozenset({"last_good_tombstone:b"}))
+
+    with pytest.raises(ResponseError, match="invalid expire time"):
+        await redis.cache.async_set_then_delete_or_raise(
+            tuple(f"last_good_tombstone:{name}" for name in "abc"), 1, 600, tuple(f"last_good:{name}" for name in "abc")
+        )
+
+    assert pipelines.executions == 0
+    assert [await client.get(f"last_good_tombstone:{name}") for name in "abc"] == [b"1", None, b"1"]
+    assert [await client.get(f"last_good:{name}") for name in "abc"] == [b"entry", b"entry", b"entry"]
+
+
+@pytest.mark.asyncio
+async def test_set_then_delete_raises_when_redis_is_lost_after_the_sets_with_every_tombstone_recorded(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Redis is lost once the SET pipeline is answered: the DEL pipeline raises, with every tombstone recorded and
+    every entry still there."""
+    from redis.exceptions import ConnectionError as RedisConnectionError
+
+    redis: Final = fake_redis_cache()
+    client: Final = redis.cache.init_async_client()
+    for name in "ab":
+        await client.set(f"last_good:{name}", "entry")
+
+    async def lose_redis(execution: int) -> None:
+        redis.server.connected = False
+
+    pipelines: Final = ScriptedPipelines(monkeypatch, redis.cache, after_execution=lose_redis)
+
+    with pytest.raises(RedisConnectionError):
+        await redis.cache.async_set_then_delete_or_raise(
+            tuple(f"last_good_tombstone:{name}" for name in "ab"), 1, 600, tuple(f"last_good:{name}" for name in "ab")
+        )
+
+    redis.server.connected = True
+    assert pipelines.executions == 1
+    assert [await client.get(f"last_good_tombstone:{name}") for name in "ab"] == [b"1", b"1"]
+    assert [await client.get(f"last_good:{name}") for name in "ab"] == [b"entry", b"entry"]
