@@ -2307,9 +2307,9 @@ async def test_saved_settings_within_their_entry_limit_are_refused_past_their_ow
     holds one entry, and costs 3 reads, the list's format pass and its read included, and 2 per group, the map's value
     and the empty list reached: 79,998 groups take 159,999 reads and are served, 79,999 take 160,001 and are refused
     with a 400 that names the saved settings and the read limit. On /v1/messages, where the Router allows a fallback
-    target's header fields, the request's checks scan the Router's own three lists once and every walk of them,
-    the saved settings' included, decides by that scan; their target carries no header field, so the counts are the
-    chat route's. The chat route keeps `param` in its error envelope.
+    target's header fields, each walk of the request's checks scans the Router's own three lists itself, the saved
+    settings' included, and decides by its own scan; their target carries no header field, so the counts are the chat
+    route's. The chat route keeps `param` in its error envelope.
     """
     from litellm.proxy import proxy_server
 
@@ -2328,7 +2328,7 @@ async def test_saved_settings_within_their_entry_limit_are_refused_past_their_ow
     assert len(saved_walks) == 1
     if route == "/v1/messages":
         assert [answer for lists, answer in scans if answer is saved_walks[0]] == [saved_walks[0]]
-        assert {id(configured) for _, configured in walks} == {id(saved_walks[0])}
+        assert len({id(configured) for _, configured in walks}) == len(walks)
         assert all(_scanned_the_routers_lists(lists, proxy_server.llm_router) for lists, _ in scans)
     if served:
         assert result.response.status_code == 200, result.response.text
@@ -3258,8 +3258,13 @@ def test_the_reviews_header_heavy_body_as_a_library_call_is_refused_at_the_route
     assert _router_call_reads(reads) == charged
 
 
+# A list only Anthropic's reading reaches: the `stop` list of a parameter override in the body's `fallbacks`, which
+# LiteLLM's reading merges into the call as it is, `timeout` not being a list, and Anthropic's reads as a model group
+# map whose `stop` list holds that group's targets. A walk reads that reading only once it decided both readings apply.
+_ONLY_ANTHROPICS_READING: Final = "an-overrides-list-only-anthropics-reading-reads"
 # Every place a target can stand in a /v1/messages request without the beta: a body fallback field, the same field of
-# its router_settings_override, or a target's own `fallbacks`, the target standing in the body's `fallbacks`
+# its router_settings_override, a target's own `fallbacks`, the target standing in the body's `fallbacks`, or the list
+# only Anthropic's reading reaches
 _CARRIER_POSITIONS: Final = (
     "body-fallbacks",
     "body-context-window-fallbacks",
@@ -3268,6 +3273,7 @@ _CARRIER_POSITIONS: Final = (
     "override-context-window-fallbacks",
     "override-content-policy-fallbacks",
     "a-targets-own-fallbacks",
+    _ONLY_ANTHROPICS_READING,
 )
 # (where the beta target stands, where the header-heavy target stands): the Router's call holds the body's field, so it
 # never reads the override's of that name, nor the heavy target in it
@@ -3275,12 +3281,15 @@ _SHADOWED_BY_THE_BODY: Final = frozenset(
     {
         ("body-fallbacks", "override-fallbacks"),
         ("a-targets-own-fallbacks", "override-fallbacks"),
+        (_ONLY_ANTHROPICS_READING, "override-fallbacks"),
         ("body-context-window-fallbacks", "override-context-window-fallbacks"),
         ("body-content-policy-fallbacks", "override-content-policy-fallbacks"),
     }
 )
 # The header-heavy target's lines: 2 reads each, the beta check's scan and the walk's pass
 _HEAVY_LINES: Final = 300
+# What the heavy target's 299 lines past one cost a walk that records it while it decides the readings
+_HEAVY_LINES_CHARGE: Final = 2 * (_HEAVY_LINES - 1)
 
 
 def _body_placing(placed: Sequence[tuple[str, Mapping[str, object]]]) -> dict[str, object]:  # mutable-ok: a body
@@ -3293,8 +3302,14 @@ def _body_placing(placed: Sequence[tuple[str, Mapping[str, object]]]) -> dict[st
         return [{"requested": targets}] if targets else None
 
     own: Final = at("a-targets-own-fallbacks")
+    anthropic_only: Final = at(_ONLY_ANTHROPICS_READING)
     root: Final = {
-        "fallbacks": [*at("body-fallbacks"), *([{"model": "other", "fallbacks": own}] if own else [])] or None,
+        "fallbacks": [
+            *at("body-fallbacks"),
+            *([{"model": "other", "fallbacks": own}] if own else []),
+            *([{"timeout": 5, "stop": anthropic_only}] if anthropic_only else []),
+        ]
+        or None,
         "context_window_fallbacks": grouped(at("body-context-window-fallbacks")),
         "content_policy_fallbacks": grouped(at("body-content-policy-fallbacks")),
     }
@@ -3312,24 +3327,43 @@ def _body_placing(placed: Sequence[tuple[str, Mapping[str, object]]]) -> dict[st
 
 
 def _carrier_order_rows() -> Iterator[object]:
-    """Every ordered pair of positions of the beta target and the heavy one, both orders when they share a list"""
+    """
+    Every ordered pair of positions of the beta target and the heavy one, both orders when they share a list, with what
+    the heavy target's lines past one cost the proxy's walk and the Router's: 598 where the walk records the heavy
+    target, in the reading the request is checked in; nothing where only Anthropic's reading reaches it, which the walk
+    reads, if at all, after it decided both readings apply; and nothing in the Router's where the body's field shadows
+    the override's that holds it
+    """
     for beta_at, heavy_at in itertools.product(_CARRIER_POSITIONS, repeat=2):
+        proxy_charge = 0 if heavy_at == _ONLY_ANTHROPICS_READING else _HEAVY_LINES_CHARGE
+        router_charge = 0 if (beta_at, heavy_at) in _SHADOWED_BY_THE_BODY else proxy_charge
         for beta_first in (True, False) if beta_at == heavy_at else (True,):
             order = "" if beta_at != heavy_at else "-beta-first" if beta_first else "-heavy-first"
-            yield pytest.param(beta_at, heavy_at, beta_first, id=f"beta-{beta_at}-heavy-{heavy_at}{order}")
+            yield pytest.param(
+                beta_at, heavy_at, beta_first, proxy_charge, router_charge, id=f"beta-{beta_at}-heavy-{heavy_at}{order}"
+            )
 
 
-@pytest.mark.parametrize(("beta_at", "heavy_at", "beta_first"), tuple(_carrier_order_rows()))
+@pytest.mark.parametrize(
+    ("beta_at", "heavy_at", "beta_first", "proxy_lines_charge", "router_lines_charge"), tuple(_carrier_order_rows())
+)
 def test_a_header_heavy_target_is_charged_alike_by_both_walks_wherever_it_and_the_beta_target_stand(
-    monkeypatch: pytest.MonkeyPatch, beta_at: str, heavy_at: str, beta_first: bool
+    monkeypatch: pytest.MonkeyPatch,
+    beta_at: str,
+    heavy_at: str,
+    beta_first: bool,
+    proxy_lines_charge: int,
+    router_lines_charge: int,
 ) -> None:
     """
     Two targets of a /v1/messages request without the beta: one whose headers carry the beta, and one whose header
-    field holds 300 lines, at every ordered pair of positions. Each walk charges a target's header fields when it
-    reaches the target, so the heavy target's 299 lines past one cost the proxy's walk 598 reads wherever the two
-    stand, and the Router's first walk of the same call the same 598, unless the call holds the body's field in place of
-    the override's that holds the heavy target, which the Router then never reads. The Router's charge of the call's
-    lists is never above the proxy's.
+    field holds 300 lines, at every ordered pair of eight positions, 72 cases. Each walk charges a target's header
+    fields when it records the target, in the reading the request is checked in, so the heavy target's 299 lines past
+    one cost the proxy's walk 598 reads wherever the two stand, and the Router's first walk of the same call the same
+    598, unless the call holds the body's field in place of the override's that holds the heavy target, which the
+    Router then never reads. Where only Anthropic's reading reaches the heavy target, its lines cost both walks
+    nothing: each reads that reading only after it decided both readings apply, and neither records the target nor
+    reads its header field then. The Router's charge of the call's lists is never above the proxy's.
     """
     from litellm.proxy.auth.auth_utils import request_fallback_walk
     from litellm.router_utils.fallback_event_handlers import call_fallbacks
@@ -3356,16 +3390,15 @@ def test_a_header_heavy_target_is_charged_alike_by_both_walks_wherever_it_and_th
 
     proxy_heavy: Final = proxy_charge(_HEAVY_LINES)
     proxy_light: Final = proxy_charge(1)
-    assert proxy_heavy - proxy_light == 2 * (_HEAVY_LINES - 1)
+    assert proxy_heavy - proxy_light == proxy_lines_charge
     router_heavy: Final = router_charge(_HEAVY_LINES)
     router_light: Final = router_charge(1)
-    shadowed: Final = (beta_at, heavy_at) in _SHADOWED_BY_THE_BODY
-    assert router_heavy - router_light == (0 if shadowed else 2 * (_HEAVY_LINES - 1))
+    assert router_heavy - router_light == router_lines_charge
     assert router_heavy <= proxy_heavy
     assert router_light <= proxy_light
 
 
-# -- The configured scan finds nothing when no hop can carry a header field, and runs once per request --------------
+# -- The configured lists count only as their scan says, which finds nothing when no hop can carry a header field --
 
 
 @pytest.mark.asyncio
@@ -3408,76 +3441,167 @@ async def test_default_under_the_beta_beside_a_configured_header_field_is_refuse
     assert router_refusal is not None and "fallbacks must be a list of model groups" in router_refusal
 
 
-def _count_proxy_scans(monkeypatch: pytest.MonkeyPatch) -> Sequence[object]:
-    """The Router of every scan of its configured fallback lists the proxy's checks make from now on"""
+# The review's configured context_window_fallbacks with an entry no reader can call before the target that carries a
+# header field, and the Router's refusal of that entry
+_A_SHAPE_ERROR_BEFORE_THE_CARRIER: Final = (
+    {"requested": [["bad"], {"model": "other", "extra_headers": {"x-api-version": "1"}}]},
+)
+_THE_REFUSAL_OF_THAT_ENTRY: Final = (
+    "context_window_fallbacks must map model group 'requested' to model names and mappings, got list"
+)
+
+
+@pytest.mark.parametrize(
+    ("configured", "credentials_allowed", "refusal"),
+    [
+        pytest.param(
+            _configured_target_with(MappingProxyType({"x-api-version": "1"})),
+            False,
+            None,
+            id="target-header-fields-refused",
+        ),
+        pytest.param(
+            _configured_target_with(MappingProxyType({"x-api-version": "1"})),
+            True,
+            "LiteLLM fallbacks must be a list of model groups, got str",
+            id="target-header-fields-allowed",
+        ),
+        pytest.param(
+            _A_SHAPE_ERROR_BEFORE_THE_CARRIER,
+            False,
+            _THE_REFUSAL_OF_THAT_ENTRY,
+            id="a-shape-error-before-the-carrier-target-header-fields-refused",
+        ),
+        pytest.param(
+            _A_SHAPE_ERROR_BEFORE_THE_CARRIER,
+            True,
+            _THE_REFUSAL_OF_THAT_ENTRY,
+            id="a-shape-error-before-the-carrier-target-header-fields-allowed",
+        ),
+    ],
+)
+def test_default_under_the_beta_as_a_library_call_is_refused_only_where_a_configured_hop_can_carry_a_header(
+    configured: Sequence[Mapping[str, object]], credentials_allowed: bool, refusal: str | None
+) -> None:
+    """
+    The same request as a Router call with no proxy before it: `"fallbacks": "default"` under the beta beside the
+    configured context_window_fallbacks target whose `extra_headers` hold `x-api-version`. The Router's walk of a
+    configured list records none of its targets, so the configured lists count toward both readings only as their scan
+    says, and the scan finds nothing where the Router refuses a fallback target's header fields. There the Router
+    serves the call, in its first call and in the walk its error handling makes of the context_window_fallbacks after a
+    failed attempt; where it allows them, its first call refuses `"default"` with its 400. An entry no reader can call
+    before that target is refused either way: the walk stops there, before it reaches the target.
+    """
+    from litellm.router_utils.fallback_event_handlers import call_fallbacks, reject_non_list_litellm_fallbacks
+
+    router: Final = _router_configured_with(configured, credentials_allowed=credentials_allowed)
+    call: Final = _the_routers_call(
+        {"model": "requested", "fallbacks": "default", "extra_headers": dict(_THE_BETA_HEADER)}
+    )
+    first_call_refusal: Final = _refusal(partial(call_fallbacks, call, router))
+
+    if refusal is not None:
+        assert first_call_refusal is not None and refusal in first_call_refusal
+        return
+    assert first_call_refusal is None
+    error_path_refusal: Final = _refusal(
+        partial(
+            reject_non_list_litellm_fallbacks,
+            router.context_window_fallbacks,
+            "requested",
+            field="context_window_fallbacks",
+            call_kwargs=call,
+        )
+    )
+    assert error_path_refusal is None
+
+
+def _count_proxy_scans(monkeypatch: pytest.MonkeyPatch, scans: Sequence[object]) -> Sequence[bool]:
+    """
+    For every walk the proxy's checks make from now on, whether the scan of the Router's configured lists it asks for
+    was made: ``scans`` are all the scans made (_count_scans)
+    """
     from litellm.proxy.auth import auth_utils
 
     scan: Final = auth_utils.router_configured_fallbacks
-    made: Final[list[object]] = []  # mutable-ok: each scan appends the Router it read
+    made: Final[list[bool]] = []  # mutable-ok: each walk appends whether its scan was made
 
     def counted(llm_router: Router | None) -> object:
-        made.append(llm_router)
-        return scan(llm_router)
+        before: Final = len(scans)
+        answer: Final = scan(llm_router)
+        made.append(len(scans) > before)
+        return answer
 
     monkeypatch.setattr(auth_utils, "router_configured_fallbacks", counted)
     return made
 
 
 @pytest.mark.asyncio
-async def test_one_request_through_the_proxys_checks_scans_the_configured_lists_once(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("credentials_allowed", "proxy_scans", "router_scans"),
+    [(True, 4, 1), (False, 0, 0)],
+    ids=["target-header-fields-allowed", "target-header-fields-refused"],
+)
+async def test_each_walk_of_one_request_scans_the_configured_lists_as_they_are_then(
+    monkeypatch: pytest.MonkeyPatch, credentials_allowed: bool, proxy_scans: int, router_scans: int
 ) -> None:
     """
-    A /v1/messages request with its own fallback list and a team's saved one: the proxy's checks walk the lists
-    before the key is read and after it, in the key's model checks, the common checks and the saved settings' check,
-    and all of them take the one scan of the Router's configured lists the request's first walk made
+    A /v1/messages request with its own fallback list and a team's saved one. The proxy's checks walk the lists four
+    times, before the key is read, in the key's model checks, in the common checks and in the saved settings' check,
+    with an await between any two of them, and keep nothing about the configuration across an await: so each walk
+    scans the Router's configured lists itself, four scans where the Router allows a fallback target's header fields,
+    and the Router's first call makes one more. Where it refuses them, the default, no hop can carry a header field,
+    and no walk scans.
     """
-    scans: Final = _count_proxy_scans(monkeypatch)
+    scans: Final = _count_scans(monkeypatch)
+    asked: Final = _count_proxy_scans(monkeypatch, scans)
     walks: Final = _count_proxy_walk_scans(monkeypatch)
     result: Final = await _Gateway(monkeypatch, requested_answers=True).send(
         {"fallbacks": [{"model": "other"}]},
         team_router_settings={"fallbacks": [{"requested": ["other"]}]},
-        credentials_allowed=True,
+        credentials_allowed=credentials_allowed,
         router_content_policy_fallbacks=({"requested": ["other"]},),
     )
 
     assert result.response.status_code == 200, result.response.text
-    assert len(walks) >= 2
-    assert len(scans) == 1
-    assert len({id(configured) for _, configured in walks}) == 1
+    assert len(walks) == 4
+    assert len(asked) == 4
+    assert sum(asked) == proxy_scans
+    assert len(scans) == proxy_scans + router_scans
 
 
-def test_a_configured_target_changed_in_place_between_two_requests_is_seen_by_the_second(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.mark.parametrize("change", ["replaced", "changed-in-place"])
+def test_a_configured_list_changed_between_two_checks_of_one_request_is_seen_by_the_later_check(change: str) -> None:
     """
-    The scan a request's checks take is kept in that request's scope and in nothing else: two checks of one request
-    make one scan, and after the configured target is given the beta in place, the next request scans the lists again
-    and reads L both ways, so its number gets the shape 400
+    The second reader's sequence, with the Router allowing a fallback target's header fields: a request's first check
+    reads L, without the beta, beside a configured target without headers and passes. While the request awaits, the
+    Router's context_window_fallbacks are replaced by a list whose target carries the beta, or that target is given the
+    beta in place. The later check of the same request scans the lists as they are then and refuses L's number with
+    the shape 400, as the Router's first call of the request does: nothing the first check made decides for it.
     """
     from litellm.proxy.auth.auth_utils import check_request_body
-    from litellm.router_utils.fallback_event_handlers import FallbackListShapeError
+    from litellm.router_utils.fallback_event_handlers import call_fallbacks
 
-    scans: Final = _count_proxy_scans(monkeypatch)
     target: Final[dict[str, object]] = {"model": "other"}  # mutable-ok: the configured target the admin changes
     router: Final = _router_configured_with(({"requested": [target]},))
     body: Final = {"model": "requested", "fallbacks": _numbers_in_metadata()}
-    first_request: Final = _messages_request(_WITHOUT_THE_BETA)
+    request: Final = _messages_request(_WITHOUT_THE_BETA)
+    first_check: Final = partial(
+        check_request_body, copy.deepcopy(body), {}, router, "requested", route="/v1/messages", request=request
+    )
 
-    for _ in range(2):
-        check_request_body(copy.deepcopy(body), {}, router, "requested", route="/v1/messages", request=first_request)
-    assert len(scans) == 1
-    target["extra_headers"] = dict(_THE_BETA_HEADER)
-    with pytest.raises(FallbackListShapeError, match=_THE_SHAPE_REFUSAL):
-        check_request_body(
-            copy.deepcopy(body),
-            {},
-            router,
-            "requested",
-            route="/v1/messages",
-            request=_messages_request(_WITHOUT_THE_BETA),
-        )
-    assert len(scans) == 2
+    assert _refusal(first_check) is None
+    if change == "replaced":
+        router.context_window_fallbacks = [{"requested": [_beta_target()]}]
+    else:
+        target["extra_headers"] = dict(_THE_BETA_HEADER)
+    later_check_refusal: Final = _refusal(
+        partial(key_fallback_model_names, copy.deepcopy(body), route="/v1/messages", request=request, llm_router=router)
+    )
+    router_refusal: Final = _refusal(partial(call_fallbacks, _the_routers_call(body), router))
+
+    assert later_check_refusal is not None and _THE_SHAPE_REFUSAL in later_check_refusal
+    assert router_refusal is not None and _THE_SHAPE_REFUSAL in router_refusal
 
 
 @pytest.mark.asyncio

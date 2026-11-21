@@ -44,7 +44,6 @@ from litellm.router_utils.clientside_credential_handler import (
 from litellm.router_utils.fallback_event_handlers import (
     HEADER_CARRIER_KWARGS,
     NO_CONFIGURED_FALLBACKS,
-    ConfiguredFallbacks,
     FallbackChecks,
     FallbackEntry,
     FallbackListShapeError,
@@ -564,11 +563,13 @@ def request_fallback_walk(
     MAX_SAVED_FALLBACK_LIST_ENTRIES. The walk refuses more, or reads past FALLBACK_WALK_READS_PER_ENTRY per entry of
     either, with a 400 before it reads them, in every reading it reads; it reads no reading a hop cannot take
     (walk_fallback_lists). On /v1/messages the mappings of ``llm_router``'s own configured lists are hops too: a scan
-    of all three lists, once per request (_request_configured_scan), decides with the request's targets whether both
-    readings apply, as in the Router's own walk of the call. The body's router_settings_override is read as the call
-    gets it after the proxy promotes it (router_settings_override_fields): the setting that can become the call's own
-    ``fallbacks`` is read as the body's own ``fallbacks`` is. So the walk charges a request's lists, and the saved
-    ones, in every reading the Router can read them in.
+    of all three lists, made by this walk and kept by nothing (router_configured_fallbacks), decides with the request's
+    targets whether both readings apply, as in the Router's own walk of the call. The checks of one request walk its
+    lists up to four times, with an await between any two of them, during which the Router's lists or its opt-in can
+    change: so each walk scans them as they are then, and no scan outlives the walk that made it. The body's
+    router_settings_override is read as the call gets it after the proxy promotes it (router_settings_override_fields):
+    the setting that can become the call's own ``fallbacks`` is read as the body's own ``fallbacks`` is. So the walk
+    charges a request's lists, and the saved ones, in every reading the Router can read them in.
     """
     messages_call: Final = route.endswith("/v1/messages")
     header_lines: Final = tuple(
@@ -590,40 +591,9 @@ def request_fallback_walk(
         anthropic_messages_call=messages_call,
         budget=MAX_FALLBACK_LIST_ENTRIES,
         saved_settings_budget=MAX_SAVED_FALLBACK_LIST_ENTRIES if saved_settings else None,
-        configured=_request_configured_scan(request, llm_router) if messages_call else NO_CONFIGURED_FALLBACKS,
+        configured=router_configured_fallbacks(llm_router) if messages_call else NO_CONFIGURED_FALLBACKS,
         router_serves=llm_router is not None,
     )
-
-
-# Where one request's scan of the Router's configured fallback lists is kept: the request's own ASGI scope
-_CONFIGURED_SCAN_SCOPE_KEY: Final = "litellm.configured_fallback_scan"
-
-
-@dataclass(frozen=True, slots=True)
-class _RequestConfiguredScan:
-    """The scan of a Router's configured fallback lists one request's checks decide by, with the Router it read"""
-
-    router: object
-    scan: ConfiguredFallbacks
-
-
-def _request_configured_scan(request: Request | None, llm_router: Router | None) -> ConfiguredFallbacks:
-    """
-    The scan of ``llm_router``'s configured fallback lists (router_configured_fallbacks), made once per request: the
-    proxy's checks of one request walk its lists up to four times, before the key is read and after, and each takes
-    the first walk's scan. It is kept in the request's ASGI scope, which the server builds for that request alone and
-    which every Request object of it shares, so no other request sees it and each request scans the lists as they are
-    then. A Router other than the one scanned, as after a reload during the request, is scanned again; a walk without
-    a request scans every time.
-    """
-    kept: Final[object] = request.scope.get(_CONFIGURED_SCAN_SCOPE_KEY) if request is not None else None
-    if isinstance(kept, _RequestConfiguredScan) and kept.router is llm_router:
-        return kept.scan
-    scan: Final = router_configured_fallbacks(llm_router)
-    if request is not None:
-        kept_scan: Final = _RequestConfiguredScan(llm_router, scan)
-        request.scope[_CONFIGURED_SCAN_SCOPE_KEY] = kept_scan  # rebind-ok: the request's own scope keeps its scan
-    return scan
 
 
 def _reject_unreadable_litellm_list(value: object, field: str) -> None:
