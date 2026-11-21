@@ -630,8 +630,9 @@ class _FallbackTally:
 class _WalkState:
     """
     What every part of one walk shares: the readings it reads, each way it read a list or a mapping, the branches it
-    reached in a way it does not read yet, the targets it reached that carry a header field, keyed by identity, and
-    whether a router_settings_override's ``fallbacks`` rides in ROUTER_FALLBACKS_KWARG (router_settings_override_fields)
+    reached in a way it does not read yet, the targets of the request's lists that carry a header field and that it
+    recorded while it decides whether both readings apply, keyed by identity (_FallbackRead.entry), and whether a
+    router_settings_override's ``fallbacks`` rides in ROUTER_FALLBACKS_KWARG (router_settings_override_fields)
     """
 
     enforced: FallbackReading
@@ -654,13 +655,16 @@ class _FallbackRead:
     read lies above it, so a walk is linear in the entries. It reads what the readings ``state.enforced`` names read: a
     branch read another way waits in ``state.deferred`` and is read only once the walk's targets enforce that way too.
     ``tally`` charges what this part reads; ``saved_settings`` is the part the root body's router_settings_override is
-    charged to, None for this one. Every pass of the walk over a value the request controls goes through pass_over.
+    charged to, None for this one. ``records_carriers`` is False for the part that reads the Router's configured lists,
+    whose targets never enter ``state.carrying``. Every pass of the walk over a value the request controls goes through
+    pass_over.
     """
 
     reading: FallbackReading
     state: _WalkState
     tally: _FallbackTally
     saved_settings: "_FallbackRead | None" = None
+    records_carriers: bool = True
 
     @classmethod
     def start(
@@ -684,9 +688,16 @@ class _FallbackRead:
         )
         return cls(reading, state, _FallbackTally.limited(_REQUEST_LISTS, budget, read_cap=read_cap), saved_settings)
 
-    def apart(self, part: str) -> "_FallbackRead":
-        """A part of the same walk, read as this one is, whose reads are counted apart as ``part`` and never refused"""
-        return _FallbackRead(self.reading, self.state, _FallbackTally.limited(part, None))
+    def configured_part(self) -> "_FallbackRead":
+        """
+        The part of the same walk that reads the Router's configured lists, read as this one is: its reads are counted
+        apart and never refused, and it records none of its targets as carriers (entry). The configured lists reach the
+        decision whether both readings apply only through the scan of them (router_configured_fallbacks), which finds
+        nothing when the Router refuses a fallback target's header fields.
+        """
+        return _FallbackRead(
+            self.reading, self.state, _FallbackTally.limited(_CONFIGURED_LISTS, None), records_carriers=False
+        )
 
     def first_read(self, way: tuple[object, ...]) -> bool:
         if way in self.state.read:
@@ -741,13 +752,18 @@ class _FallbackRead:
     ) -> FallbackEntry:
         """
         One entry the walk reaches, an item or a key it charged with its list. While the walk has yet to decide whether
-        both readings apply, a target that carries a header field is kept for that decision, and its header fields are
-        charged to this part the first time the walk records it, before any target's beta is read: so every such target
-        is charged, whatever the order of the fields, lists and targets that hold it, and reading the beta later charges
-        nothing more.
+        both readings apply, that is in the reading the request is checked in, a target of the request's lists, its own
+        or its saved settings', that carries a header field is kept for that decision, and its header fields are
+        charged to this part the first time the walk records it, before any target's beta is read: so each such target
+        is charged once, whatever the order of the fields, lists and targets that hold it, and reading the beta later
+        charges nothing more. A target the walk first reaches after it decided that both readings apply, in a branch
+        only the other reading reads, is neither kept nor charged for its header fields: no beta check reads them then,
+        and the walk passes over none of them. A target of the Router's configured lists is never kept or charged here
+        (configured_part).
         """
         if (
-            self.reading is FallbackReading.BOTH
+            self.records_carriers
+            and self.reading is FallbackReading.BOTH
             and self.state.enforced is not FallbackReading.BOTH
             and not isinstance(target, str)
             and _carries_a_header_field(target)
@@ -789,7 +805,8 @@ class ConfiguredFallbacks:
     """
     What a Router's own configured fallback lists hold that decides whether a hop can change whose list a ``fallbacks``
     field is: whether a mapping in them carries a header field, and whether such a mapping carries the beta. A scan of
-    the lists gives it on every read of them (configured_fallbacks); nothing keeps it.
+    the lists gives it on every read of them (router_configured_fallbacks); nothing keeps it. It is the only way the
+    configured lists reach that decision: a walk of them records none of their targets (_FallbackRead.configured_part).
     """
 
     carries_headers: bool = False
@@ -824,7 +841,8 @@ def walk_fallback_lists(
     order of hops decides and every ``fallbacks`` field is read both ways. The targets of the Router's own configured
     lists can be hops too: ``configured`` says whether a mapping in them carries a header field and whether one
     carries the beta (router_configured_fallbacks), and the proxy's walk and the Router's first walk of a call decide by
-    a scan of all three lists alike. The call's own ``fallbacks`` is the body's, or the setting of the root body's
+    a scan of all three lists alike; it is the only way they reach that decision, since a walk of the configured lists
+    records none of their targets. The call's own ``fallbacks`` is the body's, or the setting of the root body's
     router_settings_override that router_settings_override_fields promotes to it when the call carries none: both are
     read as the call's own, so every list that can become it is read in every reading the Router can read it in.
     ``router_serves`` says whether a Router serves the call, which decides where an override's ``fallbacks`` lands under
@@ -839,8 +857,10 @@ def walk_fallback_lists(
     the body's part's read cap: the Router's walk of a call passes it, with no budget, so every read of the call's own
     lists and header fields, in every reading, is refused past it. It also passes ``configured_lists``, the configured
     lists the call reads for the fields it does not carry, walked after the body in a part of their own that is never
-    refused. Every target that carries a header field is charged for its header fields when the walk records it, so
-    what a walk charges does not depend on the order of the fields, lists and targets it reads.
+    refused and records no carrier. Each target of the request's lists that carries a header field and that the checked
+    reading reaches is charged for its header fields when the walk records it, so what a walk charges does not depend
+    on the order of the fields, lists and targets it reads; a target first reached in a branch only the other reading
+    reads is not charged for them, since nothing then reads them (_FallbackRead.entry).
 
     The walk never passes over a container the request controls before it has charged that container's length: its own
     passes go through _FallbackRead.pass_over, and the header fields the beta check scans or copies, the request's and
@@ -863,7 +883,7 @@ def walk_fallback_lists(
     checked: Final = FallbackReading.ANTHROPIC if request_beta else FallbackReading.LITELLM
     walk.state.enforced = checked
     walk.state.anthropic_owns_fallbacks = request_beta and router_serves
-    configured_part: Final = walk.apart(_CONFIGURED_LISTS)
+    configured_part: Final = walk.configured_part()
     checked_walk: Final = _recorded(
         itertools.chain(
             iter_body_fallback_entries(body, walk), iter_body_fallback_entries(configured_lists, configured_part)
@@ -881,10 +901,11 @@ def walk_fallback_lists(
 
 def _both_readings_apply(state: _WalkState, *, request_beta: bool, configured: ConfiguredFallbacks) -> bool:
     """
-    Whether a hop can change whose list a ``fallbacks`` field is: a target the checked reading reached, or a mapping
-    of the Router's own configured lists, carries a header field, and the request or such a target carries the beta.
-    The configured lists count as their scan says. Each target the walk recorded had its header fields charged when
-    it was recorded, so reading their beta here charges nothing, in whatever order the targets come.
+    Whether a hop can change whose list a ``fallbacks`` field is: a target of the request's lists that the checked
+    reading reached, or a mapping of the Router's own configured lists, carries a header field, and the request or
+    such a target carries the beta. The configured lists count as their scan says, and only so: the walk records none
+    of their targets. Each target the walk recorded had its header fields charged when it was recorded, so reading
+    their beta here charges nothing, in whatever order the targets come.
     """
     if not state.carrying and not configured.carries_headers:
         return False
@@ -1338,12 +1359,14 @@ def _router_call_walk(
     """
     One walk of a Router call with ``lists`` in place of the fallback fields they name, read as the Router gets the
     call. A list for a field the call does not carry is the Router's configured one, walked in a part of its own that
-    has no budget or cap. ``llm_router``'s three configured lists are scanned, as the proxy's walk scans them
-    (router_configured_fallbacks), and the scan decides with the call's own targets whether both readings apply. Every
-    read of the call's own lists and header fields, from the walk's start, in every reading, is charged against
-    _ROUTER_CALL_READ_CAP, the most the proxy can have passed: the Router cannot tell a list its saved settings promoted
-    from a client's, so it refuses only a call whose own lists take more reads than any request the proxy passes, and a
-    caller of the Router as a library is held to the same net.
+    has no budget or cap and records no carrier. ``llm_router``'s three configured lists are scanned, as the proxy's
+    walk scans them (router_configured_fallbacks), and the scan decides with the call's own targets whether both
+    readings apply: it is the only part the configured lists have in that decision. Every read of the call's own lists
+    and header fields, from the walk's start, in every reading, is charged against _ROUTER_CALL_READ_CAP, the most the
+    proxy can have passed: the Router cannot tell a list its saved settings promoted from a client's, so it refuses
+    only a call whose own lists take more reads than any request the proxy passes, and a caller of the Router as a
+    library is held to the same net, on every route of the Router's first call; only an anthropic_messages call has
+    header fields read.
     """
     function_name: Final[object] = getattr(call_kwargs.get("original_generic_function"), "__name__", None)
     messages_call: Final = anthropic_messages_call or function_name == "anthropic_messages"
@@ -1377,8 +1400,9 @@ def reject_non_list_litellm_fallbacks(
     completion fallback does, so only its type is checked. A hop, a call that carries its request's
     AttemptedFallbackTargets, is not read again: each list in its kwargs is one its request's first call checked, or
     the own list of a target merged into the call, which that check walked. A walk here, on the error path, reads the
-    call with one list and no scan of the configured lists: its targets are a subset of the first call's, whose
-    decision the proxy's is a superset of, so it reads both ways only where the proxy did.
+    call with one list and no scan of the configured lists, and records no target of a configured list it reads: so it
+    decides by the call's own targets alone, a subset of what the first call decided by, and reads both ways only where
+    that call did, whose decision the proxy's is a superset of.
     """
     if list_of_targets:
         if fallbacks is not None and not isinstance(fallbacks, list):
