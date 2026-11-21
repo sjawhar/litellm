@@ -1,6 +1,8 @@
 import hashlib
+import itertools
 import json
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections import Counter
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -18,6 +20,7 @@ from litellm.litellm_core_utils.core_helpers import (
     get_metadata_variable_name_from_kwargs,
     is_object_dict,
     is_object_list,
+    is_object_sequence,
     safe_deep_copy,
 )
 from litellm.litellm_core_utils.get_llm_provider_logic import inferred_provider
@@ -348,6 +351,10 @@ def _router_fallbacks_key(kwargs: Mapping[str, object], anthropic_messages_call:
     )
 
 
+# The fields whose list the Router reads as a list of targets when it is in the client-side format
+_CLIENT_SIDE_FORMAT_FIELDS: Final = ("fallbacks", ROUTER_FALLBACKS_KWARG)
+
+
 def fallback_entries_are_targets(fallbacks: Sequence[object], field: str) -> bool:
     """
     Whether the Router calls every entry of this fallback field's list as a target, a string as a model and a mapping
@@ -355,7 +362,7 @@ def fallback_entries_are_targets(fallbacks: Sequence[object], field: str) -> boo
     list of targets it calls once that group fails: so only for a ``fallbacks`` list in the client-side format. The
     list a model group is mapped to is always a list of targets.
     """
-    return field in ("fallbacks", ROUTER_FALLBACKS_KWARG) and check_non_standard_fallback_format(fallbacks)
+    return field in _CLIENT_SIDE_FORMAT_FIELDS and check_non_standard_fallback_format(fallbacks)
 
 
 def _unsupported_group_map_entry(fallbacks: Sequence[object], field: str) -> str | None:
@@ -398,7 +405,8 @@ FALLBACK_LIST_FIELDS: Final = (
     "default_fallbacks",
 )
 # The kwargs that carry a call's headers to the provider; a target merged into the call replaces each one it carries.
-HEADER_CARRIER_KWARGS: Final = ("headers", "extra_headers", "provider_specific_header")
+_SCOPED_HEADER_KWARG: Final = "provider_specific_header"
+HEADER_CARRIER_KWARGS: Final = ("headers", "extra_headers", _SCOPED_HEADER_KWARG)
 
 
 class FallbackListShapeError(ValueError):
@@ -590,7 +598,7 @@ class _WalkState:
     enforced: FallbackReading
     read: set[tuple[object, ...]]  # mutable-ok: one walk's own record of what it read, never handed out
     deferred: list[Iterator[FallbackEntry | FallbackListRead]]  # mutable-ok: the walk's own queue of unread branches
-    carrying: list[tuple[Mapping[str, object], _FallbackTally]]  # mutable-ok: the walk's own record, never handed out
+    carrying: list[tuple[Mapping[str, object], "_FallbackRead"]]  # mutable-ok: the walk's own record, never handed out
 
     def deferred_branches(self) -> Iterator[FallbackEntry | FallbackListRead]:
         """Each branch the walk deferred, in order, read once the readings the walk reads include its way"""
@@ -606,7 +614,7 @@ class _FallbackRead:
     read lies above it, so a walk is linear in the entries. It reads what the readings ``state.enforced`` names read: a
     branch read another way waits in ``state.deferred`` and is read only once the walk's targets enforce that way too.
     ``tally`` charges what this part reads; ``saved_settings`` is the part the root body's router_settings_override is
-    charged to, None for this one.
+    charged to, None for this one. Every pass of the walk over a value the request controls goes through pass_over.
     """
 
     reading: FallbackReading
@@ -645,12 +653,36 @@ class _FallbackRead:
         return _read_in(self.state.enforced, widest=widest, via=via)
 
     def reach(self, field: str | None) -> None:
-        """A value the walk reaches, charged whether or not it read it before: the memo spares no work of the lookup"""
-        self.tally.charge(None, 0, 1, field)
+        """
+        A value the walk reaches, null included, charged whether or not it read it before: the memo spares no work of
+        the lookup
+        """
+        self.charge(1, field)
 
-    def read_items(self, container: object, items: int, field: str | None) -> None:
-        """A list or a mapping the walk is about to read for the first time this way, with its items or keys"""
-        self.tally.charge(container, items, items, field)
+    def charge(self, reads: int, field: str | None) -> None:
+        """``reads`` reads of values the walk, or the beta check it runs, is about to make"""
+        self.tally.charge(None, 0, reads, field)
+
+    def charge_length(
+        self, container: object, field: str | None, *, entries_of: object = None, passes: int = 1
+    ) -> None:
+        """
+        ``passes`` passes over ``container``, a list, a mapping or a view of one, charged by its length before any of
+        them: the walk's own (pass_over), or the beta check's scans and copies of a header container. ``entries_of`` is
+        the fallback list whose entries the container's items are, counted once however many passes read it.
+        """
+        length: Final = _length(container)
+        self.tally.charge(entries_of, length if entries_of is not None else 0, passes * length, field)
+
+    def pass_over(self, items: Collection[object], field: str | None, *, entries_of: object = None) -> Iterator[object]:
+        """
+        The one way the walk passes over a value the request controls, a list, a mapping (its keys) or a view of one:
+        ``items`` are charged by their length, and their entries when ``entries_of`` is the fallback list they are the
+        entries of, before the first item is handed out. So the walk reads no item a part's limits refuse: no loop,
+        comprehension, join, copy or scan of the walk passes over request data it has not charged.
+        """
+        self.charge_length(items, field, entries_of=entries_of)
+        return iter(items)
 
     def entry(
         self,
@@ -671,7 +703,7 @@ class _FallbackRead:
             and not isinstance(target, str)
             and any(key in target for key in HEADER_CARRIER_KWARGS)
         ):
-            self.state.carrying.append((target, self.tally))
+            self.state.carrying.append((target, self))
         return FallbackEntry(target, group, is_group_map, widest, via)
 
 
@@ -721,17 +753,26 @@ def walk_fallback_lists(
     included: past either it raises FallbackBudgetError as it reaches the list or the read. ``saved_settings_budget``
     counts the body's router_settings_override, the key's or team's saved router settings, apart against its own limit;
     None counts it with the body's lists. A part without a budget is counted and never refused.
+
+    The walk never passes over a container the request controls before it has charged that container's length: its own
+    passes go through _FallbackRead.pass_over, and the header fields the beta check scans or copies, the request's and
+    each target's, are charged before the check runs (_charge_header_carriers). Every key and value it reads counts,
+    null included, and no read costs more than a fixed amount: a group label is built from a few keys cut to a fixed
+    length after its map is charged, and a header line is charged by its characters too.
     """
+    walk: Final = _FallbackRead.start(
+        FallbackReading.BOTH if anthropic_messages_call else FallbackReading.LITELLM,
+        FallbackReading.LITELLM,
+        budget,
+        saved_settings_budget,
+    )
+    if anthropic_messages_call:
+        _charge_header_carriers(walk, carriers)
     request_beta: Final = anthropic_messages_call and provider_owns_fallbacks_field(
         carriers, anthropic_messages_call=True
     )
     checked: Final = FallbackReading.ANTHROPIC if request_beta else FallbackReading.LITELLM
-    walk: Final = _FallbackRead.start(
-        FallbackReading.BOTH if anthropic_messages_call else FallbackReading.LITELLM,
-        checked,
-        budget,
-        saved_settings_budget,
-    )
+    walk.state.enforced = checked
     checked_walk: Final = _recorded(iter_body_fallback_entries(body, walk), checked)
     if checked_walk.error is not None or not _both_readings_apply(walk.state, request_beta=request_beta):
         return checked_walk
@@ -743,35 +784,82 @@ def walk_fallback_lists(
 def _both_readings_apply(state: _WalkState, *, request_beta: bool) -> bool:
     """
     Whether a hop can change whose list a ``fallbacks`` field is: a target the checked reading reached carries a header
-    field, and the request or such a target carries the beta. Reading a target's beta reads its header fields, which
-    are charged to the target's part first.
+    field, and the request or such a target carries the beta. The walk's own record holds one item per entry it
+    charged. Reading a target's beta reads its header fields, which are charged to the target's part first.
     """
-    carrying: Final = {id(target): (target, tally) for target, tally in state.carrying}
+    carrying: Final = {id(target): (target, part) for target, part in state.carrying}
     if not carrying or request_beta:
         return bool(carrying)
-    for target, tally in carrying.values():
-        tally.charge(None, 0, _header_reads(target), None)
+    for target, part in carrying.values():
+        _charge_header_carriers(part, target)
         if provider_owns_fallbacks_field(target, anthropic_messages_call=True):
             return True
     return False
 
 
-def _header_lines(value: object) -> int:
-    return len(value) if _is_mapping(value) or is_object_list(value) else 0
-
-
-def _header_reads(target: Mapping[str, object]) -> int:
-    """
-    At least the values anthropic_owns_fallbacks reads of a target's header fields: each field with its lines, and
-    each mapping of the proxy's scoped provider_specific_header with the lines of its own extra_headers
-    """
-    scoped: Final = target.get("provider_specific_header")
-    scoped_headers: Final = (scoped,) if _is_mapping(scoped) else tuple(scoped) if is_object_list(scoped) else ()
-    return sum(1 + _header_lines(target[key]) for key in HEADER_CARRIER_KWARGS if key in target) + sum(
-        _header_lines(header) + _header_lines(header.get("extra_headers"))
-        for header in scoped_headers
-        if _is_mapping(header)
+def _length(container: object) -> int:
+    """The items of a list, a mapping or a view of one; a string or a scalar is one value, read as such"""
+    return (
+        len(container)
+        if isinstance(container, Collection) and not isinstance(container, (str, bytes, bytearray))
+        else 0
     )
+
+
+# The characters of a header line one read covers: the beta check lowercases every name, and decodes, joins and splits
+# the value of every anthropic-beta line
+_HEADER_CHARS_PER_READ: Final = 64
+
+
+def _header_line_reads(name: object, value: object) -> int:
+    texts: Final = tuple(len(text) for text in (name, value) if isinstance(text, (str, bytes, bytearray)))
+    return sum(texts) // _HEADER_CHARS_PER_READ
+
+
+def _charge_header_lines(walk: _FallbackRead, headers: object, field: str) -> None:
+    """
+    One header container the beta check reads, charged before it does: by its length for the check's scan and for
+    this pass over it, which charges each line by its characters. The check reads only a container with items(), which
+    a request body gives as a mapping.
+    """
+    if not _is_mapping(headers):
+        return
+    walk.charge_length(headers, field)
+    for name in walk.pass_over(headers, field):
+        walk.charge(_header_line_reads(name, headers[name]), field)
+
+
+def _charge_scoped_headers(walk: _FallbackRead, scoped: object) -> None:
+    """
+    The proxy's scoped provider_specific_header, charged before the beta check reads it: a mapping, which the check
+    copies twice, with its extra_headers; or a list, which it copies twice, and each mapping in it, which it copies,
+    with that mapping's extra_headers
+    """
+    if _is_mapping(scoped):
+        walk.charge_length(scoped, _SCOPED_HEADER_KWARG, passes=2)
+        _charge_header_lines(walk, scoped.get("extra_headers"), _SCOPED_HEADER_KWARG)
+    elif is_object_sequence(scoped):
+        walk.charge_length(scoped, _SCOPED_HEADER_KWARG, passes=2)
+        for header in walk.pass_over(scoped, _SCOPED_HEADER_KWARG):
+            if _is_mapping(header):
+                walk.charge_length(header, _SCOPED_HEADER_KWARG)
+                _charge_header_lines(walk, header.get("extra_headers"), _SCOPED_HEADER_KWARG)
+
+
+def _charge_header_carriers(walk: _FallbackRead, source: Mapping[str, object]) -> None:
+    """
+    Every header container the beta check of ``source`` scans or copies (anthropic_owns_fallbacks), charged by its
+    length to the part ``walk`` charges before the check runs: a header field the request controls is never read past
+    the part's limits, and one that passes them alone gets the walk's 400
+    """
+    for key in HEADER_CARRIER_KWARGS:
+        if key not in source:
+            continue
+        walk.reach(key)
+        if key == _SCOPED_HEADER_KWARG:
+            _charge_scoped_headers(walk, source[key])
+        else:
+            _charge_header_lines(walk, source[key], key)
 
 
 def walk_fallback_list(value: object, field: str, reading: FallbackReading) -> FallbackWalk:
@@ -814,25 +902,23 @@ def iter_fallback_entries(
     with its key, which ``group`` carries down. ``widest_reading`` reads every mapping without a string ``model`` as a
     group map, at every level, for a list Anthropic reads, whose names no LiteLLM reader calls, so a name in any shape
     gets the checks. A list the walk read before in the same way yields nothing again. Each value is charged to the
-    walk's part as the walk reaches it, and a list or a mapping with each of its items or keys before it is read.
+    walk's part as the walk reaches it, null included, and a list or a mapping by its length before the walk passes
+    over it (_FallbackRead.pass_over).
     """
     if depth > 2 * litellm.ROUTER_MAX_FALLBACKS:
         raise FallbackListShapeError("Rejected Request: fallback nesting exceeds the allowed validation depth.", field)
-    if value is not None:
-        walk.reach(field)
+    walk.reach(field)
     if not walk.first_read(("list", id(value), field, depth, widest_reading, group, via_litellm_fallbacks)):
         return
     if field is not None and not widest_reading:
         yield FallbackListRead(value, field, via_litellm_fallbacks)
     if _is_mapping(value):
-        walk.read_items(value, len(value), field)
         # The Router iterates a fallback list, and iterating a mapping walks its keys, so each key is a target
-        for key in value:
+        for key in walk.pass_over(value, field, entries_of=value):
             if isinstance(key, str):
                 yield walk.entry(key, group, widest=widest_reading, via=via_litellm_fallbacks)
-        for target_list in value.values():
             yield from iter_fallback_entries(
-                target_list,
+                value[key],
                 None,
                 walk,
                 depth=depth + 1,
@@ -841,11 +927,11 @@ def iter_fallback_entries(
                 via_litellm_fallbacks=via_litellm_fallbacks,
             )
     elif is_object_list(value):
-        walk.read_items(value, len(value), field)
         yield from _iter_list_entries(
             value,
             field,
             walk,
+            entries_of=value,
             depth=depth,
             widest_reading=widest_reading,
             group=group,
@@ -853,19 +939,44 @@ def iter_fallback_entries(
         )
 
 
+# A group map's label names its first keys, each cut, so building and hashing it costs a fixed amount
+_GROUP_LABEL_KEYS: Final = 4
+_GROUP_LABEL_KEY_CHARS: Final = 100
+
+
+def _group_label(group_map: Mapping[str, object]) -> str:
+    """
+    The name the entries under a group map read both ways are tagged with, built after the walk charged the map: its
+    first keys, each cut to a fixed length
+    """
+    shown: Final = tuple(str(key)[:_GROUP_LABEL_KEY_CHARS] for key in itertools.islice(group_map, _GROUP_LABEL_KEYS))
+    return ", ".join(shown) + (", ..." if len(group_map) > _GROUP_LABEL_KEYS else "")
+
+
 def _iter_list_entries(
-    items: Sequence[object],
+    items: Collection[object],
     field: str | None,
     walk: _FallbackRead,
     *,
+    entries_of: object,
     depth: int,
     widest_reading: bool,
     group: str | None,
     via_litellm_fallbacks: bool,
 ) -> Iterator[FallbackEntry | FallbackListRead]:
-    entries_are_targets: Final = not widest_reading and (field is None or fallback_entries_are_targets(items, field))
+    """
+    The entries of a list of fallback entries, ``entries_of``'s: telling a list in the client-side format from one in
+    the group format is one pass over it, and reading it another, each charged
+    """
+    entries_are_targets: Final = not widest_reading and (
+        field is None
+        or (
+            field in _CLIENT_SIDE_FORMAT_FIELDS
+            and client_side_fallback_format(walk.pass_over(items, field, entries_of=entries_of))
+        )
+    )
     read_both_ways: Final = field == "fallbacks" and not widest_reading and not entries_are_targets
-    for item in items:
+    for item in walk.pass_over(items, field, entries_of=entries_of):
         if isinstance(item, str):
             yield walk.entry(item, group, widest=widest_reading, via=via_litellm_fallbacks)
         elif not _is_entry_mapping(item):
@@ -887,7 +998,8 @@ def _iter_list_entries(
         else:
             # A model group mapped to the targets the Router calls once that group fails. In `fallbacks`,
             # litellm.acompletion's own fallback loop merges the mapping itself into the call instead.
-            item_group = ", ".join(str(key) for key in item) if read_both_ways and group is None else group
+            target_lists = walk.pass_over(item.values(), field)
+            item_group = _group_label(item) if read_both_ways and group is None else group
             if read_both_ways:
                 yield from iter_merged_target(
                     item,
@@ -897,7 +1009,7 @@ def _iter_list_entries(
                     is_group_map=True,
                     via_litellm_fallbacks=via_litellm_fallbacks,
                 )
-            for target_list in item.values():
+            for target_list in target_lists:
                 yield from iter_fallback_entries(
                     target_list,
                     None,
@@ -961,7 +1073,10 @@ def iter_body_fallback_entries(
         if not _is_mapping(source):
             continue
         for field in FALLBACK_LIST_FIELDS:
-            value = source.get(field)
+            if field not in source:
+                # A field the body does not carry holds no list; one it carries, null included, is read and counts
+                continue
+            value = source[field]
             own_fallbacks = source is body and field == "fallbacks"
             for anthropic_list, via in _list_readings(
                 walk.reading,
@@ -983,15 +1098,17 @@ def iter_body_fallback_entries(
                 else:
                     # Not read yet: read, and charged, only once the walk's targets enforce this way too
                     walk.state.deferred.append(branch)
-    context_window_swaps: Final = body.get(CONTEXT_WINDOW_FALLBACK_DICT_FIELD)
+    if CONTEXT_WINDOW_FALLBACK_DICT_FIELD not in body:
+        return
+    walk.reach(CONTEXT_WINDOW_FALLBACK_DICT_FIELD)
+    context_window_swaps: Final = body[CONTEXT_WINDOW_FALLBACK_DICT_FIELD]
     if _is_mapping(context_window_swaps):
         # Each value is the model the client wrapper swaps in, so the values are a list of targets
-        walk.reach(CONTEXT_WINDOW_FALLBACK_DICT_FIELD)
-        walk.read_items(context_window_swaps, len(context_window_swaps), CONTEXT_WINDOW_FALLBACK_DICT_FIELD)
         yield from _iter_list_entries(
-            tuple(context_window_swaps.values()),
+            context_window_swaps.values(),
             None,
             walk,
+            entries_of=context_window_swaps,
             depth=depth,
             widest_reading=widest_reading,
             group=group,
@@ -1733,21 +1850,36 @@ def check_non_standard_fallback_format(fallbacks: Sequence[object] | None) -> bo
 
     If [{"gpt-3.5-turbo": ["claude-3-haiku"]}] then standard format.
     """
-    if fallbacks is None or not isinstance(fallbacks, list) or len(fallbacks) == 0:
-        return False
-    if all(isinstance(item, str) for item in fallbacks):
-        return True
-    dict_entries: Final = tuple(item for item in fallbacks if isinstance(item, dict))
-    if len(dict_entries) == len(fallbacks):
-        for item in dict_entries:
-            for key in LiteLLMParamsTypedDict.__annotations__:
-                if key in item:
-                    # If the value is a list, it's likely a standard fallback model group mapping
-                    # (e.g. {"model": ["backup"]}) rather than a parameter override.
-                    if not isinstance(item[key], list):
-                        return True
+    return isinstance(fallbacks, list) and client_side_fallback_format(fallbacks)
 
-    return False
+
+def _fallback_format_kind(item: object) -> str:
+    """
+    How the client-side format counts one entry: a model name, a mapping that overrides a Router parameter, another
+    mapping, or neither
+    """
+    if isinstance(item, str):
+        return "name"
+    if not is_object_dict(item):
+        return "other"
+    # A list value is likely a model group's fallbacks, as in {"model": ["backup"]}, rather than a parameter override
+    overrides: Final = any(
+        key in item and not isinstance(item[key], list) for key in LiteLLMParamsTypedDict.__annotations__
+    )
+    return "override" if overrides else "mapping"
+
+
+def client_side_fallback_format(fallbacks: Iterable[object]) -> bool:
+    """
+    check_non_standard_fallback_format's reading of a list, in one pass over it: a list of model names, or of mappings
+    at least one of which overrides a Router parameter with a value that is not a list, is in the client-side format;
+    an empty list is not
+    """
+    kinds: Final = Counter(map(_fallback_format_kind, fallbacks))
+    entries: Final = kinds.total()
+    return entries > 0 and (
+        kinds["name"] == entries or (kinds["override"] > 0 and kinds["override"] + kinds["mapping"] == entries)
+    )
 
 
 _check_non_standard_fallback_format = check_non_standard_fallback_format
