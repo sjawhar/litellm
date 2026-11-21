@@ -585,8 +585,8 @@ class FallbackWalk:
 class _FallbackTally:
     """
     What one part of a walk's lists costs: their entries, each list's once however many ways the walk reads it, and the
-    values the walk reads, each once per read. Past ``budget`` entries, or past ``read_cap`` reads after the first
-    ``uncapped`` ones, the walk refuses ``part``, naming ``param`` or else the field it reads; None refuses neither.
+    values the walk reads, each once per read. Past ``budget`` entries, or past ``read_cap`` reads, the walk refuses
+    ``part``, naming ``param`` or else the field it reads; None refuses neither.
     """
 
     part: str
@@ -596,12 +596,17 @@ class _FallbackTally:
     read_cap: int | None = None
     entries: int = 0
     reads: int = 0
-    uncapped: int = 0
 
     @classmethod
-    def limited(cls, part: str, budget: int | None, param: str | None = None) -> "_FallbackTally":
-        """A part refused past ``budget`` entries and past FALLBACK_WALK_READS_PER_ENTRY reads per entry of it"""
-        return cls(part, budget, param, set(), None if budget is None else FALLBACK_WALK_READS_PER_ENTRY * budget)
+    def limited(
+        cls, part: str, budget: int | None, param: str | None = None, *, read_cap: int | None = None
+    ) -> "_FallbackTally":
+        """
+        A part refused past ``budget`` entries and past ``read_cap`` reads, by default FALLBACK_WALK_READS_PER_ENTRY
+        reads per entry of the budget
+        """
+        cap: Final = read_cap if read_cap is not None or budget is None else FALLBACK_WALK_READS_PER_ENTRY * budget
+        return cls(part, budget, param, set(), cap)
 
     def charge(self, container: object, entries: int, reads: int, field: str | None) -> None:
         """``reads`` values the walk is about to read, and the ``entries`` of ``container`` unless it counted them"""
@@ -613,31 +618,26 @@ class _FallbackTally:
             raise FallbackBudgetError(
                 f"Rejected Request: {self.part} hold more than {self.budget} entries in all.", self.param or field
             )
-        if self.read_cap is not None and self.reads - self.uncapped > self.read_cap:
+        if self.read_cap is not None and self.reads > self.read_cap:
             raise FallbackBudgetError(
                 f"Rejected Request: reading {self.part} takes more than {self.read_cap} reads of their lists, "
                 "mappings and values.",
                 self.param or field,
             )
 
-    def cap_reads_from_now(self, cap: int) -> None:
-        """The reads the part charges from now on are refused past ``cap``, as a part's past its budget's cap are"""
-        self.uncapped = self.reads
-        self.read_cap = cap
-
 
 @dataclass(slots=True)
 class _WalkState:
     """
     What every part of one walk shares: the readings it reads, each way it read a list or a mapping, the branches it
-    reached in a way it does not read yet, the targets it reached that carry a header field, with their part, and
+    reached in a way it does not read yet, the targets it reached that carry a header field, keyed by identity, and
     whether a router_settings_override's ``fallbacks`` rides in ROUTER_FALLBACKS_KWARG (router_settings_override_fields)
     """
 
     enforced: FallbackReading
     read: set[tuple[object, ...]]  # mutable-ok: one walk's own record of what it read, never handed out
     deferred: list[Iterator[FallbackEntry | FallbackListRead]]  # mutable-ok: the walk's own queue of unread branches
-    carrying: list[tuple[Mapping[str, object], "_FallbackRead"]]  # mutable-ok: the walk's own record, never handed out
+    carrying: dict[int, Mapping[str, object]]  # mutable-ok: the walk's own record, never handed out
     anthropic_owns_fallbacks: bool = False
 
     def deferred_branches(self) -> Iterator[FallbackEntry | FallbackListRead]:
@@ -669,8 +669,10 @@ class _FallbackRead:
         enforced: FallbackReading,
         budget: int | None,
         saved_settings_budget: int | None = None,
+        *,
+        read_cap: int | None = None,
     ) -> "_FallbackRead":
-        state: Final = _WalkState(enforced, set(), [], [])
+        state: Final = _WalkState(enforced, set(), [], {})
         saved_settings: Final = (
             None
             if saved_settings_budget is None
@@ -680,7 +682,7 @@ class _FallbackRead:
                 _FallbackTally.limited(_SAVED_SETTINGS_LISTS, saved_settings_budget, _SAVED_SETTINGS_PARAM),
             )
         )
-        return cls(reading, state, _FallbackTally.limited(_REQUEST_LISTS, budget), saved_settings)
+        return cls(reading, state, _FallbackTally.limited(_REQUEST_LISTS, budget, read_cap=read_cap), saved_settings)
 
     def apart(self, part: str) -> "_FallbackRead":
         """A part of the same walk, read as this one is, whose reads are counted apart as ``part`` and never refused"""
@@ -739,15 +741,20 @@ class _FallbackRead:
     ) -> FallbackEntry:
         """
         One entry the walk reaches, an item or a key it charged with its list. While the walk has yet to decide whether
-        both readings apply, a target that carries a header field is kept for that decision.
+        both readings apply, a target that carries a header field is kept for that decision, and its header fields are
+        charged to this part the first time the walk records it, before any target's beta is read: so every such target
+        is charged, whatever the order of the fields, lists and targets that hold it, and reading the beta later charges
+        nothing more.
         """
         if (
             self.reading is FallbackReading.BOTH
             and self.state.enforced is not FallbackReading.BOTH
             and not isinstance(target, str)
             and _carries_a_header_field(target)
+            and id(target) not in self.state.carrying
         ):
-            self.state.carrying.append((target, self))
+            _charge_header_carriers(self, target)
+            self.state.carrying[id(target)] = target
         return FallbackEntry(target, group, is_group_map, widest, via)
 
 
@@ -803,7 +810,7 @@ def walk_fallback_lists(
     saved_settings_budget: int | None = None,
     configured: ConfiguredFallbacks = NO_CONFIGURED_FALLBACKS,
     configured_lists: Mapping[str, object] = _NO_CONFIGURED_LISTS,
-    other_reading_read_cap: int | None = None,
+    read_cap: int | None = None,
     router_serves: bool = True,
 ) -> FallbackWalk:
     """
@@ -816,8 +823,8 @@ def walk_fallback_lists(
     reaches decide: when one of them carries a header field, and the request or such a target carries the beta, the
     order of hops decides and every ``fallbacks`` field is read both ways. The targets of the Router's own configured
     lists can be hops too: ``configured`` says whether a mapping in them carries a header field and whether one
-    carries the beta (configured_fallbacks), and the proxy's walk and the Router's first walk of a call decide by a
-    scan of all three lists alike. The call's own ``fallbacks`` is the body's, or the setting of the root body's
+    carries the beta (router_configured_fallbacks), and the proxy's walk and the Router's first walk of a call decide by
+    a scan of all three lists alike. The call's own ``fallbacks`` is the body's, or the setting of the root body's
     router_settings_override that router_settings_override_fields promotes to it when the call carries none: both are
     read as the call's own, so every list that can become it is read in every reading the Router can read it in.
     ``router_serves`` says whether a Router serves the call, which decides where an override's ``fallbacks`` lands under
@@ -828,10 +835,12 @@ def walk_fallback_lists(
     reads, at FALLBACK_WALK_READS_PER_ENTRY per entry of the budget, in every reading it reads, the deferred branches
     included: past either it raises FallbackBudgetError as it reaches the list or the read. ``saved_settings_budget``
     counts the body's router_settings_override, the key's or team's saved router settings, apart against its own limit;
-    None counts it with the body's lists. A part without a budget is counted and never refused. The Router's walk of a
-    call passes ``configured_lists``, the configured lists the call reads for the fields it does not carry, walked
-    after the body in a part of their own that is never refused, and ``other_reading_read_cap``, which caps what the
-    body's part reads in the other reading once both readings apply: past it the walk refuses as past a budget.
+    None counts it with the body's lists. A part without a budget is counted and never refused. ``read_cap`` replaces
+    the body's part's read cap: the Router's walk of a call passes it, with no budget, so every read of the call's own
+    lists and header fields, in every reading, is refused past it. It also passes ``configured_lists``, the configured
+    lists the call reads for the fields it does not carry, walked after the body in a part of their own that is never
+    refused. Every target that carries a header field is charged for its header fields when the walk records it, so
+    what a walk charges does not depend on the order of the fields, lists and targets it reads.
 
     The walk never passes over a container the request controls before it has charged that container's length: its own
     passes go through _FallbackRead.pass_over, and the header fields the beta check scans or copies, the request's and
@@ -844,6 +853,7 @@ def walk_fallback_lists(
         FallbackReading.LITELLM,
         budget,
         saved_settings_budget,
+        read_cap=read_cap,
     )
     if anthropic_messages_call:
         _charge_header_carriers(walk, carriers)
@@ -865,8 +875,6 @@ def walk_fallback_lists(
     ):
         return checked_walk
     walk.state.enforced = FallbackReading.BOTH
-    if other_reading_read_cap is not None:
-        walk.tally.cap_reads_from_now(other_reading_read_cap)
     other_reading: Final = _recorded(walk.state.deferred_branches(), FallbackReading.BOTH)
     return FallbackWalk(FallbackReading.BOTH, checked_walk.events + other_reading.events, other_reading.error)
 
@@ -875,37 +883,35 @@ def _both_readings_apply(state: _WalkState, *, request_beta: bool, configured: C
     """
     Whether a hop can change whose list a ``fallbacks`` field is: a target the checked reading reached, or a mapping
     of the Router's own configured lists, carries a header field, and the request or such a target carries the beta.
-    The configured lists count as their scan says. The walk's own record holds one item per entry it charged. Reading
-    a target's beta reads its header fields, which are charged to the target's part first.
+    The configured lists count as their scan says. Each target the walk recorded had its header fields charged when
+    it was recorded, so reading their beta here charges nothing, in whatever order the targets come.
     """
-    carrying: Final = {id(target): (target, part) for target, part in state.carrying}
-    if not carrying and not configured.carries_headers:
+    if not state.carrying and not configured.carries_headers:
         return False
     if request_beta or configured.carries_beta:
         return True
-    for target, part in carrying.values():
-        _charge_header_carriers(part, target)
-        if provider_owns_fallbacks_field(target, anthropic_messages_call=True):
-            return True
-    return False
-
-
-def configured_fallbacks(
-    fallbacks: object, context_window_fallbacks: object, content_policy_fallbacks: object
-) -> ConfiguredFallbacks:
-    """
-    A scan of a Router's three configured fallback lists, made on every read of them and kept by nothing, so a list
-    replaced, reloaded or changed in place is read as it is now (_scan_configured_fallbacks)
-    """
-    return _scan_configured_fallbacks((fallbacks, context_window_fallbacks, content_policy_fallbacks))
+    return any(
+        provider_owns_fallbacks_field(target, anthropic_messages_call=True) for target in state.carrying.values()
+    )
 
 
 def router_configured_fallbacks(llm_router: LitellmRouter | None) -> ConfiguredFallbacks:
-    """The scan of the Router's own configured fallback lists (configured_fallbacks); without a Router, none"""
+    """
+    A scan of the Router's own three configured fallback lists, made on every call and kept by nothing, so a list
+    replaced, reloaded or changed in place is read as it is now (_scan_configured_fallbacks). Without a Router, or when
+    the Router refuses a fallback target's credentials and header fields (fallback_target_credentials_allowed, read as
+    run_async_fallback reads it before a hop), no configured mapping can change a hop's header fields: a hop to a
+    target that carries one is refused before it runs, so there is nothing to scan for.
+    """
     if llm_router is None:
         return NO_CONFIGURED_FALLBACKS
-    return configured_fallbacks(
-        llm_router.fallbacks, llm_router.context_window_fallbacks, llm_router.content_policy_fallbacks
+    credentials_allowed: Final[Callable[[], bool] | None] = getattr(
+        llm_router, "fallback_target_credentials_allowed", None
+    )
+    if credentials_allowed is None or not credentials_allowed():
+        return NO_CONFIGURED_FALLBACKS
+    return _scan_configured_fallbacks(
+        (llm_router.fallbacks, llm_router.context_window_fallbacks, llm_router.content_policy_fallbacks)
     )
 
 
@@ -1315,10 +1321,10 @@ def _reject_router_unreadable_lists(walk: Callable[[], FallbackWalk], model: obj
         ) from shape_error
 
 
-# What the Router's walk of a call may read of the call's own lists in the reading only both readings applying makes
-# it read: the most the proxy can have passed for one request in every reading it read, a client's lists' read cap and
-# the saved settings' together, since one call can hold the request's own lists and lists its saved settings promote
-_ROUTER_OTHER_READING_READ_CAP: Final = FALLBACK_WALK_READS_PER_ENTRY * (
+# What the Router's walk of a call may read of the call's own lists and header fields, in every reading: the most the
+# proxy can have passed for one request in every reading it read, a client's lists' read cap and the saved settings'
+# together, since one call can hold the request's own lists and lists its saved settings promote
+_ROUTER_CALL_READ_CAP: Final = FALLBACK_WALK_READS_PER_ENTRY * (
     MAX_FALLBACK_LIST_ENTRIES + MAX_SAVED_FALLBACK_LIST_ENTRIES
 )
 
@@ -1327,37 +1333,27 @@ def _router_call_walk(
     call_kwargs: Mapping[str, object],
     lists: Mapping[str, object],
     anthropic_messages_call: bool,
-    configured: Mapping[str, object] | None = None,
+    llm_router: LitellmRouter | None = None,
 ) -> FallbackWalk:
     """
     One walk of a Router call with ``lists`` in place of the fallback fields they name, read as the Router gets the
     call. A list for a field the call does not carry is the Router's configured one, walked in a part of its own that
-    has no budget or cap. ``configured`` holds the Router's three configured lists, whose scan decides with the call's
-    own targets whether both readings apply, as it does in the proxy's walk (configured_fallbacks). The call's own
-    lists have no budget in the reading the call is checked in: the proxy's walk bounded a client's lists before the
-    call, and a caller of the Router as a library pays for its own input. The other reading, which the walk reads only
-    once both readings apply, is charged against _ROUTER_OTHER_READING_READ_CAP, the most the proxy can have passed:
-    the Router cannot tell a list its saved settings promoted from a client's, so it refuses only a call whose own
-    lists take more reads there than any request the proxy passes.
+    has no budget or cap. ``llm_router``'s three configured lists are scanned, as the proxy's walk scans them
+    (router_configured_fallbacks), and the scan decides with the call's own targets whether both readings apply. Every
+    read of the call's own lists and header fields, from the walk's start, in every reading, is charged against
+    _ROUTER_CALL_READ_CAP, the most the proxy can have passed: the Router cannot tell a list its saved settings promoted
+    from a client's, so it refuses only a call whose own lists take more reads than any request the proxy passes, and a
+    caller of the Router as a library is held to the same net.
     """
     function_name: Final[object] = getattr(call_kwargs.get("original_generic_function"), "__name__", None)
     messages_call: Final = anthropic_messages_call or function_name == "anthropic_messages"
-    scan: Final = (
-        configured_fallbacks(
-            configured.get("fallbacks"),
-            configured.get("context_window_fallbacks"),
-            configured.get("content_policy_fallbacks"),
-        )
-        if messages_call and configured is not None
-        else NO_CONFIGURED_FALLBACKS
-    )
     return walk_fallback_lists(
         {**call_kwargs, **{field: value for field, value in lists.items() if field in call_kwargs}},
         carriers=call_kwargs,
         anthropic_messages_call=messages_call,
-        configured=scan,
+        configured=router_configured_fallbacks(llm_router) if messages_call else NO_CONFIGURED_FALLBACKS,
         configured_lists={field: value for field, value in lists.items() if field not in call_kwargs},
-        other_reading_read_cap=_ROUTER_OTHER_READING_READ_CAP,
+        read_cap=_ROUTER_CALL_READ_CAP,
     )
 
 
@@ -1416,22 +1412,23 @@ def request_fallbacks(
 
 
 def call_fallbacks(
-    kwargs: Mapping[str, object], configured: Mapping[str, object]
+    kwargs: Mapping[str, object], llm_router: LitellmRouter
 ) -> list[object] | None:  # mutable-ok: the Router hands it on to its fallback functions' `list | None` parameter
     """
     The Router's fallback list for a call, read before its first attempt, after one walk of every fallback list the
-    call reads: its own, or for a field it does not carry the Router's ``configured`` one, keyed by the field. The
-    attempt reads the same lists and walks none again. A failed attempt's error handling walks the call again for
-    each error field (reject_non_list_litellm_fallbacks), and a hop's lists are its request's.
+    call reads: its own, or for a field it does not carry ``llm_router``'s configured one. The attempt reads the same
+    lists and walks none again. A failed attempt's error handling walks the call again for each error field
+    (reject_non_list_litellm_fallbacks), and a hop's lists are its request's.
     """
     key: Final = _router_fallbacks_key(kwargs, False)
     in_use: Final = {
-        key: kwargs.get(key, configured.get("fallbacks")),
-        **{field: kwargs.get(field, configured.get(field)) for field in ERROR_FALLBACK_FIELDS},
+        key: kwargs.get(key, llm_router.fallbacks),
+        "context_window_fallbacks": kwargs.get("context_window_fallbacks", llm_router.context_window_fallbacks),
+        "content_policy_fallbacks": kwargs.get("content_policy_fallbacks", llm_router.content_policy_fallbacks),
     }
     if not isinstance(kwargs.get("attempted_targets"), AttemptedFallbackTargets):
         _reject_router_unreadable_lists(
-            lambda: _router_call_walk(kwargs, in_use, False, configured), kwargs.get("model")
+            lambda: _router_call_walk(kwargs, in_use, False, llm_router), kwargs.get("model")
         )
     fallbacks: Final = in_use[key]
     return None if fallbacks is None else OBJECT_LIST_ADAPTER.validate_python(fallbacks)

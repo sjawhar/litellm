@@ -1,7 +1,7 @@
 import asyncio
 import importlib
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping, Sequence
 from datetime import datetime, timedelta
 from types import MappingProxyType
 from typing import Any, Final, Literal, NoReturn
@@ -1618,6 +1618,24 @@ async def test_the_routers_first_call_checks_a_targets_own_list_without_the_prox
         await router.acompletion(model="requested", messages=[{"role": "user", "content": "hi"}], **sent)
 
 
+def _router_of(
+    *, credentials_allowed: bool = False, context_window_fallbacks: Sequence[Mapping[str, object]] = ()
+) -> Router:
+    """
+    A Router of `requested` and `other` with the configured context_window_fallbacks given, which allows a fallback
+    target's header fields when ``credentials_allowed``, as a proxy with `allow_client_side_credentials: true` does
+    """
+    router: Final = Router(
+        model_list=[
+            {"model_name": name, "litellm_params": {"model": f"openai/{name}", "api_key": "fake"}}
+            for name in ("requested", "other")
+        ],
+        context_window_fallbacks=[dict(chain) for chain in context_window_fallbacks] or None,
+    )
+    router.fallback_target_credentials_allowed = (lambda: True) if credentials_allowed else None
+    return router
+
+
 @pytest.mark.parametrize(
     ("target_lists", "message"),
     [
@@ -1646,7 +1664,7 @@ def test_the_router_entry_reads_a_targets_own_lists_before_the_first_call(target
         "fallbacks": [{"requested": [{"model": "other", **target_lists}]}],
     }
     with pytest.raises(litellm.BadRequestError, match=message):
-        call_fallbacks(kwargs, {})
+        call_fallbacks(kwargs, _router_of())
 
 
 def test_the_router_entry_leaves_a_targets_own_list_to_anthropic_under_the_beta():
@@ -1659,21 +1677,27 @@ def test_the_router_entry_leaves_a_targets_own_list_to_anthropic_under_the_beta(
     assert request_fallbacks(kwargs, None, anthropic_messages_call=True) == kwargs["router_fallbacks"]
 
 
-@pytest.mark.parametrize("source", ["the-routers-configuration", "the-calls-own-list"])
 @pytest.mark.parametrize(
-    ("note_names", "refused"), [(175_993, False), (175_994, True)], ids=["at-the-read-cap", "one-past-it"]
+    ("source", "note_names", "refused"),
+    [
+        pytest.param("the-routers-configuration", 175_988, False, id="configured-at-the-net"),
+        pytest.param("the-routers-configuration", 175_989, True, id="configured-one-past-it"),
+        pytest.param("the-calls-own-list", 175_985, False, id="own-list-at-the-net"),
+        pytest.param("the-calls-own-list", 175_986, True, id="own-list-one-past-it"),
+    ],
 )
-def test_a_library_call_whose_own_lists_pass_the_read_cap_in_the_reading_both_ways_forces_is_refused(
-    source: str, note_names: int, refused: bool
-):
+def test_a_library_call_whose_own_lists_pass_the_routers_net_is_refused(source: str, note_names: int, refused: bool):
     """
     An anthropic_messages call without the beta, whose `fallbacks` holds a target and a parameter-only mapping with a
-    note of names. A target with the beta in its headers, in the Router's configured lists or in the call's own list,
-    makes the Router's walk read the call's lists as Anthropic's too, and that reading is charged against the most the
-    proxy can pass for one request, the request's read cap and the saved settings' together, 16 x (1,000 + 10,000) =
-    176,000: it reads 7 values before the note, the list and its read, the mapping's values, the metadata and its key,
-    the note, then its names. 175,993 names are read; 175,994 are refused with the walk's 400. The reading the call is
-    checked in has no cap, as before.
+    note of names. A target with the beta in its headers, in the Router's configured lists, which the Router allows
+    a target's header fields for, or in the call's own list, makes the Router's walk read the call's lists as
+    Anthropic's too. Every read of the call's own lists, in every reading, is charged against the most the proxy can
+    pass for one request, the request's read cap and the saved settings' together, 16 x (1,000 + 10,000) = 176,000.
+    The reading the call is checked in reads 5 values, the list, its format pass and its read, and 3 more for the own
+    target's header field, charged when the walk reaches the target; the reading both ways forces reads 7 before the
+    note, the list and its read, the mapping's values, the metadata and its key, the note, then its names. So 175,988
+    names are read beside the configured target and 175,985 beside the own one; one more is refused with the walk's
+    400. The configured target's own reads are counted apart.
     """
 
     def anthropic_messages() -> None:
@@ -1686,17 +1710,19 @@ def test_a_library_call_whose_own_lists_pass_the_read_cap_in_the_reading_both_wa
         "fallbacks": [own_target, {"metadata": {"note": ["ab"] * note_names}}],
         "original_generic_function": anthropic_messages,
     }
-    configured: Final = (
-        {"context_window_fallbacks": [{"requested": [beta_target]}]} if source == "the-routers-configuration" else {}
+    router: Final = (
+        _router_of(credentials_allowed=True, context_window_fallbacks=[{"requested": [beta_target]}])
+        if source == "the-routers-configuration"
+        else _router_of()
     )
 
     if not refused:
-        assert call_fallbacks(kwargs, configured) == kwargs["fallbacks"]
+        assert call_fallbacks(kwargs, router) == kwargs["fallbacks"]
         return
     with pytest.raises(
         litellm.BadRequestError, match="reading the request's fallback lists takes more than 176000 reads"
     ):
-        call_fallbacks(kwargs, configured)
+        call_fallbacks(kwargs, router)
 
 
 @pytest.mark.asyncio
