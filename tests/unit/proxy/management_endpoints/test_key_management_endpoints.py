@@ -6304,6 +6304,64 @@ async def test_an_owners_key_delete_that_commits_one_key_and_fails_the_other_rec
 
 
 @pytest.mark.asyncio
+async def test_an_owners_key_delete_records_the_tombstones_again_only_once_its_delayed_key_delete_committed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The owner deletes two keys, revoked at t=0 with a 30 s tombstone. At t=19 the request's record shows both
+    tombstones standing, so the revocation before the deletes sends nothing; the deletes run together. The second
+    key's fails at t=19, while the database still holds the first key's, which commits only at t=48.5. Another pod's
+    read began at t=48, before that delete committed, and got the first key; it stores it at t=50. The tombstones are
+    recorded again once every delete has ended, at t=48.5, standing until t=78.5, so that store keeps nothing and an
+    outage that follows does not serve the deleted key; a record made when the second delete failed, at t=19, would
+    have lapsed at t=49. The caller still gets the failed delete's error."""
+    import asyncio
+
+    from tests.unit.proxy.last_good_tombstone_race import (
+        revoked_before_the_write,
+        served_after_another_pod_stores,
+        tombstone_race,
+    )
+
+    race: Final = tombstone_race(monkeypatch)
+    delayed, failed = _SLOWLY_ARCHIVED_TOKENS
+    key_rows: Final = _KeyTable(
+        race.redis, tuple(LiteLLM_VerificationToken(token=token, user_id="user-1") for token in (delayed, failed))
+    )
+    prisma_client: Final = _routed_key_database(key_rows, key_rows)
+    deletes_each_key: Final = prisma_client.delete_data.side_effect
+    second_delete_failed: Final = asyncio.Event()
+
+    async def the_first_delete_commits_after_the_second_failed(tokens: Sequence[str]) -> dict[str, int]:
+        if tuple(tokens) == (failed,):
+            second_delete_failed.set()
+            raise ConnectionResetError("the database dropped the second delete")
+        await second_delete_failed.wait()
+        race.clock.now = 48.5
+        return await deletes_each_key(tokens=tokens)
+
+    prisma_client.delete_data.side_effect = the_first_delete_commits_after_the_second_failed
+    monkeypatch.setattr(  # test-quality-ok: the proxy's database, whose first key delete commits late
+        "litellm.proxy.proxy_server.prisma_client", prisma_client
+    )
+    await revoked_before_the_write(race, (delayed, failed))
+
+    with pytest.raises(ConnectionResetError, match="dropped the second delete"):
+        await delete_verification_tokens(
+            tokens=[delayed, failed],
+            user_api_key_cache=race.cache,
+            user_api_key_dict=UserAPIKeyAuth(user_id="user-1", user_role=LitellmUserRoles.INTERNAL_USER.value),
+        )
+
+    served: Final = await served_after_another_pod_stores(
+        race, delayed, UserAPIKeyAuth(token=delayed), read_began_at=48.0, stored_at=50.0
+    )
+    assert served is None
+    # The first key's delete ran at t=48.5, once its first tombstone had lapsed; the second key is kept
+    assert key_rows.deletes == [((delayed,), ())]
+    assert [row.token for row in key_rows.rows] == [failed]
+
+
+@pytest.mark.asyncio
 async def test_delete_key_fn_persists_deleted_keys(monkeypatch):
     from litellm.proxy._types import KeyRequest
     from litellm.proxy.management_endpoints.key_management_endpoints import (
@@ -11830,6 +11888,64 @@ async def test_block_key_refuses_and_leaves_the_key_unblocked_when_redis_cannot_
 
     assert refused.value.status_code == 503
     mock_prisma_client.db.litellm_verificationtoken.update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_key_block_whose_commit_answer_is_lost_records_the_tombstone_again_so_no_outage_serves_the_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A proxy admin blocks a key whose entry the request first revoked at t=0, with a 30 s tombstone. The block's
+    update runs at t=19, when the request's record shows that tombstone standing, so the revocation paired with it
+    sends Redis nothing. The update commits the block, but its answer is lost, so it raises and the eviction after it
+    never runs. Another pod's read began at t=19, before the update committed, and got the unblocked key; it stores
+    that entry at t=31, once the first tombstone lapsed at t=30. The block records the key's tombstone again once its
+    update has raised, standing until t=49, so that store keeps nothing and an outage that follows serves no entry for
+    the key, rather than the unblocked one. The admin still gets the update's error."""
+    from litellm.proxy._types import BlockKeyRequest
+    from litellm.proxy.management_endpoints.key_management_endpoints import block_key
+    from tests.unit.proxy.last_good_tombstone_race import (
+        revoked_before_the_write,
+        served_after_another_pod_stores,
+        tombstone_race,
+    )
+
+    race: Final = tombstone_race(monkeypatch)
+    prisma_client, hashed_token = _setup_block_unblock_mocks(monkeypatch)
+    key_rows: Final[dict[str, LiteLLM_VerificationToken]] = {  # mutable-ok: the block's update rewrites the row
+        hashed_token: LiteLLM_VerificationToken(token=hashed_token, blocked=False),
+    }
+
+    async def find_unique(where: Mapping[str, str]) -> LiteLLM_VerificationToken | None:
+        return key_rows.get(where["token"])
+
+    async def commits_and_loses_the_answer(
+        where: Mapping[str, str], data: Mapping[str, object]
+    ) -> LiteLLM_VerificationToken:
+        key_rows[where["token"]] = key_rows[where["token"]].model_copy(update=data)
+        raise ConnectionResetError("the commit's answer was lost")
+
+    key_table: Final = prisma_client.db.litellm_verificationtoken
+    key_table.find_unique = AsyncMock(side_effect=find_unique)
+    key_table.update = AsyncMock(side_effect=commits_and_loses_the_answer)
+    monkeypatch.setattr(  # test-quality-ok: the race's auth cache replaces the one the block's mocks set
+        "litellm.proxy.proxy_server.user_api_key_cache", race.cache
+    )
+    await revoked_before_the_write(race, (hashed_token,))
+    admin_key: Final = "sk-admin"
+
+    with pytest.raises(ConnectionResetError, match="answer was lost"):
+        await block_key(
+            data=BlockKeyRequest(key="sk-test123456789"),
+            http_request=MagicMock(),
+            user_api_key_dict=UserAPIKeyAuth(
+                user_role=LitellmUserRoles.PROXY_ADMIN, api_key=admin_key, user_id="admin_user"
+            ),
+            litellm_changed_by=None,
+        )
+
+    assert key_rows[hashed_token].blocked is True
+    served: Final = await served_after_another_pod_stores(race, hashed_token, UserAPIKeyAuth(token=hashed_token))
+    assert served is None
 
 
 @pytest.mark.asyncio

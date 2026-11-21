@@ -17668,6 +17668,61 @@ async def test_team_block_pinned_to_the_writer_revokes_the_team_under_the_alias_
     assert await _tombstoned(redis, aliases) == ("team_alias:new",)
 
 
+@pytest.mark.asyncio
+async def test_team_block_whose_commit_reply_is_lost_records_its_tombstones_again_so_no_outage_serves_the_old_team(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The request first revokes team t1's entries, under its id and its alias, at t=0, with a 30 s tombstone. The
+    block of t1 runs at t=19, when the request's record shows those tombstones standing, so its revocation sends Redis
+    nothing. Its update commits t1 blocked, then the database's answer is lost and the update raises. Another pod's
+    read began at t=19, before the update committed, and got t1 unblocked; it stores that row at t=31, once the first
+    tombstones lapsed at t=30. The block records the tombstones again once its update raises, standing until t=49, so
+    that store keeps nothing and an outage that follows serves no entry for t1, rather than the unblocked team. The
+    caller still gets the update's error."""
+    from fastapi import Request
+
+    from litellm.models.team import LiteLLM_TeamTableCachedObj
+    from litellm.proxy._types import BlockTeamRequest
+    from litellm.proxy.auth.auth_checks import team_cache_keys
+    from litellm.proxy.management_endpoints.team_endpoints import block_team
+    from tests.unit.proxy.last_good_tombstone_race import (
+        revoked_before_the_write,
+        served_after_another_pod_stores,
+        tombstone_race,
+    )
+
+    race: Final = tombstone_race(monkeypatch)
+    unblocked: Final = LiteLLM_TeamTable(team_id="t1", team_alias="lanes", blocked=False)
+    rows: Final = _BlockableTeamRows(unblocked)
+    cache_keys: Final = team_cache_keys("t1", "lanes")
+
+    async def block_then_lose_the_answer(*, where: dict[str, str], data: dict[str, bool]) -> LiteLLM_TeamTable:
+        _ = await rows.update(where=where, data=data)
+        raise ConnectionResetError("the commit's answer was lost")
+
+    teams: Final = _model_actions(find_unique=rows.find_unique, update=block_then_lose_the_answer)
+    monkeypatch.setattr(  # test-quality-ok: proxy_server module global is the endpoint's only injection point
+        "litellm.proxy.proxy_server.prisma_client", SimpleNamespace(db=SimpleNamespace(litellm_teamtable=teams))
+    )
+    monkeypatch.setattr(  # test-quality-ok: the race's auth cache, on its wall clock too, is the one the block revokes
+        "litellm.proxy.proxy_server.user_api_key_cache", race.cache
+    )
+    await revoked_before_the_write(race, cache_keys)
+
+    with pytest.raises(ConnectionResetError, match="the commit's answer was lost"):
+        await block_team(
+            data=BlockTeamRequest(team_id="t1"),
+            http_request=MagicMock(spec=Request),
+            user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN, user_id="admin"),
+        )
+
+    assert rows.team.blocked is True
+    served: Final = await served_after_another_pod_stores(
+        race, cache_keys[0], LiteLLM_TeamTableCachedObj.model_validate(unblocked.model_dump())
+    )
+    assert served is None
+
+
 class _DrivenClock:
     """The last good entries' clock, which a test moves instead of waiting."""
 

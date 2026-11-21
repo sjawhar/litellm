@@ -14,7 +14,6 @@ from collections.abc import Awaitable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from functools import partial
-from itertools import chain
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
@@ -38,10 +37,11 @@ from litellm.proxy.auth.auth_checks import (
 from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_broadcast
 from litellm.proxy.common_utils.user_api_key_cache import (
     UserApiKeyCache,
-    last_good_tombstones_recorded_if_raised,
-    record_last_good_tombstones_again,
+    last_good_recorded_after_transaction,
+    last_good_revoked_around,
     revoke_and_delete_read_rows,
     revoke_last_good,
+    revoke_last_good_then,
     serves_last_good_entries,
     team_membership_auth_cache_key,
 )
@@ -102,16 +102,13 @@ class _TeamsData(TypedDict):
 @dataclass(frozen=True, slots=True)
 class _TeamRemoval:
     """One team's rewrite. `removed` holds the user ids taken off the team (roster, `teams` array, or both);
-    `matched` holds the indexes into the requested members that named at least one of them; `revoked_entries` the
-    team's, users' and memberships' last good entries revoked before the transaction's writes, recorded again once it
-    commits."""
+    `matched` holds the indexes into the requested members that named at least one of them."""
 
     team: LiteLLM_TeamTable
     removed: frozenset[str]
     matched: frozenset[int]
     deleted_keys: tuple["prisma_models.LiteLLM_VerificationToken", ...]
     jwt_mapping_cache_keys: tuple[str, ...]
-    revoked_entries: tuple[str, ...]
 
     @property
     def deleted_key_tokens(self) -> tuple[str, ...]:
@@ -123,9 +120,6 @@ class _UserBatchDeletion:
     removals: Mapping[str, _TeamRemoval]
     deleted_keys: tuple["prisma_models.LiteLLM_VerificationToken", ...]
     jwt_mapping_cache_keys: tuple[str, ...]
-    # The users', teams' and memberships' last good entries the transaction's writes ended, recorded again once it
-    # commits; the keys' go with their eviction
-    revoked_entries: tuple[str, ...]
 
     @property
     def deleted_key_tokens(self) -> tuple[str, ...]:
@@ -136,13 +130,6 @@ class _UserBatchDeletion:
 class _DeletedKeys:
     keys: tuple["prisma_models.LiteLLM_VerificationToken", ...]
     jwt_mapping_cache_keys: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class _DeletedUserRows:
-    deleted_keys: _DeletedKeys
-    # The users' and the memberships' last good entries the deletes revoked inside the transaction
-    revoked_entries: tuple[str, ...]
 
 
 def _team_not_found(team_id: str) -> ManagementProblem:
@@ -318,6 +305,37 @@ async def _delete_keys(
     return _DeletedKeys(keys=tuple(read), jwt_mapping_cache_keys=tuple(read_jwt_mapping_cache_keys))
 
 
+async def _rewrite_team_and_members(
+    tx: "Prisma",
+    team_id: str,
+    team_alias: str | None,
+    removed_members: Sequence[Member],
+    kept_members: Sequence[Member],
+    stale_rows: Sequence["prisma_models.LiteLLM_UserTable"],
+    cleanup_ids: frozenset[str],
+    user_api_key_cache: UserApiKeyCache,
+) -> None:
+    """Take the members off the team's roster, the team off each stale user's ``teams`` and the members' memberships
+    away, inside ``last_good_revoked_around`` of the team's, the users' and the memberships' entries."""
+    async with last_good_revoked_around(
+        user_api_key_cache,
+        (
+            *(team_cache_keys(team_id, team_alias) if removed_members else ()),
+            *(row.user_id for row in stale_rows),
+            *(team_membership_auth_cache_key(team_id=team_id, user_id=user_id) for user_id in sorted(cleanup_ids)),
+        ),
+    ):
+        if removed_members:
+            roster_data: Final[_RosterData] = {
+                "members_with_roles": json.dumps(tuple(m.model_dump() for m in kept_members))
+            }
+            await _team_tx_db(tx).update(where=_eq_filter("team_id", team_id), data=roster_data)
+        for row in stale_rows:
+            teams_data: _TeamsData = {"teams": {"set": tuple(t for t in row.teams if t != team_id)}}
+            await _user_tx_db(tx).update(where=_eq_filter("user_id", row.user_id), data=teams_data)
+        await _membership_tx_db(tx).delete_many(where=_team_users_filter(team_id, cleanup_ids))
+
+
 async def _remove_members_from_team(
     prisma_client: PrismaClient,
     tx: "Prisma",
@@ -361,27 +379,16 @@ async def _remove_members_from_team(
     # round of ``_delete_keys`` reads those of its own keys
     serving: Final = serves_last_good_entries(user_api_key_cache)
     read_jwt_mapping_cache_keys: Final = () if serving else await _jwt_mapping_cache_keys_of(prisma_client, tx, keys)
-    # The roster rides on the team's entry, the team on each user's entry and the member limits on each membership's,
-    # so all of them are revoked before the first write, as the deleted keys are
-    revoked_entries: Final = (
-        *(team_cache_keys(team_id, team_alias) if removed_members else ()),
-        *(row.user_id for row in stale_rows),
-        *(team_membership_auth_cache_key(team_id=team_id, user_id=user_id) for user_id in sorted(cleanup_ids)),
-    )
+    # The deleted keys are revoked before the first write; the roster rides on the team's entry, the team on each
+    # user's entry and the member limits on each membership's, so those are revoked right before the writes that end
+    # them and recorded again after them, also when one raises
     try:
-        await revoke_last_good(user_api_key_cache, (*revoked_entries, *(k.token for k in keys)))
+        await revoke_last_good(user_api_key_cache, tuple(k.token for k in keys))
+        await _rewrite_team_and_members(
+            tx, team_id, team_alias, removed_members, kept_members, stale_rows, cleanup_ids, user_api_key_cache
+        )
     except HTTPException as refused:
         raise _revocation_refused(refused) from refused
-
-    if removed_members:
-        roster_data: Final[_RosterData] = {
-            "members_with_roles": json.dumps(tuple(m.model_dump() for m in kept_members))
-        }
-        await _team_tx_db(tx).update(where=_eq_filter("team_id", team_id), data=roster_data)
-    for row in stale_rows:
-        teams_data: _TeamsData = {"teams": {"set": tuple(t for t in row.teams if t != team_id)}}
-        await _user_tx_db(tx).update(where=_eq_filter("user_id", row.user_id), data=teams_data)
-    await _membership_tx_db(tx).delete_many(where=cleaned_in_team)
     try:
         deleted_keys: Final = await _delete_keys(
             prisma_client,
@@ -405,7 +412,6 @@ async def _remove_members_from_team(
         matched=matched,
         deleted_keys=deleted_keys.keys,
         jwt_mapping_cache_keys=deleted_keys.jwt_mapping_cache_keys,
-        revoked_entries=revoked_entries,
     )
 
 
@@ -452,9 +458,10 @@ async def bulk_remove_team_members(
     duplicates: Final = _duplicate_member_indexes(data.members)
     kept_indexes: Final = tuple(i for i in range(len(data.members)) if i not in duplicates)
     members: Final = tuple(data.members[i] for i in kept_indexes)
-    # A transaction that raises may have committed: what it revoked is recorded again then
+    # What the transaction revokes is recorded again once it ends, returned or raised (one that raises may have
+    # committed)
     async with (
-        last_good_tombstones_recorded_if_raised(user_api_key_cache),
+        last_good_recorded_after_transaction(user_api_key_cache),
         prisma_client.tx(timeout=_BATCH_TX_TIMEOUT) as tx,
     ):
         removal: Final = await _remove_members_from_team(
@@ -473,9 +480,6 @@ async def bulk_remove_team_members(
         revoked=True,
     )
     await evict_and_broadcast(cache_keys=removal.jwt_mapping_cache_keys, user_api_key_cache=user_api_key_cache)
-    # The team's, users' and memberships' rows were written inside the transaction, so their tombstones are recorded
-    # again once it committed
-    await record_last_good_tombstones_again(user_api_key_cache, removal.revoked_entries)
     _emit_team_members_metric(removal.team)
 
     matched: Final = frozenset(kept_indexes[j] for j in removal.matched)
@@ -516,28 +520,6 @@ def _scope_error(user_id: str, target_org_ids: frozenset[str], caller_admin_org_
     )
 
 
-async def _delete_user_memberships(
-    tx: "Prisma", of_users: Mapping[str, object], serving: bool, user_api_key_cache: UserApiKeyCache
-) -> tuple[str, ...]:
-    """Delete the users' team memberships; returns the last good entries of those it revoked. Each membership has its
-    own entry, so while entries are served only the memberships read, and revoked, are deleted, round by round: one
-    the team rewrites before it left, as when neither the roster nor the user's row names its team, or one committed
-    since, is revoked before it goes."""
-    memberships: Final = _membership_tx_db(tx)
-    if not serving:
-        await memberships.delete_many(where=of_users)
-        return ()
-    deleted: Final = await revoke_and_delete_read_rows(
-        user_api_key_cache,
-        partial(memberships.find_many, where=of_users),
-        lambda rows: tuple(team_membership_auth_cache_key(team_id=r.team_id, user_id=r.user_id) for r in rows),
-        lambda rows: memberships.delete_many(
-            where=_any_filter(*(_team_users_filter(r.team_id, (r.user_id,)) for r in rows))
-        ),
-    )
-    return tuple(team_membership_auth_cache_key(team_id=r.team_id, user_id=r.user_id) for r in deleted)
-
-
 async def _delete_user_rows(
     prisma_client: PrismaClient,
     tx: "Prisma",
@@ -545,7 +527,7 @@ async def _delete_user_rows(
     user_api_key_dict: UserAPIKeyAuth,
     litellm_changed_by: str | None,
     user_api_key_cache: UserApiKeyCache,
-) -> _DeletedUserRows:
+) -> _DeletedKeys:
     of_users: Final = _in_filter("user_id", user_ids)
     keys: Final = await _token_tx_db(tx).find_many(where=of_users)
     # Without last good entries the keys' mappings are read with them, as before; while they are served each delete
@@ -571,10 +553,29 @@ async def _delete_user_rows(
             _in_filter("updated_by", user_ids),
         )
     )
-    await _org_membership_tx_db(tx).delete_many(where=of_users)
-    membership_entries: Final = await _delete_user_memberships(tx, of_users, serving, user_api_key_cache)
-    await _user_tx_db(tx).delete_many(where=of_users)
-    return _DeletedUserRows(deleted_keys=deleted_keys, revoked_entries=(*sorted(user_ids), *membership_entries))
+    # The users' entries carry their organization memberships: revoked right before this delete, recorded again after
+    await revoke_last_good_then(
+        user_api_key_cache, sorted(user_ids), partial(_org_membership_tx_db(tx).delete_many, where=of_users)
+    )
+    memberships: Final = _membership_tx_db(tx)
+    if serving:
+        # Each membership has its own entry, so only the memberships read, and revoked, are deleted, round by round:
+        # one the team rewrites above left, as when neither the roster nor the user's row names its team, or one
+        # committed since, is revoked before it goes
+        _ = await revoke_and_delete_read_rows(
+            user_api_key_cache,
+            partial(memberships.find_many, where=of_users),
+            lambda rows: tuple(team_membership_auth_cache_key(team_id=r.team_id, user_id=r.user_id) for r in rows),
+            lambda rows: memberships.delete_many(
+                where=_any_filter(*(_team_users_filter(r.team_id, (r.user_id,)) for r in rows))
+            ),
+        )
+    else:
+        await memberships.delete_many(where=of_users)
+    await revoke_last_good_then(
+        user_api_key_cache, sorted(user_ids), partial(_user_tx_db(tx).delete_many, where=of_users)
+    )
+    return deleted_keys
 
 
 async def _delete_users_tx(
@@ -587,10 +588,10 @@ async def _delete_users_tx(
 ) -> _UserBatchDeletion:
     """Rewrites every team the users belong to and deletes their rows in one transaction, so a
     failure anywhere rolls back the whole batch. Teams a user still names but which no longer exist
-    are skipped; the user row goes away regardless. A transaction that raises may have committed: what it revoked is
-    recorded again then."""
+    are skipped; the user row goes away regardless. What the transaction revokes is recorded again once it ends,
+    returned or raised (one that raises may have committed)."""
     async with (
-        last_good_tombstones_recorded_if_raised(user_api_key_cache),
+        last_good_recorded_after_transaction(user_api_key_cache),
         prisma_client.tx(timeout=_BATCH_TX_TIMEOUT) as tx,
     ):
         team_rows: Final = await _team_tx_db(tx).find_many(
@@ -616,7 +617,7 @@ async def _delete_users_tx(
                 for tid in team_ids
             }
         )
-        deleted_rows: Final = await _delete_user_rows(
+        deleted_keys: Final = await _delete_user_rows(
             prisma_client,
             tx,
             frozenset(u.user_id for u in users),
@@ -624,16 +625,11 @@ async def _delete_users_tx(
             litellm_changed_by,
             user_api_key_cache,
         )
-    deleted_keys: Final = deleted_rows.deleted_keys
     return _UserBatchDeletion(
         removals=removals,
         deleted_keys=deleted_keys.keys + tuple(k for r in removals.values() for k in r.deleted_keys),
         jwt_mapping_cache_keys=deleted_keys.jwt_mapping_cache_keys
         + tuple(k for r in removals.values() for k in r.jwt_mapping_cache_keys),
-        revoked_entries=(
-            *deleted_rows.revoked_entries,
-            *chain.from_iterable(r.revoked_entries for r in removals.values()),
-        ),
     )
 
 
@@ -670,9 +666,6 @@ async def _delete_users(
     )
     await evict_and_broadcast(cache_keys=deletion.jwt_mapping_cache_keys, user_api_key_cache=user_api_key_cache)
     await evict_and_broadcast(cache_keys=sorted(user_ids), user_api_key_cache=user_api_key_cache)
-    # The users', teams' and memberships' rows were written inside the transaction, so their tombstones are recorded
-    # again once it committed
-    await record_last_good_tombstones_again(user_api_key_cache, deletion.revoked_entries)
     for removal in deletion.removals.values():
         _emit_team_members_metric(removal.team)
     audit_outcomes: Final = await _bounded(
@@ -752,9 +745,7 @@ async def bulk_delete_users(
             litellm_changed_by,
         )
         if candidates
-        else _UserBatchDeletion(
-            removals=MappingProxyType({}), deleted_keys=(), jwt_mapping_cache_keys=(), revoked_entries=()
-        )
+        else _UserBatchDeletion(removals=MappingProxyType({}), deleted_keys=(), jwt_mapping_cache_keys=())
     )
 
     def result(index: int, user_id: str) -> UserDeleteResult:

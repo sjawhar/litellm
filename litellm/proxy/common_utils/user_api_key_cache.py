@@ -883,7 +883,7 @@ _revoked_by_this_request: Final[  # mutable-ok: the record's dict grows as its t
 ] = ContextVar("last_good_revoked_by_this_request", default=None)
 
 # The keys ``revoke_last_good`` revoked while a transaction that ends access is open
-# (``last_good_tombstones_recorded_if_raised``), recorded again if it raises
+# (``last_good_recorded_after_transaction``), recorded again once it ends
 _revoked_in_open_transaction: Final[  # mutable-ok: the list grows as the transaction revokes
     ContextVar[list[str] | None]
 ] = ContextVar("last_good_revoked_in_open_transaction", default=None)
@@ -976,19 +976,11 @@ async def revoke_last_good(cache: DualCache, cache_keys: Sequence[str]) -> None:
         in_transaction.extend(cache_keys)
 
 
-async def record_last_good_tombstones_again(cache: DualCache, cache_keys: Sequence[str]) -> None:
-    """Record again, once a strict write has returned or raised, the tombstones of the entries it ended, and drop the
-    entries, in this pod's memory and in Redis (two round trips however many keys). Another worker's read that began
-    before the write committed, while the first tombstones stood, can store the old row once they lapse; a tombstone
-    recorded at time e refuses every store until e plus ``LAST_GOOD_TOMBSTONE_TTL_SECONDS``, by which time such a read
-    is late, and its delete drops one stored before e. Nothing with the setting off or with no keys.
-
-    Best effort, since the write may have committed: a Redis that fails here is logged, not raised, and leaves an old
-    row another worker stored after the first tombstones lapsed until that entry expires."""
-    store: Final = _last_good_store(cache)
-    if store is None or not store.serve_last_good_entries or not cache_keys:
-        return
-    keys: Final = tuple(dict.fromkeys(cache_keys))
+async def _record_tombstones_again(store: UserApiKeyCache, keys: Sequence[str]) -> None:
+    """Record again the tombstones of ``keys`` and drop their entries, in this pod's memory and in Redis (two round
+    trips however many keys). Best effort, since the write before it may have committed: a Redis that fails here is
+    logged, not raised, and leaves an old row another worker stored after the first tombstones lapsed until that entry
+    expires."""
     for cache_key in keys:
         store.last_good_memory.tombstone(cache_key, LAST_GOOD_TOMBSTONE_TTL_SECONDS)
     if store.redis_cache is None:
@@ -1009,41 +1001,88 @@ async def record_last_good_tombstones_again(cache: DualCache, cache_keys: Sequen
         )
 
 
-async def revoke_last_good_then(
-    cache: DualCache, cache_keys: Sequence[str], write: Callable[[], Awaitable[_Written]]
-) -> _Written:
-    """``revoke_last_good`` of ``cache_keys``, then ``write``, with nothing awaited in between: a write that ends what
-    those entries hold. A request that already revoked them, while their tombstones stand, needs no Redis here; once
-    a slow step may have outlasted them, they are revoked again, or the 503 leaves ``write`` unmade. Once ``write``
-    returns or raises, cancellation included, their tombstones are recorded again
-    (``record_last_good_tombstones_again``), and then its result or its exception goes on unchanged: a write that
-    needed no Redis here can start with only ``LAST_GOOD_LATE_STORE_MARGIN_SECONDS`` of them left, and a read another
-    worker began before it committed could otherwise store the old row once they lapse. A write that raises may still
-    have committed in part (several deletes run together, of which one failed; a driver error once the commit reached
-    the database; an await cancelled after it), and its caller's evictions after it never run. A write inside a
-    transaction commits later, so its caller records them again after the commit too. No keys: just the write."""
-    await revoke_last_good(cache, cache_keys)
-    try:
-        return await write()
-    finally:
-        await record_last_good_tombstones_again(cache, cache_keys)
+async def _record_tombstones_to_the_end(cache: DualCache, cache_keys: Sequence[str]) -> bool:
+    """Record again, once a strict write has returned or raised, the tombstones of the entries it ended
+    (``_record_tombstones_again``), and run that record to its end even when this task is cancelled meanwhile, once or
+    more: it runs as a task of its own, awaited shielded, and a cancellation that arrives while waiting is noted and
+    the wait goes on. Returns whether one arrived, for the caller to raise it once its own outcome allows. The wait is
+    bounded by the Redis client's timeouts: each command waits at most its socket timeout (``REDIS_SOCKET_TIMEOUT``,
+    0.1 s unless set, which ``litellm/_redis.py`` gives every client), and an open circuit breaker refuses at once.
+
+    Another worker's read that began before the write committed, while the first tombstones stood, can store the old
+    row once they lapse; a tombstone recorded at time e refuses every store until e plus
+    ``LAST_GOOD_TOMBSTONE_TTL_SECONDS``, by which time such a read is late, and its delete drops one stored before e.
+    Nothing with the setting off or with no keys."""
+    store: Final = _last_good_store(cache)
+    if store is None or not store.serve_last_good_entries or not cache_keys:
+        return False
+    record: Final = asyncio.ensure_future(_record_tombstones_again(store, tuple(dict.fromkeys(cache_keys))))
+    cancelled = False  # rebind-ok: set once a cancellation arrives while the record runs
+    while not record.done():
+        try:
+            await asyncio.shield(record)
+        except asyncio.CancelledError:
+            # The record goes on; the cancellation is raised once it is done
+            cancelled = True
+    if not record.cancelled():
+        _ = record.exception()  # retrieved: the record logs its own failure
+    return cancelled
 
 
 @asynccontextmanager
-async def last_good_tombstones_recorded_if_raised(cache: DualCache) -> AsyncIterator[None]:
+async def last_good_revoked_around(cache: DualCache, cache_keys: Sequence[str]) -> AsyncIterator[None]:
+    """Around the writes that end what the entries of ``cache_keys`` hold: ``revoke_last_good`` of ``cache_keys`` right
+    before, with nothing awaited in between, and their tombstones recorded again once the writes return or raise,
+    cancellation included (``_record_tombstones_to_the_end``). A request that already revoked them, while their
+    tombstones stand, needs no Redis before; once a slow step may have outlasted them, they are revoked again, or the
+    503 leaves the writes unmade.
+
+    The record after: a write that needed no Redis before can start with only ``LAST_GOOD_LATE_STORE_MARGIN_SECONDS``
+    of tombstone left, and a read another worker began before it committed could otherwise store the old row once
+    they lapse. A write that raises may still have committed in part (several deletes run together, of which one
+    failed; a driver error once the commit reached the database; an await cancelled after it), and its caller's
+    evictions after it never run. The record runs to its end even when the request is cancelled meanwhile; then the
+    caller gets, in this order: the writes' own exception, if they raised; else the cancellation, raised again once the
+    record is done; else what the writes returned. Writes inside a transaction commit later, so the transaction runs
+    inside ``last_good_recorded_after_transaction``, which records them again after its commit too."""
+    await revoke_last_good(cache, cache_keys)
+    try:
+        yield
+    except BaseException:
+        _ = await _record_tombstones_to_the_end(cache, cache_keys)
+        raise
+    if await _record_tombstones_to_the_end(cache, cache_keys):
+        raise asyncio.CancelledError
+
+
+async def revoke_last_good_then(
+    cache: DualCache, cache_keys: Sequence[str], write: Callable[[], Awaitable[_Written]]
+) -> _Written:
+    """``write``, a write that ends what the entries of ``cache_keys`` hold, inside ``last_good_revoked_around``: the
+    revocation right before it, and the record after it once it returns or raises. No keys: just the write."""
+    async with last_good_revoked_around(cache, cache_keys):
+        return await write()
+
+
+@asynccontextmanager
+async def last_good_recorded_after_transaction(cache: DualCache) -> AsyncIterator[None]:
     """Around a database transaction whose writes end access: the keys ``revoke_last_good`` revokes while it is open are
-    noted, and when the transaction raises, cancellation included, their tombstones are recorded again
-    (``record_last_good_tombstones_again``) before the exception goes on. A transaction that raises may still have
-    committed (a driver error once the commit reached the database), and then the evictions after its commit, which
-    record them when it returns, never run. Not nested: an inner one would hide its keys from the outer one. Nothing is
-    noted with the setting off, so nothing is sent then."""
+    noted, and once it ends, returned or raised, cancellation included, their tombstones are recorded again after its
+    commit (``_record_tombstones_to_the_end``). The record inside the transaction precedes the commit, and a
+    transaction that raises may still have committed (a driver error once the commit reached the database), when the
+    evictions after its commit never run. What the caller then gets follows ``last_good_revoked_around``: the
+    transaction's own exception, else a cancellation that arrived during the record, else its result. Not nested: an
+    inner one would hide its keys from the outer one. Nothing is noted with the setting off, so nothing is sent then."""
     revoked: Final[list[str]] = []  # mutable-ok: grows as the transaction revokes
     token: Final = _revoked_in_open_transaction.set(revoked)
     try:
         yield
     except BaseException:
-        await record_last_good_tombstones_again(cache, revoked)
+        _ = await _record_tombstones_to_the_end(cache, revoked)
         raise
+    else:
+        if await _record_tombstones_to_the_end(cache, revoked):
+            raise asyncio.CancelledError
     finally:
         _revoked_in_open_transaction.reset(token)
 
