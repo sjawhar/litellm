@@ -5,7 +5,7 @@ import math
 import re
 import time
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Mapping, Sequence
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar, Token
 from functools import partial
@@ -1044,7 +1044,7 @@ async def _record_tombstones_to_the_end(cache: DualCache, cache_keys: Sequence[s
 
 
 @asynccontextmanager
-async def last_good_revoked_around(cache: DualCache, cache_keys: Sequence[str]) -> AsyncIterator[None]:
+async def last_good_revoked_around(cache: DualCache, cache_keys: Sequence[str]) -> AsyncGenerator[None]:
     """Around the writes that end what the entries of ``cache_keys`` hold: ``revoke_last_good`` of ``cache_keys`` right
     before, with nothing awaited in between, and their tombstones recorded again once the writes return or raise,
     cancellation included (``_record_tombstones_to_the_end``). A request that already revoked them, while their
@@ -1079,7 +1079,7 @@ async def revoke_last_good_then(
 
 
 @asynccontextmanager
-async def last_good_recorded_after_transaction(cache: DualCache) -> AsyncIterator[None]:
+async def last_good_recorded_after_transaction(cache: DualCache) -> AsyncGenerator[None]:
     """Around a database transaction whose writes end access: the keys ``revoke_last_good`` revokes while it is open are
     noted, and once it ends, returned or raised, cancellation included, their tombstones are recorded again after its
     commit (``_record_tombstones_to_the_end``). The record inside the transaction precedes the commit, and a
