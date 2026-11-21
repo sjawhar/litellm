@@ -19,9 +19,10 @@ from litellm.proxy.auth.user_api_key_auth import (
     UserAPIKeyAuth,
     get_api_key_from_custom_header,
 )
-from fastapi import WebSocket, HTTPException, status
+from fastapi import HTTPException, WebSocket, status
+from fastapi import Request as FastAPIRequest
 
-from litellm.proxy._types import LiteLLM_UserTable, LitellmUserRoles
+from litellm.proxy._types import LiteLLM_UserTable, LitellmUserRoles, ProxyException
 from tests._master_key import MASTER_KEY
 
 
@@ -1900,3 +1901,546 @@ async def test_user_api_key_auth_websocket_rejection_adds_no_traceback_for_other
     proxy_records: Final = [record for record in caplog.records if record.name == verbose_proxy_logger.name]
     assert [record.getMessage() for record in proxy_records if record.exc_info is not None] == []
     assert [record.levelno for record in proxy_records if record.levelno >= logging.WARNING] == [logging.ERROR]
+
+
+class _Unreachable:
+    """Any table, any query: each call fails the way an unreachable Postgres does."""
+
+    def __getattr__(self, name: str) -> "_Unreachable":
+        return _Unreachable()
+
+    async def __call__(self, *args: object, **kwargs: object) -> object:
+        import httpx
+
+        raise httpx.ConnectError("All connection attempts failed")
+
+
+class _StoppedDatabase:
+    """Every read fails the way an unreachable Postgres does."""
+
+    def __init__(self) -> None:
+        self.db = _Unreachable()
+
+    async def get_data(self, **kwargs: object) -> object:
+        import httpx
+
+        raise httpx.ConnectError("All connection attempts failed")
+
+    async def attempt_db_reconnect(self, **kwargs: object) -> bool:
+        return False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("team_models", [[], ["claude-opus-5-5"]], ids=["no_team_models", "team_models"])
+async def test_key_of_a_team_blocked_before_the_outage_is_refused_while_the_database_is_stopped(
+    monkeypatch, team_models: list[str]
+):
+    """The key is served from its last good entry, whose copy of the team still says unblocked. The team itself was
+    blocked and its last good entry dropped, so the team cannot be rebuilt from the key's copy: the call is refused.
+    A key of a team with a models list carries that list, which would otherwise let the copy vouch for the team."""
+    import time
+
+    from fastapi import Request
+
+    from litellm.proxy._types import LiteLLM_TeamTableCachedObj, hash_token
+    from litellm.proxy.auth.auth_checks import delete_cache_team_object
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, remember_last_good
+
+    user_key = "sk-blocked-team-member-key"
+    cache = UserApiKeyCache(serve_last_good_entries=True)
+    await remember_last_good(
+        cache,
+        hash_token(user_key),
+        UserAPIKeyAuth(
+            token=hash_token(user_key),
+            team_id="t-blocked",
+            team_blocked=False,
+            team_models=team_models,
+            last_refreshed_at=time.time(),
+        ),
+    )
+    await remember_last_good(cache, "team_id:t-blocked", LiteLLM_TeamTableCachedObj(team_id="t-blocked"))
+    await delete_cache_team_object(
+        team_id="t-blocked", team_alias=None, user_api_key_cache=cache, proxy_logging_obj=None, revoked=True
+    )
+    monkeypatch.setattr(litellm.proxy.proxy_server, "user_api_key_cache", cache)
+    monkeypatch.setattr(litellm.proxy.proxy_server, "master_key", MASTER_KEY)
+    monkeypatch.setattr(litellm.proxy.proxy_server, "prisma_client", _StoppedDatabase())
+    request = Request(scope={"type": "http", "method": "POST", "path": "/chat/completions", "headers": []})
+    request._url = URL(url="/chat/completions")
+
+    with pytest.raises(ProxyException) as refused:
+        await user_api_key_auth(request=request, api_key="Bearer " + user_key)
+
+    assert str(refused.value.code) in ("404", "503"), refused.value
+
+
+@pytest.mark.asyncio
+async def test_key_of_a_team_member_is_served_while_the_database_is_stopped(monkeypatch):
+    """A team member's key carries the member's team spend, so auth also reads the membership row, and the user row
+    whose budget it is checked against. With the key, the team, the membership and the user all held as last good
+    entries, the stopped database refuses none of them."""
+    import time
+
+    from fastapi import Request
+
+    from litellm.proxy._types import LiteLLM_TeamMembership, LiteLLM_TeamTableCachedObj, LiteLLM_UserTable, hash_token
+    from litellm.proxy.common_utils.user_api_key_cache import (
+        UserApiKeyCache,
+        remember_last_good,
+        team_membership_auth_cache_key,
+    )
+
+    user_key = "sk-team-member-key"
+    cache = UserApiKeyCache(serve_last_good_entries=True)
+    await remember_last_good(
+        cache,
+        hash_token(user_key),
+        UserAPIKeyAuth(
+            token=hash_token(user_key),
+            user_id="u-member",
+            team_id="t-lane",
+            team_member_spend=0.0,
+            last_refreshed_at=time.time(),
+        ),
+    )
+    await remember_last_good(cache, "team_id:t-lane", LiteLLM_TeamTableCachedObj(team_id="t-lane"))
+    await remember_last_good(
+        cache,
+        team_membership_auth_cache_key(team_id="t-lane", user_id="u-member"),
+        LiteLLM_TeamMembership(user_id="u-member", team_id="t-lane"),
+    )
+    await remember_last_good(cache, "u-member", LiteLLM_UserTable(user_id="u-member"))
+    monkeypatch.setattr(litellm.proxy.proxy_server, "user_api_key_cache", cache)
+    monkeypatch.setattr(litellm.proxy.proxy_server, "master_key", MASTER_KEY)
+    monkeypatch.setattr(litellm.proxy.proxy_server, "prisma_client", _StoppedDatabase())
+    request = Request(scope={"type": "http", "method": "POST", "path": "/chat/completions", "headers": []})
+    request._url = URL(url="/chat/completions")
+
+    served = await user_api_key_auth(request=request, api_key="Bearer " + user_key)
+
+    assert (served.user_id, served.team_id, served.auth_entries) == ("u-member", "t-lane", "last_good")
+
+
+class _KeyOnlyDatabase(_StoppedDatabase):
+    """Answers the key read with ``key``; every other read fails the way an unreachable Postgres does."""
+
+    def __init__(self, key: UserAPIKeyAuth) -> None:
+        super().__init__()
+        self.key = key
+
+    async def get_data(self, **kwargs: object) -> object:
+        if kwargs.get("table_name") == "combined_view":
+            return self.key
+        return await super().get_data(**kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("serve_last_good_entries", "auth_entries"), [(True, "fresh"), (False, None)], ids=["setting_on", "setting_off"]
+)
+async def test_key_the_database_answers_for_reads_fresh_only_while_last_good_entries_are_served(
+    monkeypatch, serve_last_good_entries: bool, auth_entries: str | None
+):
+    import time
+
+    from litellm.proxy._types import hash_token
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+
+    user_key: Final = "sk-key-the-database-answers-for"
+    monkeypatch.setattr(
+        litellm.proxy.proxy_server,
+        "user_api_key_cache",
+        UserApiKeyCache(serve_last_good_entries=serve_last_good_entries),
+    )
+    monkeypatch.setattr(litellm.proxy.proxy_server, "master_key", MASTER_KEY)
+    monkeypatch.setattr(
+        litellm.proxy.proxy_server,
+        "prisma_client",
+        _KeyOnlyDatabase(UserAPIKeyAuth(token=hash_token(user_key), last_refreshed_at=time.time())),
+    )
+    request: Final = FastAPIRequest(scope={"type": "http", "method": "POST", "path": "/chat/completions", "headers": []})
+    request._url = URL(url="/chat/completions")
+
+    served: Final = await user_api_key_auth(request=request, api_key="Bearer " + user_key)
+
+    assert (served.token, served.auth_entries) == (hash_token(user_key), auth_entries)
+
+
+async def _key_with_user_and_project_held(monkeypatch, user_key: str, project: object | None) -> FastAPIRequest:
+    """A stopped database, with the key and its user held as last good entries, and its project when given."""
+    import time
+
+    from litellm.proxy._types import LiteLLM_ProjectTableCachedObj, LiteLLM_UserTable, hash_token
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, project_cache_key, remember_last_good
+
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    await remember_last_good(
+        cache,
+        hash_token(user_key),
+        UserAPIKeyAuth(
+            token=hash_token(user_key), user_id="u-project", project_id="p-lane", last_refreshed_at=time.time()
+        ),
+    )
+    await remember_last_good(cache, "u-project", LiteLLM_UserTable(user_id="u-project"))
+    if isinstance(project, LiteLLM_ProjectTableCachedObj):
+        await remember_last_good(cache, project_cache_key("p-lane"), project)
+    monkeypatch.setattr(litellm.proxy.proxy_server, "user_api_key_cache", cache)
+    monkeypatch.setattr(litellm.proxy.proxy_server, "master_key", MASTER_KEY)
+    monkeypatch.setattr(litellm.proxy.proxy_server, "prisma_client", _StoppedDatabase())
+    request: Final = FastAPIRequest(scope={"type": "http", "method": "POST", "path": "/chat/completions", "headers": []})
+    request._url = URL(url="/chat/completions")
+    return request
+
+
+@pytest.mark.asyncio
+async def test_key_whose_project_has_an_entry_is_served_while_the_database_is_stopped(monkeypatch):
+    from litellm.proxy._types import LiteLLM_ProjectTableCachedObj
+
+    request: Final = await _key_with_user_and_project_held(
+        monkeypatch, "sk-project-held", LiteLLM_ProjectTableCachedObj(project_id="p-lane")
+    )
+
+    assert (await user_api_key_auth(request=request, api_key="Bearer sk-project-held")).project_id == "p-lane"
+
+
+@pytest.mark.asyncio
+async def test_key_of_a_blocked_project_is_refused_while_the_database_is_stopped(monkeypatch):
+    from litellm.proxy._types import LiteLLM_ProjectTableCachedObj
+
+    request: Final = await _key_with_user_and_project_held(
+        monkeypatch, "sk-project-blocked", LiteLLM_ProjectTableCachedObj(project_id="p-lane", blocked=True)
+    )
+
+    with pytest.raises(ProxyException) as refused:
+        await user_api_key_auth(request=request, api_key="Bearer sk-project-blocked")
+    assert "Project=p-lane is blocked" in refused.value.message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("allow_requests_on_db_unavailable", [False, True], ids=["fallback_off", "fallback_on"])
+async def test_key_whose_project_has_no_entry_is_refused_while_the_database_is_stopped(
+    monkeypatch, allow_requests_on_db_unavailable: bool
+):
+    """Served without its project, the key would pass as if the project limited nothing. The refusal is a 503 like an
+    unreachable database, and allow_requests_on_db_unavailable must not turn it into the unlimited fallback identity."""
+    request: Final = await _key_with_user_and_project_held(monkeypatch, "sk-project-unknown", None)
+    monkeypatch.setitem(
+        litellm.proxy.proxy_server.general_settings,
+        "allow_requests_on_db_unavailable",
+        allow_requests_on_db_unavailable,
+    )
+
+    with pytest.raises(ProxyException) as refused:
+        await user_api_key_auth(request=request, api_key="Bearer sk-project-unknown")
+    assert (str(refused.value.code), refused.value.type) == ("503", "no_db_connection")
+
+
+@pytest.mark.asyncio
+async def test_master_key_call_after_one_for_a_customer_served_from_its_last_good_entry_has_its_own_customers_limits(
+    monkeypatch,
+):
+    """A master key call for a customer its last good entry answers for builds the master key's object with that
+    customer's limits. The object is not cached: the next master key call, for a customer without limits, would keep
+    every limit the merge does not overwrite, and read fresh."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from litellm.proxy._types import LiteLLM_BudgetTable, LiteLLM_EndUserTable
+    from litellm.proxy.auth.user_api_key_auth import user_api_key_auth_builder
+    from litellm.proxy.common_utils.user_api_key_cache import (
+        UserApiKeyCache,
+        end_user_cache_key,
+        last_good_auth_entries_scope,
+        remember_last_good,
+    )
+
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+    await remember_last_good(
+        cache,
+        end_user_cache_key("c-limited"),
+        LiteLLM_EndUserTable(
+            user_id="c-limited",
+            blocked=False,
+            budget_id="b-limited",
+            litellm_budget_table=LiteLLM_BudgetTable(budget_id="b-limited", rpm_limit=1),
+        ),
+    )
+    monkeypatch.setattr(litellm.proxy.proxy_server, "user_api_key_cache", cache)
+    monkeypatch.setattr(litellm.proxy.proxy_server, "master_key", MASTER_KEY)
+
+    async def master_key_call(end_user_id: str) -> tuple[int | None, tuple[str, ...]]:
+        request: Final = FastAPIRequest(
+            scope={"type": "http", "method": "POST", "path": "/chat/completions", "headers": []}
+        )
+        request._url = URL(url="/chat/completions")
+        master_key_bearer: Final = "Bearer " + MASTER_KEY
+        with last_good_auth_entries_scope() as scope:
+            served: Final = await user_api_key_auth_builder(
+                request=request,
+                api_key=master_key_bearer,
+                azure_api_key_header="",
+                anthropic_api_key_header=None,
+                google_ai_studio_api_key_header=None,
+                azure_apim_header=None,
+                request_data={"user": end_user_id},
+            )
+        for _ in range(5):
+            await asyncio.sleep(0)  # the call caches the master key object from a task it starts
+        return served.end_user_rpm_limit, scope.served
+
+    monkeypatch.setattr(litellm.proxy.proxy_server, "prisma_client", _StoppedDatabase())
+    limited: Final = await master_key_call("c-limited")
+    # The database answers again, and has no row for the next customer
+    customers: Final = SimpleNamespace(find_unique=AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        litellm.proxy.proxy_server, "prisma_client", SimpleNamespace(db=SimpleNamespace(litellm_endusertable=customers))
+    )
+
+    assert (limited, await master_key_call("c-free")) == ((1, ("LiteLLM_EndUserTable",)), (None, ()))
+
+
+@pytest.mark.asyncio
+async def test_master_key_call_for_a_customer_with_no_last_good_entry_is_refused_while_the_database_is_stopped(
+    monkeypatch,
+):
+    """A customer the stopped database cannot answer for, and that no last good entry holds, refuses a master key call
+    with 503 as it refuses a virtual key call, rather than letting the call go on as if the customer limited nothing."""
+    from litellm.proxy.auth.user_api_key_auth import user_api_key_auth_builder
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+
+    monkeypatch.setattr(litellm.proxy.proxy_server, "user_api_key_cache", UserApiKeyCache(serve_last_good_entries=True))
+    monkeypatch.setattr(litellm.proxy.proxy_server, "master_key", MASTER_KEY)
+    monkeypatch.setattr(litellm.proxy.proxy_server, "prisma_client", _StoppedDatabase())
+    request: Final = FastAPIRequest(
+        scope={"type": "http", "method": "POST", "path": "/chat/completions", "headers": []}
+    )
+    request._url = URL(url="/chat/completions")
+    master_key_bearer: Final = "Bearer " + MASTER_KEY
+
+    with pytest.raises(ProxyException) as refused:
+        await user_api_key_auth_builder(
+            request=request,
+            api_key=master_key_bearer,
+            azure_api_key_header="",
+            anthropic_api_key_header=None,
+            google_ai_studio_api_key_header=None,
+            azure_apim_header=None,
+            request_data={"user": "c-unknown"},
+        )
+    assert (str(refused.value.code), refused.value.type) == ("503", "no_db_connection")
+
+
+@pytest.mark.asyncio
+async def test_custom_auth_customer_lookup_with_no_last_good_entry_is_refused_while_the_database_is_stopped():
+    """The post custom auth checks look the customer up the same way, and refuse the same way."""
+    from litellm.proxy.auth.user_api_key_auth import _lookup_end_user_and_apply_budget
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from litellm.proxy.db.exception_handler import LastGoodEntryMissing
+
+    with pytest.raises(LastGoodEntryMissing):
+        await _lookup_end_user_and_apply_budget(
+            valid_token=UserAPIKeyAuth(end_user_id="c-unknown"),
+            route="/chat/completions",
+            parent_otel_span=None,
+            prisma_client=_StoppedDatabase(),
+            user_api_key_cache=UserApiKeyCache(serve_last_good_entries=True),
+            proxy_logging_obj=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_second_auth_run_600_s_after_the_first_in_one_context_keeps_its_store_from_its_own_start(monkeypatch):
+    """A context that outlives one request can run auth again: the second run records its own start, so a store 600 s
+    after the first run is kept, and its entry ends the expiry after the second start, not after the first."""
+    import time
+    from types import SimpleNamespace
+
+    import litellm.proxy.common_utils.user_api_key_cache as user_api_key_cache_module
+    from litellm.constants import LAST_GOOD_ENTRY_TTL_SECONDS
+    from litellm.models.team import LiteLLM_TeamTableCachedObj
+    from litellm.proxy.common_utils.user_api_key_cache import (
+        UserApiKeyCache,
+        last_good_reads_started_at,
+        recall_last_good,
+        remember_last_good,
+    )
+
+    moved: Final = [0.0]
+
+    def clock() -> float:
+        return time.monotonic() + moved[0]
+
+    monkeypatch.setattr(  # test-quality-ok: the start of auth reads is read from this module's clock
+        user_api_key_cache_module, "time", SimpleNamespace(monotonic=clock)
+    )
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True, last_good_clock=clock)
+    monkeypatch.setattr(litellm.proxy.proxy_server, "user_api_key_cache", cache)
+    monkeypatch.setattr(litellm.proxy.proxy_server, "master_key", MASTER_KEY)
+    monkeypatch.setattr(litellm.proxy.proxy_server, "prisma_client", None)
+
+    async def empty_body() -> bytes:
+        return b"{}"
+
+    async def auth_run_then_store(alias: str) -> None:
+        request: Final = FastAPIRequest(
+            scope={"type": "http", "method": "POST", "path": "/chat/completions", "headers": []}
+        )
+        request._url = URL(url="/chat/completions")
+        request.body = empty_body  # pyright: ignore[reportAttributeAccessIssue]  # the test sends no ASGI body
+        await user_api_key_auth(request=request, api_key="Bearer " + MASTER_KEY)
+        await remember_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj(team_id="t1", team_alias=alias))
+
+    with last_good_reads_started_at(None):
+        await auth_run_then_store("first")
+        moved[0] += 600
+        await auth_run_then_store("second")
+
+    # The store rounds the end down to a whole second of the real wall clock, so it may come up to a second early
+    moved[0] += LAST_GOOD_ENTRY_TTL_SECONDS - 2
+    assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) == LiteLLM_TeamTableCachedObj(
+        team_id="t1", team_alias="second"
+    )
+    moved[0] += 2
+    assert await recall_last_good(cache, "team_id:t1", LiteLLM_TeamTableCachedObj) is None
+
+
+@pytest.mark.asyncio
+async def test_the_admission_membership_read_records_its_own_start_where_none_is_inherited():
+    """The admission membership read is not deadline-bounded, so it records the start of its read itself: called where
+    no start was recorded, the row it returns is still kept as the member's last good entry."""
+    from types import SimpleNamespace
+
+    from litellm.models.team_membership import LiteLLM_TeamMembership
+    from litellm.proxy.auth.user_api_key_auth import _read_team_membership
+    from litellm.proxy.common_utils.user_api_key_cache import (
+        UserApiKeyCache,
+        last_good_reads_started_at,
+        recall_last_good,
+        team_membership_auth_cache_key,
+    )
+
+    row: Final = LiteLLM_TeamMembership(user_id="u1", team_id="t1")
+    prisma: Final = SimpleNamespace(
+        db=SimpleNamespace(litellm_teammembership=SimpleNamespace(find_first=AsyncMock(return_value=row)))
+    )
+    cache: Final = UserApiKeyCache(serve_last_good_entries=True)
+
+    with last_good_reads_started_at(None):
+        await _read_team_membership(prisma, cache, team_id="t1", user_id="u1")  # pyright: ignore[reportArgumentType]  # fake stands in for PrismaClient
+
+    cache_key: Final = team_membership_auth_cache_key(team_id="t1", user_id="u1")
+    assert await recall_last_good(cache, cache_key, LiteLLM_TeamMembership) == row
+
+
+def _serve_master_key_calls(monkeypatch: pytest.MonkeyPatch, *, serve_last_good_entries: bool) -> None:
+    """Auth on the master key path, which reads no database, with last good entries served or not."""
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+
+    cache: Final = UserApiKeyCache(serve_last_good_entries=serve_last_good_entries)
+    monkeypatch.setattr(  # test-quality-ok: auth reads the setting off this module global; no injection seam
+        litellm.proxy.proxy_server, "user_api_key_cache", cache
+    )
+    monkeypatch.setattr(  # test-quality-ok: auth reads the master key off this module global; no injection seam
+        litellm.proxy.proxy_server, "master_key", MASTER_KEY
+    )
+    monkeypatch.setattr(  # test-quality-ok: auth reads the database off this module global; no injection seam
+        litellm.proxy.proxy_server, "prisma_client", None
+    )
+
+
+async def _master_key_auth(method: str, route: str) -> None:
+    """One ``user_api_key_auth`` run with the master key, for a request with an empty body."""
+
+    async def empty_body() -> bytes:
+        return b"{}"
+
+    request: Final = FastAPIRequest(scope={"type": "http", "method": method, "path": route, "headers": []})
+    request._url = URL(url=route)
+    request.body = empty_body  # pyright: ignore[reportAttributeAccessIssue]  # the test sends no ASGI body
+    await user_api_key_auth(request=request, api_key="Bearer " + MASTER_KEY)
+
+
+def _reads_go_to_the_reader() -> bool:
+    """Whether a routed client sends this context's reads to the read replica rather than the writer."""
+    from litellm.proxy.db.prisma_client import PrismaWrapper
+    from litellm.proxy.db.routing_prisma_wrapper import RoutingPrismaWrapper
+
+    routing: Final = RoutingPrismaWrapper(
+        writer=PrismaWrapper(original_prisma=MagicMock(name="writer_prisma")),
+        reader=PrismaWrapper(original_prisma=MagicMock(name="reader_prisma")),
+    )
+    return routing._should_use_reader()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "route"),
+    [("POST", "/key/delete"), ("DELETE", "/scim/v2/Users/u1"), ("POST", "/organization/member_delete")],
+)
+async def test_auth_pins_the_reads_of_a_write_that_can_end_access_to_the_writer(
+    monkeypatch: pytest.MonkeyPatch, method: str, route: str
+):
+    """While last good entries are served, auth of a write to a route that can end access pins the request's reads,
+    and those of every task it starts, to the writer, so a lagging read replica cannot pick what the write revokes."""
+    _serve_master_key_calls(monkeypatch, serve_last_good_entries=True)
+
+    await _master_key_auth(method, route)
+
+    assert _reads_go_to_the_reader() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "route", "serve_last_good_entries"),
+    [
+        ("GET", "/key/info", True),
+        ("POST", "/chat/completions", True),
+        ("POST", "/key/delete", False),
+        ("DELETE", "/scim/v2/Users/u1", False),
+        ("POST", "/organization/member_delete", False),
+    ],
+)
+async def test_auth_keeps_reads_on_the_reader_for_a_request_that_cannot_end_access_or_with_the_setting_off(
+    monkeypatch: pytest.MonkeyPatch, method: str, route: str, serve_last_good_entries: bool
+):
+    """A read of a management route, an inference call, and any request while last good entries are not served read
+    from the reader after auth, even in a context an earlier pin left on the writer, since auth sets the pin anew."""
+    from litellm.proxy.db.routing_prisma_wrapper import reads_pinned_to_writer
+
+    _serve_master_key_calls(monkeypatch, serve_last_good_entries=serve_last_good_entries)
+
+    with reads_pinned_to_writer():
+        await _master_key_auth(method, route)
+        assert _reads_go_to_the_reader() is True
+
+
+@pytest.mark.asyncio
+async def test_a_second_auth_run_in_one_context_sets_the_writer_pin_anew(monkeypatch: pytest.MonkeyPatch):
+    """A context that outlives one request can run auth again: a run for a key delete pins its reads to the writer,
+    and a later run for an inference call in the same context sends them back to the reader."""
+    _serve_master_key_calls(monkeypatch, serve_last_good_entries=True)
+
+    await _master_key_auth("POST", "/key/delete")
+    assert _reads_go_to_the_reader() is False
+
+    await _master_key_auth("POST", "/chat/completions")
+    assert _reads_go_to_the_reader() is True
+
+
+@pytest.mark.asyncio
+async def test_auth_with_a_plain_dual_cache_as_the_auth_cache_answers_and_pins_nothing(monkeypatch: pytest.MonkeyPatch):
+    """The auth cache can be a plain DualCache, which keeps no last good entries: auth of a key delete answers as
+    without the setting, and sets the reads of the request back on the reader, rather than failing on the setting
+    only the cache's subclass carries."""
+    from litellm.caching.dual_cache import DualCache
+    from litellm.proxy.db.routing_prisma_wrapper import reads_pinned_to_writer
+
+    _serve_master_key_calls(monkeypatch, serve_last_good_entries=False)
+    monkeypatch.setattr(  # test-quality-ok: auth reads the setting off this module global; no injection seam
+        litellm.proxy.proxy_server, "user_api_key_cache", DualCache()
+    )
+
+    with reads_pinned_to_writer():
+        await _master_key_auth("POST", "/key/delete")
+        assert _reads_go_to_the_reader() is True

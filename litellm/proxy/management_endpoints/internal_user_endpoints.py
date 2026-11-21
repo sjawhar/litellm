@@ -15,10 +15,13 @@ These are members of a Team on LiteLLM
 import asyncio
 import json
 import traceback
-from collections.abc import Awaitable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from datetime import datetime, timezone
+from functools import partial
+from itertools import chain
 from types import MappingProxyType
-from typing import Any, Final, Literal, Protocol, cast, overload
+from typing import Any, Final, Literal, NamedTuple, Protocol, cast, overload
 
 import fastapi
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
@@ -33,10 +36,12 @@ from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.proxy._types import *
 from litellm.proxy.auth.auth_checks import (
     delete_cache_key_objects,
+    delete_cache_team_object,
     forget_missing_user,
     get_jwt_key_mapping_cache_keys_for_tokens,
     get_team_object,
     get_user_object,
+    team_cache_keys,
 )
 from litellm.proxy.auth.auth_utils import enforce_batch_limits_are_admin_only
 from litellm.proxy.auth.password_policy import (
@@ -49,6 +54,11 @@ from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_
 from litellm.proxy.common_utils.user_api_key_cache import (
     AUTH_OBJECTS_TARGET,
     object_permission_cache_key,
+    revoke_and_delete_read_rows,
+    revoke_last_good,
+    revoke_last_good_then,
+    serves_last_good_entries,
+    team_membership_auth_cache_key,
     user_object_permission_id_cache_key,
 )
 from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
@@ -82,6 +92,7 @@ from litellm.proxy.management_helpers.object_permission_utils import (  # noqa: 
 )
 from litellm.proxy.management_helpers.utils import management_endpoint_wrapper
 from litellm.proxy.utils import handle_exception_on_proxy, hash_password
+from litellm.repositories.chunked_in import find_many_in
 from litellm.repositories.organization_repository import OrganizationRepository
 from litellm.repositories.prisma_protocols import TableActions
 from litellm.repositories.table_repositories import (
@@ -2402,6 +2413,131 @@ async def get_users(
     }
 
 
+class _DeletedUserKeys(NamedTuple):
+    keys: Sequence["prisma_models.LiteLLM_VerificationToken"]
+    jwt_mapping_cache_keys: Sequence[str]
+
+
+def _deletable_user(
+    user_id: str,
+    user_row: "prisma_models.LiteLLM_UserTable | None",
+    *,
+    caller_is_proxy_admin: bool,
+    target_org_ids_by_user: Mapping[str, AbstractSet[str]],
+    caller_admin_org_ids: AbstractSet[str],
+) -> "prisma_models.LiteLLM_UserTable":
+    """The row of a user /user/delete may delete: 404 when there is none, 403 when the caller may not delete it."""
+    if user_row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": f"User not found, passed user_id={user_id}"},
+        )
+
+    if not caller_is_proxy_admin:
+        target_org_ids: Final = target_org_ids_by_user.get(user_id, frozenset())
+        # Org-admin may only delete users whose entire org membership is
+        # within their admin scope. A target with ANY org outside the
+        # caller's scope (or no org at all) requires PROXY_ADMIN.
+        if not target_org_ids or not target_org_ids <= caller_admin_org_ids:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": (
+                        f"User {user_id} is not within your admin scope. "
+                        "Only PROXY_ADMIN may delete users outside your "
+                        "administered organizations."
+                    )
+                },
+            )
+    return user_row
+
+
+def _listed_team_membership_cache_keys(user_row: "prisma_models.LiteLLM_UserTable") -> tuple[str, ...]:
+    """The cache keys of the user's memberships of the teams its row lists."""
+    return tuple(
+        team_membership_auth_cache_key(team_id=team_id, user_id=user_row.user_id) for team_id in user_row.teams
+    )
+
+
+async def _check_and_revoke_users_to_delete(
+    prisma_client: "PrismaClient",
+    user_api_key_cache: "UserApiKeyCache",
+    user_ids: Sequence[str],
+    key_filter: _UserIdInFilter,
+    deletable: Callable[[str, "prisma_models.LiteLLM_UserTable | None"], "prisma_models.LiteLLM_UserTable"],
+) -> tuple["prisma_models.LiteLLM_UserTable", ...]:
+    """While last good entries are served, /user/delete checks every user before its first write, and revokes before
+    it the entries the request ends: the users', their keys', and those of the teams and memberships they leave. The
+    teams are read for their aliases, and the memberships for their teams, since a membership can name a team the
+    user's row does not. Returns the users' rows, in the order of ``user_ids``."""
+    user_rows: Final = tuple(
+        [
+            deletable(user_id, await UserRepository(prisma_client).table.find_unique(where={"user_id": user_id}))
+            for user_id in user_ids
+        ]
+    )
+    keys: Final = await _verification_token_table(prisma_client).find_many(where=key_filter)
+    left_teams: Final = await find_many_in(
+        TeamRepository(prisma_client).table, "team_id", chain.from_iterable(user_row.teams for user_row in user_rows)
+    )
+    left_memberships: Final = await _team_membership_table(prisma_client).find_many(where=key_filter)
+    await revoke_last_good(
+        user_api_key_cache,
+        (
+            *user_ids,
+            *(key.token for key in keys),
+            *chain.from_iterable(team_cache_keys(team.team_id, team.team_alias) for team in left_teams),
+            *chain.from_iterable(_listed_team_membership_cache_keys(user_row) for user_row in user_rows),
+            *(team_membership_auth_cache_key(team_id=row.team_id, user_id=row.user_id) for row in left_memberships),
+        ),
+    )
+    return user_rows
+
+
+async def _jwt_mapping_cache_keys_of(
+    prisma_client: "PrismaClient", keys: Sequence["prisma_models.LiteLLM_VerificationToken"]
+) -> tuple[str, ...]:
+    """The mapping rows go with their key, so their cache keys are read before it goes."""
+    return await get_jwt_key_mapping_cache_keys_for_tokens(
+        hashed_tokens=tuple(key.token for key in keys), prisma_client=prisma_client
+    )
+
+
+async def _delete_users_keys_in_one_delete(
+    prisma_client: "PrismaClient", key_filter: _UserIdInFilter
+) -> _DeletedUserKeys:
+    """No last good entry to revoke, so the users' keys are read, with their mappings, and go in one delete, as without
+    that setting."""
+    token_table: Final = _verification_token_table(prisma_client)
+    keys: Final = await token_table.find_many(where=key_filter)
+    jwt_mapping_cache_keys: Final = await _jwt_mapping_cache_keys_of(prisma_client, keys)
+    await token_table.delete_many(where=key_filter)
+    return _DeletedUserKeys(keys=keys, jwt_mapping_cache_keys=jwt_mapping_cache_keys)
+
+
+async def _delete_users_keys_round_by_round(
+    prisma_client: "PrismaClient", user_api_key_cache: "UserApiKeyCache", key_filter: _UserIdInFilter
+) -> _DeletedUserKeys:
+    """Only the keys read, and revoked, are deleted, round by round from a read of its own, so a key created for the
+    users since the read before the first write is revoked before it goes; keys that keep appearing refuse with 409.
+    Each round's mappings are read before its revocation, so nothing is awaited between that and the delete."""
+    token_table: Final = _verification_token_table(prisma_client)
+    jwt_mapping_cache_keys: Final[list[str]] = []  # mutable-ok: each deleted key's mappings, read before it goes
+
+    async def read_jwt_mappings(keys: Sequence["prisma_models.LiteLLM_VerificationToken"]) -> None:
+        jwt_mapping_cache_keys.extend(await _jwt_mapping_cache_keys_of(prisma_client, keys))
+
+    deleted: Final = await revoke_and_delete_read_rows(
+        user_api_key_cache,
+        partial(token_table.find_many, where=key_filter),
+        lambda keys: tuple(key.token for key in keys),
+        # bounded-ok: revoke_and_delete_read_rows hands each call at most IN_LIST_CHUNK_SIZE rows
+        lambda keys: token_table.delete_many(where={"token": {"in": [key.token for key in keys]}}),
+        prepare=read_jwt_mappings,
+    )
+    return _DeletedUserKeys(keys=deleted, jwt_mapping_cache_keys=tuple(jwt_mapping_cache_keys))
+
+
 @router.post(
     "/user/delete",
     tags=["Internal User management"],
@@ -2493,32 +2629,29 @@ async def delete_user(
                 continue
             target_org_ids_by_user.setdefault(m.user_id, set()).add(m.organization_id)
 
-    # check that all teams passed exist
-    for user_id in data.user_ids:
-        user_row = await UserRepository(prisma_client).table.find_unique(where={"user_id": user_id})
+    key_filter: Final[_UserIdInFilter] = {"user_id": {"in": data.user_ids}}
+    serving: Final = serves_last_good_entries(user_api_key_cache)
+    deletable: Final = partial(
+        _deletable_user,
+        caller_is_proxy_admin=caller_is_proxy_admin,
+        target_org_ids_by_user=target_org_ids_by_user,
+        caller_admin_org_ids=caller_admin_org_ids,
+    )
+    # While last good entries are served every user is checked, and what the request ends revoked, before the first
+    # write; otherwise each user is checked in turn below, as without that setting
+    checked_rows: Final = (
+        await _check_and_revoke_users_to_delete(prisma_client, user_api_key_cache, data.user_ids, key_filter, deletable)
+        if serving
+        else None
+    )
 
-        if user_row is None:
-            raise HTTPException(
-                status_code=404,
-                detail={"error": f"User not found, passed user_id={user_id}"},
-            )
-
-        if not caller_is_proxy_admin:
-            target_org_ids = target_org_ids_by_user.get(user_id, set())
-            # Org-admin may only delete users whose entire org membership is
-            # within their admin scope. A target with ANY org outside the
-            # caller's scope (or no org at all) requires PROXY_ADMIN.
-            if not target_org_ids or not target_org_ids.issubset(caller_admin_org_ids):
-                raise HTTPException(
-                    status_code=403,
-                    detail={
-                        "error": (
-                            f"User {user_id} is not within your admin scope. "
-                            "Only PROXY_ADMIN may delete users outside your "
-                            "administered organizations."
-                        )
-                    },
-                )
+    # check that all users passed exist
+    for index, user_id in enumerate(data.user_ids):
+        user_row = (
+            checked_rows[index]
+            if checked_rows is not None
+            else deletable(user_id, await UserRepository(prisma_client).table.find_unique(where={"user_id": user_id}))
+        )
 
         # we do this after the first for loop, since first for loop is for validation. we only want this inserted after validation passes
         if is_audit_logging_enabled():
@@ -2549,7 +2682,7 @@ async def delete_user(
         fetch_all_teams: Sequence[prisma_models.LiteLLM_TeamTable] = await TeamRepository(
             prisma_client
         ).table.find_many(where={"team_id": {"in": user_row.teams}})
-        teams_to_update: list[tuple[str, str]] = []
+        teams_to_update: list[tuple[str, str, str | None]] = []
         for team in fetch_all_teams:
             removed_team_members, new_team_members = cleanup_members_with_roles(
                 existing_team_row=LiteLLM_TeamTable.model_validate(team.model_dump()),
@@ -2561,38 +2694,50 @@ async def delete_user(
             )
             if removed_team_members:
                 _db_new_team_members: list[dict] = [m.model_dump() for m in new_team_members]
-                teams_to_update.append((team.team_id, json.dumps(_db_new_team_members)))
+                teams_to_update.append((team.team_id, json.dumps(_db_new_team_members), team.team_alias))
 
         ## update teams
 
-        for team_id, members_with_roles in teams_to_update:
-            await TeamRepository(prisma_client).table.update(
-                where={"team_id": team_id},
-                data={"members_with_roles": members_with_roles},
+        for team_id, members_with_roles, team_alias in teams_to_update:
+            # The alias this team's own read found is revoked again right before its roster write, so a team renamed
+            # since the read above does not keep, under its new alias, an entry listing the user
+            await revoke_last_good_then(
+                user_api_key_cache,
+                team_cache_keys(team_id, team_alias),
+                partial(
+                    TeamRepository(prisma_client).table.update,
+                    where={"team_id": team_id},
+                    data={"members_with_roles": members_with_roles},
+                ),
+            )
+            await delete_cache_team_object(
+                team_id=team_id,
+                team_alias=team_alias,
+                user_api_key_cache=user_api_key_cache,
+                proxy_logging_obj=proxy_logging_obj,
+                revoked=True,
             )
     # End of Audit logging
 
     ## DELETE ASSOCIATED KEYS
-    key_filter: Final[_UserIdInFilter] = {"user_id": {"in": data.user_ids}}
-    keys_to_delete: Final = await _verification_token_table(prisma_client).find_many(where=key_filter)
-    hashed_tokens_to_delete: Final = tuple(key.token for key in keys_to_delete)
-    jwt_mapping_cache_keys: Final = await get_jwt_key_mapping_cache_keys_for_tokens(
-        hashed_tokens=hashed_tokens_to_delete,
-        prisma_client=prisma_client,
+    deleted_keys: Final = await (
+        _delete_users_keys_round_by_round(prisma_client, user_api_key_cache, key_filter)
+        if serving
+        else _delete_users_keys_in_one_delete(prisma_client, key_filter)
     )
-    await _verification_token_table(prisma_client).delete_many(where=key_filter)
-    if keys_to_delete:
+    if deleted_keys.keys:
         KeyManagementEventHooks.create_key_deleted_audit_logs(
-            keys_being_deleted=keys_to_delete,
+            keys_being_deleted=deleted_keys.keys,
             user_api_key_dict=user_api_key_dict,
             litellm_changed_by=litellm_changed_by,
         )
     await delete_cache_key_objects(
-        hashed_tokens=hashed_tokens_to_delete,
+        hashed_tokens=tuple(key.token for key in deleted_keys.keys),
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
+        revoked=True,
     )
-    await evict_and_broadcast(cache_keys=jwt_mapping_cache_keys, user_api_key_cache=user_api_key_cache)
+    await evict_and_broadcast(cache_keys=deleted_keys.jwt_mapping_cache_keys, user_api_key_cache=user_api_key_cache)
 
     ## DELETE ASSOCIATED INVITATION LINKS
     await _invitation_link_table(prisma_client).delete_many(
@@ -2606,13 +2751,39 @@ async def delete_user(
     )
 
     ## DELETE ASSOCIATED ORGANIZATION MEMBERSHIPS
-    await _organization_membership_table(prisma_client).delete_many(where={"user_id": {"in": data.user_ids}})
+    # The users' entries carry their organization memberships, so the users are revoked again right before this
+    # delete: the steps since the revocation above may have outlasted its tombstones
+    await revoke_last_good_then(
+        user_api_key_cache,
+        data.user_ids,
+        partial(_organization_membership_table(prisma_client).delete_many, where={"user_id": {"in": data.user_ids}}),
+    )
 
     ## DELETE ASSOCIATED TEAM MEMBERSHIPS
-    await _team_membership_table(prisma_client).delete_many(where={"user_id": {"in": data.user_ids}})
+    if serving:
+        team_memberships: Final = _team_membership_table(prisma_client)
+        # Each membership has its own entry, so only the memberships read, and revoked, are deleted, round by round
+        # from a read of its own: one added since the read before the first write is revoked before it goes
+        _ = await revoke_and_delete_read_rows(
+            user_api_key_cache,
+            partial(team_memberships.find_many, where=key_filter),
+            lambda rows: tuple(
+                team_membership_auth_cache_key(team_id=row.team_id, user_id=row.user_id) for row in rows
+            ),
+            lambda rows: team_memberships.delete_many(
+                where={"OR": [{"team_id": row.team_id, "user_id": row.user_id} for row in rows]}
+            ),
+        )
+    else:
+        await _team_membership_table(prisma_client).delete_many(where={"user_id": {"in": data.user_ids}})
 
     ## DELETE USERS
-    deleted_users: Final = await _user_table(prisma_client).delete_many(where={"user_id": {"in": data.user_ids}})
+    # The users are revoked again right before their delete, for the time the team memberships' rounds take
+    deleted_users: Final = await revoke_last_good_then(
+        user_api_key_cache,
+        data.user_ids,
+        partial(_user_table(prisma_client).delete_many, where={"user_id": {"in": data.user_ids}}),
+    )
     await evict_and_broadcast(cache_keys=tuple(data.user_ids), user_api_key_cache=user_api_key_cache)
 
     return deleted_users

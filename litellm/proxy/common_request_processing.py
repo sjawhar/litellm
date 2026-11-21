@@ -1880,6 +1880,7 @@ class ProxyBaseLLMRequestProcessing:
             "x-litellm-key-rpm-limit": str(user_api_key_dict.rpm_limit),
             "x-litellm-key-max-budget": str(user_api_key_dict.max_budget),
             "x-litellm-key-spend": str(updated_spend),
+            "x-litellm-auth-entries": getattr(user_api_key_dict, "auth_entries", None),
             "x-litellm-response-duration-ms": str(timing_values.get("_response_ms")),
             "x-litellm-overhead-duration-ms": str(timing_values.get("litellm_overhead_time_ms")),
             "x-litellm-callback-duration-ms": str(hidden_params.get("callback_duration_ms", None)),

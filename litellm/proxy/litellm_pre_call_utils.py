@@ -1733,6 +1733,7 @@ class LiteLLMProxyRequestSetup:
                 user_api_key_dict.budget_reset_at.isoformat() if user_api_key_dict.budget_reset_at else None
             ),
             user_api_key_auth_metadata=auth_metadata,
+            user_api_key_auth_entries=user_api_key_dict.auth_entries,
         )
         return user_api_key_logged_metadata
 

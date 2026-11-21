@@ -21,7 +21,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Generic, Literal, Optional, Protocol, TypeAlias
 
 from fastapi import HTTPException, Request, status
-from pydantic import BaseModel, TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 from typing_extensions import NotRequired, ReadOnly, Required, TypedDict, Unpack
 
 import litellm
@@ -36,6 +36,7 @@ from litellm.constants import (
     DEFAULT_MAX_RECURSE_DEPTH,
     EMAIL_BUDGET_ALERT_MAX_SPEND_ALERT_PERCENTAGE,
     END_USER_RESTRICTED_REGISTRY_MAX_SIZE,
+    LAST_GOOD_SERVED_COPY_TTL_SECONDS,
     LITELLM_PROXY_MASTER_KEY_ALIAS,
     MODEL_ACCESS_GROUP_REGISTRY_MAX_SIZE,
     REGISTRY_ERROR_NEGATIVE_CACHE_TTL,
@@ -111,22 +112,36 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     NO_TEAM_MEMBERSHIP_SENTINEL,
     TAG_REGISTRY_OVERFLOW_SENTINEL,
     UserApiKeyCache,
+    default_end_user_budget_cache_key,
     end_user_cache_key,
     end_user_restricted_registry_cache_key,
+    end_user_validation_cache_key,
+    forget_last_good,
+    forget_missing_last_good,
     get_management_object_ttl,
+    keep_last_good_served_copy,
+    last_good_auth_entries_scope,
     model_access_group_cache_key,
     model_access_group_registry_cache_key,
     model_access_group_spend_counter_key,
     object_permission_cache_key,
     project_cache_key,
     project_spend_counter_key,
+    recall_last_good,
+    record_last_good_served_copy,
+    remember_last_good,
+    serves_last_good_entries,
     tag_cache_key,
     tag_registry_cache_key,
+    team_member_default_budget_cache_key,
     team_membership_auth_cache_key,
     team_membership_reservation_cache_key,
 )
+from litellm.proxy.common_utils.user_api_key_cache import (
+    T as _LastGoodT,
+)
 from litellm.proxy.db.db_lookup_gate import bounded_db_lookup, db_lookup_gate
-from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
+from litellm.proxy.db.exception_handler import LastGoodEntryMissing, PrismaDBExceptionHandler
 from litellm.proxy.guardrails.tool_name_extraction import (
     TOOL_CAPABLE_CALL_TYPES,
     extract_request_tool_names,
@@ -152,6 +167,7 @@ from litellm.repositories.table_repositories import (
 )
 from litellm.repositories.team_repository import TeamRepository
 from litellm.repositories.user_repository import UserRepository
+from litellm.repositories.verification_token_repository import VerificationTokenRepository
 from litellm.router import Router
 from litellm.types.proxy.auth.auth_checks import UserNotFoundError
 from litellm.types.proxy.model_access_group_budget import ModelAccessGroupBudget
@@ -166,6 +182,7 @@ from .auth_utils import get_model_from_request, get_request_route_template, requ
 
 if TYPE_CHECKING:
     from opentelemetry.trace import Span as _Span
+    from prisma import Prisma
 
     Span = _Span
 else:
@@ -330,7 +347,7 @@ class _PrismaTagRow(Protocol):
 
 
 def _tag_table(repo: _PrismaTableHolder[_PrismaTagRow]) -> _PrismaAuthTable[_PrismaTagRow]:
-    return repo.table
+    return _DeadlineBoundedTable(repo.table, "tag")
 
 
 class _PrismaEndUserRow(Protocol):
@@ -340,7 +357,7 @@ class _PrismaEndUserRow(Protocol):
 
 
 def _end_user_table(repo: _PrismaTableHolder[_PrismaEndUserRow]) -> _PrismaAuthTable[_PrismaEndUserRow]:
-    return repo.table
+    return _DeadlineBoundedTable(repo.table, "end_user_registry")
 
 
 class _PrismaMaxBudgetRow(Protocol):
@@ -361,7 +378,7 @@ class _PrismaModelAccessGroupBudgetRow(Protocol):
 def _model_access_group_budget_table(
     repo: _PrismaTableHolder[_PrismaModelAccessGroupBudgetRow],
 ) -> _PrismaAuthTable[_PrismaModelAccessGroupBudgetRow]:
-    return repo.table
+    return _DeadlineBoundedTable(repo.table, "model_access_group_budget")
 
 
 class _MemberModelScope(Protocol):
@@ -1198,6 +1215,7 @@ async def common_checks(
         proxy_logging_obj=proxy_logging_obj,
         team_membership=loaded_team_membership,
         team_membership_loaded=team_membership_loaded,
+        budgets_enforced=not skip_all_budget_checks,
     )
 
     # Run before apply_key_tags_pre_auth injects key metadata.tags into request_body.
@@ -1561,7 +1579,7 @@ async def get_default_end_user_budget(
     if prisma_client is None or default_budget_id is None:
         return None
 
-    cache_key: Final = f"default_end_user_budget:{default_budget_id}"
+    cache_key: Final = default_end_user_budget_cache_key(default_budget_id)
 
     # Check cache first
     cached_budget: Final = await user_api_key_cache.async_get_cache(
@@ -1571,7 +1589,6 @@ async def get_default_end_user_budget(
     if cached_budget is not None:
         return cached_budget
 
-    # Fetch from database
     try:
         budget_record: Final = await _dictable_table(BudgetRepository(prisma_client), "budget").find_unique(
             where={"budget_id": default_budget_id}
@@ -1582,6 +1599,7 @@ async def get_default_end_user_budget(
                 "Default end user budget not found in database: %s",
                 default_budget_id.replace("\r", "").replace("\n", ""),
             )
+            await forget_missing_last_good(user_api_key_cache, cache_key)
             return None
 
         _budget_obj: Final = LiteLLM_BudgetTable.model_validate(budget_record.dict())
@@ -1592,12 +1610,12 @@ async def get_default_end_user_budget(
             model_type=LiteLLM_BudgetTable,
             ttl=get_management_object_ttl(user_api_key_cache),
         )
-
+        await remember_last_good(user_api_key_cache, cache_key, _budget_obj)
         return _budget_obj
 
     except Exception as e:
         verbose_proxy_logger.error("Error fetching default end user budget: %s", e)
-        return None
+        return await recall_last_good_limits_after(e, user_api_key_cache, cache_key, LiteLLM_BudgetTable)
 
 
 @log_db_metrics
@@ -1625,7 +1643,7 @@ async def get_team_member_default_budget(
     if prisma_client is None:
         return None
 
-    cache_key: Final = f"team_member_default_budget:{budget_id}"
+    cache_key: Final = team_member_default_budget_cache_key(budget_id)
 
     cached_budget: Final = await user_api_key_cache.async_get_cache(
         key=cache_key,
@@ -1638,12 +1656,13 @@ async def get_team_member_default_budget(
         budget_record: Final = await _dictable_table(BudgetRepository(prisma_client), "budget").find_unique(
             where={"budget_id": budget_id}
         )
-    except Exception:
+    except Exception as e:
         verbose_proxy_logger.exception("Error fetching team-default member budget %s", budget_id)
-        return None
+        return await recall_last_good_limits_after(e, user_api_key_cache, cache_key, LiteLLM_BudgetTable)
 
     if budget_record is None:
         verbose_proxy_logger.warning("Team-default member budget not found in database: %s", budget_id)
+        await forget_missing_last_good(user_api_key_cache, cache_key)
         return None
 
     budget: Final = LiteLLM_BudgetTable.model_validate(budget_record.dict())
@@ -1653,6 +1672,7 @@ async def get_team_member_default_budget(
         model_type=LiteLLM_BudgetTable,
         ttl=get_management_object_ttl(user_api_key_cache),
     )
+    await remember_last_good(user_api_key_cache, cache_key, budget)
 
     return budget
 
@@ -1782,6 +1802,11 @@ _check_end_user_budget: Final = check_end_user_budget
 #: Columns whose non-null value makes an end-user row restrict something auth enforces. ``blocked``
 #: is separate: it restricts when true rather than when merely set.
 _RESTRICTED_COLUMNS: Final = ("budget_id", "allowed_model_region", "default_model", "object_permission_id")
+#: List columns that restrict when they hold at least one element.
+_RESTRICTED_LIST_COLUMNS: Final = ("models",)
+_BLOCKED_COLUMN: Final = "blocked"
+#: Every column ``_restricted_end_user_where`` reads: a write that sets one can move the row into or out of it.
+END_USER_RESTRICTION_COLUMNS: Final = frozenset((_BLOCKED_COLUMN, *_RESTRICTED_COLUMNS, *_RESTRICTED_LIST_COLUMNS))
 
 
 def _column_is_set(column: str) -> Mapping[str, object]:
@@ -1796,8 +1821,20 @@ def _array_is_not_empty(column: str) -> Mapping[str, object]:
 
 def _restricted_end_user_where() -> Mapping[str, object]:
     """Prisma filter selecting every end-user row that carries a restriction auth enforces."""
-    restrictions: Final = (*map(_column_is_set, _RESTRICTED_COLUMNS), _array_is_not_empty("models"))
-    return {"OR": [{"blocked": True}, *restrictions]}
+    restrictions: Final = (
+        *map(_column_is_set, _RESTRICTED_COLUMNS),
+        *map(_array_is_not_empty, _RESTRICTED_LIST_COLUMNS),
+    )
+    return {"OR": [{_BLOCKED_COLUMN: True}, *restrictions]}
+
+
+def end_user_row_is_restricted(row: Mapping[str, object]) -> bool:
+    """Whether an end-user row with these column values matches ``_restricted_end_user_where``."""
+    return (
+        row.get(_BLOCKED_COLUMN) is True
+        or any(row.get(column) is not None for column in _RESTRICTED_COLUMNS)
+        or any(row.get(column) for column in _RESTRICTED_LIST_COLUMNS)
+    )
 
 
 class _RegistryNotCached:
@@ -1812,20 +1849,33 @@ _END_USER_REGISTRY_LOAD_LOCK: Final = asyncio.Lock()
 _MODEL_ACCESS_GROUP_REGISTRY_LOAD_LOCK: Final = asyncio.Lock()
 
 
+class _RegistryIds(BaseModel):
+    """The ids a registry held when the database last answered for it."""
+
+    model_config = ConfigDict(frozen=True)
+
+    ids: tuple[str, ...]
+
+
 @with_service_target(AUTH_OBJECTS_TARGET)
 async def _cached_registry(
     cache_key: str,
     overflow_sentinel: str,
     user_api_key_cache: UserApiKeyCache,
 ) -> frozenset[str] | None | _RegistryNotCached:
-    """The cached registry answer, or ``_REGISTRY_NOT_CACHED`` when the caller has to query."""
+    """The cached registry answer, or ``_REGISTRY_NOT_CACHED`` when the caller has to query. A registry its last good
+    entry answered is cached as that entry, so a request that reads it back records it like the one that recalled it."""
     cached: Final = await _raw_cache(user_api_key_cache).async_get_cache(key=cache_key)
     if cached == overflow_sentinel:
         return None
     # Memory hands back the tuple that was written; Redis round-trips it through JSON as a list.
     if isinstance(cached, (list, tuple)):
         return frozenset(entry for entry in cached if isinstance(entry, str))
-    return _REGISTRY_NOT_CACHED
+    served_from_last_good: Final = CacheCodec.deserialize(cached, _RegistryIds)
+    if served_from_last_good is None:
+        return _REGISTRY_NOT_CACHED
+    record_last_good_served_copy(user_api_key_cache, cache_key, _RegistryIds.__name__)
+    return frozenset(served_from_last_good.ids)
 
 
 @with_service_target(AUTH_OBJECTS_TARGET)
@@ -1848,27 +1898,43 @@ async def _fetch_and_cache_registry(
     max_size: int,
     fetch_ids: Callable[[], Awaitable[tuple[str, ...]]],
     user_api_key_cache: UserApiKeyCache,
+    *,
+    keep_last_good: bool = False,
 ) -> frozenset[str] | None:
-    """The registry as the database has it, cached whole, or ``None`` when it is unusable."""
+    """The registry as the database has it, cached whole, or ``None`` when it is unusable. With ``keep_last_good``,
+    the last registry the database returned answers while the database is unreachable."""
     try:
         registry_ids: Final = await fetch_ids()
     except Exception as e:  # noqa: BLE001  # fail-safe: any registry load error must degrade to per-id lookups, never break auth
+        # Its own scope, so the copy below ends with what this recall served, not with an earlier copy the request read
+        with last_good_auth_entries_scope() as registry_scope:
+            kept: Final = (
+                await recall_last_good_after(e, user_api_key_cache, cache_key, _RegistryIds) if keep_last_good else None
+            )
         verbose_proxy_logger.warning(
-            "Registry %s could not be loaded from the database, so per-id lookups will run and the "
-            "registry query is suppressed for %ss: %s",
+            "Registry %s could not be loaded from the database, so %s for %ss: %s",
             cache_key,
-            REGISTRY_ERROR_NEGATIVE_CACHE_TTL,
+            "per-id lookups will run and the registry query is suppressed"
+            if kept is None
+            else "its last good entry answers",
+            REGISTRY_ERROR_NEGATIVE_CACHE_TTL if kept is None else LAST_GOOD_SERVED_COPY_TTL_SECONDS,
             e,
         )
-        await _cache_registry_answer(
-            cache_key=cache_key,
-            value=overflow_sentinel,
-            ttl=REGISTRY_ERROR_NEGATIVE_CACHE_TTL,
-            user_api_key_cache=user_api_key_cache,
-        )
-        return None
+        if kept is None:
+            await _cache_registry_answer(
+                cache_key=cache_key,
+                value=overflow_sentinel,
+                ttl=REGISTRY_ERROR_NEGATIVE_CACHE_TTL,
+                user_api_key_cache=user_api_key_cache,
+            )
+            return None
+        # Not in Redis: memory refills from Redis with a fresh time, so the copy could outlive the entry
+        keep_last_good_served_copy(user_api_key_cache, cache_key, kept, registry_scope)
+        return frozenset(kept.ids)
 
     if len(registry_ids) > max_size:
+        if keep_last_good:
+            await forget_missing_last_good(user_api_key_cache, cache_key)
         await _cache_registry_answer(
             cache_key=cache_key,
             value=overflow_sentinel,
@@ -1883,6 +1949,8 @@ async def _fetch_and_cache_registry(
         ttl=get_management_object_ttl(user_api_key_cache),
         user_api_key_cache=user_api_key_cache,
     )
+    if keep_last_good:
+        await remember_last_good(user_api_key_cache, cache_key, _RegistryIds(ids=registry_ids))
     return frozenset(registry_ids)
 
 
@@ -1893,6 +1961,8 @@ async def _load_bounded_registry(
     load_lock: asyncio.Lock,
     fetch_ids: Callable[[], Awaitable[tuple[str, ...]]],
     user_api_key_cache: UserApiKeyCache,
+    *,
+    keep_last_good: bool = False,
 ) -> frozenset[str] | None:
     """
     A bounded id set under one cache key, so an id outside it costs no DB read.
@@ -1917,6 +1987,7 @@ async def _load_bounded_registry(
             max_size=max_size,
             fetch_ids=fetch_ids,
             user_api_key_cache=user_api_key_cache,
+            keep_last_good=keep_last_good,
         )
 
 
@@ -1940,6 +2011,7 @@ async def _load_end_user_restricted_registry(
         load_lock=_END_USER_REGISTRY_LOAD_LOCK,
         fetch_ids=fetch_ids,
         user_api_key_cache=user_api_key_cache,
+        keep_last_good=True,
     )
 
 
@@ -2040,7 +2112,6 @@ async def get_end_user_object(
     ):
         return None
 
-    # Fetch from database
     try:
         response: Final = await _dictable_table(EndUserRepository(prisma_client), "end_user").find_unique(
             where={"user_id": end_user_id},
@@ -2048,21 +2119,27 @@ async def get_end_user_object(
         )
 
         if response is None:
-            raise Exception
+            await forget_missing_last_good(user_api_key_cache, _key)
+            return None
 
-        end_user_row: Final = await _apply_default_budget_to_end_user(
-            end_user_obj=LiteLLM_EndUserTable.model_validate(response.dict()),
-            prisma_client=prisma_client,
-            user_api_key_cache=user_api_key_cache,
-            parent_otel_span=parent_otel_span,
-        )
+        with last_good_auth_entries_scope() as default_budget_scope:
+            end_user_row: Final = await _apply_default_budget_to_end_user(
+                end_user_obj=LiteLLM_EndUserTable.model_validate(response.dict()),
+                prisma_client=prisma_client,
+                user_api_key_cache=user_api_key_cache,
+                parent_otel_span=parent_otel_span,
+            )
 
-        await user_api_key_cache.async_set_cache(
-            key=_key,
-            value=end_user_row,
-            model_type=LiteLLM_EndUserTable,
-            ttl=get_management_object_ttl(user_api_key_cache),
-        )
+        # Neither cached nor kept when the default budget came from a last good entry: a later read that resolves no
+        # default keeps the cached row's budget, and a new entry would keep that budget past its own entry's expiry
+        if not default_budget_scope.served:
+            await user_api_key_cache.async_set_cache(
+                key=_key,
+                value=end_user_row,
+                model_type=LiteLLM_EndUserTable,
+                ttl=get_management_object_ttl(user_api_key_cache),
+            )
+            await remember_last_good(user_api_key_cache, _key, end_user_row)
 
         if key_end_user_budget_id is None:
             return end_user_row
@@ -2075,12 +2152,46 @@ async def get_end_user_object(
             key_end_user_budget_id=key_end_user_budget_id,
         )
 
-    except Exception:
-        return None
+    except LastGoodEntryMissing:
+        raise
+    except Exception as e:
+        served: Final = await recall_last_good_limits_after(e, user_api_key_cache, _key, LiteLLM_EndUserTable)
+        if served is None:
+            return None
+        return await _apply_default_budget_to_end_user(
+            end_user_obj=served,
+            prisma_client=prisma_client,
+            user_api_key_cache=user_api_key_cache,
+            parent_otel_span=parent_otel_span,
+            key_end_user_budget_id=key_end_user_budget_id,
+        )
+
+
+async def last_good_end_user_blocked(error: Exception, end_user_id: str, user_api_key_cache: DualCache) -> bool:
+    """Whether ``end_user_id`` was blocked when the database last answered, for a check that reads only the blocked
+    flag while ``error`` says the database cannot be reached. The customer's own last good entry answers; else the
+    last good restricted registry, which holds every blocked customer, proves it was not blocked. While last good
+    entries are served and neither is kept the request is refused with ``LastGoodEntryMissing``; any other failure
+    raises ``error`` again."""
+    entry: Final = await recall_last_good_after(
+        error, user_api_key_cache, end_user_cache_key(end_user_id), LiteLLM_EndUserTable
+    )
+    if entry is not None:
+        return entry.blocked
+    registry: Final = await recall_last_good_after(
+        error, user_api_key_cache, end_user_restricted_registry_cache_key(), _RegistryIds
+    )
+    if registry is not None and end_user_id not in registry.ids:
+        return False
+    if serves_last_good_entries(user_api_key_cache) and PrismaDBExceptionHandler.is_database_unreachable_error(error):
+        raise LastGoodEntryMissing(error) from error
+    raise error
 
 
 _END_USER_VALIDATION_NEGATIVE_TTL: Final = 60
 _END_USER_VALIDATION_POSITIVE_TTL: Final = 300
+#: The validation verdict of an id only a last good entry vouched for: a request that reads it back reads last_good.
+_END_USER_VALID_FROM_LAST_GOOD: Final = "valid_from_last_good"
 
 
 @with_service_target(AUTH_OBJECTS_TARGET)
@@ -2122,27 +2233,38 @@ async def resolve_and_validate_end_user_id(
         return raw_end_user_id
 
     has_default_budget: Final = bool(litellm.max_end_user_budget_id) or key_end_user_budget_id is not None
-    cache_key: Final = f"end_user_validation:{raw_end_user_id}"
+    cache_key: Final = end_user_validation_cache_key(raw_end_user_id)
     cached: Final = await _raw_cache(user_api_key_cache).async_get_cache(key=cache_key)
+    if cached == _END_USER_VALID_FROM_LAST_GOOD:
+        record_last_good_served_copy(user_api_key_cache, cache_key, _END_USER_VALID_FROM_LAST_GOOD)
+        return raw_end_user_id
     if cached == "valid":
         return raw_end_user_id
     if cached == "invalid":
         return raw_end_user_id if has_default_budget else None
 
-    is_valid: Final = await _end_user_id_exists_in_db(
-        end_user_id=raw_end_user_id,
-        prisma_client=prisma_client,
-        user_api_key_cache=user_api_key_cache,
-        parent_otel_span=parent_otel_span,
-        proxy_logging_obj=proxy_logging_obj,
-        route=route,
-    )
+    with last_good_auth_entries_scope() as validation_scope:
+        is_valid: Final = await _end_user_id_exists_in_db(
+            end_user_id=raw_end_user_id,
+            prisma_client=prisma_client,
+            user_api_key_cache=user_api_key_cache,
+            parent_otel_span=parent_otel_span,
+            proxy_logging_obj=proxy_logging_obj,
+            route=route,
+        )
 
-    await user_api_key_cache.async_set_cache(
-        key=cache_key,
-        value="valid" if is_valid else "invalid",
-        ttl=(_END_USER_VALIDATION_POSITIVE_TTL if is_valid else _END_USER_VALIDATION_NEGATIVE_TTL),
+    verdict: Final = (
+        "invalid" if not is_valid else _END_USER_VALID_FROM_LAST_GOOD if validation_scope.served else "valid"
     )
+    if validation_scope.served:
+        # Not in Redis: memory refills from Redis with a fresh time, so the verdict could outlive the entry it rests on
+        keep_last_good_served_copy(user_api_key_cache, cache_key, verdict, validation_scope)
+    else:
+        await user_api_key_cache.async_set_cache(
+            key=cache_key,
+            value=verdict,
+            ttl=(_END_USER_VALIDATION_POSITIVE_TTL if is_valid else _END_USER_VALIDATION_NEGATIVE_TTL),
+        )
 
     return raw_end_user_id if is_valid or has_default_budget else None
 
@@ -2167,6 +2289,14 @@ async def _end_user_id_exists_in_db(
         )
         if end_user_obj is not None:
             return True
+    except LastGoodEntryMissing:
+        # An id the restricted registry's copy leaves out restricts nothing, whether or not its row exists, so it is
+        # validated as before; any other id may carry limits no entry keeps, and the request is refused
+        registry: Final = await _load_end_user_restricted_registry(
+            prisma_client=prisma_client, user_api_key_cache=user_api_key_cache
+        )
+        if registry is None or end_user_id in registry:
+            raise
     except Exception as e:
         verbose_proxy_logger.debug("end_user validation: get_end_user_object lookup failed: %s", e)
 
@@ -2208,6 +2338,7 @@ async def _load_tag_registry(
         load_lock=_TAG_REGISTRY_LOAD_LOCK,
         fetch_ids=fetch_ids,
         user_api_key_cache=user_api_key_cache,
+        keep_last_good=True,
     )
 
 
@@ -2230,7 +2361,42 @@ async def _load_model_access_group_registry(
         load_lock=_MODEL_ACCESS_GROUP_REGISTRY_LOAD_LOCK,
         fetch_ids=fetch_ids,
         user_api_key_cache=user_api_key_cache,
+        keep_last_good=True,
     )
+
+
+async def _last_good_rows_after(
+    error: Exception,
+    user_api_key_cache: UserApiKeyCache,
+    names: Sequence[str],
+    cache_key: Callable[[str], str],
+    model_type: type[_LastGoodT],
+) -> tuple[tuple[str, _LastGoodT], ...]:
+    """The last good entries of the rows a batch read could not fetch, when ``error`` says the database could not be
+    reached, else none. While last good entries are served, a row with no entry kept refuses the request with
+    ``LastGoodEntryMissing``: its absence would read as no budget at all."""
+    if not PrismaDBExceptionHandler.is_database_unreachable_error(error):
+        return ()
+    kept: Final = [(name, await recall_last_good(user_api_key_cache, cache_key(name), model_type)) for name in names]
+    if serves_last_good_entries(user_api_key_cache) and any(row is None for _, row in kept):
+        raise LastGoodEntryMissing(error) from error
+    return tuple((name, row) for name, row in kept if row is not None)
+
+
+async def _keep_last_good_rows(
+    user_api_key_cache: UserApiKeyCache,
+    names: Sequence[str],
+    fetched: Sequence[tuple[str, BaseModel]],
+    cache_key: Callable[[str], str],
+) -> None:
+    """Keep each row a batch read returned as its last good entry, and drop the entry of each name it did not return."""
+    found: Final = MappingProxyType(dict(fetched))
+    for name in names:
+        row = found.get(name)
+        if row is None:
+            await forget_missing_last_good(user_api_key_cache, cache_key(name))
+        else:
+            await remember_last_good(user_api_key_cache, cache_key(name), row)
 
 
 @with_service_target(AUTH_OBJECTS_TARGET)
@@ -2255,6 +2421,12 @@ async def _fetch_uncached_model_access_group_budgets(
             where={"access_group_name": {"in": list(uncached_groups)}},
             include={"litellm_budget_table": True},
         )
+    except Exception as e:  # noqa: BLE001  # fail-safe: a fetch error yields "no budget rows" unless last good entries cover an outage
+        verbose_proxy_logger.debug("Error batch fetching model access group budgets from database: %s", e)
+        return await _last_good_rows_after(
+            e, user_api_key_cache, uncached_groups, model_access_group_cache_key, ModelAccessGroupBudget
+        )
+    try:
         fetched: Final = tuple((row.access_group_name, _model_access_group_budget(row)) for row in db_rows)
         for fetched_name, fetched_obj in fetched:
             await user_api_key_cache.async_set_cache(
@@ -2266,8 +2438,8 @@ async def _fetch_uncached_model_access_group_budgets(
     except Exception as e:  # noqa: BLE001  # fail-safe: a budget fetch error must yield "no budget rows", never break auth
         verbose_proxy_logger.debug("Error batch fetching model access group budgets from database: %s", e)
         return ()
-    else:
-        return fetched
+    await _keep_last_good_rows(user_api_key_cache, uncached_groups, fetched, model_access_group_cache_key)
+    return fetched
 
 
 def _model_access_group_budget(row: _PrismaModelAccessGroupBudgetRow) -> ModelAccessGroupBudget:
@@ -2337,6 +2509,10 @@ async def _fetch_uncached_tags(
             where={"tag_name": {"in": list(tags_to_fetch)}},
             include={"litellm_budget_table": True},
         )
+    except Exception as e:  # noqa: BLE001  # fail-safe: a fetch error yields "no budget objects" unless last good entries cover an outage
+        verbose_proxy_logger.debug("Error batch fetching tags from database: %s", e)
+        return await _last_good_rows_after(e, user_api_key_cache, tags_to_fetch, tag_cache_key, LiteLLM_TagTable)
+    try:
         fetched: Final = tuple((db_tag.tag_name, LiteLLM_TagTable.model_validate(db_tag.dict())) for db_tag in db_tags)
         for fetched_name, fetched_obj in fetched:
             await user_api_key_cache.async_set_cache(
@@ -2348,8 +2524,8 @@ async def _fetch_uncached_tags(
     except Exception as e:  # noqa: BLE001  # fail-safe: a tag fetch error must yield "no budget objects", never break auth
         verbose_proxy_logger.debug("Error batch fetching tags from database: %s", e)
         return ()
-    else:
-        return fetched
+    await _keep_last_good_rows(user_api_key_cache, tags_to_fetch, fetched, tag_cache_key)
+    return fetched
 
 
 @log_db_metrics
@@ -2463,18 +2639,21 @@ async def _fetch_team_membership_from_db(
     )
     membership: Final = None if response is None else LiteLLM_TeamMembership.model_validate(response.dict())
     _key: Final = team_membership_reservation_cache_key(user_id=user_id, team_id=team_id)
+    last_good_key: Final = team_membership_auth_cache_key(team_id=team_id, user_id=user_id)
     if membership is None:
         await user_api_key_cache.async_set_cache(
             key=_key,
             value=NO_TEAM_MEMBERSHIP_SENTINEL,
             ttl=get_management_object_ttl(user_api_key_cache),
         )
+        await forget_missing_last_good(user_api_key_cache, last_good_key)
     else:
         await user_api_key_cache.async_set_cache(
             key=_key,
             value=membership,
             model_type=LiteLLM_TeamMembership,
         )
+        await remember_last_good(user_api_key_cache, last_good_key, membership)
     return membership
 
 
@@ -2529,7 +2708,7 @@ async def get_team_membership(
 
     inflight: Final[object] = _team_membership_inflight.get(_key)
     if isinstance(inflight, asyncio.Task):
-        return _membership_from_shared_load(await asyncio.shield(inflight))
+        return await _shared_membership_or_last_good(inflight, user_api_key_cache, team_id=team_id, user_id=user_id)
 
     if prisma_client is None:
         raise Exception("No db connected")
@@ -2552,7 +2731,31 @@ async def get_team_membership(
             _team_membership_inflight.pop(_key, None)
 
     task.add_done_callback(_clear_inflight)
-    return _membership_from_shared_load(await asyncio.shield(task))
+    return await _shared_membership_or_last_good(task, user_api_key_cache, team_id=team_id, user_id=user_id)
+
+
+async def _shared_membership_or_last_good(
+    load: asyncio.Future[LiteLLM_TeamMembership | None],
+    user_api_key_cache: UserApiKeyCache,
+    *,
+    team_id: str,
+    user_id: str,
+) -> LiteLLM_TeamMembership | None:
+    """The shared load's membership. When it fails, each caller recalls the last good entry itself rather than share
+    one caller's recall, so every request served from it records that in its own scope."""
+    try:
+        loaded: Final = await asyncio.shield(load)
+    except Exception as e:
+        served: Final = await recall_last_good_after(
+            e,
+            user_api_key_cache,
+            team_membership_auth_cache_key(team_id=team_id, user_id=user_id),
+            LiteLLM_TeamMembership,
+        )
+        if served is None:
+            raise
+        return served
+    return _membership_from_shared_load(loaded)
 
 
 def model_in_access_group(model: str, team_models: list[str] | None, llm_router: Router | None) -> bool:
@@ -2840,6 +3043,7 @@ async def get_user_object(
                         value=None,
                         last_db_access_time=last_db_access_time,
                     )
+                    await forget_missing_last_good(user_api_key_cache, user_id)
                 raise UserNotFoundError(user_id=user_id)
 
         if response.organization_memberships is not None and len(response.organization_memberships) > 0:
@@ -2867,6 +3071,7 @@ async def get_user_object(
             model_type=LiteLLM_UserTable,
             ttl=get_management_object_ttl(user_api_key_cache),
         )
+        await remember_last_good(user_api_key_cache, user_id, _response)
 
         # save to db access time
         _update_last_db_access_time(
@@ -2880,7 +3085,22 @@ async def get_user_object(
         raise
     except Exception as e:
         _log_budget_lookup_failure("user", e)
-        raise _user_read_failure(user_id=user_id, error=e)
+        return await _user_after_read_failure(e, user_api_key_cache, user_id, check_db_only=bool(check_db_only))
+
+
+async def _user_after_read_failure(
+    error: Exception, user_api_key_cache: UserApiKeyCache, user_id: str, *, check_db_only: bool
+) -> LiteLLM_UserTable:
+    """The user's last good entry while the database is unreachable, never for an authoritative (``check_db_only``)
+    read; otherwise the read failure is raised."""
+    served: Final = (
+        None
+        if check_db_only
+        else await recall_last_good_limits_after(error, user_api_key_cache, user_id, LiteLLM_UserTable)
+    )
+    if served is None:
+        raise _user_read_failure(user_id=user_id, error=error)
+    return served
 
 
 def _user_read_failure(user_id: str, error: Exception) -> Exception:
@@ -2913,13 +3133,53 @@ async def _cache_management_object(
     )
 
 
+class _TeamAliasTarget(BaseModel):
+    """The team an alias resolved to when the database last answered for it."""
+
+    model_config = ConfigDict(frozen=True)
+
+    team_id: str
+
+
+async def recall_last_good_after(
+    error: Exception, user_api_key_cache: DualCache, cache_key: str, model_type: type[_LastGoodT]
+) -> _LastGoodT | None:
+    """The last good entry for ``cache_key`` when ``error`` says the database could not be reached, else None."""
+    if not PrismaDBExceptionHandler.is_database_unreachable_error(error):
+        return None
+    found: Final = await recall_last_good(user_api_key_cache, cache_key, model_type)
+    if found is not None:
+        verbose_proxy_logger.warning(
+            "The database is unreachable (%s); found the last good %s entry", type(error).__name__, model_type.__name__
+        )
+    return found
+
+
+async def recall_last_good_limits_after(
+    error: Exception, user_api_key_cache: DualCache, cache_key: str, model_type: type[_LastGoodT]
+) -> _LastGoodT | None:
+    """The last good entry of a project, organization, user, customer or budget when ``error`` says the database could
+    not be reached, else None. While last good entries are served, an unreachable database with no entry kept raises
+    ``LastGoodEntryMissing``: the object's absence would read as no limits at all."""
+    served: Final = await recall_last_good_after(error, user_api_key_cache, cache_key, model_type)
+    if served is not None:
+        return served
+    if serves_last_good_entries(user_api_key_cache) and PrismaDBExceptionHandler.is_database_unreachable_error(error):
+        raise LastGoodEntryMissing(error) from error
+    return None
+
+
 @with_service_target(AUTH_OBJECTS_TARGET)
 async def cache_team_object(
     team_id: str,
     team_table: LiteLLM_TeamTableCachedObj,
     user_api_key_cache: UserApiKeyCache,
     proxy_logging_obj: ProxyLogging | None,
+    *,
+    keep_last_good: bool,
 ) -> None:
+    """``keep_last_good`` is True when the database just returned ``team_table``, by a read or as the row a write
+    returned, and False for a team patched in the cache, which must not restart its last good entry's expiry."""
     ## CACHE REFRESH TIME!
     team_table.last_refreshed_at = time.time()
 
@@ -2939,6 +3199,8 @@ async def cache_team_object(
         proxy_logging_obj=proxy_logging_obj,
         model_type=LiteLLM_TeamTableCachedObj,
     )
+    if keep_last_good:
+        await remember_last_good(user_api_key_cache, key, team_table)
 
     # Invalidate the alias-keyed cache so the JWT auth path with
     # `team_alias_jwt_field` (which reads via `get_team_object_by_alias`)
@@ -3113,6 +3375,39 @@ async def invalidate_team_member_spend_state(
         ),
         user_api_key_cache=user_api_key_cache,
     )
+    await _evict_team_member_keys(user_id=user_id, team_id=team_id, user_api_key_cache=user_api_key_cache)
+
+
+async def _evict_team_member_keys(user_id: str, team_id: str, user_api_key_cache: UserApiKeyCache) -> None:
+    """A key's last good entry carries its team member's spend and rate limits as of its last read, so while last good
+    entries are served a member change evicts that member's keys in the team. Without that setting a member change
+    reads and evicts no key, as before it. Best effort, like every eviction after a committed write."""
+    from litellm.proxy.proxy_server import prisma_client, proxy_logging_obj
+
+    if prisma_client is None or not serves_last_good_entries(user_api_key_cache):
+        return
+    try:
+        member_keys: Final = await VerificationTokenRepository(prisma_client).table.find_many(
+            where={"user_id": user_id, "team_id": team_id}
+        )
+    except Exception as e:  # noqa: BLE001  # the member write committed; a failed eviction must not fail it
+        verbose_proxy_logger.warning(
+            "Could not evict the keys of team member %s in team %s; they may carry the old member limits: %s",
+            user_id,
+            team_id,
+            e,
+        )
+        return
+    await delete_cache_key_objects(
+        hashed_tokens=tuple(key.token for key in member_keys),
+        user_api_key_cache=user_api_key_cache,
+        proxy_logging_obj=proxy_logging_obj,
+    )
+
+
+def team_cache_keys(team_id: str, team_alias: str | None) -> tuple[str, ...]:
+    """The keys `_cache_team_object` writes a team under: its id, and its alias when it has one."""
+    return (f"team_id:{team_id}", *((f"team_alias:{team_alias}",) if team_alias else ()))
 
 
 @with_service_target(AUTH_OBJECTS_TARGET)
@@ -3121,6 +3416,8 @@ async def delete_cache_team_object(
     team_alias: str | None,
     user_api_key_cache: UserApiKeyCache,
     proxy_logging_obj: ProxyLogging | None,
+    *,
+    revoked: bool = False,
 ) -> None:
     """
     Evict both keys `_cache_team_object` writes.
@@ -3134,8 +3431,11 @@ async def delete_cache_team_object(
     Eviction is best-effort, matching `_cache_team_object`. `delete_team` calls this after the team
     rows are already gone, so letting an unreachable cache backend raise here would fail a request
     whose delete has committed.
+
+    `revoked` is for a delete or a block: it tombstones the team's last good entries, so a read that was in
+    flight when the row changed cannot store them again.
     """
-    keys: Final = (f"team_id:{team_id}", *((f"team_alias:{team_alias}",) if team_alias else ()))
+    keys: Final = team_cache_keys(team_id, team_alias)
 
     for key in keys:
         try:
@@ -3151,6 +3451,7 @@ async def delete_cache_team_object(
                 key,
                 e,
             )
+        await forget_last_good(user_api_key_cache, key, tombstone=revoked)
         await publish_auth_cache_invalidation(cache_key=key)
 
 
@@ -3183,6 +3484,8 @@ async def delete_cache_key_object(
     hashed_token: str,
     user_api_key_cache: UserApiKeyCache,
     proxy_logging_obj: ProxyLogging | None,
+    *,
+    revoked: bool = False,
 ) -> None:
     """
     Evict one key object, best-effort, matching `delete_cache_team_object` and
@@ -3197,6 +3500,9 @@ async def delete_cache_key_object(
     cache-first with no freshness check, so a worker that never receives the broadcast keeps
     admitting requests against the pre-mutation object (e.g. a just-reset spend) until its own
     copy's TTL expires.
+
+    `revoked` is for a delete or a block: it tombstones the key's last good entry, so a read that was in
+    flight when the row changed cannot store it again.
     """
     key: Final = hashed_token
 
@@ -3213,6 +3519,7 @@ async def delete_cache_key_object(
             e,
         )
 
+    await forget_last_good(user_api_key_cache, key, tombstone=revoked)
     await publish_auth_cache_invalidation(cache_key=key)
 
 
@@ -3223,6 +3530,8 @@ async def delete_cache_key_objects(
     hashed_tokens: Sequence[str],
     user_api_key_cache: UserApiKeyCache,
     proxy_logging_obj: ProxyLogging | None,
+    *,
+    revoked: bool = False,
 ) -> None:
     """
     Evict a batch of key objects, for callers that delete keys in bulk rather than through
@@ -3242,6 +3551,7 @@ async def delete_cache_key_objects(
                 hashed_token=hashed_token,
                 user_api_key_cache=user_api_key_cache,
                 proxy_logging_obj=proxy_logging_obj,
+                revoked=revoked,
             )
             for hashed_token in hashed_tokens
         ),
@@ -3367,6 +3677,7 @@ async def _get_team_object_from_user_api_key_cache(
         team_table=_response,
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
+        keep_last_good=True,
     )
 
     # save to db access time
@@ -3450,8 +3761,16 @@ async def get_team_object(
             use_writer=bool(check_db_only),
         )
     except TeamNotFoundError:
+        await forget_missing_last_good(user_api_key_cache, key)
         raise
-    except Exception:
+    except Exception as e:
+        served: Final = (
+            None
+            if check_db_only
+            else await recall_last_good_after(e, user_api_key_cache, key, LiteLLM_TeamTableCachedObj)
+        )
+        if served is not None:
+            return served
         raise HTTPException(
             status_code=404,
             detail={"error": f"Team doesn't exist in db. Team={team_id}. Create team via `/team/new` call."},
@@ -3607,28 +3926,37 @@ async def get_team_object_by_alias(
     if cached_team_obj is not None:
         return cached_team_obj
 
-    # Query database by team_alias
     try:
         teams: Final = await _team_table(TeamRepository(prisma_client)).find_many(
             where={"team_alias": team_alias}, include=_TEAM_GRANT_RELATIONS
         )
+    except Exception as e:
+        served: Final = await _last_good_team_for_alias(e, team_alias, user_api_key_cache)
+        if served is not None:
+            return served
+        verbose_proxy_logger.exception("Error looking up team by alias: %s", team_alias)
+        raise HTTPException(
+            status_code=500,
+            detail={"error": f"Error looking up team by alias '{team_alias}': {e}"},
+        ) from e
 
-        if not teams:
-            raise HTTPException(
-                status_code=404,
-                detail={
-                    "error": f"Team with alias '{team_alias}' doesn't exist in db. Create team via `/team/new` call."
-                },
-            )
+    if not teams:
+        await forget_missing_last_good(user_api_key_cache, cache_key)
+        raise HTTPException(
+            status_code=404,
+            detail={"error": f"Team with alias '{team_alias}' doesn't exist in db. Create team via `/team/new` call."},
+        )
 
-        if len(teams) > 1:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "error": f"Multiple teams found with alias '{team_alias}'. Please use team_id_jwt_field instead or ensure team aliases are unique."
-                },
-            )
+    if len(teams) > 1:
+        await forget_missing_last_good(user_api_key_cache, cache_key)
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": f"Multiple teams found with alias '{team_alias}'. Please use team_id_jwt_field instead or ensure team aliases are unique."
+            },
+        )
 
+    try:
         team: Final = teams[0]
         team_obj: Final = LiteLLM_TeamTableCachedObj.model_validate(team.model_dump())
 
@@ -3650,32 +3978,45 @@ async def get_team_object_by_alias(
                     e,
                 )
 
-        # Cache the result by both alias and team_id
-        await user_api_key_cache.async_set_cache(
+        # The id entry first: writing it evicts the alias entry, which is written from this verified single row next.
+        await cache_team_object(
+            team_id=team_obj.team_id,
+            team_table=team_obj,
+            user_api_key_cache=user_api_key_cache,
+            proxy_logging_obj=proxy_logging_obj,
+            keep_last_good=True,
+        )
+        await _cache_management_object(
             key=cache_key,
             value=team_obj,
+            user_api_key_cache=user_api_key_cache,
+            proxy_logging_obj=proxy_logging_obj,
             model_type=LiteLLM_TeamTableCachedObj,
-            ttl=DEFAULT_IN_MEMORY_TTL,
         )
-        # Also cache by team_id for consistency
-        team_id_cache_key: Final = f"team_id:{team_obj.team_id}"
-        await user_api_key_cache.async_set_cache(
-            key=team_id_cache_key,
-            value=team_obj,
-            model_type=LiteLLM_TeamTableCachedObj,
-            ttl=DEFAULT_IN_MEMORY_TTL,
-        )
+        await remember_last_good(user_api_key_cache, cache_key, _TeamAliasTarget(team_id=team_obj.team_id))
 
         return team_obj
 
-    except HTTPException:
-        raise
     except Exception as e:
         verbose_proxy_logger.exception("Error looking up team by alias: %s", team_alias)
         raise HTTPException(
             status_code=500,
             detail={"error": f"Error looking up team by alias '{team_alias}': {e}"},
         )
+
+
+async def _last_good_team_for_alias(
+    error: Exception, team_alias: str, user_api_key_cache: UserApiKeyCache
+) -> LiteLLM_TeamTableCachedObj | None:
+    """The last good team ``team_alias`` named, read through the team's own entry so a later update, rename or
+    delete of the team wins over the alias it once had."""
+    target: Final = await recall_last_good_after(
+        error, user_api_key_cache, f"team_alias:{team_alias}", _TeamAliasTarget
+    )
+    if target is None:
+        return None
+    team: Final = await recall_last_good(user_api_key_cache, f"team_id:{target.team_id}", LiteLLM_TeamTableCachedObj)
+    return team if team is not None and team.team_alias == team_alias else None
 
 
 @log_db_metrics
@@ -3996,15 +4337,25 @@ class _TokenInFilter(TypedDict):
     token: ReadOnly[Mapping[str, Sequence[str]]]
 
 
+def _jwt_key_mapping_tx_table(tx: "Prisma") -> _PrismaAuthTable[_PrismaJWTKeyMappingRow]:
+    return tx.litellm_jwtkeymapping  # pyright: ignore[reportReturnType]  # the protocol widens the generated inputs
+
+
 async def get_jwt_key_mapping_cache_keys_for_tokens(
     hashed_tokens: Sequence[str],
     prisma_client: PrismaClient,
+    tx: "Prisma | None" = None,
 ) -> tuple[str, ...]:
-    """Cache keys of every JWT claim mapped to any of the given virtual keys."""
+    """Cache keys of every JWT claim mapped to any of the given virtual keys. A caller that holds a transaction open
+    passes it as ``tx`` and the read goes through it: on another connection the read could wait for the one the
+    transaction holds, when the pool has no other to give."""
     if not hashed_tokens:
         return ()
     token_filter: Final[_TokenInFilter] = {"token": {"in": tuple(hashed_tokens)}}
-    mappings: Final = await _jwt_key_mapping_table(JWTKeyMappingRepository(prisma_client)).find_many(where=token_filter)
+    table: Final = (
+        _jwt_key_mapping_table(JWTKeyMappingRepository(prisma_client)) if tx is None else _jwt_key_mapping_tx_table(tx)
+    )
+    mappings: Final = await table.find_many(where=token_filter)
     return tuple(jwt_key_mapping_cache_key(m.jwt_claim_name, m.jwt_claim_value, m.jwt_issuer) for m in mappings)
 
 
@@ -4072,15 +4423,19 @@ async def get_key_object(
         raise Exception(f"Key doesn't exist in cache + check_cache_only=True. key={key}.")
 
     # else, check db
-    _valid_token: Final[BaseModel | None] = await fetch_key_object_from_db_with_reconnect(
-        hashed_token=hashed_token,
-        prisma_client=prisma_client,
-        parent_otel_span=parent_otel_span,
-        proxy_logging_obj=proxy_logging_obj,
-        check_db_only=check_db_only,
-    )
+    try:
+        _valid_token: Final[BaseModel | None] = await fetch_key_object_from_db_with_reconnect(
+            hashed_token=hashed_token,
+            prisma_client=prisma_client,
+            parent_otel_span=parent_otel_span,
+            proxy_logging_obj=proxy_logging_obj,
+            check_db_only=check_db_only,
+        )
+    except Exception as e:  # noqa: BLE001  # re-raised by _last_good_key_or_raise unless an outage is covered
+        return await _last_good_key_or_raise(e, user_api_key_cache, hashed_token, check_db_only=check_db_only)
 
     if _valid_token is None:
+        await forget_missing_last_good(user_api_key_cache, hashed_token)
         raise ProxyException(
             message=f"Authentication Error, Invalid proxy server token passed. key={hashed_token}, not found in db. Create key via `/key/generate` call.",
             type=ProxyErrorTypes.token_not_found_in_db,
@@ -4113,15 +4468,37 @@ async def get_key_object(
     if check_db_only:
         return _response
 
-    # save the key object to cache
+    await _cache_key_read_from_db(hashed_token, _response, user_api_key_cache, proxy_logging_obj)
+    return _response
+
+
+async def _last_good_key_or_raise(
+    error: Exception, user_api_key_cache: UserApiKeyCache, hashed_token: str, *, check_db_only: bool
+) -> UserAPIKeyAuth:
+    """The key's last good entry when ``error`` is an unreachable database, else ``error`` again. An authoritative
+    (``check_db_only``) read is never served a cached copy."""
+    served: Final = (
+        None if check_db_only else await recall_last_good_after(error, user_api_key_cache, hashed_token, UserAPIKeyAuth)
+    )
+    if served is None:
+        raise error
+    return served
+
+
+async def _cache_key_read_from_db(
+    hashed_token: str,
+    key: UserAPIKeyAuth,
+    user_api_key_cache: UserApiKeyCache,
+    proxy_logging_obj: ProxyLogging | None,
+) -> None:
     await cache_key_object(
         hashed_token=hashed_token,
-        user_api_key_obj=_response,
+        user_api_key_obj=key,
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
     )
-
-    return _response
+    if key.token == hashed_token:
+        await remember_last_good(user_api_key_cache, hashed_token, copy_user_api_key_auth_for_cache(key))
 
 
 def copy_user_api_key_auth_for_cache(
@@ -4129,6 +4506,7 @@ def copy_user_api_key_auth_for_cache(
 ) -> UserAPIKeyAuth:
     copied_key_obj: Final = user_api_key_obj.model_copy()
     copied_key_obj.budget_reservation = None
+    copied_key_obj.auth_entries = None
     copied_key_obj.budget_throttle_pct = None
     copied_key_obj.parent_otel_span = None
     copied_key_obj.request_route = None
@@ -4314,15 +4692,16 @@ async def get_org_object(
         response: Final = await _model_dump_table(OrganizationRepository(prisma_client), "organization").find_unique(
             **query_kwargs
         )
-    except Exception:
-        # An operational failure (DB down, timeout, cache fault) is NOT the same fact as a confirmed
-        # missing row, and relabelling it as "doesn't exist" made every caller unable to tell them
-        # apart — a caller that treats absence as "this org places no restriction" then drops a real
-        # org ceiling during an outage. Propagate the real error; callers that already catch
-        # Exception are unaffected.
-        raise
+    except Exception as e:
+        # An operational failure is NOT a confirmed missing row: a caller that treats absence as "this org places no
+        # restriction" would drop a real org ceiling during an outage. Serve the last good entry or propagate.
+        served: Final = await recall_last_good_limits_after(e, user_api_key_cache, cache_key, LiteLLM_OrganizationTable)
+        if served is None:
+            raise
+        return served
 
     if response is None:
+        await forget_missing_last_good(user_api_key_cache, cache_key)
         raise OrganizationNotFoundError(
             f"Organization doesn't exist in db. Organization={org_id}. Create organization via `/organization/new` call."
         )
@@ -4335,8 +4714,14 @@ async def get_org_object(
         model_type=LiteLLM_OrganizationTable,
         ttl=DEFAULT_IN_MEMORY_TTL,
     )
+    await remember_last_good(user_api_key_cache, cache_key, _org_obj)
 
     return _org_obj
+
+
+def organization_cache_keys(org_id: str) -> tuple[str, ...]:
+    """Every key an organization is cached under: with and without its budget, and as the last known organization."""
+    return (f"org_id:{org_id}", f"org_id:{org_id}:with_budget", _last_known_org_cache_key(org_id))
 
 
 def _last_known_org_cache_key(org_id: str) -> str:
@@ -4370,16 +4755,19 @@ async def get_org_object_for_request(
     proxy_logging_obj: ProxyLogging | None,
 ) -> LiteLLM_OrganizationTable | None:
     try:
-        org: Final = await get_org_object(
-            org_id=org_id,
-            prisma_client=prisma_client,
-            user_api_key_cache=user_api_key_cache,
-            parent_otel_span=parent_otel_span,
-            proxy_logging_obj=proxy_logging_obj,
-            include_budget_table=True,
-        )
+        with last_good_auth_entries_scope() as org_scope:
+            org: Final = await get_org_object(
+                org_id=org_id,
+                prisma_client=prisma_client,
+                user_api_key_cache=user_api_key_cache,
+                parent_otel_span=parent_otel_span,
+                proxy_logging_obj=proxy_logging_obj,
+                include_budget_table=True,
+            )
     except OrganizationNotFoundError:
         return None
+    except LastGoodEntryMissing:
+        raise
     except Exception as e:
         if not PrismaDBExceptionHandler.is_database_service_unavailable_error_in_chain(e):
             verbose_proxy_logger.debug("org lookup failed, continuing without org limits", exc_info=True)
@@ -4395,7 +4783,8 @@ async def get_org_object_for_request(
         raise
     if org is None:
         return None
-    await _keep_last_known_org(org, org_id, user_api_key_cache)
+    if not org_scope.served:
+        await _keep_last_known_org(org, org_id, user_api_key_cache)
     return org
 
 
@@ -4944,6 +5333,7 @@ async def _org_granted_models(
     prisma_client: PrismaClient,
     user_api_key_cache: UserApiKeyCache,
     proxy_logging_obj: ProxyLogging,
+    budgets_enforced: bool = False,
 ) -> Sequence[str]:
     """The org allowlist reached through the key, or through its team when the key names no org."""
     org_id: Final = valid_token.org_id or (team_object.organization_id if team_object is not None else None)
@@ -4957,6 +5347,12 @@ async def _org_granted_models(
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
         )
+    except LastGoodEntryMissing:
+        # A budgeted group serves the model and only the org can say whether it grants it; with budget checks
+        # skipped, the groups the other levels grant are still attributed
+        if budgets_enforced:
+            raise
+        return ()
     except Exception as e:  # noqa: BLE001  # fail-safe: attribution degrades to "no org grant", it must never break auth
         verbose_proxy_logger.debug("access group attribution: org lookup failed: %s", e)
         return ()
@@ -4972,6 +5368,7 @@ async def _granted_model_lists(
     proxy_logging_obj: ProxyLogging,
     team_membership: LiteLLM_TeamMembership | None = None,
     team_membership_loaded: bool = False,
+    budgets_enforced: bool = False,
 ) -> tuple[Sequence[str], ...]:
     """One model allowlist per level that participates in authorizing the request."""
     return (
@@ -4993,6 +5390,7 @@ async def _granted_model_lists(
             prisma_client=prisma_client,
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
+            budgets_enforced=budgets_enforced,
         ),
     )
 
@@ -5081,6 +5479,7 @@ async def collect_matched_model_access_groups(
     proxy_logging_obj: ProxyLogging,
     team_membership: LiteLLM_TeamMembership | None = None,
     team_membership_loaded: bool = False,
+    budgets_enforced: bool = False,
 ) -> tuple[str, ...]:
     """
     The budgeted model access groups that authorized this request, sorted and deduplicated.
@@ -5097,6 +5496,9 @@ async def collect_matched_model_access_groups(
     The whole walk is gated on the budget registry, because collecting every match costs a full scan
     of each allowlist where the plain access check stops at the first hit. An empty registry means no
     group carries a budget, so there is nothing to attribute and no work worth doing.
+
+    An org with no last good entry in an outage raises ``LastGoodEntryMissing`` with ``budgets_enforced``;
+    without, it grants nothing and the other levels' matches stand, as for any other failed org lookup.
     """
     if model is None or valid_token is None or llm_router is None or prisma_client is None:
         return ()
@@ -5128,6 +5530,7 @@ async def collect_matched_model_access_groups(
             proxy_logging_obj=proxy_logging_obj,
             team_membership=team_membership,
             team_membership_loaded=team_membership_loaded,
+            budgets_enforced=budgets_enforced,
         )
         for granted_model in granted_models
     )
@@ -5145,9 +5548,11 @@ async def stamp_matched_model_access_groups(
     proxy_logging_obj: ProxyLogging,
     team_membership: LiteLLM_TeamMembership | None = None,
     team_membership_loaded: bool = False,
+    budgets_enforced: bool = False,
 ) -> tuple[str, ...]:
     """Record the groups that authorized this request on its auth object, for the post-call spend
-    writer and the reservation counters, and hand them back for the budget check."""
+    writer and the reservation counters, and hand them back for the budget check. With ``budgets_enforced``, an org
+    with no last good entry in an outage refuses the request rather than dropping the groups it may grant."""
     if valid_token is None:
         return ()
 
@@ -5163,7 +5568,12 @@ async def stamp_matched_model_access_groups(
             proxy_logging_obj=proxy_logging_obj,
             team_membership=team_membership,
             team_membership_loaded=team_membership_loaded,
+            budgets_enforced=budgets_enforced,
         )
+    except LastGoodEntryMissing:
+        if budgets_enforced:
+            raise
+        return ()
     except Exception as e:  # noqa: BLE001  # fail-safe: attribution is spend telemetry, it must never break auth
         verbose_proxy_logger.debug("model access group attribution failed: %s", e)
         return ()
@@ -6653,12 +7063,20 @@ async def get_project_object(
     if deserialized_project is not None:
         return deserialized_project
 
-    # Fetch from DB
-    project_row: Final = await _model_dump_table(ProjectRepository(prisma_client), "project").find_unique(
-        where={"project_id": project_id},
-        include={"litellm_budget_table": True},
-    )
+    try:
+        project_row: Final = await _model_dump_table(ProjectRepository(prisma_client), "project").find_unique(
+            where={"project_id": project_id},
+            include={"litellm_budget_table": True},
+        )
+    except Exception as e:
+        served: Final = await recall_last_good_limits_after(
+            e, user_api_key_cache, cache_key, LiteLLM_ProjectTableCachedObj
+        )
+        if served is None:
+            raise
+        return served
     if project_row is None:
+        await forget_missing_last_good(user_api_key_cache, cache_key)
         return None
 
     project_obj: Final = LiteLLM_ProjectTableCachedObj.model_validate(project_row.model_dump())
@@ -6672,6 +7090,7 @@ async def get_project_object(
         proxy_logging_obj=proxy_logging_obj,
         model_type=LiteLLM_ProjectTableCachedObj,
     )
+    await remember_last_good(user_api_key_cache, cache_key, project_obj)
 
     return project_obj
 
@@ -6736,6 +7155,8 @@ async def organization_max_budget_check(
             proxy_logging_obj=proxy_logging_obj,
             include_budget_table=True,
         )
+    except LastGoodEntryMissing:
+        raise
     except Exception:
         # If organization lookup fails, skip the check
         return

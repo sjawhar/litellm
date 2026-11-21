@@ -2590,6 +2590,113 @@ async def test_auto_register_first_request_propagates_user_email(active: bool) -
 
 
 @pytest.mark.asyncio
+async def test_auto_register_reuses_the_users_key_after_an_admin_role_its_last_good_entry_gave() -> None:
+    """Under AUTO_REGISTER a proxy admin's JWT caches a marker that skips the mapping lookup on later requests. An admin
+    role the user's last good entry gave caches no marker: once the database answers with the user demoted, the next
+    request reuses the user's key and runs its checks, which refuse a model the key does not allow."""
+    from litellm.proxy._types import UnregisteredJWTClientBehavior
+    from litellm.proxy.common_utils.user_api_key_cache import (
+        last_good_auth_entries_scope,
+        recall_last_good,
+        remember_last_good,
+    )
+
+    jwt_token: Final = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyMSJ9.signature"
+    jwt_handler: Final = MagicMock()
+    jwt_handler.is_jwt.return_value = True
+    jwt_handler.auth_jwt = AsyncMock(return_value={"sub": "user1"})
+    jwt_handler.litellm_jwtauth = LiteLLM_JWTAuth(
+        virtual_key_claim_field="sub",
+        virtual_key_mapping_cache_ttl=300,
+        unregistered_jwt_client_behavior=UnregisteredJWTClientBehavior.AUTO_REGISTER,
+        auto_register_map_existing_key=True,
+    )
+    user_entries: Final = UserApiKeyCache(serve_last_good_entries=True)
+    await remember_last_good(
+        user_entries,
+        "validated-user",
+        LiteLLM_UserTable(user_id="validated-user", user_role=LitellmUserRoles.PROXY_ADMIN.value),
+    )
+    user_rows: Final[list[LiteLLM_UserTable]] = []  # empty while the user read fails
+
+    async def auth_builder(**kwargs: object) -> dict[str, object]:
+        """The user read of JWTAuthManager.auth_builder: the row once the database answers, else the last good entry."""
+        user_object: Final = (
+            user_rows[-1] if user_rows else await recall_last_good(user_entries, "validated-user", LiteLLM_UserTable)
+        )
+        return {
+            "is_proxy_admin": user_object is not None and user_object.user_role == LitellmUserRoles.PROXY_ADMIN.value,
+            "team_object": None,
+            "user_object": user_object,
+            "end_user_object": None,
+            "org_object": None,
+            "token": jwt_token,
+            "team_id": "validated-team",
+            "user_id": "validated-user",
+            "user_email": None,
+            "end_user_id": None,
+            "org_id": None,
+            "team_membership": None,
+            "jwt_claims": {"sub": "user1"},
+        }
+
+    async def request() -> tuple[str | None, tuple[str, ...]]:
+        mock_request: Final = MagicMock()
+        mock_request.url.path = "/v1/chat/completions"
+        mock_request.method = "POST"
+        mock_request.headers = {"authorization": f"Bearer {jwt_token}"}
+        mock_request.query_params = {}
+        mock_request.state = SimpleNamespace()
+        with last_good_auth_entries_scope() as scope:
+            token: Final = await user_api_key_auth_builder(
+                request=mock_request,
+                api_key=jwt_token,
+                azure_api_key_header="",
+                anthropic_api_key_header=None,
+                google_ai_studio_api_key_header=None,
+                azure_apim_header=None,
+                request_data={"model": "model-b"},
+            )
+        return token.user_role, scope.served
+
+    existing_key: Final = "hashed-existing-key"
+    with (
+        patch("litellm.proxy.proxy_server.general_settings", {"enable_jwt_auth": True}),
+        patch("litellm.proxy.proxy_server.premium_user", True),
+        patch("litellm.proxy.proxy_server.master_key", "sk-master"),
+        patch("litellm.proxy.proxy_server.prisma_client", MagicMock()),
+        patch("litellm.proxy.proxy_server.user_api_key_cache", DualCache()),
+        patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj",
+            MagicMock(post_call_failure_hook=AsyncMock(return_value=None)),
+        ),
+        patch("litellm.proxy.proxy_server.jwt_handler", jwt_handler),
+        patch(
+            "litellm.proxy.auth.user_api_key_auth._lookup_jwt_mapping_token_hash",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+        patch("litellm.proxy.auth.user_api_key_auth.JWTAuthManager.auth_builder", new=auth_builder),
+        patch(
+            "litellm.proxy.auth.user_api_key_auth._auto_register_jwt_mapping",
+            new_callable=AsyncMock,
+            return_value=UserAPIKeyAuth(
+                token=existing_key,
+                api_key=existing_key,
+                user_id="validated-user",
+                team_id="validated-team",
+                models=["model-a"],
+            ),
+        ),
+    ):
+        assert await request() == (LitellmUserRoles.PROXY_ADMIN, ("LiteLLM_UserTable",))
+        user_rows.append(LiteLLM_UserTable(user_id="validated-user", user_role=LitellmUserRoles.INTERNAL_USER.value))
+
+        with pytest.raises(ProxyException, match="not available for this API key"):
+            await request()
+
+
+@pytest.mark.asyncio
 async def test_auto_register_stamps_new_key_with_jwt_agent_id():
     """The virtual key AUTO_REGISTER creates must carry the agent id auth_builder bound
     from the JWT claim, and the first request's principal must carry it too, or the

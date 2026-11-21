@@ -1922,6 +1922,28 @@ class TestProxyBaseLLMRequestProcessing:
         assert "x-litellm-key-spend" in headers_7
         assert float(headers_7["x-litellm-key-spend"]) == 0.001  # Should use original spend on error
 
+    def test_get_custom_headers_carries_the_auth_entries_mark_and_leaves_it_out_when_unset(self):
+        """One test over the three values, so the unset case is checked beside the two that send the header: on its
+        own it would also pass where the header is never sent."""
+
+        def sent_mark(auth_entries: str | None) -> dict[str, str]:
+            mock_user_api_key_dict = MagicMock(spec=UserAPIKeyAuth)
+            mock_user_api_key_dict.tpm_limit = None
+            mock_user_api_key_dict.rpm_limit = None
+            mock_user_api_key_dict.max_budget = None
+            mock_user_api_key_dict.spend = 0
+            mock_user_api_key_dict.auth_entries = auth_entries
+            headers = ProxyBaseLLMRequestProcessing.get_custom_headers(
+                user_api_key_dict=mock_user_api_key_dict, call_id="call-1"
+            )
+            return {name: value for name, value in headers.items() if name == "x-litellm-auth-entries"}
+
+        assert [sent_mark(value) for value in ("fresh", "last_good", None)] == [
+            {"x-litellm-auth-entries": "fresh"},
+            {"x-litellm-auth-entries": "last_good"},
+            {},
+        ]
+
     @pytest.mark.parametrize(
         ("hidden_params", "request_data", "expected_call_id"),
         [

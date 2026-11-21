@@ -4160,6 +4160,28 @@ def test_user_and_team_spend_and_budget_default_to_none_in_standard_logging_meta
     assert logging_metadata["user_api_key_team_max_budget"] is None
 
 
+@pytest.mark.parametrize("auth_entries", ["fresh", "last_good", None])
+def test_auth_entries_reach_the_request_metadata_and_the_standard_logging_metadata(auth_entries):
+    """
+    The proxy's own mark replaces whatever the caller sent under the same metadata key
+    """
+    from litellm.litellm_core_utils.litellm_logging import StandardLoggingPayloadSetup
+
+    user_api_key_dict = UserAPIKeyAuth()
+    user_api_key_dict.auth_entries = auth_entries
+
+    data = LiteLLMProxyRequestSetup.add_user_api_key_auth_to_request_metadata(
+        data={"metadata": {"user_api_key_auth_entries": "forged"}},
+        user_api_key_dict=user_api_key_dict,
+        _metadata_variable_name="metadata",
+    )
+    logging_metadata = StandardLoggingPayloadSetup.get_standard_logging_metadata(data["metadata"])
+
+    assert data["metadata"]["user_api_key_auth_entries"] == auth_entries
+    assert logging_metadata["user_api_key_auth_entries"] == auth_entries
+
+
+
 @pytest.mark.asyncio
 async def test_team_guardrails_append_to_key_guardrails():
     """

@@ -20,6 +20,7 @@ import secrets
 import traceback
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, Optional, Protocol, TypeVar, cast
 
@@ -57,6 +58,7 @@ from litellm.proxy.auth.auth_checks import (  # noqa: F401  # legacy module expo
     _delete_cache_key_object,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
     can_team_access_model,
     delete_cache_key_object,
+    delete_cache_key_objects,
     get_jwt_key_mapping_cache_keys_for_token,
     get_key_end_user_budget_id,
     get_org_object,
@@ -84,7 +86,12 @@ from litellm.proxy.common_utils.config_sync_pubsub import (
 )
 from litellm.proxy.common_utils.rbac_utils import check_org_admin_can_generate_keys
 from litellm.proxy.common_utils.timezone_utils import get_budget_reset_time
-from litellm.proxy.common_utils.user_api_key_cache import AUTH_OBJECTS_TARGET, UserApiKeyCache
+from litellm.proxy.common_utils.user_api_key_cache import (
+    AUTH_OBJECTS_TARGET,
+    UserApiKeyCache,
+    revoke_last_good,
+    revoke_last_good_then,
+)
 from litellm.proxy.hooks.key_management_event_hooks import KeyManagementEventHooks
 from litellm.proxy.hooks.model_max_budget_limiter import build_model_max_budget_usage
 from litellm.proxy.management.teams.authz import TEAM_ADMIN_ONLY, TEAM_OR_ORG_ADMIN, is_team_admin
@@ -489,6 +496,13 @@ class _LegacyDumpable(Protocol):
 
 def _legacy_model_dict(row: _LegacyDumpable) -> Mapping[str, object]:
     return row.dict()
+
+
+class _DumpableKeyRow(Protocol):
+    """A key to archive: the database's row, which the delete paths read, or the proxy's
+    ``LiteLLM_VerificationToken``. The archive copies its columns through ``model_dump``."""
+
+    def model_dump(self) -> Mapping[str, object]: ...
 
 
 def _as_object_dict(values: Mapping[str, object]) -> Mapping[str, object]:
@@ -2726,6 +2740,25 @@ def _resolve_token_to_update(data: UpdateKeyRequest, existing_key_row: LiteLLM_V
     return existing_key_row.token
 
 
+async def _revoke_key_if_update_ends_it(
+    data: UpdateKeyRequest,
+    non_default_values: Mapping[str, object],
+    existing_key_row: LiteLLM_VerificationToken,
+    user_api_key_cache: UserApiKeyCache,
+) -> tuple[str, ...]:
+    """A block, or an expiry moved to now or earlier, ends the key as a delete does: its last good entry is revoked
+    before the first write, again right before the key's own write, and the eviction after the write tombstones it
+    again. Returns the key's cache key, for the revocation paired with that write, or none when the update ends
+    nothing."""
+    expires: Final = non_default_values.get("expires")
+    ends_key: Final = data.blocked is True or (isinstance(expires, datetime) and expires <= datetime.now(timezone.utc))
+    if not ends_key:
+        return ()
+    ended_keys: Final = (hash_token_if_needed(_resolve_token_to_update(data=data, existing_key_row=existing_key_row)),)
+    await revoke_last_good(user_api_key_cache, ended_keys)
+    return ended_keys
+
+
 async def _process_single_key_update(
     update_key_request: UpdateKeyRequest,
     user_api_key_dict: UserAPIKeyAuth,
@@ -2887,15 +2920,21 @@ async def _process_single_key_update(
             detail={"error": "Database not connected"},
         )
 
+    ended_keys: Final = await _revoke_key_if_update_ends_it(
+        key_request, non_default_values, existing_key_row, user_api_key_cache
+    )
     update_values: Final = await _handle_update_object_permission(
         data_json=non_default_values,
         existing_key_row=existing_key_row,
         prisma_client=prisma_client,
     )
     _data: Final = {**update_values, "token": key_request.key}
+    # Revoked again right before the key's write, since the object permission write may outlast the revocation above
     response: Final[Mapping[str, object] | None] = cast(  # cast-ok: every update_data branch returns a str-keyed dict
         "Mapping[str, object] | None",
-        await prisma_client.update_data(token=key_request.key, data=_data),
+        await revoke_last_good_then(
+            user_api_key_cache, ended_keys, partial(prisma_client.update_data, token=key_request.key, data=_data)
+        ),
     )
 
     # Permission row first: a key-object miss between the two evictions would re-cache stale grants
@@ -2910,6 +2949,7 @@ async def _process_single_key_update(
         hashed_token=hash_token_if_needed(key_request.key),
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
+        revoked=bool(ended_keys),
     )
 
     # After the key's own cache entry is dropped, so a failure here cannot leave the key
@@ -3563,23 +3603,37 @@ async def update_key_fn(
         if prisma_client is None:
             raise Exception("Not connected to DB!")
 
+        ended_keys: Final = await _revoke_key_if_update_ends_it(
+            data, non_default_values, existing_key_row, user_api_key_cache
+        )
         update_values: Final = await _handle_update_object_permission(
             data_json=non_default_values,
             existing_key_row=existing_key_row,
             prisma_client=prisma_client,
         )
         changed_by: Final = user_api_key_dict.user_id or litellm_proxy_admin_name
+        # Revoked again right before the key's write, since the object permission write may outlast the revocation
+        # above; the soft budget's transaction opens right after it, its budget write before the key's in it
         response: Final = (
-            await _update_key_row_with_soft_budget(
-                prisma_client=prisma_client,
-                key=key,
-                data=data,
-                non_default_values=update_values,
-                existing_key_row=existing_key_row,
-                changed_by=changed_by,
+            await revoke_last_good_then(
+                user_api_key_cache,
+                ended_keys,
+                partial(
+                    _update_key_row_with_soft_budget,
+                    prisma_client=prisma_client,
+                    key=key,
+                    data=data,
+                    non_default_values=update_values,
+                    existing_key_row=existing_key_row,
+                    changed_by=changed_by,
+                ),
             )
             if "soft_budget" in data.model_fields_set
-            else await prisma_client.update_data(token=key, data=MappingProxyType({**update_values, "token": key}))
+            else await revoke_last_good_then(
+                user_api_key_cache,
+                ended_keys,
+                partial(prisma_client.update_data, token=key, data=MappingProxyType({**update_values, "token": key})),
+            )
         )
 
         # Delete - key from cache, since it's been updated!
@@ -3595,6 +3649,7 @@ async def update_key_fn(
             hashed_token=hash_token_if_needed(key),
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
+            revoked=bool(ended_keys),
         )
 
         # After the key's own cache entry is dropped, so a failure here cannot leave the key
@@ -5003,6 +5058,20 @@ async def can_modify_verification_token(
     return False
 
 
+async def _delete_each_key(prisma_client: PrismaClient, tokens: Sequence[str | None]) -> None:
+    """Delete each of ``tokens`` with a delete of its own, all at once, and raise the first failure only once every
+    delete has ended: some may commit while another fails, and the record of their tombstones after this write
+    (``revoke_last_good_then``) has to follow every delete that committed."""
+
+    async def delete_one(token: str | None) -> None:
+        await prisma_client.delete_data(tokens=[token])
+
+    outcomes: Final = await asyncio.gather(*(delete_one(token) for token in tokens), return_exceptions=True)
+    failure: Final = next((outcome for outcome in outcomes if isinstance(outcome, BaseException)), None)
+    if failure is not None:
+        raise failure
+
+
 @with_service_target(AUTH_OBJECTS_TARGET)
 async def delete_verification_tokens(
     tokens: list,
@@ -5028,7 +5097,7 @@ async def delete_verification_tokens(
                 - List of keys being deleted, this contains information about the key_alias, token, and user_id being deleted,
                 this is passed down to the KeyManagementEventHooks to delete the keys from the secret manager and handle audit logs
     """
-    from litellm.proxy.proxy_server import prisma_client
+    from litellm.proxy.proxy_server import prisma_client, proxy_logging_obj
 
     failed_tokens: list = []
     try:
@@ -5065,6 +5134,13 @@ async def delete_verification_tokens(
                             status_code=status.HTTP_403_FORBIDDEN,
                             detail={"error": "You are not authorized to delete this key"},
                         )
+            # The admin delete below matches every requested token, found by the read or not, so it revokes them all
+            revoked_tokens: Final = (
+                tuple(hashed_tokens)
+                if user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN.value
+                else tuple(key.token for key in authorized_keys if key.token is not None)
+            )
+            await revoke_last_good(user_api_key_cache, revoked_tokens)
             await persist_deleted_verification_tokens(
                 keys=authorized_keys,
                 prisma_client=prisma_client,
@@ -5089,13 +5165,22 @@ async def delete_verification_tokens(
                 for cache_key in keys_for_token
             )
 
+            # Revoked again right before the delete, since the archive write and the mapping reads above may outlast
+            # the revocation before them
             if user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN.value:
-                deleted_tokens = await prisma_client.delete_data(tokens=tokens)
+                deleted_tokens = await revoke_last_good_then(
+                    user_api_key_cache, revoked_tokens, partial(prisma_client.delete_data, tokens=tokens)
+                )
                 if deleted_tokens is not None and len(deleted_tokens) != len(tokens):
                     failed_tokens = [token for token in tokens if token not in deleted_tokens]
             else:
-                deletion_tasks: Final = [prisma_client.delete_data(tokens=[key.token]) for key in authorized_keys]
-                await asyncio.gather(*deletion_tasks)
+                # One revocation of every key before their deletes run together: a revocation in each gathered delete
+                # would run in a task of its own, which this request's record of its revocations does not reach
+                await revoke_last_good_then(
+                    user_api_key_cache,
+                    revoked_tokens,
+                    partial(_delete_each_key, prisma_client, tuple(key.token for key in authorized_keys)),
+                )
 
                 deleted_tokens = [key.token for key in authorized_keys]
                 if len(deleted_tokens) != len(tokens):
@@ -5112,11 +5197,12 @@ async def delete_verification_tokens(
         verbose_proxy_logger.debug(traceback.format_exc())
         raise e
 
-    for key in tokens:
-        user_api_key_cache.delete_cache(key)
-        # remove hash token from cache
-        hashed_token = hash_token(cast(str, key))
-        user_api_key_cache.delete_cache(hashed_token)
+    await delete_cache_key_objects(
+        hashed_tokens=hashed_tokens,
+        user_api_key_cache=user_api_key_cache,
+        proxy_logging_obj=proxy_logging_obj,
+        revoked=True,
+    )
 
     # After credential invalidation, so a failure here can never keep a deleted key alive.
     for deleted_key in authorized_keys:
@@ -5135,7 +5221,7 @@ async def delete_verification_tokens(
 
 
 def _transform_verification_tokens_to_deleted_records(
-    keys: Sequence[LiteLLM_VerificationToken],
+    keys: Sequence[_DumpableKeyRow],
     user_api_key_dict: UserAPIKeyAuth,
     litellm_changed_by: str | None = None,
 ) -> list[dict[str, object]]:
@@ -5210,7 +5296,7 @@ async def _save_deleted_verification_token_records(
 
 
 async def persist_deleted_verification_tokens(
-    keys: Sequence[LiteLLM_VerificationToken],
+    keys: Sequence[_DumpableKeyRow],
     prisma_client: PrismaClient,
     user_api_key_dict: UserAPIKeyAuth,
     litellm_changed_by: str | None = None,
@@ -5681,6 +5767,7 @@ async def _execute_virtual_key_regeneration(
             request=data if data is not None else RegenerateKeyRequest(),
         ),
     )
+    await revoke_last_good(user_api_key_cache, (hashed_api_key,))
     update_values: Final = await _handle_update_object_permission(
         data_json=non_default_values,
         existing_key_row=key_in_db,
@@ -5711,11 +5798,16 @@ async def _execute_virtual_key_regeneration(
         grace_period=data.grace_period if data else None,
     )
 
-    updated_token: Final[LiteLLM_VerificationToken | None] = await _prisma_table(
-        VerificationTokenRepository(prisma_client)
-    ).update(
-        where={"token": hashed_api_key},
-        data=with_settings_updated_at(jsonified_update_data),
+    # Revoked again right before the old hash's rewrite, since the permission, archive and grace period writes above may
+    # outlast the revocation before them
+    updated_token: Final[LiteLLM_VerificationToken | None] = await revoke_last_good_then(
+        user_api_key_cache,
+        (hashed_api_key,),
+        partial(
+            _prisma_table(VerificationTokenRepository(prisma_client)).update,
+            where={"token": hashed_api_key},
+            data=with_settings_updated_at(jsonified_update_data),
+        ),
     )
     updated_token_dict: Final[dict[str, object]] = dict(updated_token) if updated_token is not None else {}
     updated_token_dict["key"] = new_token
@@ -5733,6 +5825,7 @@ async def _execute_virtual_key_regeneration(
             hashed_token=hash_token_if_needed(key),
             user_api_key_cache=user_api_key_cache,
             proxy_logging_obj=proxy_logging_obj,
+            revoked=True,
         )
 
     await evict_and_broadcast(cache_keys=jwt_mapping_cache_keys, user_api_key_cache=user_api_key_cache)
@@ -7430,6 +7523,8 @@ async def block_key(
             code=status.HTTP_404_NOT_FOUND,
         )
 
+    await revoke_last_good(user_api_key_cache, (hashed_token,))
+
     if is_audit_logging_enabled():
         asyncio.create_task(
             create_audit_log_for_update(
@@ -7451,9 +7546,16 @@ async def block_key(
             )
         )
 
-    record: Final = await _prisma_table(VerificationTokenRepository(prisma_client)).update(
-        where={"token": hashed_token},
-        data=with_settings_updated_at({"blocked": True}),
+    # Revoked right before the update and recorded again after it, also when the update raises: its commit may have
+    # reached the database
+    record: Final = await revoke_last_good_then(
+        user_api_key_cache,
+        (hashed_token,),
+        partial(
+            _prisma_table(VerificationTokenRepository(prisma_client)).update,
+            where={"token": hashed_token},
+            data=with_settings_updated_at({"blocked": True}),
+        ),
     )
 
     ## UPDATE KEY CACHE - invalidate so next read re-fetches from DB
@@ -7461,6 +7563,7 @@ async def block_key(
         hashed_token=hashed_token,
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
+        revoked=True,
     )
 
     return record

@@ -1952,6 +1952,14 @@ LITELLM_SETTINGS_SAFE_DB_OVERRIDES: Final = [
 ]
 SPECIAL_LITELLM_AUTH_TOKEN: Final = ["ui-token"]
 DEFAULT_MANAGEMENT_OBJECT_IN_MEMORY_CACHE_TTL = int(os.getenv("DEFAULT_MANAGEMENT_OBJECT_IN_MEMORY_CACHE_TTL", 60))
+LAST_GOOD_AUTH_ENTRIES_IN_MEMORY: Final = int(os.getenv("LAST_GOOD_AUTH_ENTRIES_IN_MEMORY", "10000"))
+# Bounds how old a last good auth entry served while the database is unreachable can be, from its database read.
+LAST_GOOD_ENTRY_TTL_SECONDS: Final = int(os.getenv("LAST_GOOD_ENTRY_TTL_SECONDS", "600"))
+# A value served from a last good entry is cached this briefly, so the copy cannot outlive the entry by much.
+LAST_GOOD_SERVED_COPY_TTL_SECONDS: Final = 30
+# The record of a strict write's tombstones after it waits at most this long for Redis, then gives up, logged.
+LAST_GOOD_RECORD_TIMEOUT_SECONDS: Final = 5
+LAST_GOOD_TOMBSTONE_TTL_SECONDS: Final = int(os.getenv("LAST_GOOD_TOMBSTONE_TTL_SECONDS", "600"))
 DEFAULT_ACCESS_GROUP_CACHE_TTL: Final = int(os.getenv("DEFAULT_ACCESS_GROUP_CACHE_TTL", 600))
 SPEND_LOG_KEY_METADATA_CACHE_TTL: Final = 600
 SPEND_LOG_KEY_METADATA_MISS_CACHE_TTL: Final = 30

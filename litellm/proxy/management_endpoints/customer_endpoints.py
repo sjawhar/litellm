@@ -13,6 +13,8 @@ All /customer management endpoints
 from collections.abc import Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from datetime import datetime, timedelta
+from functools import partial
+from itertools import chain
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, NamedTuple, Protocol, TypeVar, overload
 
@@ -30,10 +32,14 @@ import litellm
 from litellm._logging import verbose_proxy_logger
 from litellm.litellm_core_utils.duration_parser import duration_in_seconds
 from litellm.proxy._types import *
+from litellm.proxy.auth.auth_checks import END_USER_RESTRICTION_COLUMNS, end_user_row_is_restricted
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.user_api_key_cache import (
     end_user_cache_key,
     end_user_restricted_registry_cache_key,
+    end_user_validation_cache_key,
+    revoke_last_good,
+    revoke_last_good_then,
 )
 from litellm.proxy.management_endpoints.common_daily_activity import get_daily_activity
 from litellm.proxy.management_endpoints.common_utils import validate_budget_duration
@@ -134,8 +140,14 @@ async def _evict_end_user_cache_keys(cache_keys: Sequence[str]) -> None:
 
 
 def _end_user_cache_keys(user_ids: Sequence[str]) -> tuple[str, ...]:
-    """The per-id entries plus the registry, which any restriction change can move ids in or out of."""
-    return (*(end_user_cache_key(user_id) for user_id in user_ids), end_user_restricted_registry_cache_key())
+    """The per-id entries, the per-id validation verdicts, whose cached "invalid" would drop a customer just created,
+    and the registry, which any restriction change can move ids in or out of."""
+    return (
+        *chain.from_iterable(
+            (end_user_cache_key(user_id), end_user_validation_cache_key(user_id)) for user_id in user_ids
+        ),
+        end_user_restricted_registry_cache_key(),
+    )
 
 
 def _to_customer_response(record: BaseModel) -> CustomerResponse:
@@ -177,18 +189,27 @@ async def block_user(data: BlockUsers):
         }'
         ```
     """
-    from litellm.proxy.proxy_server import prisma_client
+    from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
 
+    if prisma_client is not None:
+        await revoke_last_good(user_api_key_cache, _end_user_cache_keys(data.user_ids))
     try:
         records: Final = []
         if prisma_client is not None:
             for id in data.user_ids:
-                record = await _typed_table(EndUserRepository(prisma_client)).upsert(
-                    where={"user_id": id},
-                    data={
-                        "create": {"user_id": id, "blocked": True},
-                        "update": {"blocked": True},
-                    },
+                # Its customer's entries and the registry are revoked again right before its upsert: an earlier
+                # customer's upsert may have outlasted the tombstones of the revocation above
+                record = await revoke_last_good_then(
+                    user_api_key_cache,
+                    _end_user_cache_keys((id,)),
+                    partial(
+                        _typed_table(EndUserRepository(prisma_client)).upsert,
+                        where={"user_id": id},
+                        data={
+                            "create": {"user_id": id, "blocked": True},
+                            "update": {"blocked": True},
+                        },
+                    ),
                 )
                 records.append(record)
             await _evict_end_user_cache_keys(_end_user_cache_keys(data.user_ids))
@@ -200,6 +221,8 @@ async def block_user(data: BlockUsers):
 
         return {"blocked_users": records}
     except Exception as e:
+        if isinstance(e, HTTPException) and e.status_code == 503:
+            raise  # only a revocation answers 503 here, before its customer's upsert: the operator retries
         verbose_proxy_logger.error("An error occurred - %s", e)
         raise HTTPException(status_code=500, detail={"error": str(e)})
 
@@ -419,6 +442,7 @@ async def new_end_user(
         litellm_proxy_admin_name,
         llm_router,
         prisma_client,
+        user_api_key_cache,
     )
 
     if prisma_client is None:
@@ -444,8 +468,19 @@ async def new_end_user(
 
         new_end_user_obj: dict[str, object] = {}
 
-        ## CREATE BUDGET ## if set
         _new_budget: Final = new_budget_request(data)
+        _user_data: Final = _STR_OBJECT_DICT.validate_python(data.dict(exclude_none=True))
+        # The row as it will be written: a budget created or named here links by budget_id, an object permission by
+        # object_permission_id. When the restricted registry would hold it, the registry and the id's entry are revoked
+        # before any write, as for a block, so neither Redis failing at the eviction nor a registry read in flight
+        # keeps a copy that leaves this customer out
+        restricted: Final = end_user_row_is_restricted(
+            {**_user_data, "budget_id": _new_budget or data.budget_id, "object_permission_id": data.object_permission}
+        )
+        if restricted:
+            await revoke_last_good(user_api_key_cache, _end_user_cache_keys((data.user_id,)))
+
+        ## CREATE BUDGET ## if set
         if _new_budget is not None:
             try:
                 budget_record: Final = await _typed_table(BudgetRepository(prisma_client)).create(
@@ -461,8 +496,6 @@ async def new_end_user(
             new_end_user_obj["budget_id"] = budget_record.budget_id
         elif data.budget_id is not None:
             new_end_user_obj["budget_id"] = data.budget_id
-
-        _user_data: Final = _STR_OBJECT_DICT.validate_python(data.dict(exclude_none=True))
 
         for k, v in _user_data.items():
             if k not in BudgetNewRequest.model_fields:
@@ -486,9 +519,16 @@ async def new_end_user(
             new_end_user_obj.pop("object_permission", None)
 
         ## WRITE TO DB ##
-        end_user_record: Final = await _typed_table(EndUserRepository(prisma_client)).create(
-            data=new_end_user_obj,
-            include={"litellm_budget_table": True, "object_permission": True},
+        # Revoked again right before the write that adds the customer to the registry: the budget and permission
+        # writes above may have outlasted the tombstones of the first revocation
+        end_user_record: Final = await revoke_last_good_then(
+            user_api_key_cache,
+            _end_user_cache_keys((data.user_id,)) if restricted else (),
+            partial(
+                _typed_table(EndUserRepository(prisma_client)).create,
+                data=new_end_user_obj,
+                include={"litellm_budget_table": True, "object_permission": True},
+            ),
         )
 
         await _evict_end_user_cache_keys(_end_user_cache_keys((data.user_id,)))
@@ -663,7 +703,7 @@ async def update_end_user(
     ```
     """
 
-    from litellm.proxy.proxy_server import litellm_proxy_admin_name, prisma_client
+    from litellm.proxy.proxy_server import litellm_proxy_admin_name, prisma_client, user_api_key_cache
 
     try:
         data_json: Final = _STR_OBJECT_DICT.validate_python(data.json())
@@ -706,6 +746,19 @@ async def update_end_user(
 
             elif k in LiteLLM_EndUserTable.model_fields:
                 update_end_user_table_data[k] = v
+
+        # The row columns this update writes: an object permission links by object_permission_id, and a budget it
+        # creates by budget_id. When one is a column the restricted registry reads, the registry and the customer's
+        # entry are revoked before any write, as for a block, so neither Redis failing at the eviction nor a registry
+        # read in flight keeps a copy from before the change
+        written_columns: Final = {
+            *update_end_user_table_data,
+            *(("object_permission_id",) if "object_permission" in non_default_values else ()),
+            *(("budget_id",) if budget_table_data and end_user_budget_table is None else ()),
+        }
+        writes_restriction: Final = not END_USER_RESTRICTION_COLUMNS.isdisjoint(written_columns)
+        if writes_restriction:
+            await revoke_last_good(user_api_key_cache, _end_user_cache_keys((data.user_id,)))
 
         ## Handle object permission updates (MCP servers, vector stores, etc.)
         await _handle_customer_object_permission_update(
@@ -751,10 +804,17 @@ async def update_end_user(
         if data.user_id is not None and len(data.user_id) > 0:
             update_end_user_table_data["user_id"] = data.user_id
             verbose_proxy_logger.debug("In update customer, user_id condition block.")
-            response: Final = await _typed_table(EndUserRepository(prisma_client)).update(
-                where={"user_id": data.user_id},
-                data=update_end_user_table_data,
-                include={"litellm_budget_table": True, "object_permission": True},
+            # Revoked again right before the write that moves the customer in the registry: the permission and budget
+            # writes above may have outlasted the tombstones of the first revocation
+            response: Final = await revoke_last_good_then(
+                user_api_key_cache,
+                _end_user_cache_keys((data.user_id,)) if writes_restriction else (),
+                partial(
+                    _typed_table(EndUserRepository(prisma_client)).update,
+                    where={"user_id": data.user_id},
+                    data=update_end_user_table_data,
+                    include={"litellm_budget_table": True, "object_permission": True},
+                ),
             )
             if response is None:
                 raise ValueError(f"Failed updating customer data. User ID does not exist passed user_id={data.user_id}")
@@ -807,7 +867,7 @@ async def delete_end_user(
     See below for all params 
     ```
     """
-    from litellm.proxy.proxy_server import prisma_client
+    from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
 
     try:
         if prisma_client is None:
@@ -830,9 +890,15 @@ async def delete_end_user(
                     param="user_ids",
                 )
 
-            # All users exist, proceed with deletion
-            response: Final = await _typed_table(EndUserRepository(prisma_client)).delete_many(
-                where={"user_id": {"in": data.user_ids}}
+            # A deleted customer falls back to the default end-user budget and leaves the restricted registry, so its
+            # entries are revoked right before the delete, as for a block, and recorded again after it
+            response: Final = await revoke_last_good_then(
+                user_api_key_cache,
+                _end_user_cache_keys(data.user_ids),
+                partial(
+                    _typed_table(EndUserRepository(prisma_client)).delete_many,
+                    where={"user_id": {"in": data.user_ids}},
+                ),
             )
             verbose_proxy_logger.debug("received response from updating prisma client. response=%s", response)
 

@@ -2920,6 +2920,9 @@ class AdapterCompletionStreamWrapper:
             raise StopAsyncIteration
 
 
+AuthEntriesSource: TypeAlias = Literal["fresh", "last_good"]
+
+
 class StandardLoggingUserAPIKeyMetadata(TypedDict):
     user_api_key_hash: str | None  # hash of the litellm virtual key used
     user_api_key_alias: str | None
@@ -2941,6 +2944,7 @@ class StandardLoggingUserAPIKeyMetadata(TypedDict):
     user_api_key_end_user_id: str | None
     user_api_key_request_route: str | None
     user_api_key_auth_metadata: dict[str, str] | None
+    user_api_key_auth_entries: NotRequired[ReadOnly[AuthEntriesSource | None]]
 
 
 class StandardLoggingMCPToolCall(TypedDict, total=False):

@@ -19,6 +19,7 @@ import fastapi
 import orjson
 from fastapi import HTTPException, Request, WebSocket, status
 from fastapi.security.api_key import APIKeyHeader
+from pydantic import BaseModel, ConfigDict
 from starlette.exceptions import WebSocketException
 
 import litellm
@@ -76,6 +77,8 @@ from litellm.proxy.auth.auth_checks import (  # noqa: F401  # legacy module expo
     is_valid_fallback_model,
     jwt_key_mapping_cache_key,
     key_model_aliases_for_auth_check,
+    recall_last_good_after,
+    recall_last_good_limits_after,
     resolve_and_validate_end_user_id,
     resolve_default_end_user_budget,
     team_member_max_budget_alert_check,
@@ -148,12 +151,19 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     UserApiKeyCache,
     end_user_cache_key,
     end_user_restricted_registry_cache_key,
+    forget_missing_last_good,
+    last_good_auth_entries_scope,
+    mark_last_good_read_start,
     model_access_group_registry_cache_key,
+    remember_last_good,
+    serves_last_good_entries,
+    start_last_good_reads,
     team_membership_auth_cache_key,
 )
 from litellm.proxy.db.db_lookup_gate import bounded_db_lookup
 from litellm.proxy.db.db_span import db_span
-from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
+from litellm.proxy.db.exception_handler import LastGoodEntryMissing, PrismaDBExceptionHandler
+from litellm.proxy.db.routing_prisma_wrapper import pin_reads_to_writer
 from litellm.proxy.litellm_pre_call_utils import LiteLLMProxyRequestSetup
 from litellm.proxy.spend_tracking.carried_budget_state import carry_team_and_user_budget_state
 from litellm.proxy.spend_tracking.spend_counter_batch import (
@@ -171,6 +181,7 @@ from litellm.repositories.verification_token_repository import VerificationToken
 from litellm.router_utils.common_utils import resolve_model_group_alias
 from litellm.secret_managers.main import get_secret_bool
 from litellm.types.services import ServiceTypes
+from litellm.types.utils import AuthEntriesSource
 
 try:
     from litellm_enterprise.proxy.auth.user_api_key_auth import (
@@ -761,6 +772,14 @@ def update_valid_token_with_end_user_params(valid_token: UserAPIKeyAuth, end_use
 _global_spend_coordinator: Final = EventDrivenCacheCoordinator(log_prefix="[GLOBAL SPEND]")
 
 
+class _ProxyBudgetSpend(BaseModel):
+    """The proxy budget row's spend when the database last answered for it."""
+
+    model_config = ConfigDict(frozen=True)
+
+    spend: float
+
+
 async def fetch_global_spend_with_event_coordination(
     cache_key: str,
     user_api_key_cache: UserApiKeyCache,
@@ -772,6 +791,9 @@ async def fetch_global_spend_with_event_coordination(
 
     Reads the proxy budget aggregate user row, which accrues proxy-wide spend
     per request and is zeroed by ResetBudgetJob every ``litellm.budget_duration``.
+    While the database is unreachable, the spend it last returned answers. That answer is recalled by each request
+    after the shared load fails, never cached by the coordinator, so every request served from it records the recall
+    in its own ``last_good_auth_entries_scope``.
     """
 
     async def _load_global_spend() -> float | None:
@@ -779,13 +801,24 @@ async def fetch_global_spend_with_event_coordination(
             prisma_client.db.litellm_usertable.find_unique(where={"user_id": LITELLM_PROXY_BUDGET_NAME}),
             name="proxy_budget",
         )
-        return float(proxy_budget_row.spend) if proxy_budget_row is not None else None
+        if proxy_budget_row is None:
+            await forget_missing_last_good(user_api_key_cache, cache_key)
+            return None
+        spend: Final = float(proxy_budget_row.spend)
+        await remember_last_good(user_api_key_cache, cache_key, _ProxyBudgetSpend(spend=spend))
+        return spend
 
-    return await _global_spend_coordinator.get_or_load(
-        cache_key=cache_key,
-        cache=user_api_key_cache,  # pyright: ignore[reportArgumentType]
-        load_fn=_load_global_spend,
-    )
+    try:
+        return await _global_spend_coordinator.get_or_load(
+            cache_key=cache_key,
+            cache=user_api_key_cache,  # pyright: ignore[reportArgumentType]
+            load_fn=_load_global_spend,
+        )
+    except Exception as e:
+        served: Final = await recall_last_good_limits_after(e, user_api_key_cache, cache_key, _ProxyBudgetSpend)
+        if served is None:
+            raise
+        return served.spend
 
 
 _fetch_global_spend_with_event_coordination: Final = fetch_global_spend_with_event_coordination
@@ -1781,7 +1814,10 @@ async def user_api_key_auth_builder(
                     # standard JWT auth_builder below
 
                 if do_standard_jwt_auth:
-                    with tracer.trace("litellm.proxy.auth.jwt_auth_builder"):
+                    with (
+                        tracer.trace("litellm.proxy.auth.jwt_auth_builder"),
+                        last_good_auth_entries_scope() as jwt_auth_scope,
+                    ):
                         result: Final = await JWTAuthManager.auth_builder(
                             request_data=request_data,
                             general_settings=general_settings,
@@ -1824,7 +1860,9 @@ async def user_api_key_auth_builder(
                         # DB mapping lookup in _resolve_jwt_to_virtual_key.
                         # Without this, every proxy-admin request under
                         # AUTO_REGISTER re-hits get_jwt_key_mapping_object.
-                        if pending_auto_register is not None:
+                        # Not cached when auth_builder served a last good entry, which the role may rest on: the marker
+                        # would skip the mapping lookup and key reuse once the database answers with the current role
+                        if pending_auto_register is not None and not jwt_auth_scope.served:
                             await user_api_key_cache.async_set_cache(
                                 key=pending_auto_register.cache_key,
                                 value=_JWT_PROXY_ADMIN_SENTINEL,
@@ -1978,6 +2016,8 @@ async def user_api_key_auth_builder(
         ## Check END-USER OBJECT
         _end_user_object = None
         end_user_params: Final = {}
+        # Records whether the end user's limits came from a last good entry, so the master key object is not cached
+        end_user_scope: Final = last_good_auth_entries_scope()
 
         raw_end_user_id: Final = get_end_user_id_from_request_body(request_data, safe_get_request_headers(request))
         end_user_id = await resolve_and_validate_end_user_id(
@@ -1997,7 +2037,7 @@ async def user_api_key_auth_builder(
             try:
                 end_user_params["end_user_id"] = end_user_id
 
-                with tracer.trace("litellm.proxy.auth.get_end_user_object"):
+                with tracer.trace("litellm.proxy.auth.get_end_user_object"), end_user_scope:
                     _end_user_object = await get_end_user_object(
                         end_user_id=end_user_id,
                         prisma_client=prisma_client,
@@ -2020,11 +2060,12 @@ async def user_api_key_auth_builder(
                         get_default_end_user_budget,
                     )
 
-                    default_budget: Final = await get_default_end_user_budget(
-                        prisma_client=prisma_client,
-                        user_api_key_cache=user_api_key_cache,
-                        parent_otel_span=parent_otel_span,
-                    )
+                    with end_user_scope:
+                        default_budget: Final = await get_default_end_user_budget(
+                            prisma_client=prisma_client,
+                            user_api_key_cache=user_api_key_cache,
+                            parent_otel_span=parent_otel_span,
+                        )
                     if default_budget is not None:
                         _apply_budget_limits_to_end_user_params(
                             end_user_params=end_user_params,
@@ -2032,7 +2073,9 @@ async def user_api_key_auth_builder(
                             end_user_id=end_user_id,
                         )
             except Exception as e:
-                if isinstance(e, litellm.BudgetExceededError):
+                # A customer or default budget the database cannot read and no last good entry holds refuses the
+                # call, as on the virtual key path, rather than letting it go on without that customer's limits
+                if isinstance(e, (litellm.BudgetExceededError, LastGoodEntryMissing)):
                     raise e
                 verbose_proxy_logger.debug("Unable to find user in db. Error - %s", e)
 
@@ -2179,14 +2222,17 @@ async def user_api_key_auth_builder(
                 route=route,
                 start_time=start_time,
             )
-            asyncio.create_task(
-                cache_key_object(
-                    hashed_token=hash_token(master_key),
-                    user_api_key_obj=_user_api_key_obj,
-                    user_api_key_cache=user_api_key_cache,
-                    proxy_logging_obj=proxy_logging_obj,
+            # Not cached when the end user's limits came from a last good entry: the merge for a later master key call
+            # keeps every limit its own end user leaves unset, and that call would read fresh
+            if not end_user_scope.served:
+                asyncio.create_task(
+                    cache_key_object(
+                        hashed_token=hash_token(master_key),
+                        user_api_key_obj=_user_api_key_obj,
+                        user_api_key_cache=user_api_key_cache,
+                        proxy_logging_obj=proxy_logging_obj,
+                    )
                 )
-            )
 
             _user_api_key_obj = update_valid_token_with_end_user_params(
                 valid_token=_user_api_key_obj, end_user_params=end_user_params
@@ -2404,29 +2450,9 @@ async def validate_resolved_virtual_key(  # noqa: C901  # Preserve ordering of e
             _user_id: Final = valid_token.user_id
             _team_id: Final = valid_token.team_id
             if prisma_client is not None and _user_id is not None and _team_id is not None:
-                _cache_key: Final = team_membership_auth_cache_key(team_id=_team_id, user_id=_user_id)
-
-                team_member_info = await user_api_key_cache.async_get_cache(
-                    key=_cache_key,
-                    model_type=LiteLLM_TeamMembership,
+                team_member_info: Final = await _read_team_membership(
+                    prisma_client, user_api_key_cache, team_id=_team_id, user_id=_user_id
                 )
-                if team_member_info is None:
-                    # read from DB
-                    _db_member: Final = await TeamMembershipRepository(prisma_client).table.find_first(
-                        where={
-                            "user_id": _user_id,
-                            "team_id": _team_id,
-                        },
-                        include={"litellm_budget_table": True},
-                    )
-                    if _db_member is not None:
-                        team_member_info = LiteLLM_TeamMembership.model_validate(_db_member.model_dump())
-                        await user_api_key_cache.async_set_cache(
-                            key=_cache_key,
-                            value=team_member_info,
-                            model_type=LiteLLM_TeamMembership,
-                            ttl=5,
-                        )
 
                 if team_member_info is not None and team_member_info.litellm_budget_table is not None:
                     team_member_budget: Final = team_member_info.litellm_budget_table.effective_max_budget(
@@ -2595,7 +2621,11 @@ async def validate_resolved_virtual_key(  # noqa: C901  # Preserve ordering of e
                         parent_otel_span=parent_otel_span,
                         proxy_logging_obj=proxy_logging_obj,
                     )
-            except HTTPException:
+            except HTTPException as team_lookup_error:
+                if serves_last_good_entries(
+                    user_api_key_cache
+                ) and PrismaDBExceptionHandler.is_database_unreachable_error(team_lookup_error):
+                    raise
                 token_team_models: Final = _token_team_models(valid_token)
                 _team_obj = LiteLLM_TeamTableCachedObj(
                     team_id=valid_token.team_id,
@@ -2758,7 +2788,9 @@ def _team_obj_from_token(valid_token: UserAPIKeyAuth) -> LiteLLM_TeamTableCached
     )
 
 
-def _token_can_vouch_for_team(valid_token: UserAPIKeyAuth, lookup_error: BaseException) -> bool:
+def _token_can_vouch_for_team(
+    valid_token: UserAPIKeyAuth, lookup_error: BaseException, *, serving_last_good: bool = False
+) -> bool:
     """Whether the token's own team fields may stand in for a team that failed to
     resolve, without widening access.
 
@@ -2771,6 +2803,10 @@ def _token_can_vouch_for_team(valid_token: UserAPIKeyAuth, lookup_error: BaseExc
     not a degraded read, so nothing may stand in for it and no setting may
     override that.
 
+    While last good entries are served and the database is unreachable, the team's own last good entry is the
+    authority: the token itself may be a last good entry older than the block or delete that dropped the team's,
+    so it may not stand in either.
+
     Otherwise the team's grant is merely unknown. A token carrying one may vouch,
     since replaying a recorded grant cannot widen it and denying every team key
     while the row is briefly unreadable would trade the widening for an outage. A
@@ -2782,6 +2818,8 @@ def _token_can_vouch_for_team(valid_token: UserAPIKeyAuth, lookup_error: BaseExc
     if valid_token.team_id == UI_TEAM_ID:
         return True
     if isinstance(lookup_error, TeamNotFoundError):
+        return False
+    if serving_last_good and PrismaDBExceptionHandler.is_database_unreachable_error(lookup_error):
         return False
     if valid_token.team_models:
         return True
@@ -3052,7 +3090,9 @@ async def run_centralized_common_checks(
         # _team_obj_from_token asserts that precondition.
         if user_api_key_auth_obj.team_id is None:
             team_object = None
-        elif _token_can_vouch_for_team(user_api_key_auth_obj, team_result):
+        elif _token_can_vouch_for_team(
+            user_api_key_auth_obj, team_result, serving_last_good=serves_last_good_entries(user_api_key_cache)
+        ):
             team_object = _team_obj_from_token(user_api_key_auth_obj)
         else:
             raise team_result
@@ -3452,6 +3492,14 @@ def _spend_counter_redis_cache() -> RedisCache | None:
     return spend_counter_cache.redis_cache
 
 
+def _auth_entries_source(scope: last_good_auth_entries_scope) -> AuthEntriesSource | None:
+    from litellm.proxy.proxy_server import user_api_key_cache
+
+    if not serves_last_good_entries(user_api_key_cache):
+        return None
+    return "last_good" if scope.served else "fresh"
+
+
 def _identity_cache_keys(api_key: str, *, end_user_id: str | None, key_is_resolved: bool) -> tuple[str, ...]:
     """Cache keys auth reads before it knows the key's owners, all known from the request alone. A key object is
     cached under the hash of the bearer, so the bearer itself never reaches Redis."""
@@ -3465,6 +3513,36 @@ def _identity_cache_keys(api_key: str, *, end_user_id: str | None, key_is_resolv
         )
         if key is not None
     )
+
+
+async def _read_team_membership(
+    prisma_client: PrismaClient, user_api_key_cache: UserApiKeyCache, *, team_id: str, user_id: str
+) -> LiteLLM_TeamMembership | None:
+    """The member's membership row: the short-lived cache, else the database, else, while the database is
+    unreachable, the last good entry it returned."""
+    cache_key: Final = team_membership_auth_cache_key(team_id=team_id, user_id=user_id)
+    cached: Final = await user_api_key_cache.async_get_cache(key=cache_key, model_type=LiteLLM_TeamMembership)
+    if cached is not None:
+        return cached
+    # Not deadline-bounded, so it records its own start for a call outside a request
+    mark_last_good_read_start()
+    try:
+        db_member: Final = await TeamMembershipRepository(prisma_client).table.find_first(
+            where={"user_id": user_id, "team_id": team_id},
+            include={"litellm_budget_table": True},
+        )
+    except Exception as e:
+        served: Final = await recall_last_good_after(e, user_api_key_cache, cache_key, LiteLLM_TeamMembership)
+        if served is None:
+            raise
+        return served
+    if db_member is None:
+        await forget_missing_last_good(user_api_key_cache, cache_key)
+        return None
+    member: Final = LiteLLM_TeamMembership.model_validate(db_member.model_dump())
+    await user_api_key_cache.async_set_cache(key=cache_key, value=member, model_type=LiteLLM_TeamMembership, ttl=5)
+    await remember_last_good(user_api_key_cache, cache_key, member)
+    return member
 
 
 async def _prefetch_referenced_auth_objects(
@@ -3520,6 +3598,40 @@ def _seed_request_destinations(user_api_key_dict: UserAPIKeyAuth, request: Reque
         verbose_proxy_logger.debug("OTel V2: tenant destination resolution failed: %s", exc)
 
 
+# Route families whose writes can end access: deleting, blocking, deactivating or narrowing a key, team, user,
+# organization, project, customer, agent, UI session or JWT key mapping
+_ACCESS_ENDING_ROUTE_PREFIXES: Final = (
+    "/key/",
+    "/team/",
+    "/user/",
+    "/organization/",
+    "/v2/organization/",
+    "/project/",
+    "/customer/",
+    "/end_user/",
+    "/scim/v2/",
+    "/jwt/key/mapping/",
+    "/management/v1/",
+    "/v1/agents",
+    "/session/",
+)
+_READ_ONLY_METHODS: Final = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def _request_can_end_access(request: Request) -> bool:
+    """While last good entries are served, a write to a management route that can end access reads from the writer,
+    so a lagging read replica cannot pick what it revokes."""
+    from litellm.proxy.proxy_server import user_api_key_cache
+
+    return (
+        # The auth cache can be a plain DualCache, which keeps no last good entries
+        serves_last_good_entries(user_api_key_cache)
+        # A request whose method cannot be read counts as a write, so it reads the writer
+        and RouteChecks.get_request_method(request=request) not in _READ_ONLY_METHODS
+        and get_request_route(request=request).startswith(_ACCESS_ENDING_ROUTE_PREFIXES)
+    )
+
+
 @tracer.wrap()
 async def user_api_key_auth(
     request: Request,
@@ -3533,6 +3645,12 @@ async def user_api_key_auth(
     """
     Parent function to authenticate user api key / jwt token.
     """
+
+    # Every auth read and last good store of this request, and of every task it creates, counts from here; set anew even
+    # when the context holds a start, so an earlier request's start never reaches these reads
+    start_last_good_reads()
+    # Its reads, from here on and in every task it creates, go to the writer when it can end access; set anew as well
+    pin_reads_to_writer(_request_can_end_access(request))
 
     # Create the SERVER span and stash it on request.state BEFORE reading the
     # body. _read_request_body can raise ProxyException for malformed JSON;
@@ -3553,6 +3671,7 @@ async def user_api_key_auth(
         phase_span(f"auth {route}"),
         service_target(AUTH_OBJECTS_TARGET),
         spend_counter_batch_scope(_spend_counter_redis_cache()),
+        last_good_auth_entries_scope() as auth_entries_scope,
     ):
         try:
             user_api_key_auth_obj: Final = await user_api_key_auth_builder(
@@ -3592,7 +3711,10 @@ async def user_api_key_auth(
                 api_key=api_key,
             )
             if recovered_auth_obj is not None:
+                recovered_auth_obj.auth_entries = _auth_entries_source(auth_entries_scope)
                 return recovered_auth_obj
+
+    user_api_key_auth_obj.auth_entries = _auth_entries_source(auth_entries_scope)
 
     # Identity is now resolved. Seed it AFTER the auth span closes so the Baggage
     # persists on the request task (detaching the span's context token inside the
@@ -3787,7 +3909,8 @@ async def _lookup_end_user_and_apply_budget(
                 if valid_token.end_user_max_budget is None:
                     valid_token.end_user_max_budget = default_budget.max_budget
     except Exception as e:
-        if isinstance(e, litellm.BudgetExceededError):
+        # As in the builder: a customer or default budget with no last good entry in an outage refuses the call
+        if isinstance(e, (litellm.BudgetExceededError, LastGoodEntryMissing)):
             raise e
         verbose_proxy_logger.debug("Unable to find user in db. Error - %s", e)
     return valid_token, end_user_object

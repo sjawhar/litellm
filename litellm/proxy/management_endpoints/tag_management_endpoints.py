@@ -481,6 +481,9 @@ async def update_tag(
             "message": f"Tag {tag.name} updated successfully",
             "tag": tag_config,
         }
+    except HTTPException:
+        # keep its status: a missing tag stays a 404 and a refused budget value a 400, not a 500
+        raise
     except Exception as e:
         verbose_proxy_logger.exception("Error updating tag: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
