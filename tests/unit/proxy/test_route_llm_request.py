@@ -1,7 +1,9 @@
 import pytest
 
 
-from types import SimpleNamespace
+import itertools
+from collections.abc import Iterator, Mapping
+from types import MappingProxyType, SimpleNamespace
 from typing import Final
 from unittest.mock import MagicMock
 
@@ -516,6 +518,139 @@ async def test_route_request_router_settings_override_fallbacks_on_anthropic_mes
     assert call_kwargs.get("fallbacks") == expected_fallbacks
     assert call_kwargs.get("router_fallbacks") == expected_router_fallbacks
     assert call_kwargs["num_retries"] == 3
+
+
+# -- Which list a router_settings_override promotes into the call, and under which keyword, written out by hand ------
+
+# The list each token names, at the body's root or in the override; a token the request does not carry is "absent"
+_PROMOTION_VALUES: Final[Mapping[str, tuple[Mapping[str, object], ...] | None]] = MappingProxyType(
+    {
+        "the-requests": ({"requested": ["from-the-request"]},),
+        "the-saved": ({"requested": ["from-the-saved-settings"]},),
+        "empty": (),
+        "null": None,
+    }
+)
+# (the field at the body's root, the override's, the field the call ends with): the request's own field wins, a null it
+# carries included, an empty override list is promoted, and a null one is not
+_PROMOTED_INTO_ITS_OWN_FIELD: Final = (
+    ("absent", "the-saved", "the-saved"),
+    ("absent", "empty", "empty"),
+    ("absent", "null", "absent"),
+    ("the-requests", "the-saved", "the-requests"),
+    ("the-requests", "empty", "the-requests"),
+    ("the-requests", "null", "the-requests"),
+    ("empty", "the-saved", "empty"),
+    ("empty", "empty", "empty"),
+    ("empty", "null", "empty"),
+    ("null", "the-saved", "null"),
+    ("null", "empty", "null"),
+    ("null", "null", "null"),
+)
+# `fallbacks` with the beta and a Router: (the body's root `fallbacks`, the override's, the call's `fallbacks`, its
+# `router_fallbacks`): the override's goes to the Router's own list, whatever the root `fallbacks` holds
+_PROMOTED_INTO_THE_ROUTERS_OWN_LIST: Final = (
+    ("absent", "the-saved", "absent", "the-saved"),
+    ("absent", "empty", "absent", "empty"),
+    ("absent", "null", "absent", "absent"),
+    ("the-requests", "the-saved", "the-requests", "the-saved"),
+    ("the-requests", "empty", "the-requests", "empty"),
+    ("the-requests", "null", "the-requests", "absent"),
+    ("empty", "the-saved", "empty", "the-saved"),
+    ("empty", "empty", "empty", "empty"),
+    ("empty", "null", "empty", "absent"),
+    ("null", "the-saved", "null", "the-saved"),
+    ("null", "empty", "null", "empty"),
+    ("null", "null", "null", "absent"),
+)
+_PROMOTED_FIELDS: Final = ("fallbacks", "context_window_fallbacks", "content_policy_fallbacks")
+# Every keyword a fallback list can reach the Router or litellm under
+_CALL_FALLBACK_KEYWORDS: Final = (*_PROMOTED_FIELDS, "router_fallbacks")
+
+
+def _promotion_value(token: str) -> list[object] | None:  # mutable-ok: a fallback field's list, as a body sends it
+    value: Final = _PROMOTION_VALUES[token]
+    return None if value is None else list(value)
+
+
+def _promotion_rows() -> Iterator[object]:
+    """Each field, with and without the beta and a Router, beside every root and override state, and its expectation"""
+    for field, beta, router in itertools.product(_PROMOTED_FIELDS, (False, True), (False, True)):
+        route = f"{field}-{'beta' if beta else 'no-beta'}-{'router' if router else 'no-router'}"
+        if field == "fallbacks" and beta and router:
+            for root, override, fallbacks, router_fallbacks in _PROMOTED_INTO_THE_ROUTERS_OWN_LIST:
+                yield pytest.param(
+                    field,
+                    beta,
+                    router,
+                    root,
+                    override,
+                    {"fallbacks": fallbacks, "router_fallbacks": router_fallbacks},
+                    id=f"{route}-root-{root}-override-{override}",
+                )
+        else:
+            for root, override, expected in _PROMOTED_INTO_ITS_OWN_FIELD:
+                yield pytest.param(
+                    field,
+                    beta,
+                    router,
+                    root,
+                    override,
+                    {field: expected},
+                    id=f"{route}-root-{root}-override-{override}",
+                )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("field", "beta", "router", "root", "override", "expected"), tuple(_promotion_rows()))
+async def test_a_router_settings_override_lands_in_the_calls_fields_as_written_out(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    beta: bool,
+    router: bool,
+    root: str,
+    override: str,
+    expected: Mapping[str, str],
+) -> None:
+    """
+    What the routing hands the Router, or litellm without one, for a /v1/messages request whose key or team
+    router_settings_override holds one fallback field. Each expected list is written out here, not derived from the
+    promotion: the request's own field wins, a null it carries included; an empty override list is promoted and a null
+    one is not; with the beta and a Router the override's `fallbacks` goes to the Router's own list, `router_fallbacks`,
+    whatever the body's root `fallbacks` holds, and without a Router it stays `fallbacks`; the error fields land in
+    their own field with and without either.
+    """
+    import litellm
+
+    calls: Final[list[Mapping[str, object]]] = []  # mutable-ok: each routed call appends the kwargs it was handed
+
+    def routed(**kwargs: object) -> str:  # kwargs-ok: the Router's and litellm's anthropic_messages take any kwargs
+        calls.append(kwargs)
+        return "routed"
+
+    llm_router: Final = (
+        litellm.Router(
+            model_list=[
+                {"model_name": "requested", "litellm_params": {"model": "anthropic/requested", "api_key": "fake"}}
+            ]
+        )
+        if router
+        else None
+    )
+    monkeypatch.setattr(llm_router if llm_router is not None else litellm, "anthropic_messages", routed)
+    data: Final = {
+        "model": "requested",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 5,
+        **({"extra_headers": {"anthropic-beta": "server-side-fallback-2026-07-01"}} if beta else {}),
+        **({} if root == "absent" else {field: _promotion_value(root)}),
+        "router_settings_override": {field: _promotion_value(override)},
+    }
+
+    assert await route_request(data, llm_router, None, "anthropic_messages") == "routed"
+    assert len(calls) == 1
+    handed: Final = {keyword: calls[0][keyword] for keyword in _CALL_FALLBACK_KEYWORDS if keyword in calls[0]}
+    assert handed == {keyword: _promotion_value(token) for keyword, token in expected.items() if token != "absent"}
 
 
 def test_gated_mock_params_cover_mock_router_testing_params():
