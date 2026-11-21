@@ -7955,11 +7955,7 @@ class Router:
         record_disable_fallbacks(kwargs, disable_fallbacks is True)
         fallbacks: Final[list | None] = call_fallbacks(
             kwargs,  # pyright: ignore[reportUnknownArgumentType]  # the Router's untyped call kwargs
-            {
-                "fallbacks": self.fallbacks,
-                "context_window_fallbacks": self.context_window_fallbacks,
-                "content_policy_fallbacks": self.content_policy_fallbacks,
-            },
+            self,
         )
         context_window_fallbacks: list | None = kwargs.get("context_window_fallbacks", self.context_window_fallbacks)
         content_policy_fallbacks: list | None = kwargs.get("content_policy_fallbacks", self.content_policy_fallbacks)
