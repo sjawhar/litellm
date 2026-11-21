@@ -5681,12 +5681,14 @@ async def test_delete_user_reads_a_key_rounds_jwt_mappings_before_the_rounds_rev
 async def test_delete_user_records_the_users_tombstone_again_after_its_delete_so_an_older_read_cannot_store_its_row(
     mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The request revokes the user at t=0, and its user delete runs at t=19, when the request's record shows the
-    user's 30 s tombstone standing 11 s more, so the revocation paired with that delete sends nothing to Redis.
-    Another pod's read began at t=19, before the delete committed, and got the user's row; it stores that row at t=31,
-    after the first tombstone lapsed at t=30. Once the delete returns, the user's tombstone is recorded again, at t=19
-    and standing until t=49, so that store keeps nothing, and a database outage after it serves no entry for the
-    deleted user."""
+    """The request revokes the user at t=0, with a 30 s tombstone, and deletes it at t=19. Its organization memberships
+    delete, paired with the user's revocation, sends nothing to Redis then, the request's record showing the
+    tombstone standing, and records the user's tombstone again at t=19, until t=49. The team memberships' rounds take
+    until t=24.5, and the user row delete, its revocation still skipped (24.5 s is under the tombstone time less 5 s),
+    records it again at t=24.5, until t=54.5. Another pod's read began at t=24.4, before the row delete committed, and
+    got the user's row; it stores that row at t=49.2, 24.8 s after it began, so not late, and once the earlier records
+    lapsed. Only the record after the user row delete refuses that store, and a database outage after it serves no
+    entry for the deleted user."""
     from litellm.proxy._types import DeleteUserRequest
     from litellm.proxy.management_endpoints.internal_user_endpoints import delete_user
     from tests.unit.proxy.last_good_tombstone_race import (
@@ -5697,6 +5699,18 @@ async def test_delete_user_records_the_users_tombstone_again_after_its_delete_so
 
     race: Final = tombstone_race(monkeypatch)
     prisma_client, leaver = _leaving_user(mocker, race.cache, ("team-1",))
+    membership_reads: Final = [0]  # mutable-ok: counts the team membership reads
+
+    async def memberships_rounds_take_until_the_row_delete(*_args: object, **_kwargs: object) -> list[object]:
+        # The first read is the one before the first write; the second is the rounds', after the memberships delete
+        membership_reads[0] += 1
+        if membership_reads[0] == 2:
+            race.clock.now = 24.5
+        return []
+
+    prisma_client.db.litellm_teammembership.find_many = mocker.AsyncMock(
+        side_effect=memberships_rounds_take_until_the_row_delete
+    )
     await revoked_before_the_write(race, (_LEAVER,))
 
     deleted: Final = await delete_user(
@@ -5706,7 +5720,7 @@ async def test_delete_user_records_the_users_tombstone_again_after_its_delete_so
 
     assert deleted == 1
     prisma_client.db.litellm_usertable.delete_many.assert_awaited_once_with(where={"user_id": {"in": [_LEAVER]}})
-    served: Final = await served_after_another_pod_stores(race, _LEAVER, leaver)
+    served: Final = await served_after_another_pod_stores(race, _LEAVER, leaver, read_began_at=24.4, stored_at=49.2)
     assert served is None
 
 

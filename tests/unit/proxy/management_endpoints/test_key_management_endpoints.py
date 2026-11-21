@@ -6254,6 +6254,56 @@ async def test_key_delete_answers_503_and_deletes_no_key_when_redis_is_lost_afte
 
 
 @pytest.mark.asyncio
+async def test_an_owners_key_delete_that_commits_one_key_and_fails_the_other_records_the_tombstones_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The owner deletes two keys, revoked at t=0 with a 30 s tombstone. At t=19 the request's record shows both
+    tombstones standing, so the revocation before the deletes sends nothing; the deletes run together, the first key's
+    commits and the second key's fails. Another pod's read began at t=19, before the first delete committed, and got
+    the first key; it stores it at t=31, once the first tombstone lapsed at t=30. The tombstones are recorded again
+    once every delete has ended, failed or not, so that store keeps nothing and an outage that follows does not serve
+    the deleted key, and the caller still gets the failed delete's error."""
+    from tests.unit.proxy.last_good_tombstone_race import (
+        revoked_before_the_write,
+        served_after_another_pod_stores,
+        tombstone_race,
+    )
+
+    race: Final = tombstone_race(monkeypatch)
+    committed, failed = _SLOWLY_ARCHIVED_TOKENS
+    key_rows: Final = _KeyTable(
+        race.redis, tuple(LiteLLM_VerificationToken(token=token, user_id="user-1") for token in (committed, failed))
+    )
+    prisma_client: Final = _routed_key_database(key_rows, key_rows)
+    deletes_each_key: Final = prisma_client.delete_data.side_effect
+
+    async def the_second_delete_fails(tokens: Sequence[str]) -> dict[str, int]:
+        if tuple(tokens) == (failed,):
+            raise ConnectionResetError("the database dropped the second delete")
+        return await deletes_each_key(tokens=tokens)
+
+    prisma_client.delete_data.side_effect = the_second_delete_fails
+    monkeypatch.setattr(  # test-quality-ok: the proxy's database, whose second key delete fails
+        "litellm.proxy.proxy_server.prisma_client", prisma_client
+    )
+    await revoked_before_the_write(race, (committed, failed))
+
+    with pytest.raises(ConnectionResetError, match="dropped the second delete"):
+        await delete_verification_tokens(
+            tokens=[committed, failed],
+            user_api_key_cache=race.cache,
+            user_api_key_dict=UserAPIKeyAuth(user_id="user-1", user_role=LitellmUserRoles.INTERNAL_USER.value),
+        )
+
+    served: Final = await served_after_another_pod_stores(race, committed, UserAPIKeyAuth(token=committed))
+    assert served is None
+    assert ([deleted for deleted, _ in key_rows.deletes], [row.token for row in key_rows.rows]) == (
+        [(committed,)],
+        [failed],
+    )
+
+
+@pytest.mark.asyncio
 async def test_delete_key_fn_persists_deleted_keys(monkeypatch):
     from litellm.proxy._types import KeyRequest
     from litellm.proxy.management_endpoints.key_management_endpoints import (

@@ -126,6 +126,7 @@ from litellm.proxy.common_utils.json_merge_patch import apply_json_merge_patch
 from litellm.proxy.common_utils.user_api_key_cache import (
     UserApiKeyCache,
     forget_last_good,
+    last_good_tombstones_recorded_if_raised,
     record_last_good_tombstones_again,
     revoke_and_delete_read_rows,
     revoke_last_good,
@@ -3810,8 +3811,9 @@ async def _team_member_delete(
     # UPDATE takes). Now that member_add reads under the advisory lock instead, this has to
     # take it too, and re-read the roster under it rather than off the snapshot validated
     # above, or a member_add that commits in between can have its addition silently
-    # overwritten by this delete computing from stale data.
-    async with prisma_client.tx() as tx:
+    # overwritten by this delete computing from stale data. A transaction that raises may have committed: what it
+    # revoked is recorded again then, as the steps after its commit record it when it returns
+    async with last_good_tombstones_recorded_if_raised(user_api_key_cache), prisma_client.tx() as tx:
         await tx.query_raw(TEAM_ADVISORY_LOCK_SQL, data.team_id)
 
         fresh_members: Final = await TeamRepository(prisma_client).get_members_with_roles_locked(tx, data.team_id)
@@ -4680,7 +4682,7 @@ async def delete_team(
     # or is still waiting on the lock, in which case its own re-read happens after this commits
     # and sees the row gone before it writes anything.
     delete_filter: Final[_TeamIdInFilter] = {"team_id": {"in": data.team_ids}}
-    async with prisma_client.tx() as tx:
+    async with last_good_tombstones_recorded_if_raised(user_api_key_cache), prisma_client.tx() as tx:
         for team_id in sorted(data.team_ids):
             await tx.query_raw(TEAM_ADVISORY_LOCK_SQL, team_id)
         # The steps since the first revocation can outlast its tombstones, so the teams are revoked again here
@@ -4728,7 +4730,10 @@ async def _delete_team_keys(
         # Only the keys a round read, and revoked right before, are deleted: a key created for one of these teams
         # since the delete's first read is read, revoked, archived and deleted in a round of its own, and keys that
         # keep appearing refuse with 409, rolling back every round's archive and delete
-        async with prisma_client.tx(timeout=_TEAM_KEYS_DELETE_TX_TIMEOUT) as tx:
+        async with (
+            last_good_tombstones_recorded_if_raised(user_api_key_cache),
+            prisma_client.tx(timeout=_TEAM_KEYS_DELETE_TX_TIMEOUT) as tx,
+        ):
             return await _revoke_and_delete_keys_in_rounds(
                 tx,
                 team_keys_where,

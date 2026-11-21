@@ -1827,6 +1827,100 @@ class TestLastGoodEntries:
         assert await _in_redis(redis.cache, "last_good_tombstone", ("hashed-key",)) == (False,)
         assert cache.last_good_memory.tombstoned("hashed-key") is False
 
+    @staticmethod
+    def _on_a_30_s_tombstone(
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> tuple[_Clock, RedisCache, UserApiKeyCache, ScriptedPipelines]:
+        """A 30 s tombstone, the driven clock at t=0, a ``RedisCache`` over fake Redis on it, a cache serving last good
+        entries over that, and the count of its pipeline executions."""
+        monkeypatch.setattr(  # test-quality-ok: these races take a 30 s tombstone; no setting seam
+            "litellm.proxy.common_utils.user_api_key_cache.LAST_GOOD_TOMBSTONE_TTL_SECONDS", 30
+        )
+        clock: Final = _Clock(now=0.0)
+        redis: Final = fake_redis_cache()
+        cache: Final = _cache_on_driven_clocks(monkeypatch, clock, redis.cache)
+        return clock, redis.cache, cache, ScriptedPipelines(monkeypatch, redis.cache)
+
+    @pytest.mark.asyncio
+    async def test_a_paired_write_that_raises_still_gets_its_tombstones_recorded_again_and_its_own_error_goes_on(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The request revoked the key at t=0, two executions. Its paired write at t=19 needs no Redis before it and
+        raises, as a write can after it committed in part or once its commit reached the database: the key's
+        tombstone is still recorded again after it, two more executions, standing 30 s from t=19, and the caller gets
+        the write's own error."""
+        clock, redis, cache, pipelines = self._on_a_30_s_tombstone(monkeypatch)
+        key: Final = "hashed-key-whose-delete-fails"
+        await revoke_last_good(cache, (key,))
+        clock.now = 19.0
+
+        async def write() -> None:
+            raise ConnectionResetError("the database dropped the delete")
+
+        with pytest.raises(ConnectionResetError, match="dropped the delete"):
+            await revoke_last_good_then(cache, (key,), write)
+
+        assert pipelines.executions == 4
+        assert await redis.init_async_client().ttl(f"last_good_tombstone:{key}") == 30
+
+    @pytest.mark.asyncio
+    async def test_a_paired_write_that_is_cancelled_still_gets_its_tombstones_recorded_again(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The pair revokes the key at t=0, two executions, and its write is cancelled at t=19 while it runs: the
+        cancellation goes on to the caller, and the key's tombstone is recorded again on the way, two more
+        executions, standing 30 s from t=19."""
+        clock, redis, cache, pipelines = self._on_a_30_s_tombstone(monkeypatch)
+        key: Final = "hashed-key-whose-delete-is-cancelled"
+        started: Final = asyncio.Event()
+        never: Final = asyncio.Event()
+
+        async def write() -> None:
+            started.set()
+            await never.wait()
+
+        pair: Final = asyncio.create_task(revoke_last_good_then(cache, (key,), write))
+        await started.wait()
+        clock.now = 19.0
+        _ = pair.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await pair
+
+        assert pipelines.executions == 4
+        assert await redis.init_async_client().ttl(f"last_good_tombstone:{key}") == 30
+
+    @pytest.mark.asyncio
+    async def test_a_transaction_that_raises_records_again_the_tombstones_of_what_it_revoked(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The request revoked the key at t=0. Inside a transaction at t=19 its revocation of the key needs no Redis,
+        and the transaction then raises, as one can once its commit reached the database: on the way out the key's
+        tombstone is recorded again, standing 30 s from t=19, and the transaction's own error goes on. A revocation
+        made outside the transaction is not recorded again by it."""
+        from litellm.proxy.common_utils.user_api_key_cache import last_good_tombstones_recorded_if_raised
+
+        clock, redis, cache, pipelines = self._on_a_30_s_tombstone(monkeypatch)
+        key: Final = "hashed-key-revoked-in-the-transaction"
+        outside: Final = "hashed-key-revoked-before-the-transaction"
+        await revoke_last_good(cache, (key, outside))
+        clock.now = 19.0
+
+        async def transaction() -> None:
+            async with last_good_tombstones_recorded_if_raised(cache):
+                await revoke_last_good(cache, (key,))
+                raise RuntimeError("the commit's answer was lost")
+
+        with pytest.raises(RuntimeError, match="answer was lost"):
+            await transaction()
+
+        client: Final = redis.init_async_client()
+        assert pipelines.executions == 4
+        assert (await client.ttl(f"last_good_tombstone:{key}"), await client.ttl(f"last_good_tombstone:{outside}")) == (
+            30,
+            11,
+        )
+
 
 async def _in_redis(redis: RedisCache, prefix: str, cache_keys: Sequence[str]) -> tuple[bool, ...]:
     """Whether the Redis server holds ``<prefix>:<cache key>``, for each of ``cache_keys``."""
