@@ -20,12 +20,22 @@ DEFAULT_HEALTH_CHECK_PROMPT: Final = str(os.getenv("DEFAULT_HEALTH_CHECK_PROMPT"
 AZURE_DEFAULT_RESPONSES_API_VERSION: Final = str(os.getenv("AZURE_DEFAULT_RESPONSES_API_VERSION", "preview"))
 AZURE_OPENAI_AUDIO_PROVIDERS: Final = frozenset({"azure", "azure_ai"})
 ROUTER_MAX_FALLBACKS: Final = int(os.getenv("ROUTER_MAX_FALLBACKS", 5))
-# The entries a request's fallback lists may hold in all, in the reading the request is checked in, each counted once
-# across every list and depth: the proxy refuses more with 400 before it reads them. Each entry is a model a hop may
-# call, one after another, so a request means a handful; the largest shape, a Router-format map of model groups, holds
-# an entry per group and per fallback, and 1,000 holds 250 groups with three fallbacks each. The fallback walk caps
-# nesting at 2 * ROUTER_MAX_FALLBACKS, and its entry visits at 16 per entry of this budget.
+# The entries a request's fallback lists may hold in all, each counted once across every list, depth and reading the
+# fallback walk reads: the proxy refuses more with 400 before it reads them. Each entry is a model a hop may call, one
+# after another, so a request means a handful; the largest shape, a Router-format map of model groups, holds an entry
+# per group and per fallback, and 1,000 holds 250 groups with three fallbacks each. The walk caps nesting at
+# 2 * ROUTER_MAX_FALLBACKS.
 MAX_FALLBACK_LIST_ENTRIES: Final = 1000
+# The entries the fallback lists of a key's or team's saved router_settings may hold in all, counted apart from the
+# request's own: stored configuration that an authorised writer saved, so not the limit meant for a request, yet a
+# request reads it on every call, so it is bounded too. 10,000 holds 2,500 groups with three fallbacks each.
+MAX_SAVED_FALLBACK_LIST_ENTRIES: Final = 10000
+# The values one walk of fallback lists may read per entry of the budget its lists are counted against: every list,
+# mapping and scalar each time the walk reaches it, each item and key of a list or mapping it reads, and a target's
+# header fields where the walk reads them. At the entry budget a body costs 1 to 5 reads per entry in the readings the
+# walk reads: a list of names read once 1, read both ways 2, ten nested group maps around 990 names read both ways
+# about 5. 16 is three times the dearest of them; past it the walk refuses with 400, as past the budget.
+FALLBACK_WALK_READS_PER_ENTRY: Final = 16
 ROUTER_FALLBACK_ERROR_DETAIL_MAX_CHARS: Final = 2000
 RUNTIME_UPDATABLE_ROUTER_SETTINGS: Final[frozenset[str]] = frozenset(
     {

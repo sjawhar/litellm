@@ -177,6 +177,7 @@ from litellm.router_utils.fallback_event_handlers import (
     FALLBACK_LIST_FIELDS,
     HEADER_CARRIER_KWARGS,
     ROUTER_SETTINGS_OVERRIDE_KWARG,
+    FallbackBudgetError,
 )
 from litellm.secret_managers.main import get_secret_bool
 from litellm.types.services import ServiceTypes
@@ -3905,7 +3906,9 @@ async def enforce_router_settings_fallback_access(
     The checks a body's fallback lists get, for the key or team router_settings_override the proxy applies after auth,
     through the same entry points: the body's check of every target, then the key's model checks of every model the
     lists name. Their targets merge into this request's call, so its model, its header fields and its own fallback
-    lists come along: whose list a ``fallbacks`` is depends on every target the request's hops can merge.
+    lists come along: whose list a ``fallbacks`` is depends on every target the request's hops can merge. The saved
+    settings are counted apart from the request's own lists, each against its own limit, and a refusal for going over
+    one names which.
     """
     route: Final = get_request_route(request)
     model: Final = request_data.get("model")
@@ -3928,7 +3931,15 @@ async def enforce_router_settings_fallback_access(
             model if isinstance(model, str) else "",
             route=route,
             request=request,
+            saved_settings=True,
         )
+    except FallbackBudgetError as e:
+        raise ProxyException(
+            message=str(e),
+            type=ProxyErrorTypes.bad_request_error,
+            param=e.param,
+            code=status.HTTP_400_BAD_REQUEST,
+        ) from e
     except ValueError as e:
         raise ProxyException(
             message=f"Key or team router_settings: {e}",

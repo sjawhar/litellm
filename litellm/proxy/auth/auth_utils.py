@@ -20,6 +20,7 @@ from litellm.constants import (
     EMPTY_MAPPING,
     INVALID_VIRTUAL_KEY_ERROR_MARKER,
     MAX_FALLBACK_LIST_ENTRIES,
+    MAX_SAVED_FALLBACK_LIST_ENTRIES,
     MINIMUM_CUSTOM_KEY_LENGTH,
     STANDARD_CUSTOMER_ID_HEADERS,
 )
@@ -543,14 +544,18 @@ _FALLBACK_TARGET_MOCK_FIELDS: Final = frozenset(
 _URL_DESTINATION_FIELDS: Final = ("model", "file_id")
 
 
-def request_fallback_walk(route: str, request: Request | None, request_body: Mapping[str, object]) -> FallbackWalk:
+def request_fallback_walk(
+    route: str, request: Request | None, request_body: Mapping[str, object], *, saved_settings: bool = False
+) -> FallbackWalk:
     """
     One walk of every fallback list a request carries, read as the Router gets the call: an anthropic_messages call on
     /v1/messages, whose header carriers are the body's, with the provider_specific_header the proxy builds from the
-    request's Anthropic headers in place of the body's (add_provider_specific_headers_to_request). The lists may hold
-    MAX_FALLBACK_LIST_ENTRIES entries in all in the reading the request is checked in; the walk refuses more with a 400
-    before it reads them. A reading only tried, to see whether a target's headers enforce it too, counts toward it
-    only once they do (walk_fallback_lists).
+    request's Anthropic headers in place of the body's (add_provider_specific_headers_to_request). The request's own
+    lists may hold MAX_FALLBACK_LIST_ENTRIES entries in all; with ``saved_settings`` the body's
+    router_settings_override is the key's or team's saved router settings, counted apart against
+    MAX_SAVED_FALLBACK_LIST_ENTRIES. The walk refuses more, or reads past FALLBACK_WALK_READS_PER_ENTRY per entry of
+    either, with a 400 before it reads them, in every reading it reads; it reads no reading a hop cannot take
+    (walk_fallback_lists).
     """
     messages_call: Final = route.endswith("/v1/messages")
     header_lines: Final = tuple(
@@ -567,7 +572,11 @@ def request_fallback_walk(route: str, request: Request | None, request_body: Map
         **({"provider_specific_header": {"extra_headers": sent}} if sent else {}),
     }
     return walk_fallback_lists(
-        request_body, carriers=carriers, anthropic_messages_call=messages_call, budget=MAX_FALLBACK_LIST_ENTRIES
+        request_body,
+        carriers=carriers,
+        anthropic_messages_call=messages_call,
+        budget=MAX_FALLBACK_LIST_ENTRIES,
+        saved_settings_budget=MAX_SAVED_FALLBACK_LIST_ENTRIES if saved_settings else None,
     )
 
 
@@ -956,12 +965,14 @@ def check_request_body(
     *,
     route: str | None = None,
     request: Request | None = None,
+    saved_settings: bool = False,
 ) -> FallbackModelNames:
     """
     is_request_body_safe's checks, returning the models the body's fallback lists name. A fallback target is merged
     into the call, so every entry of every fallback list the body carries goes through _check_fallback_entry. One walk
     of the lists, the one the Router's own check reads them with, serves whose list each ``fallbacks`` is, the checks
-    and the names.
+    and the names. ``saved_settings`` marks a body whose router_settings_override is the key's or team's saved router
+    settings, which the walk counts apart from the request's own lists (request_fallback_walk).
     """
     from litellm.proxy.litellm_pre_call_utils import (  # the setup module imports this one
         metadata_variable_name_for_route,
@@ -978,7 +989,9 @@ def check_request_body(
         entry=partial(_check_fallback_entry, settings),
         litellm_list=_reject_unreadable_litellm_list,
     )
-    return FallbackModelNames.of(request_fallback_walk(route or "", request, request_body).check(checks))
+    return FallbackModelNames.of(
+        request_fallback_walk(route or "", request, request_body, saved_settings=saved_settings).check(checks)
+    )
 
 
 def _check_banned_params_in_body(
