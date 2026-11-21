@@ -38,6 +38,7 @@ from litellm.proxy.auth.auth_checks import (
 from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_broadcast
 from litellm.proxy.common_utils.user_api_key_cache import (
     UserApiKeyCache,
+    last_good_tombstones_recorded_if_raised,
     record_last_good_tombstones_again,
     revoke_and_delete_read_rows,
     revoke_last_good,
@@ -451,7 +452,11 @@ async def bulk_remove_team_members(
     duplicates: Final = _duplicate_member_indexes(data.members)
     kept_indexes: Final = tuple(i for i in range(len(data.members)) if i not in duplicates)
     members: Final = tuple(data.members[i] for i in kept_indexes)
-    async with prisma_client.tx(timeout=_BATCH_TX_TIMEOUT) as tx:
+    # A transaction that raises may have committed: what it revoked is recorded again then
+    async with (
+        last_good_tombstones_recorded_if_raised(user_api_key_cache),
+        prisma_client.tx(timeout=_BATCH_TX_TIMEOUT) as tx,
+    ):
         removal: Final = await _remove_members_from_team(
             prisma_client, tx, team_id, team.team_alias, members, user_api_key_dict, user_api_key_cache
         )
@@ -582,8 +587,12 @@ async def _delete_users_tx(
 ) -> _UserBatchDeletion:
     """Rewrites every team the users belong to and deletes their rows in one transaction, so a
     failure anywhere rolls back the whole batch. Teams a user still names but which no longer exist
-    are skipped; the user row goes away regardless."""
-    async with prisma_client.tx(timeout=_BATCH_TX_TIMEOUT) as tx:
+    are skipped; the user row goes away regardless. A transaction that raises may have committed: what it revoked is
+    recorded again then."""
+    async with (
+        last_good_tombstones_recorded_if_raised(user_api_key_cache),
+        prisma_client.tx(timeout=_BATCH_TX_TIMEOUT) as tx,
+    ):
         team_rows: Final = await _team_tx_db(tx).find_many(
             where=_in_filter("team_id", frozenset(t for teams in teams_of.values() for t in teams))
         )

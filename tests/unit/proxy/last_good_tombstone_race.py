@@ -86,10 +86,17 @@ async def revoked_before_the_write(race: TombstoneRace, cache_keys: tuple[str, .
     race.clock.now = RACE_WRITE_AT
 
 
-async def served_after_another_pod_stores(race: TombstoneRace, cache_key: str, old_row: _Row) -> _Row | None:
-    """Another pod stores ``old_row``, which its read begun at t=19 got, at t=31; returns what a third pod serves for
-    ``cache_key`` in an outage that follows."""
-    race.clock.now = RACE_STORE_AT
-    with last_good_reads_started_at(RACE_WRITE_AT):
+async def served_after_another_pod_stores(
+    race: TombstoneRace,
+    cache_key: str,
+    old_row: _Row,
+    *,
+    read_began_at: float = RACE_WRITE_AT,
+    stored_at: float = RACE_STORE_AT,
+) -> _Row | None:
+    """Another pod stores ``old_row``, which its read begun at ``read_began_at`` (t=19) got, at ``stored_at`` (t=31);
+    returns what a third pod serves for ``cache_key`` in an outage that follows."""
+    race.clock.now = stored_at
+    with last_good_reads_started_at(read_began_at):
         await remember_last_good(race.pod(), cache_key, old_row)
     return await recall_last_good(race.pod(), cache_key, type(old_row))

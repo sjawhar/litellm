@@ -5058,6 +5058,20 @@ async def can_modify_verification_token(
     return False
 
 
+async def _delete_each_key(prisma_client: PrismaClient, tokens: Sequence[str | None]) -> None:
+    """Delete each of ``tokens`` with a delete of its own, all at once, and raise the first failure only once every
+    delete has ended: some may commit while another fails, and the record of their tombstones after this write
+    (``revoke_last_good_then``) has to follow every delete that committed."""
+
+    async def delete_one(token: str | None) -> None:
+        await prisma_client.delete_data(tokens=[token])
+
+    outcomes: Final = await asyncio.gather(*(delete_one(token) for token in tokens), return_exceptions=True)
+    failure: Final = next((outcome for outcome in outcomes if isinstance(outcome, BaseException)), None)
+    if failure is not None:
+        raise failure
+
+
 @with_service_target(AUTH_OBJECTS_TARGET)
 async def delete_verification_tokens(
     tokens: list,
@@ -5165,7 +5179,7 @@ async def delete_verification_tokens(
                 await revoke_last_good_then(
                     user_api_key_cache,
                     revoked_tokens,
-                    lambda: asyncio.gather(*(prisma_client.delete_data(tokens=[key.token]) for key in authorized_keys)),
+                    partial(_delete_each_key, prisma_client, tuple(key.token for key in authorized_keys)),
                 )
 
                 deleted_tokens = [key.token for key in authorized_keys]
