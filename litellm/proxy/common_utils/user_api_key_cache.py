@@ -1057,8 +1057,14 @@ async def last_good_revoked_around(cache: DualCache, cache_keys: Sequence[str]) 
     evictions after it never run. The record runs to its end even when the request is cancelled meanwhile; then the
     caller gets, in this order: the writes' own exception, if they raised; else the cancellation, raised again once the
     record is done; else what the writes returned. Writes inside a transaction commit later, so the transaction runs
-    inside ``last_good_recorded_after_transaction``, which records them again after its commit too."""
+    inside ``last_good_recorded_after_transaction``, and while it is open no record follows the writes here: one would
+    precede the commit and hold the transaction's locks for Redis, and the transaction's own record covers these keys
+    once it has ended, returned or raised."""
     await revoke_last_good(cache, cache_keys)
+    if _revoked_in_open_transaction.get() is not None:
+        # Noted by the revocation above for the transaction's record, which follows its commit
+        yield
+        return
     try:
         yield
     except BaseException:
@@ -1072,7 +1078,8 @@ async def revoke_last_good_then(
     cache: DualCache, cache_keys: Sequence[str], write: Callable[[], Awaitable[_Written]]
 ) -> _Written:
     """``write``, a write that ends what the entries of ``cache_keys`` hold, inside ``last_good_revoked_around``: the
-    revocation right before it, and the record after it once it returns or raises. No keys: just the write."""
+    revocation right before it, and the record after it once it returns or raises, or inside a transaction the
+    transaction's record once it ends. No keys: just the write."""
     async with last_good_revoked_around(cache, cache_keys):
         return await write()
 
@@ -1081,11 +1088,12 @@ async def revoke_last_good_then(
 async def last_good_recorded_after_transaction(cache: DualCache) -> AsyncGenerator[None]:
     """Around a database transaction whose writes end access: the keys ``revoke_last_good`` revokes while it is open are
     noted, and once it ends, returned or raised, cancellation included, their tombstones are recorded again after its
-    commit (``_record_tombstones_to_the_end``). The record inside the transaction precedes the commit, and a
-    transaction that raises may still have committed (a driver error once the commit reached the database), when the
-    evictions after its commit never run. What the caller then gets follows ``last_good_revoked_around``: the
-    transaction's own exception, else a cancellation that arrived during the record, else its result. Not nested: an
-    inner one would hide its keys from the outer one. Nothing is noted with the setting off, so nothing is sent then."""
+    commit (``_record_tombstones_to_the_end``). A pair inside it (``last_good_revoked_around``) leaves its record to
+    this one, since its own would precede the commit; and a transaction that raises may still have committed (a driver
+    error once the commit reached the database), when the evictions after its commit never run. What the caller then
+    gets follows ``last_good_revoked_around``: the transaction's own exception, else a cancellation that arrived during
+    the record, else its result. Not nested: an inner one would hide its keys from the outer one. Nothing is noted with
+    the setting off, so nothing is sent then."""
     revoked: Final[list[str]] = []  # mutable-ok: grows as the transaction revokes
     token: Final = _revoked_in_open_transaction.set(revoked)
     try:

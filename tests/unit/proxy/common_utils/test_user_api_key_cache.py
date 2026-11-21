@@ -1928,6 +1928,65 @@ class TestLastGoodEntries:
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("write_ends", ["returned", "raised"])
+    async def test_a_pair_inside_a_transaction_leaves_its_record_to_the_transaction_whose_record_refuses_a_late_store(
+        self, monkeypatch: pytest.MonkeyPatch, write_ends: str
+    ) -> None:
+        """The request revoked the key at t=0, before its transaction opened. Inside the transaction at t=19 a pair's
+        write ends the key's entry, and returns or raises: the pair's revocation needs no Redis, the tombstone standing
+        11 s more, and nothing is sent to Redis after the write while the transaction is open, where a record would
+        precede the commit. Once the transaction ends, its record sends the key's tombstone SET and then its entry's
+        DEL, two executions, and the tombstone stands 30 s from t=19. Another pod's read began at t=19, before the
+        commit, and got the old row; its store at t=31, once the first tombstone lapsed, is refused, so an outage
+        serves nothing."""
+        from litellm.proxy.common_utils.user_api_key_cache import last_good_recorded_after_transaction
+
+        clock, redis, cache, pipelines = self._on_a_30_s_tombstone(monkeypatch)
+        key: Final = "hashed-key-paired-in-the-transaction"
+        events: Final[list[str]] = []  # mutable-ok: each send to Redis, the write and the transaction's end, in order
+        sends: Final = redis.async_set_then_delete_or_raise
+
+        async def sent_in_order(set_keys: Sequence[str], value: object, ttl: int, delete_keys: Sequence[str]) -> None:
+            events.append(f"SET {' '.join(set_keys)}, then DEL {' '.join(delete_keys)}")
+            await sends(set_keys, value, ttl, delete_keys)
+
+        monkeypatch.setattr(  # test-quality-ok: notes each Redis send among the write and the transaction's end
+            redis, "async_set_then_delete_or_raise", sent_in_order
+        )
+
+        async def write() -> str:
+            events.append("write")
+            if write_ends == "raised":
+                raise ConnectionResetError("the commit's answer was lost")
+            return "written"
+
+        async def transaction() -> str:
+            async with last_good_recorded_after_transaction(cache):
+                try:
+                    return await revoke_last_good_then(cache, (key,), write)
+                finally:
+                    events.append("the transaction ends")
+
+        await revoke_last_good(cache, (key,))
+        clock.now = 19.0
+        if write_ends == "raised":
+            with pytest.raises(ConnectionResetError, match="answer was lost"):
+                await transaction()
+        else:
+            assert await transaction() == "written"
+
+        tombstone_then_drop: Final = f"SET last_good_tombstone:{key}, then DEL last_good:{key}"
+        assert events == [tombstone_then_drop, "write", "the transaction ends", tombstone_then_drop]
+        assert pipelines.executions == 4
+        assert await redis.init_async_client().ttl(f"last_good_tombstone:{key}") == 30
+        other_pod: Final = _cache_on_driven_clocks(monkeypatch, clock, redis)
+        clock.now = 31.0
+        with last_good_reads_started_at(19.0):
+            await remember_last_good(other_pod, key, UserAPIKeyAuth(token=key))
+        outage_pod: Final = _cache_on_driven_clocks(monkeypatch, clock, redis)
+        assert await recall_last_good(outage_pod, key, UserAPIKeyAuth) is None
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("write_raises", "cancellations"),
         [(False, 1), (True, 1), (False, 2)],
