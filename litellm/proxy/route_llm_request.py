@@ -12,7 +12,7 @@ import litellm
 from litellm.llms.anthropic.common_utils import anthropic_owns_fallbacks
 from litellm.proxy._types import ProxyException, UserAPIKeyAuth
 from litellm.router_utils.common_utils import is_proxy_admin_request
-from litellm.router_utils.fallback_event_handlers import ROUTER_FALLBACKS_KWARG
+from litellm.router_utils.fallback_event_handlers import router_settings_override_fields
 
 # Client-supplied params that make the router or the call path fabricate a
 # failure or a delay instead of calling the provider. The ``mock_testing_*``
@@ -683,16 +683,19 @@ async def _route_request_single_attempt(  # noqa: ANN202  # returns unawaited pr
         ]
 
         # A /v1/messages request whose anthropic-beta header opts into server-side fallback sends its `fallbacks` to
-        # Anthropic, so the key/team fallback list reaches the Router under its own name
+        # Anthropic, so the key/team fallback list reaches the Router under its own name. Which setting lands in which
+        # field, and what wins, is one function's, the one the fallback checks read the override by too.
         server_side: Final = route_type == "anthropic_messages" and anthropic_owns_fallbacks(
             data  # pyright: ignore[reportUnknownArgumentType]  # the route's untyped body
         )
-        settings_destination: Final = MappingProxyType(
-            {"fallbacks": ROUTER_FALLBACKS_KWARG} if llm_router is not None and server_side else {}
+        promoted: Final = router_settings_override_fields(
+            data,  # pyright: ignore[reportUnknownArgumentType]  # the route's untyped body
+            override_settings,  # pyright: ignore[reportUnknownArgumentType]  # the key's or team's untyped settings
+            per_request_settings,
+            anthropic_owns_fallbacks=llm_router is not None and server_side,
         )
-        for key in per_request_settings:
-            if override_settings.get(key) is not None and settings_destination.get(key, key) not in data:
-                data[settings_destination.get(key, key)] = override_settings[key]
+        for field, setting in promoted.items():
+            data[field] = override_settings[setting]
 
         # Use main router with overridden kwargs
         if llm_router is not None:
