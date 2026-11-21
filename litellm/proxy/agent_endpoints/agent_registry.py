@@ -724,12 +724,12 @@ class AgentRegistry:
         """
         from prisma.types import LiteLLM_AgentsTableWhereUniqueInput
 
-        from litellm.proxy.common_utils.user_api_key_cache import last_good_tombstones_recorded_if_raised
+        from litellm.proxy.common_utils.user_api_key_cache import last_good_recorded_after_transaction
         from litellm.proxy.proxy_server import user_api_key_cache
 
         where: Final[LiteLLM_AgentsTableWhereUniqueInput] = {"agent_id": agent_id}
-        # A transaction that raises may have committed: the keys its rounds revoked are recorded again then
-        async with last_good_tombstones_recorded_if_raised(user_api_key_cache), prisma_client.tx() as tx:
+        # The keys its rounds revoke are recorded again once the transaction ends, returned or raised
+        async with last_good_recorded_after_transaction(user_api_key_cache), prisma_client.tx() as tx:
             existing: Final = await tx.litellm_agentstable.find_unique(where=where)
             if existing is None:
                 raise ValueError(f"Agent not found, passed agent_id={agent_id}")

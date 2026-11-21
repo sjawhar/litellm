@@ -7546,9 +7546,16 @@ async def block_key(
             )
         )
 
-    record: Final = await _prisma_table(VerificationTokenRepository(prisma_client)).update(
-        where={"token": hashed_token},
-        data=with_settings_updated_at({"blocked": True}),
+    # Revoked right before the update and recorded again after it, also when the update raises: its commit may have
+    # reached the database
+    record: Final = await revoke_last_good_then(
+        user_api_key_cache,
+        (hashed_token,),
+        partial(
+            _prisma_table(VerificationTokenRepository(prisma_client)).update,
+            where={"token": hashed_token},
+            data=with_settings_updated_at({"blocked": True}),
+        ),
     )
 
     ## UPDATE KEY CACHE - invalidate so next read re-fetches from DB

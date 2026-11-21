@@ -126,8 +126,8 @@ from litellm.proxy.common_utils.json_merge_patch import apply_json_merge_patch
 from litellm.proxy.common_utils.user_api_key_cache import (
     UserApiKeyCache,
     forget_last_good,
-    last_good_tombstones_recorded_if_raised,
-    record_last_good_tombstones_again,
+    last_good_recorded_after_transaction,
+    last_good_revoked_around,
     revoke_and_delete_read_rows,
     revoke_last_good,
     revoke_last_good_then,
@@ -3811,9 +3811,9 @@ async def _team_member_delete(
     # UPDATE takes). Now that member_add reads under the advisory lock instead, this has to
     # take it too, and re-read the roster under it rather than off the snapshot validated
     # above, or a member_add that commits in between can have its addition silently
-    # overwritten by this delete computing from stale data. A transaction that raises may have committed: what it
-    # revoked is recorded again then, as the steps after its commit record it when it returns
-    async with last_good_tombstones_recorded_if_raised(user_api_key_cache), prisma_client.tx() as tx:
+    # overwritten by this delete computing from stale data. What the transaction revokes is recorded again once it
+    # ends, returned or raised (a transaction that raises may have committed)
+    async with last_good_recorded_after_transaction(user_api_key_cache), prisma_client.tx() as tx:
         await tx.query_raw(TEAM_ADVISORY_LOCK_SQL, data.team_id)
 
         fresh_members: Final = await TeamRepository(prisma_client).get_members_with_roles_locked(tx, data.team_id)
@@ -3872,9 +3872,11 @@ async def _team_member_delete(
                 hashed_tokens=tuple(key.token for key in keys_to_delete), prisma_client=prisma_client, tx=tx
             )
         )
-        # The roster rides on the team's entry, the team on each user's entry and the member limits on each
-        # membership's, so all of them are revoked before the first write, as the deleted keys are
-        await revoke_last_good(
+        # The deleted keys are revoked before the first write; the roster rides on the team's entry, the team on each
+        # user's entry and the member limits on each membership's, so those are revoked right before the writes that
+        # end them and recorded again after them, also when one raises
+        await revoke_last_good(user_api_key_cache, tuple(key.token for key in keys_to_delete))
+        async with last_good_revoked_around(
             user_api_key_cache,
             (
                 *(team_cache_keys(data.team_id, existing_team_row.team_alias) if removed_team_members else ()),
@@ -3883,24 +3885,20 @@ async def _team_member_delete(
                     team_membership_auth_cache_key(team_id=data.team_id, user_id=user_id)
                     for user_id in sorted(user_ids_to_delete)
                 ),
-                *(key.token for key in keys_to_delete),
             ),
-        )
-
-        if removed_team_members:
-            await _team_tx_db(tx).update(
-                where={"team_id": data.team_id},
-                data={"members_with_roles": json.dumps(_db_new_team_members)},
-            )
-
-        for existing_user in stale_user_rows:
-            await tx.litellm_usertable.update(
-                where={"user_id": existing_user.user_id},
-                data={"teams": {"set": [team for team in existing_user.teams if team != data.team_id]}},
-            )
-
-        for _uid in sorted(user_ids_to_delete):
-            await tx.litellm_teammembership.delete_many(where={"team_id": data.team_id, "user_id": _uid})
+        ):
+            if removed_team_members:
+                await _team_tx_db(tx).update(
+                    where={"team_id": data.team_id},
+                    data={"members_with_roles": json.dumps(_db_new_team_members)},
+                )
+            for existing_user in stale_user_rows:
+                await tx.litellm_usertable.update(
+                    where={"user_id": existing_user.user_id},
+                    data={"teams": {"set": [team for team in existing_user.teams if team != data.team_id]}},
+                )
+            for _uid in sorted(user_ids_to_delete):
+                await tx.litellm_teammembership.delete_many(where={"team_id": data.team_id, "user_id": _uid})
 
         deleted_keys: Final = await _delete_team_member_keys(
             tx,
@@ -3945,9 +3943,6 @@ async def _team_member_delete(
         await forget_last_good(
             user_api_key_cache, team_membership_auth_cache_key(team_id=data.team_id, user_id=user_id), tombstone=True
         )
-    # The users' rows were written inside the transaction, so their tombstones are recorded again once it committed;
-    # the team's, the keys' and the memberships' were above
-    await record_last_good_tombstones_again(user_api_key_cache, tuple(user.user_id for user in stale_user_rows))
 
     _emit_team_members_metric(existing_team_row)
 
@@ -4682,7 +4677,7 @@ async def delete_team(
     # or is still waiting on the lock, in which case its own re-read happens after this commits
     # and sees the row gone before it writes anything.
     delete_filter: Final[_TeamIdInFilter] = {"team_id": {"in": data.team_ids}}
-    async with last_good_tombstones_recorded_if_raised(user_api_key_cache), prisma_client.tx() as tx:
+    async with last_good_recorded_after_transaction(user_api_key_cache), prisma_client.tx() as tx:
         for team_id in sorted(data.team_ids):
             await tx.query_raw(TEAM_ADVISORY_LOCK_SQL, team_id)
         # The steps since the first revocation can outlast its tombstones, so the teams are revoked again here
@@ -4731,7 +4726,7 @@ async def _delete_team_keys(
         # since the delete's first read is read, revoked, archived and deleted in a round of its own, and keys that
         # keep appearing refuse with 409, rolling back every round's archive and delete
         async with (
-            last_good_tombstones_recorded_if_raised(user_api_key_cache),
+            last_good_recorded_after_transaction(user_api_key_cache),
             prisma_client.tx(timeout=_TEAM_KEYS_DELETE_TX_TIMEOUT) as tx,
         ):
             return await _revoke_and_delete_keys_in_rounds(
@@ -5461,9 +5456,13 @@ async def _set_team_blocked(
     ):
         team_access_denied()
 
-    if blocked:
-        await revoke_last_good(user_api_key_cache, team_cache_keys(team_id, existing_team.team_alias))
-    record: Final = await _team_db(prisma_client).update(where={"team_id": team_id}, data={"blocked": blocked})
+    # A block is revoked right before its write and recorded again after it, also when the write raises: its commit
+    # may have reached the database. An unblock ends nothing
+    record: Final = await revoke_last_good_then(
+        user_api_key_cache,
+        team_cache_keys(team_id, existing_team.team_alias) if blocked else (),
+        partial(_team_db(prisma_client).update, where={"team_id": team_id}, data={"blocked": blocked}),
+    )
     await _evict_cached_teams(((team_id, existing_team.team_alias),), revoked=blocked)
     return record
 

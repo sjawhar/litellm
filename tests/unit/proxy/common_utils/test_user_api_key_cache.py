@@ -1891,14 +1891,15 @@ class TestLastGoodEntries:
         assert await redis.init_async_client().ttl(f"last_good_tombstone:{key}") == 30
 
     @pytest.mark.asyncio
-    async def test_a_transaction_that_raises_records_again_the_tombstones_of_what_it_revoked(
-        self, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize("ends", ["raised", "returned"])
+    async def test_a_transaction_records_again_the_tombstones_of_what_it_revoked_once_it_ends(
+        self, monkeypatch: pytest.MonkeyPatch, ends: str
     ) -> None:
         """The request revoked the key at t=0. Inside a transaction at t=19 its revocation of the key needs no Redis,
-        and the transaction then raises, as one can once its commit reached the database: on the way out the key's
-        tombstone is recorded again, standing 30 s from t=19, and the transaction's own error goes on. A revocation
-        made outside the transaction is not recorded again by it."""
-        from litellm.proxy.common_utils.user_api_key_cache import last_good_tombstones_recorded_if_raised
+        and the transaction then returns, or raises as one can once its commit reached the database: once it ends the
+        key's tombstone is recorded again, after the commit, standing 30 s from t=19, and the transaction's own error,
+        if it raised, goes on. A revocation made outside the transaction is not recorded again by it."""
+        from litellm.proxy.common_utils.user_api_key_cache import last_good_recorded_after_transaction
 
         clock, redis, cache, pipelines = self._on_a_30_s_tombstone(monkeypatch)
         key: Final = "hashed-key-revoked-in-the-transaction"
@@ -1906,13 +1907,18 @@ class TestLastGoodEntries:
         await revoke_last_good(cache, (key, outside))
         clock.now = 19.0
 
-        async def transaction() -> None:
-            async with last_good_tombstones_recorded_if_raised(cache):
+        async def transaction() -> str:
+            async with last_good_recorded_after_transaction(cache):
                 await revoke_last_good(cache, (key,))
-                raise RuntimeError("the commit's answer was lost")
+                if ends == "raised":
+                    raise RuntimeError("the commit's answer was lost")
+            return "committed"
 
-        with pytest.raises(RuntimeError, match="answer was lost"):
-            await transaction()
+        if ends == "raised":
+            with pytest.raises(RuntimeError, match="answer was lost"):
+                await transaction()
+        else:
+            assert await transaction() == "committed"
 
         client: Final = redis.init_async_client()
         assert pipelines.executions == 4
@@ -1920,6 +1926,60 @@ class TestLastGoodEntries:
             30,
             11,
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("write_raises", "cancellations"),
+        [(False, 1), (True, 1), (False, 2)],
+        ids=["after_a_write_that_returned", "after_a_write_that_raised", "twice"],
+    )
+    async def test_a_record_after_the_write_runs_to_its_end_when_the_request_is_cancelled_while_it_waits(
+        self, monkeypatch: pytest.MonkeyPatch, write_raises: bool, cancellations: int
+    ) -> None:
+        """The pair revokes the key at t=0, two executions, and its write at t=19 returns or raises. The record after
+        it waits before sending its first pipeline, and the request is cancelled meanwhile, once or twice. The record
+        still runs to its end, two more executions, the key's tombstone standing 30 s from t=19. Then the caller gets
+        the write's own error if it raised, else the cancellation, raised again once the record is done."""
+        clock, redis, cache, pipelines = self._on_a_30_s_tombstone(monkeypatch)
+        key: Final = "hashed-key-whose-record-is-cancelled"
+        record_waits: Final = asyncio.Event()
+        release_record: Final = asyncio.Event()
+        sends: Final = redis.async_set_then_delete_or_raise
+        calls: Final = [0]  # mutable-ok: counts the pipelines' calls, the revocation's then the record's
+
+        async def record_waits_before_sending(
+            set_keys: Sequence[str], value: object, ttl: int, delete_keys: Sequence[str]
+        ) -> None:
+            calls[0] += 1
+            if calls[0] == 2:
+                record_waits.set()
+                await release_record.wait()
+            await sends(set_keys, value, ttl, delete_keys)
+
+        monkeypatch.setattr(  # test-quality-ok: the record's first pipeline waits until the test releases it
+            redis, "async_set_then_delete_or_raise", record_waits_before_sending
+        )
+
+        async def write() -> str:
+            clock.now = 19.0
+            if write_raises:
+                raise ConnectionResetError("the commit's answer was lost")
+            return "written"
+
+        pair: Final = asyncio.create_task(revoke_last_good_then(cache, (key,), write))
+        await record_waits.wait()
+        for _ in range(cancellations):
+            _ = pair.cancel()
+            # Lets the pair take the cancellation and go back to waiting for the record
+            await asyncio.sleep(0)
+        release_record.set()
+
+        with pytest.raises(ConnectionResetError if write_raises else asyncio.CancelledError):
+            await pair
+
+        assert pipelines.executions == 4
+        assert await redis.init_async_client().ttl(f"last_good_tombstone:{key}") == 30
+        assert pair.cancelled() is not write_raises
 
 
 async def _in_redis(redis: RedisCache, prefix: str, cache_keys: Sequence[str]) -> tuple[bool, ...]:
