@@ -2323,6 +2323,86 @@ def test_a_targets_long_header_list_is_refused_before_the_beta_check_copies_it()
     assert passes == []
 
 
+def _header_field_reads(name: str, value: str) -> int:
+    """
+    What the walk charges for a header field of one line before the beta check reads it: the field reached, its mapping
+    scanned by the check and passed over by the walk, 3, and the line by every 64 characters of its name and value
+    """
+    return 3 + (len(name) + len(value)) // 64
+
+
+# One anthropic-beta line whose value alone is far past the read cap: 3 + (14 + 2,000,000) // 64 = 31,253 reads
+_LONG_BETA_VALUE_CHARS: Final = 2_000_000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("where", "beta", "charged"),
+    [
+        pytest.param("body", False, 31_253, id="a-body-header-field-without-the-beta"),
+        pytest.param("body", True, 31_253, id="a-body-header-field-with-the-beta"),
+        # The list holding the target, reached, passed over to tell its format and passed over to read it: 3 more
+        pytest.param("target", False, 3 + 31_253, id="a-targets-header-field"),
+    ],
+)
+async def test_a_header_line_past_the_read_cap_is_refused_before_the_beta_check_scans_it(
+    monkeypatch: pytest.MonkeyPatch, where: str, beta: bool, charged: int
+) -> None:
+    """
+    On /v1/messages the beta check reads an `anthropic-beta` line's name and value. The walk charges a line by every
+    64 characters of the two before the check runs, so one value of 2,000,000 characters in a body header field, or in
+    the header field of a target whose beta the walk reads, passes the read cap at 31,253 reads for the field and is
+    refused with 400 before the key is read; the beta check reads no header name or value. The request's own header
+    fields are charged before its HTTP header's, so the beta does not change the count.
+    """
+    value: Final = "x" * _LONG_BETA_VALUE_CHARS
+    header_field: Final = {"extra_headers": {"anthropic-beta": value}}
+    body_fields: Final[dict[str, object]] = (  # mutable-ok: the gateway's own body parameter, read and not changed
+        dict(header_field) if where == "body" else {"fallbacks": [{"model": "other", **header_field}]}
+    )
+    read: Final = _count_header_names_read(monkeypatch)
+    reads: Final = _count_reads(monkeypatch)
+    result: Final = await _Gateway(monkeypatch).send(body_fields, beta=beta, credentials=False)
+
+    assert result.response.status_code == 400, result.response.text
+    assert "reading the request's fallback lists takes more than 16000 reads" in result.response.text
+    assert _error_param(result.response) == "extra_headers"
+    assert _header_field_reads("anthropic-beta", value) == 31_253
+    assert sum(reads) == charged
+    assert read == []
+    assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+
+
+@pytest.mark.asyncio
+async def test_a_header_line_under_the_read_cap_is_scanned_once_and_served(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    The control: a body `anthropic-beta` line of 6,400 characters costs the body check's walk 3 + (14 + 6,400) // 64 =
+    103 reads, then the beta check reads its name and its value once each; the request is served
+    """
+    from litellm.proxy.auth.auth_utils import is_request_body_safe
+
+    value: Final = "x" * 6_400
+    header_field: Final[dict[str, object]] = {  # mutable-ok: the gateway's own body parameter, read and not changed
+        "extra_headers": {"anthropic-beta": value}
+    }
+    read: Final = _count_header_names_read(monkeypatch)
+    reads: Final = _count_reads(monkeypatch)
+
+    assert is_request_body_safe(
+        {"model": "requested", **copy.deepcopy(header_field)},
+        {},
+        _router_without_fallback_group(),
+        "requested",
+        route="/v1/messages",
+    )
+    assert sum(reads) == _header_field_reads("anthropic-beta", value) == 103
+    assert read == ["anthropic-beta", value]
+
+    served: Final = await _Gateway(monkeypatch, requested_answers=True).send(copy.deepcopy(header_field))
+    assert served.response.status_code == 200, served.response.text
+    assert served.calls == {"requested": 1, "other": 0, "forbidden": 0, "attacker": 0}
+
+
 @pytest.mark.asyncio
 async def test_the_routers_first_call_walks_every_fallback_list_it_reads_once(monkeypatch: pytest.MonkeyPatch) -> None:
     """
