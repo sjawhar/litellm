@@ -1,7 +1,7 @@
 import asyncio
 import importlib
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping, Sequence
 from datetime import datetime, timedelta
 from types import MappingProxyType
 from typing import Any, Final, Literal, NoReturn
@@ -22,6 +22,7 @@ from litellm.router_utils.fallback_event_handlers import (
     MidStreamFallbackControls,
     _trigger_cooldown_for_failed_deployment,
     attempted_retries_for_request,
+    call_fallbacks,
     carry_over_routed_deployment,
     clear_pre_routing_selection,
     committed_retry_budget_for_request,
@@ -34,6 +35,8 @@ from litellm.router_utils.fallback_event_handlers import (
     mid_stream_retry_kwargs,
     record_pre_routing_selection,
     record_retry_attempt,
+    reject_non_list_litellm_fallbacks,
+    request_fallbacks,
     routed_deployment_id,
     run_async_fallback,
 )
@@ -212,6 +215,10 @@ async def _acreate_file(*args: object, **kwargs: object) -> NoReturn:
 
 async def _acancel_batch(*args: object, **kwargs: object) -> NoReturn:
     raise AssertionError("only used for its __name__")
+
+
+async def _ageneric_api_call_with_fallbacks_helper(*args: object, **kwargs: object) -> NoReturn:
+    raise AssertionError("only used for its __name__: the Router stamps litellm_metadata for it")
 
 
 async def _acompletion(*args: object, **kwargs: object) -> NoReturn:
@@ -1251,6 +1258,67 @@ async def test_run_async_fallback_preserves_original_model_group_on_nested_fallb
     assert metadata["original_model_group"] == "primary-model"
 
 
+# The call's metadata bucket for each original function: litellm_metadata for a generic call such as /v1/messages
+_CALL_BUCKETS: Final = (
+    pytest.param(None, "metadata", id="metadata-call"),
+    pytest.param(_ageneric_api_call_with_fallbacks_helper, "litellm_metadata", id="litellm-metadata-call"),
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("original_function", "call_bucket"), _CALL_BUCKETS)
+@pytest.mark.parametrize("added", [{}, None, {"user_api_key_hash": "forged"}], ids=["empty", "none", "forged"])
+async def test_a_dict_targets_metadata_keeps_every_key_the_call_holds(
+    original_function: object, call_bucket: str, added: object
+):
+    """A target's metadata only adds keys to the call's, so the hop keeps the identity the call was stamped with"""
+    router = RecordingRouter()
+
+    await run_async_fallback(
+        litellm_router=router,
+        fallback_model_group=[{"model": "fallback-model", call_bucket: added}],
+        original_model_group="primary-model",
+        original_exception=RuntimeError("original failed"),
+        max_fallbacks=3,
+        fallback_depth=0,
+        original_function=original_function,
+        **{call_bucket: {"user_api_key_hash": "caller-hash", "tags": ["call-tag"]}},
+    )
+
+    metadata = router.received_kwargs[call_bucket]
+    assert metadata["user_api_key_hash"] == "caller-hash"
+    assert metadata["tags"] == ["call-tag"]
+    assert metadata["model_group"] == "fallback-model"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("original_function", "call_bucket"), _CALL_BUCKETS)
+@pytest.mark.parametrize("target_bucket", ["metadata", "litellm_metadata"])
+async def test_a_dict_targets_metadata_adds_its_own_keys_but_no_identity(
+    original_function: object, call_bucket: str, target_bucket: str
+):
+    """Whichever bucket a reader checks first, an identity key in a target's metadata never stands in for the call's"""
+    router = RecordingRouter()
+
+    await run_async_fallback(
+        litellm_router=router,
+        fallback_model_group=[
+            {"model": "fallback-model", target_bucket: {"added": "by-target", "user_api_key_auth": {"models": []}}}
+        ],
+        original_model_group="primary-model",
+        original_exception=RuntimeError("original failed"),
+        max_fallbacks=3,
+        fallback_depth=0,
+        original_function=original_function,
+        **{call_bucket: {"user_api_key_hash": "caller-hash"}},
+    )
+
+    assert router.received_kwargs[target_bucket]["added"] == "by-target"
+    assert "user_api_key_auth" not in router.received_kwargs[target_bucket]
+    assert router.received_kwargs[call_bucket]["user_api_key_hash"] == "caller-hash"
+
+
+
 class TestPreRoutingSelectionCarriesToFallbacks:
     """#38832: a complexity/auto router picks a tier behind the router name, but fallback
     lookup kept using the router name, so the tier's configured chain never ran."""
@@ -1423,6 +1491,258 @@ def test_get_fallback_model_group_matches_provider_prefixed_key():
     fallback_model_group, _ = get_fallback_model_group(fallbacks=fallbacks, model_group="gpt-4o")
 
     assert fallback_model_group == ["claude-3-haiku"]
+
+
+def test_get_fallback_model_group_reads_an_entry_that_names_a_model_as_a_target():
+    """An entry with a string ``model`` is a target in any key order, so none of its keys names a group; a ``model``
+    that maps to a list still maps the group named ``model``."""
+    named_target: Final = {"requested": ["forbidden"], "model": "other"}
+    generic_named_target: Final = {"*": ["forbidden"], "model": "other"}
+
+    assert get_fallback_model_group(fallbacks=[named_target], model_group="requested") == (None, None)
+    assert get_fallback_model_group(fallbacks=[generic_named_target], model_group="requested") == (None, None)
+    assert get_fallback_model_group(fallbacks=[{"model": ["a", "b"]}], model_group="model") == (["a", "b"], None)
+
+
+@pytest.mark.parametrize("field", ["fallbacks", "context_window_fallbacks", "content_policy_fallbacks"])
+@pytest.mark.parametrize("chain", ["abc", {"other": []}, 1, None], ids=["string", "mapping", "number", "none"])
+def test_reject_non_list_litellm_fallbacks_refuses_a_group_mapped_to_a_non_list(field: str, chain: object):
+    with pytest.raises(litellm.BadRequestError, match=f"{field} must map model group 'requested' to a list"):
+        reject_non_list_litellm_fallbacks(["other", {"requested": chain}], "requested", field=field)
+
+
+@pytest.mark.parametrize("field", ["fallbacks", "context_window_fallbacks", "content_policy_fallbacks"])
+def test_reject_non_list_litellm_fallbacks_keeps_group_maps_of_lists(field: str):
+    """A string and a group mapped to a list (`model` and `*` included) pass in every field"""
+    fallbacks: Final = ["other", {"requested": ["other"]}, {"*": [{"model": "other"}]}, {"model": ["other"]}]
+    assert reject_non_list_litellm_fallbacks(fallbacks, "requested", field=field) is None
+
+
+@pytest.mark.parametrize("field", ["context_window_fallbacks", "content_policy_fallbacks"])
+@pytest.mark.parametrize("target", [{"requested": ["other"], "model": "other"}, {"model": "other", "n": 1}])
+def test_reject_non_list_litellm_fallbacks_refuses_a_target_in_an_error_field(field: str, target: dict):
+    """These two fields only map model groups to their fallbacks, so a target there would match no group"""
+    with pytest.raises(litellm.BadRequestError, match=f"{field} maps model groups to their fallbacks"):
+        reject_non_list_litellm_fallbacks(["other", target], "requested", field=field)
+
+
+def test_reject_non_list_litellm_fallbacks_keeps_a_target_beside_a_string_in_fallbacks():
+    """The Router skips it there, as it skips every target in a `fallbacks` list it resolves by group"""
+    assert reject_non_list_litellm_fallbacks(["other", {"model": "other", "n": 1}], "requested") is None
+
+
+@pytest.mark.parametrize("field", ["fallbacks", "context_window_fallbacks", "content_policy_fallbacks"])
+def test_reject_non_list_litellm_fallbacks_refuses_an_empty_mapping_among_group_maps(field: str):
+    """The Router reads a group map by its first key, which an empty mapping does not have"""
+    with pytest.raises(litellm.BadRequestError, match=f"{field} must not hold an empty mapping"):
+        reject_non_list_litellm_fallbacks(["other", {}], "requested", field=field)
+
+
+@pytest.mark.parametrize("field", ["fallbacks", "context_window_fallbacks", "content_policy_fallbacks"])
+@pytest.mark.parametrize(
+    ("fallbacks", "message"),
+    [
+        pytest.param([["other"]], "must hold model names and mappings, got list", id="entry"),
+        pytest.param(
+            [{"requested": [["other"]]}],
+            "must map model group 'requested' to model names and mappings, got list",
+            id="entry-of-a-group-list",
+        ),
+    ],
+)
+def test_reject_non_list_litellm_fallbacks_refuses_a_nested_list(field: str, fallbacks: list, message: str):
+    """Every reader takes an entry for a model name or a mapping, so a nested list would fail after the first call"""
+    with pytest.raises(litellm.BadRequestError, match=f"{field} {message}"):
+        reject_non_list_litellm_fallbacks(fallbacks, "requested", field=field)
+
+
+def test_reject_non_list_litellm_fallbacks_reads_no_group_map_in_a_list_of_targets():
+    """The Router calls a `fallbacks` list of targets as is, so an entry there without a model is an override"""
+    targets: Final = [{"model": "other"}, {"timeout": 5}, {"stop": ["END"]}, {}]
+    assert reject_non_list_litellm_fallbacks(targets, "requested") is None
+
+
+_NESTED_LIST_REFUSAL: Final = "LiteLLM fallbacks must hold model names and mappings, got list"
+
+
+def _target_with_a_nested_list() -> dict[str, object]:
+    """A target whose own `fallbacks` no reader can call, which a hop would merge into the call"""
+    return {"model": "other", "fallbacks": [["bad"]]}
+
+
+@pytest.mark.parametrize(
+    "mark",
+    [None, {"keys": ["requested"]}, ["requested"]],
+    ids=["no-mark", "a-mapping-a-body-can-send", "a-list-a-body-can-send"],
+)
+def test_a_call_without_its_requests_attempted_targets_gets_the_routers_list_check(mark: object):
+    """
+    Only a hop skips the Router's list check: a call carrying its request's AttemptedFallbackTargets, which
+    run_async_fallback creates. A request body can send `attempted_targets` only as data, which the setup drops and
+    which marks nothing here either.
+    """
+    kwargs: Final = {"model": "requested"} if mark is None else {"model": "requested", "attempted_targets": mark}
+    with pytest.raises(litellm.BadRequestError, match=_NESTED_LIST_REFUSAL):
+        reject_non_list_litellm_fallbacks([_target_with_a_nested_list()], "requested", call_kwargs=kwargs)
+
+
+def test_a_hop_reads_no_list_its_requests_first_call_checked():
+    """A hop's lists are its request's own, or a merged target's own, which its request's first call walked"""
+    kwargs: Final = {"model": "other", "attempted_targets": AttemptedFallbackTargets(frozenset({"requested"}))}
+    assert reject_non_list_litellm_fallbacks([_target_with_a_nested_list()], "other", call_kwargs=kwargs) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["the-call", "the-routers-configuration"])
+async def test_the_routers_first_call_checks_a_targets_own_list_without_the_proxy(source: str):
+    """
+    A call that reaches the Router without the proxy is walked by the Router's own first call, which its hops rely on:
+    a target's own list no reader can call is refused there before any deployment answers, whether the call sends the
+    list or the Router's configuration holds it
+    """
+    deployment_key: Final = "-".join(("fake", "deployment", "key"))
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": name,
+                "litellm_params": {"model": f"openai/{name}", "api_key": deployment_key, "mock_response": "served"},
+            }
+            for name in ("requested", "other")
+        ],
+        fallbacks=[{"requested": [_target_with_a_nested_list()]}] if source == "the-routers-configuration" else None,
+        num_retries=0,
+    )
+    sent: Final = {"fallbacks": [_target_with_a_nested_list()]} if source == "the-call" else {}
+
+    with pytest.raises(litellm.BadRequestError, match=_NESTED_LIST_REFUSAL):
+        await router.acompletion(model="requested", messages=[{"role": "user", "content": "hi"}], **sent)
+
+
+def _router_of(
+    *, credentials_allowed: bool = False, context_window_fallbacks: Sequence[Mapping[str, object]] = ()
+) -> Router:
+    """
+    A Router of `requested` and `other` with the configured context_window_fallbacks given, which allows a fallback
+    target's header fields when ``credentials_allowed``, as a proxy with `allow_client_side_credentials: true` does
+    """
+    router: Final = Router(
+        model_list=[
+            {"model_name": name, "litellm_params": {"model": f"openai/{name}", "api_key": "fake"}}
+            for name in ("requested", "other")
+        ],
+        context_window_fallbacks=[dict(chain) for chain in context_window_fallbacks] or None,
+    )
+    router.fallback_target_credentials_allowed = (lambda: True) if credentials_allowed else None
+    return router
+
+
+@pytest.mark.parametrize(
+    ("target_lists", "message"),
+    [
+        pytest.param(
+            {"fallbacks": [["bad"]]}, "LiteLLM fallbacks must hold model names and mappings, got list", id="nested-list"
+        ),
+        pytest.param(
+            {"context_window_fallbacks": [{"model": "x"}]},
+            "LiteLLM context_window_fallbacks maps model groups to their fallbacks",
+            id="target-in-an-error-field",
+        ),
+        pytest.param(
+            {"content_policy_fallbacks": [{"requested": "abc"}]},
+            "LiteLLM content_policy_fallbacks must map model group 'requested' to a list",
+            id="group-mapped-to-a-non-list",
+        ),
+    ],
+)
+def test_the_router_entry_reads_a_targets_own_lists_before_the_first_call(target_lists: dict, message: str):
+    """
+    A hop merges the target, and the Router reads its lists then, so the call's one walk refuses them before the first
+    attempt
+    """
+    kwargs: Final[dict[str, object]] = {
+        "model": "requested",
+        "fallbacks": [{"requested": [{"model": "other", **target_lists}]}],
+    }
+    with pytest.raises(litellm.BadRequestError, match=message):
+        call_fallbacks(kwargs, _router_of())
+
+
+def test_the_router_entry_leaves_a_targets_own_list_to_anthropic_under_the_beta():
+    """Under the beta a hop sends the target's own `fallbacks` to Anthropic, which reads `"default"` as its own"""
+    kwargs: Final[dict[str, object]] = {
+        "model": "requested",
+        "extra_headers": {"anthropic-beta": "server-side-fallback-2026-07-01"},
+        "router_fallbacks": [{"requested": [{"model": "other", "fallbacks": "default"}]}],
+    }
+    assert request_fallbacks(kwargs, None, anthropic_messages_call=True) == kwargs["router_fallbacks"]
+
+
+@pytest.mark.parametrize(
+    ("source", "note_names", "refused"),
+    [
+        pytest.param("the-routers-configuration", 175_988, False, id="configured-at-the-net"),
+        pytest.param("the-routers-configuration", 175_989, True, id="configured-one-past-it"),
+        pytest.param("the-calls-own-list", 175_985, False, id="own-list-at-the-net"),
+        pytest.param("the-calls-own-list", 175_986, True, id="own-list-one-past-it"),
+    ],
+)
+def test_a_library_call_whose_own_lists_pass_the_routers_net_is_refused(source: str, note_names: int, refused: bool):
+    """
+    An anthropic_messages call without the beta, whose `fallbacks` holds a target and a parameter-only mapping with a
+    note of names. A target with the beta in its headers, in the Router's configured lists, which the Router allows
+    a target's header fields for, or in the call's own list, makes the Router's walk read the call's lists as
+    Anthropic's too. Every read of the call's own lists, in every reading, is charged against the most the proxy can
+    pass for one request, the request's read cap and the saved settings' together, 16 x (1,000 + 10,000) = 176,000.
+    The reading the call is checked in reads 5 values, the list, its format pass and its read, and 3 more for the own
+    target's header field, charged when the walk reaches the target; the reading both ways forces reads 7 before the
+    note, the list and its read, the mapping's values, the metadata and its key, the note, then its names. So 175,988
+    names are read beside the configured target and 175,985 beside the own one; one more is refused with the walk's
+    400. The configured target's own reads are counted apart.
+    """
+
+    def anthropic_messages() -> None:
+        """The function a Router call of /v1/messages names as its original_generic_function"""
+
+    beta_target: Final = {"model": "other", "extra_headers": {"anthropic-beta": "server-side-fallback-2026-07-01"}}
+    own_target: Final = beta_target if source == "the-calls-own-list" else {"model": "other"}
+    kwargs: Final[dict[str, object]] = {  # mutable-ok: the Router's untyped call kwargs
+        "model": "requested",
+        "fallbacks": [own_target, {"metadata": {"note": ["ab"] * note_names}}],
+        "original_generic_function": anthropic_messages,
+    }
+    router: Final = (
+        _router_of(credentials_allowed=True, context_window_fallbacks=[{"requested": [beta_target]}])
+        if source == "the-routers-configuration"
+        else _router_of()
+    )
+
+    if not refused:
+        assert call_fallbacks(kwargs, router) == kwargs["fallbacks"]
+        return
+    with pytest.raises(
+        litellm.BadRequestError, match="reading the request's fallback lists takes more than 176000 reads"
+    ):
+        call_fallbacks(kwargs, router)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["context_window_fallbacks", "content_policy_fallbacks"])
+async def test_the_router_reads_a_nested_targets_own_fallbacks_in_an_error_field_with_the_calls_context(field: str):
+    """
+    The call is not an Anthropic messages call, so a nested target's own `fallbacks` is LiteLLM's, with its rules: the
+    call's one walk refuses it before the first attempt
+    """
+    router: Final = Router(
+        model_list=[{"model_name": "requested", "litellm_params": {"model": "openai/requested", "api_key": "fake"}}]
+    )
+    nested: Final = [{"requested": [{"model": "other", "fallbacks": [{"requested": "abc"}]}]}]
+    with pytest.raises(litellm.BadRequestError, match="LiteLLM fallbacks must map model group 'requested' to a list"):
+        await router.acompletion(
+            model="requested",
+            messages=[{"role": "user", "content": "hi"}],
+            mock_response="unused",
+            **{field: nested},
+        )
 
 
 def test_get_fallback_model_group_exact_match_beats_prefixed_match():

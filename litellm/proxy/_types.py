@@ -5053,12 +5053,12 @@ class LitellmDataForBackendLLMCall(TypedDict, total=False):
     stream_timeout: float | None
     user: str | None
     num_retries: int | None
-    # True when the effective timeout came from a caller-controlled source (the
+    # The names of the timeouts that came from a caller-controlled source (the
     # `x-litellm-timeout`/`x-litellm-stream-timeout` headers, or a `timeout`/`request_timeout`/
     # `stream_timeout` field in the request body) rather than deployment config, so a
     # deliberately tiny value isn't treated as a deployment health signal (see
-    # cooldown_handlers._trigger_cooldown_for_failed_deployment).
-    client_side_timeout: bool
+    # cooldown_handlers._trigger_cooldown_for_failed_deployment). Absent when there are none.
+    client_side_timeout: tuple[str, ...]
     keepalive_seconds: float | None
 
 
