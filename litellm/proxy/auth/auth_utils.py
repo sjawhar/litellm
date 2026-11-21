@@ -43,11 +43,13 @@ from litellm.router_utils.clientside_credential_handler import (
 )
 from litellm.router_utils.fallback_event_handlers import (
     HEADER_CARRIER_KWARGS,
+    NO_CONFIGURED_FALLBACKS,
     FallbackChecks,
     FallbackEntry,
     FallbackListShapeError,
     FallbackWalk,
     fallback_target_model_name,
+    router_configured_fallbacks,
     walk_fallback_lists,
 )
 from litellm.types.llms.anthropic import ANTHROPIC_API_HEADERS
@@ -545,7 +547,12 @@ _URL_DESTINATION_FIELDS: Final = ("model", "file_id")
 
 
 def request_fallback_walk(
-    route: str, request: Request | None, request_body: Mapping[str, object], *, saved_settings: bool = False
+    route: str,
+    request: Request | None,
+    request_body: Mapping[str, object],
+    *,
+    llm_router: Router | None,
+    saved_settings: bool = False,
 ) -> FallbackWalk:
     """
     One walk of every fallback list a request carries, read as the Router gets the call: an anthropic_messages call on
@@ -555,7 +562,9 @@ def request_fallback_walk(
     router_settings_override is the key's or team's saved router settings, counted apart against
     MAX_SAVED_FALLBACK_LIST_ENTRIES. The walk refuses more, or reads past FALLBACK_WALK_READS_PER_ENTRY per entry of
     either, with a 400 before it reads them, in every reading it reads; it reads no reading a hop cannot take
-    (walk_fallback_lists).
+    (walk_fallback_lists). On /v1/messages the targets of ``llm_router``'s own configured lists are hops too: their
+    summary decides with the request's targets whether both readings apply, as in the Router's own walk of the call,
+    so the walk charges a request's lists in every reading the Router can read them in.
     """
     messages_call: Final = route.endswith("/v1/messages")
     header_lines: Final = tuple(
@@ -577,6 +586,7 @@ def request_fallback_walk(
         anthropic_messages_call=messages_call,
         budget=MAX_FALLBACK_LIST_ENTRIES,
         saved_settings_budget=MAX_SAVED_FALLBACK_LIST_ENTRIES if saved_settings else None,
+        configured=router_configured_fallbacks(llm_router) if messages_call else NO_CONFIGURED_FALLBACKS,
     )
 
 
@@ -621,7 +631,7 @@ def _entry_names(entries: Iterable[FallbackEntry]) -> tuple[str, ...]:
 
 
 def key_fallback_model_names(
-    request_body: Mapping[str, object], *, route: str, request: Request | None
+    request_body: Mapping[str, object], *, route: str, request: Request | None, llm_router: Router | None
 ) -> FallbackModelNames:
     """
     The models every fallback list of the request names, through the one walk every check of the lists shares:
@@ -629,7 +639,7 @@ def key_fallback_model_names(
     to Anthropic on the hop, read in the widest way since Anthropic reads only the ``model`` of each entry. The key or
     team router settings the proxy applies after auth come through check_request_body, as the body does.
     """
-    return FallbackModelNames.of(request_fallback_walk(route, request, request_body).check())
+    return FallbackModelNames.of(request_fallback_walk(route, request, request_body, llm_router=llm_router).check())
 
 
 def _read_both_ways_note(groups: Sequence[str]) -> str:
@@ -693,9 +703,13 @@ def request_names_provider_fallback_models(
     """
     if not route.endswith("/v1/messages"):
         return False
+    from litellm.proxy.proxy_server import llm_router  # the server module imports this one
+
     readable_request: Final = request if request is not None and "headers" in request.scope else None
     try:
-        names: Final = key_fallback_model_names(request_body, route=route, request=readable_request)
+        names: Final = key_fallback_model_names(
+            request_body, route=route, request=readable_request, llm_router=llm_router
+        )
     except ValueError:
         return True
     return bool(names.anthropic)
@@ -990,7 +1004,9 @@ def check_request_body(
         litellm_list=_reject_unreadable_litellm_list,
     )
     return FallbackModelNames.of(
-        request_fallback_walk(route or "", request, request_body, saved_settings=saved_settings).check(checks)
+        request_fallback_walk(
+            route or "", request, request_body, llm_router=llm_router, saved_settings=saved_settings
+        ).check(checks)
     )
 
 

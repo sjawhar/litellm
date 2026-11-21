@@ -1438,7 +1438,9 @@ async def common_checks(
 
     # A fallback target can serve the request in the requested model's place. LiteLLM dispatches its own fallback
     # lists through aliases, but Anthropic gets the names in its own list as sent.
-    fallback_names: Final = key_fallback_model_names(_typed_request_body(request_body), route=route, request=request)
+    fallback_names: Final = key_fallback_model_names(
+        _typed_request_body(request_body), route=route, request=request, llm_router=llm_router
+    )
     if end_user_object is not None and end_user_object.models:
         with tracer.trace("litellm.proxy.auth.common_checks.can_customer_call_model"):
             if _model:
