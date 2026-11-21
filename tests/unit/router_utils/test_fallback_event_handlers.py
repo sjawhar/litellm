@@ -1659,6 +1659,45 @@ def test_the_router_entry_leaves_a_targets_own_list_to_anthropic_under_the_beta(
     assert request_fallbacks(kwargs, None, anthropic_messages_call=True) == kwargs["router_fallbacks"]
 
 
+@pytest.mark.parametrize("source", ["the-routers-configuration", "the-calls-own-list"])
+@pytest.mark.parametrize(
+    ("note_names", "refused"), [(15_993, False), (15_994, True)], ids=["at-the-read-cap", "one-past-it"]
+)
+def test_a_library_call_whose_own_lists_pass_the_read_cap_in_the_reading_both_ways_forces_is_refused(
+    source: str, note_names: int, refused: bool
+):
+    """
+    An anthropic_messages call without the beta, whose `fallbacks` holds a target and a parameter-only mapping with a
+    note of names. A target with the beta in its headers, in the Router's configured lists or in the call's own list,
+    makes the Router's walk read the call's lists as Anthropic's too, and that reading is charged against the
+    request's read cap, 16,000: it reads 7 values before the note, the list and its read, the mapping's values, the
+    metadata and its key, the note, then its names. 15,993 names are read; 15,994 are refused with the walk's 400. The
+    reading the call is checked in has no cap, as before.
+    """
+
+    def anthropic_messages() -> None:
+        """The function a Router call of /v1/messages names as its original_generic_function"""
+
+    beta_target: Final = {"model": "other", "extra_headers": {"anthropic-beta": "server-side-fallback-2026-07-01"}}
+    own_target: Final = beta_target if source == "the-calls-own-list" else {"model": "other"}
+    kwargs: Final[dict[str, object]] = {  # mutable-ok: the Router's untyped call kwargs
+        "model": "requested",
+        "fallbacks": [own_target, {"metadata": {"note": ["ab"] * note_names}}],
+        "original_generic_function": anthropic_messages,
+    }
+    configured: Final = (
+        {"context_window_fallbacks": [{"requested": [beta_target]}]} if source == "the-routers-configuration" else {}
+    )
+
+    if not refused:
+        assert call_fallbacks(kwargs, configured) == kwargs["fallbacks"]
+        return
+    with pytest.raises(
+        litellm.BadRequestError, match="reading the request's fallback lists takes more than 16000 reads"
+    ):
+        call_fallbacks(kwargs, configured)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("field", ["context_window_fallbacks", "content_policy_fallbacks"])
 async def test_the_router_reads_a_nested_targets_own_fallbacks_in_an_error_field_with_the_calls_context(field: str):

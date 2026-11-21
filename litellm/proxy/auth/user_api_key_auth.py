@@ -3846,7 +3846,7 @@ async def enforce_key_and_fallback_model_access(
     # run in common_checks.
     await enforce_fallback_target_access(
         valid_token=valid_token,
-        names=key_fallback_model_names(request_data, route=route, request=request),
+        names=key_fallback_model_names(request_data, route=route, request=request, llm_router=llm_router),
         llm_model_list=llm_model_list,  # pyright: ignore[reportUnknownArgumentType]  # the proxy's untyped model list
         llm_router=llm_router,
     )

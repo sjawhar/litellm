@@ -1679,18 +1679,41 @@ def _header_text(value: object) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _holds_server_side_fallback_token(beta: str) -> bool:
+    """
+    Whether a lowercased ``anthropic-beta`` value that holds the server-side fallback prefix holds a token that starts
+    with it, as HTTP reads the value: split at commas, each token stripped. Only the text around each place the prefix
+    occurs is read: back to the comma before it, which only whitespace may follow, and on to the next comma when it
+    does not start its token, since nothing else in that token can.
+    """
+    start = beta.find(_SERVER_SIDE_FALLBACK_BETA_PREFIX)  # rebind-ok: the search moves on past each token ruled out
+    while start != -1:
+        token_start = beta.rfind(",", 0, start) + 1
+        if token_start == start or beta[token_start:start].isspace():
+            return True
+        next_comma = beta.find(",", start)
+        if next_comma == -1:
+            return False
+        start = beta.find(_SERVER_SIDE_FALLBACK_BETA_PREFIX, next_comma + 1)
+    return False
+
+
 def anthropic_beta_opts_into_server_side_fallback(headers: object) -> bool:
-    """Whether ``headers`` carry a ``server-side-fallback-*`` token in ``anthropic-beta``, matched as HTTP does"""
+    """
+    Whether ``headers`` carry a ``server-side-fallback-*`` token in ``anthropic-beta``, matched as HTTP does: every
+    line's value split at commas, each token stripped and lowercased. Each value is lowercased and searched for the
+    prefix once; only a value that holds it is read token by token, and then only around each place it occurs, so a
+    long line costs one search however many tokens it holds.
+    """
     if not isinstance(headers, _HeaderItems):
         return False
-    beta_values: Final = tuple(
-        text
+    beta_values: Final = (
+        text.lower()
         for name, value in headers.items()
         if (_header_text(name) or "").lower() == "anthropic-beta" and (text := _header_text(value)) is not None
     )
     return any(
-        token.strip().lower().startswith(_SERVER_SIDE_FALLBACK_BETA_PREFIX)
-        for token in ",".join(beta_values).split(",")
+        _SERVER_SIDE_FALLBACK_BETA_PREFIX in beta and _holds_server_side_fallback_token(beta) for beta in beta_values
     )
 
 
