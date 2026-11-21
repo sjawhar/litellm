@@ -100,18 +100,6 @@ class _AsyncRedisCommands(Protocol):
     def eval(self, script: str, numkeys: int, *keys_and_args: str | bytes | float) -> Awaitable[object]: ...
 
 
-class _SetThenDeletePipeline(Protocol):
-    """The commands ``RedisCache.async_set_then_delete_or_raise`` queues on a redis-py pipeline, and its ``execute``,
-    which the stubs leave without a return type: one reply per command, and with the default ``raise_on_error`` the
-    first command error raised once every reply is in."""
-
-    def set(self, name: str, value: str, ex: int | None = None) -> object: ...
-
-    def delete(self, *names: str) -> object: ...
-
-    async def execute(self, raise_on_error: bool = True) -> Sequence[object]: ...
-
-
 _GENERIC_CALLER_MODULES: Final = frozenset(
     {
         __name__,
@@ -2044,18 +2032,16 @@ class RedisCache(BaseCache):
         when the second raises, every SET landed and some DELs may have."""
         client: Final = self._async_commands()
         payload: Final = json.dumps(value)
-        async with client.pipeline(transaction=False) as opened_sets:
-            sets: Final[_SetThenDeletePipeline] = opened_sets
+        async with client.pipeline(transaction=False) as pipe:
             for key in set_keys:
-                _ = sets.set(self.check_and_fix_namespace(key=key), payload, ex=ttl)
-            _ = await sets.execute()
+                _ = pipe.set(self.check_and_fix_namespace(key=key), payload, ex=ttl)
+            _ = await pipe.execute()  # pyright: ignore[reportUnknownMemberType]  # stubs give execute no return type
         if not delete_keys:
             return
-        async with client.pipeline(transaction=False) as opened_deletes:
-            deletes: Final[_SetThenDeletePipeline] = opened_deletes
+        async with client.pipeline(transaction=False) as pipe:
             for key in delete_keys:
-                _ = deletes.delete(self.check_and_fix_namespace(key=key))
-            _ = await deletes.execute()
+                _ = pipe.delete(self.check_and_fix_namespace(key=key))
+            _ = await pipe.execute()  # pyright: ignore[reportUnknownMemberType]  # stubs give execute no return type
 
     @_redis_circuit_breaker_guard
     async def async_server_version(self) -> str:
