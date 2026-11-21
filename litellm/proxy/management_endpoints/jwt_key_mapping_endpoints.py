@@ -1,6 +1,7 @@
 import re
 from collections.abc import Mapping, Sequence
 from datetime import datetime
+from functools import partial
 from typing import Final, Protocol
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -17,7 +18,7 @@ from litellm.proxy._types import (
 from litellm.proxy.auth.auth_checks import jwt_key_mapping_cache_key
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_broadcast
-from litellm.proxy.common_utils.user_api_key_cache import revoke_last_good
+from litellm.proxy.common_utils.user_api_key_cache import revoke_last_good_then
 from litellm.proxy.management_endpoints.common_utils import (  # noqa: F401  # legacy module exports
     _user_has_admin_view,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
     user_api_key_has_admin_view,
@@ -237,15 +238,14 @@ async def update_jwt_key_mapping(
         old_cache_key: Final = jwt_key_mapping_cache_key(
             old_mapping.jwt_claim_name, old_mapping.jwt_claim_value, old_mapping.jwt_issuer
         )
-        scope_cache_key: Final = jwt_key_mapping_cache_key(
-            old_mapping.jwt_claim_name,
-            old_mapping.jwt_claim_value,
-            update_data.get("jwt_issuer", old_mapping.jwt_issuer),
+        # Only the scope the mapping leaves held what it resolved. A scope it moves to holds no row whenever the move
+        # can succeed (the unique constraint on issuer and claim), and when it holds one the move fails with 409, which
+        # must leave that row's entry alone; the eviction after the write drops the new scope's cached answer
+        updated_mapping: Final = await revoke_last_good_then(
+            user_api_key_cache,
+            (old_cache_key,) if update_data.keys() & _RESOLVING_FIELDS else (),
+            partial(_mapping_table(prisma_client).update, where={"id": data.id}, data=update_data),
         )
-        if update_data.keys() & _RESOLVING_FIELDS:
-            await revoke_last_good(user_api_key_cache, tuple(dict.fromkeys((old_cache_key, scope_cache_key))))
-
-        updated_mapping: Final = await _mapping_table(prisma_client).update(where={"id": data.id}, data=update_data)
 
         if updated_mapping is None:
             raise HTTPException(status_code=404, detail="Mapping not found")
@@ -300,8 +300,9 @@ async def delete_jwt_key_mapping(
         cache_key: Final = jwt_key_mapping_cache_key(
             old_mapping.jwt_claim_name, old_mapping.jwt_claim_value, old_mapping.jwt_issuer
         )
-        await revoke_last_good(user_api_key_cache, (cache_key,))
-        await _mapping_table(prisma_client).delete(where={"id": data.id})
+        await revoke_last_good_then(
+            user_api_key_cache, (cache_key,), partial(_mapping_table(prisma_client).delete, where={"id": data.id})
+        )
 
         # Evict only after the row is gone, else a concurrent request can
         # re-cache the deleted mapping and keep it authorized until TTL.

@@ -1951,20 +1951,17 @@ async def test_a_read_that_started_before_a_repoint_cannot_keep_the_old_key_afte
 async def test_issuer_miss_paused_across_auto_registration_and_global_create_keeps_the_issuer_off_the_global_row():
     """The paused read found no row for the issuer, then the issuer's row is auto-registered to a restricted key and a
     broader global row is created. The resumed read goes on to the global row for its own request, but no outage may
-    send the issuer's caller there: the store keeps no answer for a scope that had no row. Once the tombstones the
-    create wrote have lapsed, a read that began after them keeps the global row, and the issuer's caller still does not
-    reach it."""
+    send the issuer's caller there: the store keeps no answer for a scope that had no row. The create evicts the
+    global scope's cached answer without a tombstone, so a read that begins after it keeps the global row at once, and
+    the issuer's caller still does not reach it."""
     import time
 
-    from litellm.constants import LAST_GOOD_TOMBSTONE_TTL_SECONDS
     from litellm.proxy._types import CreateJWTKeyMappingRequest, hash_token
     from litellm.proxy.auth.user_api_key_auth import _auto_register_jwt_mapping
     from litellm.proxy.common_utils.user_api_key_cache import last_good_reads_started_at
 
-    moved = [0.0]
-
     def clock() -> float:
-        return time.monotonic() + moved[0]
+        return time.monotonic()
 
     minted = "minted-by-auto-registration"
     restricted = hash_token(minted)
@@ -2004,8 +2001,7 @@ async def test_issuer_miss_paused_across_auto_registration_and_global_create_kee
     assert await recall_last_good(
         user_api_key_cache, jwt_key_mapping_cache_key("sub", "svc-7", _ISSUER), _JWTKeyMappingTarget
     ) is None
-    # The create's tombstones lapse, and only a read that begins after them may keep the global row
-    moved[0] += LAST_GOOD_TOMBSTONE_TTL_SECONDS
+    # The create recorded no tombstone, so a read that begins after it keeps the global row
     await user_api_key_cache.async_delete_cache(jwt_key_mapping_cache_key("sub", "svc-7"))
     with last_good_reads_started_at(clock()):
         assert (await _resolve(table, user_api_key_cache)).token == _OLD_KEY
@@ -2089,3 +2085,43 @@ async def test_a_mapping_description_update_writes_while_redis_is_down():
         )
 
     assert (table.rows[0]["description"], table.rows[0]["token"]) == ("renamed", _OLD_KEY)
+
+
+class _ScopedMappingTable(_MappingTable):
+    """As ``_MappingTable``, with the unique constraint on ``(jwt_issuer, jwt_claim_name, jwt_claim_value)``: an update
+    that would give a row another row's scope fails as Postgres does."""
+
+    async def update(self, where: dict[str, object], data: dict[str, object]) -> SimpleNamespace:
+        row = next(row for row in self.rows if row["id"] == where["id"])
+        moved = {**row, **data}
+        scope = ("jwt_issuer", "jwt_claim_name", "jwt_claim_value")
+        if any(other is not row and all(other[column] == moved[column] for column in scope) for other in self.rows):
+            raise Exception("Unique constraint failed on the fields: (`jwt_issuer`,`jwt_claim_name`,`jwt_claim_value`)")
+        return await super().update(where, data)
+
+
+@pytest.mark.asyncio
+async def test_a_mapping_moved_onto_an_issuer_scope_that_holds_a_row_answers_409_and_leaves_that_rows_entry_alone():
+    """The global mapping is moved to an issuer whose scope already holds a mapping for the same claim, so the unique
+    constraint refuses the update with 409. The revocation before the write takes only the scope the mapping leaves:
+    the row that holds the issuer's scope, which the request does not change, keeps its last good entry, and no
+    tombstone stands for it in Redis or in this pod's memory."""
+    from litellm.proxy._types import UpdateJWTKeyMappingRequest
+
+    redis = fake_redis_cache()
+    table = _ScopedMappingTable(_mapping_row("mapping-1", _OLD_KEY), _mapping_row("mapping-2", _NEW_KEY, _ISSUER))
+    user_api_key_cache = await _cache_holding_both_keys(redis_cache=redis.cache)
+    occupied = jwt_key_mapping_cache_key("sub", "svc-7", _ISSUER)
+    await remember_last_good(user_api_key_cache, occupied, _JWTKeyMappingTarget(token=_NEW_KEY))
+
+    with _endpoints_on(table, user_api_key_cache), pytest.raises(HTTPException) as refused:
+        await update_jwt_key_mapping(
+            data=UpdateJWTKeyMappingRequest(id="mapping-1", jwt_issuer=_ISSUER), user_api_key_dict=_make_admin_auth()
+        )
+
+    assert (refused.value.status_code, table.rows[0]["jwt_issuer"]) == (409, "")
+    assert await recall_last_good(user_api_key_cache, occupied, _JWTKeyMappingTarget) == _JWTKeyMappingTarget(
+        token=_NEW_KEY
+    )
+    assert await redis.cache.init_async_client().exists(f"last_good_tombstone:{occupied}") == 0
+    assert user_api_key_cache.last_good_memory.tombstoned(occupied) is False
