@@ -18156,6 +18156,67 @@ async def test_team_member_removal_key_round_answers_503_and_keeps_its_keys_when
     assert removal.prisma.tx.return_value.__aexit__.await_args.args[0] is HTTPException
 
 
+# A Redis round trip of the slow Redis a removal's transaction must fit within its timeout
+_SLOW_REDIS_ROUND_TRIP_SECONDS: Final = 0.7
+
+
+@pytest.mark.asyncio
+async def test_team_member_removal_makes_one_revocation_pass_in_its_transaction_so_a_slow_redis_fits_its_timeout(
+    monkeypatch,
+):
+    """Each Redis round trip takes 0.7 s. member-1 holds a key in team-1, and the removal revokes the team's, the
+    user's, the membership's and the key's entries in one pass right before its first write, two round trips; the key
+    round then needs no Redis while those tombstones stand, and no record follows a paired write while the transaction
+    is open. So the transaction, opened with the default timeout, spends 1.4 s on Redis, within that timeout, as when
+    no record followed a strict write; with the keys revoked apart and a record after each paired write it made 8
+    round trips there, 5.6 s, past that timeout."""
+    from litellm.proxy._types import TeamMemberDeleteRequest
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from litellm.proxy.utils import _PRISMA_DEFAULT_TX_TIMEOUT
+    from tests.unit.caching.fake_redis_cache import ScriptedPipelines, fake_redis_cache
+
+    clock: Final = _DrivenClock()
+    redis: Final = fake_redis_cache()
+    token: Final = "hashed-member-key"
+    key_rows: Final = _KeyRows(redis, [_member_key(token)], created_after_read={})
+    removal: Final = _wire_member_key_removal(
+        monkeypatch,
+        UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=True, last_good_clock=clock),
+        key_rows,
+    )
+
+    async def round_trip(_execution: int) -> None:
+        clock.now += _SLOW_REDIS_ROUND_TRIP_SECONDS
+
+    pipelines: Final = ScriptedPipelines(monkeypatch, redis.cache, after_execution=round_trip)
+    transaction: Final = removal.prisma.tx.return_value
+    entered: Final = transaction.__aenter__.return_value
+    # The round trips made and the clock, as the transaction opens and as it ends
+    opened_and_ended: Final[list[tuple[int, float]]] = []  # mutable-ok: one entry at the open, one at the end
+
+    async def open_transaction(*_args: object) -> object:
+        opened_and_ended.append((pipelines.executions, clock.now))
+        return entered
+
+    async def end_transaction(*_args: object) -> None:
+        opened_and_ended.append((pipelines.executions, clock.now))
+
+    transaction.__aenter__ = AsyncMock(side_effect=open_transaction)
+    transaction.__aexit__ = AsyncMock(side_effect=end_transaction)
+
+    await team_member_delete(
+        data=TeamMemberDeleteRequest(team_id="team-1", user_id="member-1"),
+        user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN, user_id="admin-user"),
+    )
+
+    removal.prisma.tx.assert_called_once_with()
+    opened, ended = opened_and_ended
+    assert (ended[0] - opened[0], ended[1] - opened[1]) == (2, pytest.approx(2 * _SLOW_REDIS_ROUND_TRIP_SECONDS))
+    assert ended[1] - opened[1] < _PRISMA_DEFAULT_TX_TIMEOUT.total_seconds()
+    assert key_rows.deletes == [_KeyDelete(where={"token": {"in": [token]}}, deleted=(token,), tombstoned=(token,))]
+
+
+
 class _OneWriterConnection:
     """A writer pool of one connection. While a transaction holds it, a read on the routed client has none to run on
     and waits for the transaction, which waits for the read until it times out; here that read fails at once."""

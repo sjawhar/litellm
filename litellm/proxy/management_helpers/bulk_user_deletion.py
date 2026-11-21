@@ -313,16 +313,19 @@ async def _rewrite_team_and_members(
     kept_members: Sequence[Member],
     stale_rows: Sequence["prisma_models.LiteLLM_UserTable"],
     cleanup_ids: frozenset[str],
+    key_tokens: Sequence[str],
     user_api_key_cache: UserApiKeyCache,
 ) -> None:
     """Take the members off the team's roster, the team off each stale user's ``teams`` and the members' memberships
-    away, inside ``last_good_revoked_around`` of the team's, the users' and the memberships' entries."""
+    away, inside ``last_good_revoked_around`` of the team's, the users' and the memberships' entries, and of the keys
+    of ``key_tokens``, deleted after it: one revocation for them all."""
     async with last_good_revoked_around(
         user_api_key_cache,
         (
             *(team_cache_keys(team_id, team_alias) if removed_members else ()),
             *(row.user_id for row in stale_rows),
             *(team_membership_auth_cache_key(team_id=team_id, user_id=user_id) for user_id in sorted(cleanup_ids)),
+            *key_tokens,
         ),
     ):
         if removed_members:
@@ -379,13 +382,20 @@ async def _remove_members_from_team(
     # round of ``_delete_keys`` reads those of its own keys
     serving: Final = serves_last_good_entries(user_api_key_cache)
     read_jwt_mapping_cache_keys: Final = () if serving else await _jwt_mapping_cache_keys_of(prisma_client, tx, keys)
-    # The deleted keys are revoked before the first write; the roster rides on the team's entry, the team on each
-    # user's entry and the member limits on each membership's, so those are revoked right before the writes that end
-    # them and recorded again after them, also when one raises
+    # The roster rides on the team's entry, the team on each user's entry and the member limits on each membership's,
+    # so all of them are revoked right before the writes that end them, with the keys deleted below, in one revocation:
+    # the key rounds then need no Redis while those tombstones stand. The transaction's record covers them all
     try:
-        await revoke_last_good(user_api_key_cache, tuple(k.token for k in keys))
         await _rewrite_team_and_members(
-            tx, team_id, team_alias, removed_members, kept_members, stale_rows, cleanup_ids, user_api_key_cache
+            tx,
+            team_id,
+            team_alias,
+            removed_members,
+            kept_members,
+            stale_rows,
+            cleanup_ids,
+            tuple(k.token for k in keys),
+            user_api_key_cache,
         )
     except HTTPException as refused:
         raise _revocation_refused(refused) from refused

@@ -3872,10 +3872,10 @@ async def _team_member_delete(
                 hashed_tokens=tuple(key.token for key in keys_to_delete), prisma_client=prisma_client, tx=tx
             )
         )
-        # The deleted keys are revoked before the first write; the roster rides on the team's entry, the team on each
-        # user's entry and the member limits on each membership's, so those are revoked right before the writes that
-        # end them and recorded again after them, also when one raises
-        await revoke_last_good(user_api_key_cache, tuple(key.token for key in keys_to_delete))
+        # The roster rides on the team's entry, the team on each user's entry and the member limits on each
+        # membership's, so all of them are revoked right before the writes that end them, with the keys deleted below,
+        # in one revocation: the key rounds then need no Redis while those tombstones stand. The transaction's record
+        # covers them all once it ends, returned or raised
         async with last_good_revoked_around(
             user_api_key_cache,
             (
@@ -3885,6 +3885,7 @@ async def _team_member_delete(
                     team_membership_auth_cache_key(team_id=data.team_id, user_id=user_id)
                     for user_id in sorted(user_ids_to_delete)
                 ),
+                *(key.token for key in keys_to_delete),
             ),
         ):
             if removed_team_members:
