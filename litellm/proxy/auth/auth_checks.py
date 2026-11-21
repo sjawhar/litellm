@@ -4311,14 +4311,14 @@ def jwt_key_mapping_cache_key(jwt_claim_name: str, jwt_claim_value: str, jwt_iss
     """Cache key under which a JWT-claim-to-key mapping is stored, scoped to one
     issuer (or the issuer-agnostic/global scope when ``jwt_issuer`` is falsy).
 
-    Scoped by issuer (when one is configured) so a cached hit or ``__NO_MAPPING__`` miss
-    for one issuer's claim value can never be served to a different issuer whose claim
-    value happens to collide. Unchanged for the global scope, keeping the single-issuer
-    (no ``litellm_jwtauth.issuers`` configured) cache key format stable across this fix.
+    The issuer and the claim name are length-prefixed, so two different scopes or claims never share a key, whatever
+    ``:`` the issuer, the claim name or the claim value contain: a cached hit, a ``__NO_MAPPING__`` miss or a last good
+    entry of one is never served to another. The ``jwt_key_mapping_v2:`` prefix keeps this text apart from the
+    ``jwt_key_mapping:{issuer}:{claim}:{value}`` text of earlier versions, which pods of both versions use side by side
+    during a rolling upgrade.
     """
-    if not jwt_issuer:
-        return f"jwt_key_mapping:{jwt_claim_name}:{jwt_claim_value}"
-    return f"jwt_key_mapping:{jwt_issuer}:{jwt_claim_name}:{jwt_claim_value}"
+    issuer: Final = jwt_issuer or ""
+    return f"jwt_key_mapping_v2:{len(issuer)}:{issuer}:{len(jwt_claim_name)}:{jwt_claim_name}:{jwt_claim_value}"
 
 
 @log_db_metrics

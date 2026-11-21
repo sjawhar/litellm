@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -16,13 +16,14 @@ from typing import Final
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 
+import httpx
 import pytest
 from fastapi import HTTPException, status
 
 import litellm
 import litellm.proxy.proxy_server
 from litellm.caching.dual_cache import DualCache
-from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, last_good_auth_entries_scope
 from litellm.proxy._types import (
     LiteLLMRoutes,
     LiteLLM_JWTAuth,
@@ -2011,7 +2012,7 @@ async def test_auto_register_binds_api_key_to_token_hash():
             user_api_key_cache=user_api_key_cache,
             parent_otel_span=None,
             proxy_logging_obj=MagicMock(),
-            cache_key="jwt_key_mapping:sub:user1",
+            cache_key=jwt_key_mapping_cache_key("sub", "user1"),
             team_id="validated-team",
             user_id="validated-user",
             org_id="validated-org",
@@ -2065,7 +2066,7 @@ def _auto_register_kwargs(prisma_client, user_api_key_cache, jwt_handler, **over
         "user_api_key_cache": user_api_key_cache,
         "parent_otel_span": None,
         "proxy_logging_obj": MagicMock(),
-        "cache_key": "jwt_key_mapping:sub:validated-user",
+        "cache_key": jwt_key_mapping_cache_key("sub", "validated-user"),
         "team_id": "validated-team",
         "user_id": "validated-user",
         "org_id": "jwt-org",
@@ -2272,7 +2273,7 @@ async def test_auto_register_map_existing_key_reuses_when_the_user_was_matched_b
                 user_api_key_cache,
                 jwt_handler,
                 claim_value="idp-subject-not-the-db-user-id",
-                cache_key="jwt_key_mapping:sub:idp-subject-not-the-db-user-id",
+                cache_key=jwt_key_mapping_cache_key("sub", "idp-subject-not-the-db-user-id"),
             )
         )
 
@@ -2310,7 +2311,7 @@ async def test_auto_register_map_existing_key_mints_when_the_claim_is_not_a_user
                 jwt_handler,
                 virtual_key_claim_field="azp",
                 claim_value="shared-client-app",
-                cache_key="jwt_key_mapping:azp:shared-client-app",
+                cache_key=jwt_key_mapping_cache_key("azp", "shared-client-app"),
             )
         )
 
@@ -2438,7 +2439,7 @@ async def test_auto_register_map_existing_key_first_request_runs_key_checks(
             return_value=_PendingAutoRegister(
                 claim_field="sub",
                 claim_value="user1",
-                cache_key="jwt_key_mapping:sub:user1",
+                cache_key=jwt_key_mapping_cache_key("sub", "user1"),
             ),
         ),
         patch(
@@ -2546,7 +2547,7 @@ async def test_auto_register_first_request_propagates_user_email(active: bool) -
             return_value=_PendingAutoRegister(
                 claim_field="sub",
                 claim_value="user1",
-                cache_key="jwt_key_mapping:sub:user1",
+                cache_key=jwt_key_mapping_cache_key("sub", "user1"),
             ),
         ),
         patch(
@@ -2743,7 +2744,7 @@ async def test_auto_register_stamps_new_key_with_jwt_agent_id():
             user_api_key_cache=user_api_key_cache,
             parent_otel_span=None,
             proxy_logging_obj=MagicMock(),
-            cache_key="jwt_key_mapping:appid:2f5c9b1e-6a4d-4c8e-9f0b-7d1a3e5c9b21",
+            cache_key=jwt_key_mapping_cache_key("appid", "2f5c9b1e-6a4d-4c8e-9f0b-7d1a3e5c9b21"),
             team_id="validated-team",
             user_id="validated-user",
             agent_id="canonical-agent-id",
@@ -2808,7 +2809,7 @@ async def test_auto_register_race_loser_keeps_winners_agent_id(losing_agent_id: 
             user_api_key_cache=user_api_key_cache,
             parent_otel_span=None,
             proxy_logging_obj=MagicMock(),
-            cache_key="jwt_key_mapping:tid:shared-tenant",
+            cache_key=jwt_key_mapping_cache_key("tid", "shared-tenant"),
             team_id="validated-team",
             user_id="validated-user",
             agent_id=losing_agent_id,
@@ -2885,7 +2886,7 @@ async def test_jwt_auto_register_forwards_bound_agent_id():
             return_value=_PendingAutoRegister(
                 claim_field="sub",
                 claim_value="user1",
-                cache_key="jwt_key_mapping:sub:user1",
+                cache_key=jwt_key_mapping_cache_key("sub", "user1"),
             ),
         ),
         patch(  # test-quality-ok: the builder calls this static method directly; no dependency injection seam exists
@@ -3200,7 +3201,7 @@ class TestJWTOAuth2Coexistence:
                 return_value=_PendingAutoRegister(
                     claim_field="sub",
                     claim_value="user1",
-                    cache_key="jwt_key_mapping:sub:user1",
+                    cache_key=jwt_key_mapping_cache_key("sub", "user1"),
                 ),
             ),
             patch(
@@ -9734,6 +9735,289 @@ async def test_issuer_agnostic_mapping_matches_every_issuer():
         assert resolved.token == "hashed-legacy-key"
 
 
+class _JWTKeyMappingTable:
+    """A ``LiteLLM_JWTKeyMapping`` table; while ``stopped``, every read fails the way an unreachable Postgres does."""
+
+    def __init__(self, *rows: dict[str, object]) -> None:
+        self.rows = list(rows)
+        self.stopped = False
+
+    async def find_first(self, where: dict[str, object]) -> SimpleNamespace | None:
+        if self.stopped:
+            raise httpx.ConnectError("All connection attempts failed")
+        matches: Final = (SimpleNamespace(**row) for row in self.rows if all(row.get(k) == v for k, v in where.items()))
+        return next(matches, None)
+
+
+def _svc_mapping(token: str, jwt_issuer: str = ISSUER_TWO) -> dict[str, object]:
+    return {
+        "jwt_issuer": jwt_issuer,
+        "jwt_claim_name": "sub",
+        "jwt_claim_value": "svc-7",
+        "token": token,
+        "is_active": True,
+    }
+
+
+async def _cache_holding_keys(*tokens: str, serve_last_good_entries: bool = True) -> UserApiKeyCache:
+    """The auth cache already holds each mapped key, so the mapping row is the only entry a lookup can serve from
+    last good."""
+    cache: Final = UserApiKeyCache(serve_last_good_entries=serve_last_good_entries)
+    for token in tokens:
+        await cache.async_set_cache(key=token, value=UserAPIKeyAuth(token=token, api_key=token))
+    return cache
+
+
+async def _resolve_svc(table: _JWTKeyMappingTable, cache: UserApiKeyCache) -> object:
+    from litellm.proxy.auth.user_api_key_auth import _resolve_jwt_to_virtual_key
+
+    return await _resolve_jwt_to_virtual_key(
+        jwt_claims={JWTHandler.LITELLM_JWT_ISSUER_CLAIM: ISSUER_TWO, "sub": "svc-7"},
+        jwt_handler=_per_issuer_virtual_key_jwt_handler(global_claim_field=None),
+        prisma_client=SimpleNamespace(db=SimpleNamespace(litellm_jwtkeymapping=table)),
+        user_api_key_cache=cache,
+        parent_otel_span=None,
+        proxy_logging_obj=MagicMock(),
+    )
+
+
+async def _resolve_unscoped_svc(table: _JWTKeyMappingTable, cache: UserApiKeyCache) -> object:
+    """A token no configured issuer stamped, so the lookup reads the global scope only."""
+    from litellm.proxy.auth.user_api_key_auth import _resolve_jwt_to_virtual_key
+
+    return await _resolve_jwt_to_virtual_key(
+        jwt_claims={"sub": "svc-7"},
+        jwt_handler=_per_issuer_virtual_key_jwt_handler(global_claim_field="sub", global_behavior="reject"),
+        prisma_client=SimpleNamespace(db=SimpleNamespace(litellm_jwtkeymapping=table)),
+        user_api_key_cache=cache,
+        parent_otel_span=None,
+        proxy_logging_obj=MagicMock(),
+    )
+
+
+async def _outlive_the_mapping_cache(cache: UserApiKeyCache) -> None:
+    for jwt_issuer in (ISSUER_TWO, None):
+        await cache.async_delete_cache(jwt_key_mapping_cache_key("sub", "svc-7", jwt_issuer))
+
+
+async def _stopped_after_one_read(cache: UserApiKeyCache, row: dict[str, object]) -> _JWTKeyMappingTable:
+    """The database answers one lookup, the mapping's cache entry expires, then the database stops."""
+    table: Final = _JWTKeyMappingTable(row)
+    await _resolve_svc(table, cache)
+    await _outlive_the_mapping_cache(cache)
+    table.stopped = True
+    return table
+
+
+@pytest.mark.asyncio
+async def test_mapping_row_is_served_from_its_last_good_entry_once_its_cache_entry_has_expired():
+    """The served token is not cached again, so every call during the outage is served from the entry."""
+    cache: Final = await _cache_holding_keys("hashed-mapped-key")
+    table: Final = await _stopped_after_one_read(cache, _svc_mapping("hashed-mapped-key"))
+
+    served: Final = await _resolve_svc(table, cache)
+
+    assert isinstance(served, UserAPIKeyAuth)
+    assert served.token == "hashed-mapped-key"
+    assert await cache.async_get_cache(jwt_key_mapping_cache_key("sub", "svc-7", ISSUER_TWO)) is None
+
+
+@pytest.mark.asyncio
+async def test_a_call_served_through_a_last_good_mapping_row_reads_last_good(monkeypatch):
+    from litellm.proxy.auth.user_api_key_auth import _auth_entries_source
+
+    cache: Final = await _cache_holding_keys("hashed-mapped-key")
+    table: Final = await _stopped_after_one_read(cache, _svc_mapping("hashed-mapped-key"))
+    monkeypatch.setattr(litellm.proxy.proxy_server, "user_api_key_cache", cache)
+
+    with last_good_auth_entries_scope() as scope:
+        await _resolve_svc(table, cache)
+
+    assert (scope.served, _auth_entries_source(scope)) == (("_JWTKeyMappingTarget",), "last_good")
+
+
+@pytest.mark.asyncio
+async def test_mapping_row_never_read_is_refused_while_the_database_is_stopped():
+    cache: Final = await _cache_holding_keys("hashed-mapped-key")
+    table: Final = _JWTKeyMappingTable(_svc_mapping("hashed-mapped-key"))
+    table.stopped = True
+
+    with pytest.raises(httpx.ConnectError):
+        await _resolve_svc(table, cache)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("row_issuer", "resolve"),
+    [(ISSUER_TWO, _resolve_svc), ("", _resolve_unscoped_svc)],
+    ids=["issuer_row", "global_row"],
+)
+async def test_mapping_row_the_database_reported_missing_is_refused_in_a_later_outage(
+    row_issuer: str, resolve: Callable[[_JWTKeyMappingTable, UserApiKeyCache], Awaitable[object]]
+):
+    """Each case reads the row in its own scope, the issuer's or the global one, so the outage reads that same scope's
+    entry and fails if the row the database reported missing was not forgotten there."""
+    cache: Final = await _cache_holding_keys("hashed-mapped-key")
+    table: Final = _JWTKeyMappingTable(_svc_mapping("hashed-mapped-key", jwt_issuer=row_issuer))
+    assert getattr(await resolve(table, cache), "token", None) == "hashed-mapped-key"
+    table.rows.clear()
+    await _outlive_the_mapping_cache(cache)
+    with pytest.raises(HTTPException):
+        await resolve(table, cache)
+    await _outlive_the_mapping_cache(cache)
+    table.stopped = True
+
+    with pytest.raises(httpx.ConnectError):
+        await resolve(table, cache)
+
+
+@pytest.mark.asyncio
+async def test_mapping_row_is_refreshed_when_the_database_answers_again():
+    cache: Final = await _cache_holding_keys("hashed-old-key", "hashed-new-key")
+    table: Final = await _stopped_after_one_read(cache, _svc_mapping("hashed-old-key"))
+    during_the_first_outage: Final = await _resolve_svc(table, cache)
+    table.stopped = False
+    table.rows[0] = _svc_mapping("hashed-new-key")
+    await _resolve_svc(table, cache)
+    await _outlive_the_mapping_cache(cache)
+    table.stopped = True
+
+    during_the_second_outage: Final = await _resolve_svc(table, cache)
+
+    assert isinstance(during_the_first_outage, UserAPIKeyAuth)
+    assert isinstance(during_the_second_outage, UserAPIKeyAuth)
+    assert (during_the_first_outage.token, during_the_second_outage.token) == ("hashed-old-key", "hashed-new-key")
+
+
+@pytest.mark.asyncio
+async def test_mapping_row_is_refused_while_the_database_is_stopped_with_the_setting_off():
+    cache: Final = await _cache_holding_keys("hashed-mapped-key", serve_last_good_entries=False)
+    table: Final = await _stopped_after_one_read(cache, _svc_mapping("hashed-mapped-key"))
+
+    with pytest.raises(httpx.ConnectError):
+        await _resolve_svc(table, cache)
+
+
+@pytest.mark.asyncio
+async def test_while_the_database_is_stopped_the_global_row_serves_a_token_without_an_issuer_but_not_an_issuer_caller():
+    """Only the database can say an issuer has no row of its own, so an issuer's caller that resolved through the
+    global row is refused during the outage. A token that carries no issuer resolves in the global scope itself."""
+    from litellm.proxy.auth.user_api_key_auth import _resolve_jwt_to_virtual_key
+
+    cache: Final = await _cache_holding_keys("hashed-global-key")
+    table: Final = _JWTKeyMappingTable(_svc_mapping("hashed-global-key", jwt_issuer=""))
+    jwt_handler: Final = _per_issuer_virtual_key_jwt_handler(global_claim_field="sub")
+    issuer_claim: Final = {JWTHandler.LITELLM_JWT_ISSUER_CLAIM: ISSUER_TWO}
+
+    async def resolve(claims: dict[str, str]) -> object:
+        return await _resolve_jwt_to_virtual_key(
+            jwt_claims={**claims, "sub": "svc-7"},
+            jwt_handler=jwt_handler,
+            prisma_client=SimpleNamespace(db=SimpleNamespace(litellm_jwtkeymapping=table)),
+            user_api_key_cache=cache,
+            parent_otel_span=None,
+            proxy_logging_obj=MagicMock(),
+        )
+
+    while_answering: Final = (await resolve(issuer_claim), await resolve({}))
+    await _outlive_the_mapping_cache(cache)
+    table.stopped = True
+    served: Final = await resolve({})
+
+    assert [getattr(key, "token", None) for key in (*while_answering, served)] == ["hashed-global-key"] * 3
+    with pytest.raises(httpx.ConnectError):
+        await resolve(issuer_claim)
+
+
+@pytest.mark.asyncio
+async def test_issuer_never_read_is_refused_while_another_issuer_kept_the_global_row():
+    from litellm.proxy.auth.user_api_key_auth import _resolve_jwt_to_virtual_key
+
+    cache: Final = await _cache_holding_keys("hashed-global-key")
+    table: Final = _JWTKeyMappingTable(_svc_mapping("hashed-global-key", jwt_issuer=""))
+    warmed: Final = await _resolve_jwt_to_virtual_key(
+        jwt_claims={JWTHandler.LITELLM_JWT_ISSUER_CLAIM: ISSUER_ONE, "sub": "svc-7"},
+        jwt_handler=_per_issuer_virtual_key_jwt_handler(global_claim_field="sub"),
+        prisma_client=SimpleNamespace(db=SimpleNamespace(litellm_jwtkeymapping=table)),
+        user_api_key_cache=cache,
+        parent_otel_span=None,
+        proxy_logging_obj=MagicMock(),
+    )
+    await _outlive_the_mapping_cache(cache)
+    table.stopped = True
+
+    assert isinstance(warmed, UserAPIKeyAuth)
+    assert warmed.token == "hashed-global-key"
+    with pytest.raises(httpx.ConnectError):
+        await _resolve_svc(table, cache)
+
+
+@pytest.mark.asyncio
+async def test_issuer_scopes_whose_parts_join_to_the_same_text_keep_separate_entries():
+    """Issuer ``.../a`` with sub ``sub:v`` and issuer ``.../a:sub`` with sub ``v`` join to the same text when the parts
+    are only separated by ``:``. Warming the second must not answer the first during an outage."""
+    from litellm.proxy.auth.user_api_key_auth import _resolve_jwt_to_virtual_key
+
+    first_issuer: Final = "https://idp.example/a"
+    second_issuer: Final = "https://idp.example/a:sub"
+    jwt_handler: Final = MagicMock()
+    jwt_handler.litellm_jwtauth = LiteLLM_JWTAuth(
+        virtual_key_claim_field="sub", unregistered_jwt_client_behavior="reject"
+    )
+    cache: Final = await _cache_holding_keys("hashed-second-key")
+    table: Final = _JWTKeyMappingTable(
+        {
+            "jwt_issuer": second_issuer,
+            "jwt_claim_name": "sub",
+            "jwt_claim_value": "v",
+            "token": "hashed-second-key",
+            "is_active": True,
+        }
+    )
+
+    async def resolve(issuer: str, sub: str) -> object:
+        return await _resolve_jwt_to_virtual_key(
+            jwt_claims={JWTHandler.LITELLM_JWT_ISSUER_CLAIM: issuer, "sub": sub},
+            jwt_handler=jwt_handler,
+            prisma_client=SimpleNamespace(db=SimpleNamespace(litellm_jwtkeymapping=table)),
+            user_api_key_cache=cache,
+            parent_otel_span=None,
+            proxy_logging_obj=MagicMock(),
+        )
+
+    warmed: Final = await resolve(second_issuer, "v")
+    for issuer, sub in ((first_issuer, "sub:v"), (second_issuer, "v"), (None, "sub:v"), (None, "v")):
+        await cache.async_delete_cache(jwt_key_mapping_cache_key("sub", sub, issuer))
+    table.stopped = True
+
+    assert isinstance(warmed, UserAPIKeyAuth)
+    assert warmed.token == "hashed-second-key"
+    with pytest.raises(httpx.ConnectError):
+        await resolve(first_issuer, "sub:v")
+
+
+def _earlier_version_mapping_key(jwt_claim_name: str, jwt_claim_value: str, jwt_issuer: str | None = None) -> str:
+    """The mapping cache key text of versions before the length-prefixed one, which a rolling upgrade still runs."""
+    if not jwt_issuer:
+        return f"jwt_key_mapping:{jwt_claim_name}:{jwt_claim_value}"
+    return f"jwt_key_mapping:{jwt_issuer}:{jwt_claim_name}:{jwt_claim_value}"
+
+
+@pytest.mark.parametrize(
+    ("earlier", "current"),
+    [
+        (("9", "https://a:3:sub:v", None), ("sub", "v", "https://a")),
+        (("sub", "v", "https://a"), ("9", "https://a:3:sub:v", None)),
+        (("sub", "v", None), ("sub", "v", None)),
+    ],
+    ids=["earlier_global_vs_issuer", "earlier_issuer_vs_global", "same_global_scope"],
+)
+def test_mapping_cache_key_never_equals_the_key_text_of_an_earlier_version(
+    earlier: tuple[str, str, str | None], current: tuple[str, str, str | None]
+):
+    assert jwt_key_mapping_cache_key(*current) != _earlier_version_mapping_key(*earlier)
+
+
 @pytest.mark.asyncio
 async def test_auth_flow_enters_virtual_key_mapping_when_only_an_issuer_configures_the_claim_field():
     jwt_token = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJzdmMtYWNjb3VudC03In0.signature"
@@ -10508,7 +10792,7 @@ async def test_auto_register_mapping_insert_emits_a_postgres_insert_event_for_th
             user_api_key_cache=user_api_key_cache,
             parent_otel_span=None,
             proxy_logging_obj=MagicMock(),
-            cache_key="jwt_key_mapping:sub:user1",
+            cache_key=jwt_key_mapping_cache_key("sub", "user1"),
             team_id="validated-team",
             user_id="validated-user",
         )
