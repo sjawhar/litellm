@@ -126,6 +126,7 @@ from litellm.proxy.common_utils.json_merge_patch import apply_json_merge_patch
 from litellm.proxy.common_utils.user_api_key_cache import (
     UserApiKeyCache,
     forget_last_good,
+    record_last_good_tombstones_again,
     revoke_and_delete_read_rows,
     revoke_last_good,
     revoke_last_good_then,
@@ -3942,6 +3943,9 @@ async def _team_member_delete(
         await forget_last_good(
             user_api_key_cache, team_membership_auth_cache_key(team_id=data.team_id, user_id=user_id), tombstone=True
         )
+    # The users' rows were written inside the transaction, so their tombstones are recorded again once it committed;
+    # the team's, the keys' and the memberships' were above
+    await record_last_good_tombstones_again(user_api_key_cache, tuple(user.user_id for user in stale_user_rows))
 
     _emit_team_members_metric(existing_team_row)
 

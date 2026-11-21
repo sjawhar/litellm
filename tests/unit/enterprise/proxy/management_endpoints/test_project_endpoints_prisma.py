@@ -1457,6 +1457,39 @@ async def test_project_delete_with_the_setting_off_reads_and_deletes_each_projec
 
 
 @pytest.mark.asyncio
+async def test_project_delete_records_the_tombstone_again_after_the_delete_so_an_outage_cannot_serve_the_old_project(
+    monkeypatch,
+):
+    """With a 30 s tombstone, the request revokes the project's entry at t=0 and deletes the project at t=19, when its
+    record shows that tombstone standing for 11 s more, so the delete sends no Redis command before it. Another pod's
+    read began at t=19, before the delete committed, and got the old project; it stores it at t=31, after the first
+    tombstone lapsed at t=30. Once the delete returns, the request records the project's tombstone again for 30 s
+    from t=19, so that store is refused and an outage that follows serves no project."""
+    from litellm.proxy._types import LiteLLM_ProjectTableCachedObj
+    from tests.unit.proxy.last_good_tombstone_race import (
+        revoked_before_the_write,
+        served_after_another_pod_stores,
+        tombstone_race,
+    )
+
+    race: Final = tombstone_race(monkeypatch)
+    project_id: Final = f"project-{uuid.uuid4()}"
+    cache_key: Final = project_cache_key(project_id)
+    projects: Final = _ProjectTable((project_id,), race.redis)
+    _serve_project_table(monkeypatch, projects, race.cache)
+    await revoked_before_the_write(race, (cache_key,))
+
+    deleted: Final = await _delete_projects(project_id)
+
+    assert [project.project_id for project in deleted] == [project_id]
+    assert projects.deletes == [(project_id, True)]
+    served: Final = await served_after_another_pod_stores(
+        race, cache_key, LiteLLM_ProjectTableCachedObj(project_id=project_id)
+    )
+    assert served is None
+
+
+@pytest.mark.asyncio
 async def test_project_eviction_publishes_cross_worker_invalidation(monkeypatch):
     """
     Single-worker eviction only fixes the handling worker; the broadcast is what

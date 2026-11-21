@@ -2504,3 +2504,108 @@ async def test_delete_organization_with_last_good_entries_off_reads_nothing_befo
     assert log == [*each_organization, *each_organization]
     assert organizations.org_ids == []
     assert [table.rows for table in children] == [(), (), ()]
+
+
+@pytest.mark.asyncio
+async def test_delete_organization_records_its_tombstones_again_after_the_row_delete_so_no_outage_serves_the_old_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The request first revokes organization org-doomed's entries at t=0, with a 30 s tombstone. Its delete runs at
+    t=19, when the request's record shows those tombstones standing, so neither the revocation before its first delete
+    nor the one paired with the organization's row delete sends Redis anything. Another pod's read began at t=19,
+    before the row delete committed, and got the organization; it stores that row at t=31, once the first tombstones
+    lapsed at t=30. The delete records the organization's tombstones again once its row delete returns, standing until
+    t=49, so that store keeps nothing and an outage that follows serves no entry for the deleted organization, rather
+    than its old row."""
+    from litellm.proxy._types import (
+        DeleteOrganizationRequest,
+        LiteLLM_OrganizationTable,
+        LitellmUserRoles,
+        UserAPIKeyAuth,
+    )
+    from litellm.proxy.auth.auth_checks import organization_cache_keys
+    from litellm.proxy.management_endpoints.organization_endpoints import delete_organization
+    from tests.unit.proxy.last_good_tombstone_race import (
+        revoked_before_the_write,
+        served_after_another_pod_stores,
+        tombstone_race,
+    )
+
+    race: Final = tombstone_race(monkeypatch)
+    old_row: Final = LiteLLM_OrganizationTable(
+        organization_id="org-doomed", budget_id="budget-org-doomed", created_by="admin", updated_by="admin"
+    )
+    organizations: Final = _deleted_organization_table()
+    database: Final = SimpleNamespace(
+        db=SimpleNamespace(
+            litellm_teamtable=_Rows(()),
+            litellm_verificationtoken=_Rows(()),
+            litellm_organizationmembership=_Rows(()),
+            litellm_jwtkeymapping=CascadingJWTMappingTable([]),
+            litellm_organizationtable=organizations,
+        )
+    )
+    _org_endpoints_use(monkeypatch, database, race.cache)
+    await revoked_before_the_write(race, organization_cache_keys("org-doomed"))
+
+    deleted: Final = await delete_organization(
+        data=DeleteOrganizationRequest(organization_ids=["org-doomed"]),
+        user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN),
+    )
+
+    assert [org.organization_id for org in deleted] == ["org-doomed"]
+    organizations.delete.assert_awaited_once()
+    served: Final = await served_after_another_pod_stores(race, organization_cache_keys("org-doomed")[0], old_row)
+    assert served is None
+
+
+@pytest.mark.asyncio
+async def test_organization_member_delete_records_the_tombstone_again_so_no_outage_serves_the_removed_membership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The request first revokes member-1's entry at t=0, with a 30 s tombstone. The removal of member-1 from org-1
+    runs at t=19, when the request's record shows that tombstone standing, so the revocation paired with the
+    membership's delete sends Redis nothing. Another pod's read began at t=19, before the delete committed, and got
+    member-1 as an admin of org-1; it stores that row at t=31, once the first tombstone lapsed at t=30. The removal
+    records member-1's tombstone again once its delete returns, standing until t=49, so that store keeps nothing and an
+    outage that follows serves no entry for member-1, rather than the row that still makes it an admin of org-1."""
+    from datetime import datetime, timezone
+
+    from litellm.proxy._types import (
+        LiteLLM_OrganizationMembershipTable,
+        LiteLLM_UserTable,
+        LitellmUserRoles,
+        OrganizationMemberDeleteRequest,
+        UserAPIKeyAuth,
+    )
+    from litellm.proxy.management_endpoints.organization_endpoints import organization_member_delete
+    from tests.unit.proxy.last_good_tombstone_race import (
+        revoked_before_the_write,
+        served_after_another_pod_stores,
+        tombstone_race,
+    )
+
+    race: Final = tombstone_race(monkeypatch)
+    joined: Final = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    admin_membership: Final = LiteLLM_OrganizationMembershipTable(
+        user_id="member-1",
+        organization_id="org-1",
+        user_role=LitellmUserRoles.ORG_ADMIN.value,
+        created_at=joined,
+        updated_at=joined,
+    )
+    memberships: Final = _Rows((admin_membership,))
+    database: Final = SimpleNamespace(db=SimpleNamespace(litellm_organizationmembership=memberships))
+    _org_endpoints_use(monkeypatch, database, race.cache)
+    await revoked_before_the_write(race, ("member-1",))
+
+    removed: Final = await organization_member_delete(
+        data=OrganizationMemberDeleteRequest(organization_id="org-1", user_id="member-1"),
+        user_api_key_dict=UserAPIKeyAuth(user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+    )
+
+    assert (removed, memberships.rows) == (admin_membership, ())
+    served: Final = await served_after_another_pod_stores(
+        race, "member-1", LiteLLM_UserTable(user_id="member-1", organization_memberships=[admin_membership])
+    )
+    assert served is None
