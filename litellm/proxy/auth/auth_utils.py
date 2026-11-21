@@ -562,9 +562,12 @@ def request_fallback_walk(
     router_settings_override is the key's or team's saved router settings, counted apart against
     MAX_SAVED_FALLBACK_LIST_ENTRIES. The walk refuses more, or reads past FALLBACK_WALK_READS_PER_ENTRY per entry of
     either, with a 400 before it reads them, in every reading it reads; it reads no reading a hop cannot take
-    (walk_fallback_lists). On /v1/messages the targets of ``llm_router``'s own configured lists are hops too: their
-    summary decides with the request's targets whether both readings apply, as in the Router's own walk of the call,
-    so the walk charges a request's lists in every reading the Router can read them in.
+    (walk_fallback_lists). On /v1/messages the mappings of ``llm_router``'s own configured lists are hops too: a scan
+    of all three lists on every request decides with the request's targets whether both readings apply, as in the
+    Router's own walk of the call. The body's router_settings_override is read as the call gets it after the proxy
+    promotes it (router_settings_override_fields): the setting that can become the call's own ``fallbacks`` is read
+    as the body's own ``fallbacks`` is. So the walk charges a request's lists, and the saved ones, in every reading the
+    Router can read them in.
     """
     messages_call: Final = route.endswith("/v1/messages")
     header_lines: Final = tuple(
@@ -587,6 +590,7 @@ def request_fallback_walk(
         budget=MAX_FALLBACK_LIST_ENTRIES,
         saved_settings_budget=MAX_SAVED_FALLBACK_LIST_ENTRIES if saved_settings else None,
         configured=router_configured_fallbacks(llm_router) if messages_call else NO_CONFIGURED_FALLBACKS,
+        router_serves=llm_router is not None,
     )
 
 

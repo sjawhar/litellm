@@ -645,8 +645,9 @@ class _Gateway:
         user_id: str | None = None,
         team_models: tuple[str, ...] = ("requested", "other"),
         router_fallbacks: Sequence[Mapping[str, object]] = (),
-        # The Router's own context_window_fallbacks, a proxy admin's configuration
+        # The Router's own context_window_fallbacks and content_policy_fallbacks, a proxy admin's configuration
         router_context_window_fallbacks: Sequence[Mapping[str, object]] = (),
+        router_content_policy_fallbacks: Sequence[Mapping[str, object]] = (),
         enforce_fallback_model_access: bool = False,
         # general_settings.allow_client_side_credentials, the proxy-wide opt-in the body's checks read
         client_side_credentials: bool = False,
@@ -690,6 +691,7 @@ class _Gateway:
             routing_groups=[dict(group) for group in routing_groups] or None,
             fallbacks=[dict(chain) for chain in router_fallbacks] or None,
             context_window_fallbacks=[dict(chain) for chain in router_context_window_fallbacks] or None,
+            content_policy_fallbacks=[dict(chain) for chain in router_content_policy_fallbacks] or None,
             fallback_access_check=router_fallback_access_check if enforce_fallback_model_access else None,
         )
         router.fallback_target_credentials_allowed = (lambda: True) if credentials_allowed else None
@@ -1621,6 +1623,7 @@ def _count_walks(monkeypatch: pytest.MonkeyPatch) -> Sequence[Mapping[str, objec
         configured: fallback_event_handlers.ConfiguredFallbacks = fallback_event_handlers.NO_CONFIGURED_FALLBACKS,
         configured_lists: Mapping[str, object] = no_lists,
         other_reading_read_cap: int | None = None,
+        router_serves: bool = True,
     ) -> fallback_event_handlers.FallbackWalk:
         walks.append({**body, **configured_lists})
         return walk_fallback_lists(
@@ -1632,11 +1635,81 @@ def _count_walks(monkeypatch: pytest.MonkeyPatch) -> Sequence[Mapping[str, objec
             configured=configured,
             configured_lists=configured_lists,
             other_reading_read_cap=other_reading_read_cap,
+            router_serves=router_serves,
         )
 
     for module in (auth_utils, fallback_event_handlers):
         monkeypatch.setattr(module, "walk_fallback_lists", counted)
     return walks
+
+
+def _count_scans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Sequence[tuple[tuple[object, object, object], object]]:
+    """Every scan of a Router's configured lists from now on: the three lists it read, and what it answered"""
+    from litellm.router_utils import fallback_event_handlers
+
+    scan: Final = fallback_event_handlers._scan_configured_fallbacks  # pyright: ignore[reportPrivateUsage]  # the scan
+    scans: Final[list[tuple[tuple[object, object, object], object]]] = []  # mutable-ok: each scan appends its row
+
+    def counted(lists: tuple[object, object, object]) -> fallback_event_handlers.ConfiguredFallbacks:
+        answer: Final = scan(lists)
+        scans.append((lists, answer))
+        return answer
+
+    monkeypatch.setattr(fallback_event_handlers, "_scan_configured_fallbacks", counted)
+    return scans
+
+
+def _scanned_the_routers_lists(lists: tuple[object, object, object], router: object) -> bool:
+    """Whether a scan read the Router's own three configured lists, the objects themselves"""
+    kept: Final = (
+        getattr(router, "fallbacks", None),
+        getattr(router, "context_window_fallbacks", None),
+        getattr(router, "content_policy_fallbacks", None),
+    )
+    return all(read is held for read, held in zip(lists, kept, strict=True))
+
+
+def _count_proxy_walk_scans(monkeypatch: pytest.MonkeyPatch) -> Sequence[tuple[bool, object]]:
+    """
+    Every walk the proxy's checks make from now on: whether it counts saved settings apart, and the scan of the Router's
+    configured lists it decides by
+    """
+    from litellm.proxy.auth import auth_utils
+    from litellm.router_utils import fallback_event_handlers
+
+    given: Final[list[tuple[bool, object]]] = []  # mutable-ok: each walk appends what it was given
+    walk_fallback_lists: Final = auth_utils.walk_fallback_lists
+    no_lists: Final[Mapping[str, object]] = MappingProxyType({})
+
+    def counted(
+        body: Mapping[str, object],
+        *,
+        carriers: Mapping[str, object],
+        anthropic_messages_call: bool,
+        budget: int | None = None,
+        saved_settings_budget: int | None = None,
+        configured: fallback_event_handlers.ConfiguredFallbacks = fallback_event_handlers.NO_CONFIGURED_FALLBACKS,
+        configured_lists: Mapping[str, object] = no_lists,
+        other_reading_read_cap: int | None = None,
+        router_serves: bool = True,
+    ) -> fallback_event_handlers.FallbackWalk:
+        given.append((saved_settings_budget is not None, configured))
+        return walk_fallback_lists(
+            body,
+            carriers=carriers,
+            anthropic_messages_call=anthropic_messages_call,
+            budget=budget,
+            saved_settings_budget=saved_settings_budget,
+            configured=configured,
+            configured_lists=configured_lists,
+            other_reading_read_cap=other_reading_read_cap,
+            router_serves=router_serves,
+        )
+
+    monkeypatch.setattr(auth_utils, "walk_fallback_lists", counted)
+    return given
 
 
 def _count_reads(monkeypatch: pytest.MonkeyPatch) -> list[int]:
@@ -1704,15 +1777,16 @@ def test_the_body_check_visits_nested_fallbacks_a_fixed_number_of_times_each(
     """
     The shape of the review's body at the budget, ten nested mappings around 990 names: the body check visits each
     entry, and reads each value, a fixed number of times, not once per path through the mappings above it, and only in
-    the reading the request is checked in, since no hop can take the other. The Router's own lists change none of it
-    while no target of theirs carries a header field: their summary, made once per configuration and here before the
-    count, says no hop of theirs can change the reading.
+    the reading the request is checked in, since no hop can take the other. On /v1/messages the check scans the
+    Router's own three lists for this request, and its walk decides by that scan; while no mapping of theirs carries
+    a header field, no hop of theirs can change the reading. The scan reads no value charged to the request and builds
+    no entry, so it adds nothing to the counts. The chat route reads no configured list.
     """
     from litellm.proxy.auth.auth_utils import is_request_body_safe
-    from litellm.router_utils.fallback_event_handlers import router_configured_fallbacks
 
     router: Final = _router_configured_without_header_fields() if configured else _router_without_fallback_group()
-    assert not router_configured_fallbacks(router).carries_headers
+    scans: Final = _count_scans(monkeypatch)
+    walks: Final = _count_proxy_walk_scans(monkeypatch)
     visits: Final = _count_visits(monkeypatch)
     reads: Final = _count_reads(monkeypatch)
     body: Final = {"model": "requested", "fallbacks": _nested_fallbacks(990)}
@@ -1723,6 +1797,13 @@ def test_the_body_check_visits_nested_fallbacks_a_fixed_number_of_times_each(
     assert sum(reads) == _walk_reads(990, anthropic=anthropic_reading) + (
         _ONE_BETA_LINE_READS if anthropic_beta is not None else 0
     )
+    if route != "/v1/messages":
+        assert scans == []
+        return
+    assert len(scans) == 1
+    assert _scanned_the_routers_lists(scans[0][0], router)
+    assert len(walks) == 1
+    assert walks[0][1] is scans[0][1]
 
 
 @pytest.mark.parametrize("names", [1000, 20000], ids=["the-8-kb-body", "the-189-kb-body"])
@@ -2200,25 +2281,45 @@ async def test_saved_settings_past_their_limit_are_refused_with_their_own_param(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("groups", "served"), [(79_998, True), (79_999, False)], ids=["at-the-read-cap", "past-it"])
 @pytest.mark.parametrize(
-    "router_fallbacks",
-    [(), ({"requested": [{"model": "other", "timeout": 5}]},)],
-    ids=["no-configured-lists", "configured-lists-without-a-header-field"],
+    ("route", "router_fallbacks"),
+    [
+        pytest.param("/v1/chat/completions", (), id="chat-no-configured-lists"),
+        pytest.param(
+            "/v1/messages",
+            ({"requested": [{"model": "other", "timeout": 5}]},),
+            id="messages-configured-lists-without-a-header-field",
+        ),
+    ],
 )
 async def test_saved_settings_within_their_entry_limit_are_refused_past_their_own_read_cap(
-    monkeypatch: pytest.MonkeyPatch, groups: int, served: bool, router_fallbacks: Sequence[Mapping[str, object]]
+    monkeypatch: pytest.MonkeyPatch,
+    groups: int,
+    served: bool,
+    route: str,
+    router_fallbacks: Sequence[Mapping[str, object]],
 ) -> None:
     """
     Saved settings have their own read cap, 16 reads per entry of their 10,000: 160,000. One group map of empty lists
     holds one entry, and costs 3 reads, the list's format pass and its read included, and 2 per group, the map's value
     and the empty list reached: 79,998 groups take 159,999 reads and are served, 79,999 take 160,001 and are refused
-    with a 400 that names the saved settings and the read limit, whether or not the Router has configured lists of its
-    own whose targets carry no header field
+    with a 400 that names the saved settings and the read limit. On /v1/messages the check of the saved settings scans
+    the Router's own three lists for the request and decides by that scan; their target carries no header field, so
+    the counts are the chat route's. The chat route keeps `param` in its error envelope.
     """
+    from litellm.proxy import proxy_server
+
+    scans: Final = _count_scans(monkeypatch)
+    walks: Final = _count_proxy_walk_scans(monkeypatch)
     settings: Final = {"fallbacks": [{f"group-{index}": [] for index in range(groups)}]}
     result: Final = await _Gateway(monkeypatch, requested_answers=True).send(
-        {}, team_router_settings=settings, route="/v1/chat/completions", router_fallbacks=router_fallbacks
+        {}, team_router_settings=settings, route=route, router_fallbacks=router_fallbacks
     )
 
+    saved_walks: Final = tuple(configured for saved, configured in walks if saved)
+    assert len(saved_walks) == 1
+    if route == "/v1/messages":
+        assert [answer for lists, answer in scans if answer is saved_walks[0]] == [saved_walks[0]]
+        assert all(_scanned_the_routers_lists(lists, proxy_server.llm_router) for lists, _ in scans)
     if served:
         assert result.response.status_code == 200, result.response.text
         return
@@ -2227,7 +2328,8 @@ async def test_saved_settings_within_their_entry_limit_are_refused_past_their_ow
         "reading the fallback lists of the key's or team's saved router_settings takes more than 160000 reads"
         in result.response.text
     )
-    assert _error_param(result.response) == "router_settings"
+    if route == "/v1/chat/completions":
+        assert _error_param(result.response) == "router_settings"
     assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
 
 
@@ -2568,7 +2670,7 @@ async def test_a_configured_target_that_brings_the_beta_gets_anthropics_reading_
     """
     The review's configuration: the Router's own context_window_fallbacks hold a target whose headers carry the beta,
     so its hop can make the request's `fallbacks` Anthropic's without the beta, and the Router's walk reads the lists
-    both ways. The proxy's walk decides by the same summary of the configuration and reads both readings before the key
+    both ways. The proxy's walk decides by a scan of the same configuration and reads both readings before the key
     is read. LiteLLM's reading of the review's body reads 5 values, the list, its format pass and its read; Anthropic's
     reads the parameter-only mapping as a group map, 7 values before the note (the list and its read, the mapping's
     values, the metadata and its key, the note), and refuses the note's 200,000 names past the entry budget with 400
@@ -2593,8 +2695,8 @@ def test_the_routers_walk_of_a_call_the_proxy_passed_reads_what_the_proxy_charge
     """
     The review's body with 100 names in its note, beside the review's configuration: the proxy's walk reads both
     readings, charges 5 + 7 + 100 values and passes the body. The Router's first call of the same request decides by
-    the same summary, reads the call's lists in the same two readings and charges them the same 112 values; its walk
-    of its own configured lists is charged apart.
+    a scan of the same lists, reads the call's lists in the same two readings and charges them the same 112 values;
+    its walk of its own configured lists is charged apart.
     """
     from litellm.proxy.auth.auth_utils import is_request_body_safe
     from litellm.router_utils.fallback_event_handlers import call_fallbacks
@@ -2644,8 +2746,8 @@ async def test_a_body_the_router_refuses_for_its_shape_beside_a_configured_targe
     A configured target with a header field makes the Router read a request's `fallbacks` both ways: without the beta
     when the target brings it, where a number in a parameter-only mapping is neither a name nor a mapping in
     Anthropic's reading, and with the beta whatever the header, where `"default"` is not a list in LiteLLM's. The
-    Router refused both for their shape after the proxy passed them. The proxy's walk decides by the same summary of
-    the configuration, so it refuses them with 400 and the same kind of message before the key is read.
+    Router refused both for their shape after the proxy passed them. The proxy's walk decides by a scan of the same
+    configuration, so it refuses them with 400 and the same kind of message before the key is read.
     """
     result: Final = await _Gateway(monkeypatch).send(
         copy.deepcopy(dict(body_fields)),
@@ -2659,34 +2761,17 @@ async def test_a_body_the_router_refuses_for_its_shape_beside_a_configured_targe
     assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
 
 
-def _count_summaries(monkeypatch: pytest.MonkeyPatch) -> Sequence[tuple[object, object, object]]:
-    """The configured lists of every summary made of a Router's configuration from now on"""
-    from litellm.router_utils import fallback_event_handlers
-
-    summarise: Final = (
-        fallback_event_handlers._summarise_configured_fallbacks  # pyright: ignore[reportPrivateUsage]  # the summary
-    )
-    made: Final[list[tuple[object, object, object]]] = []  # mutable-ok: each summary appends the lists it read
-
-    def counted(lists: tuple[object, object, object]) -> fallback_event_handlers.ConfiguredFallbacks:
-        made.append(lists)
-        return summarise(lists)
-
-    monkeypatch.setattr(fallback_event_handlers, "_summarise_configured_fallbacks", counted)
-    return made
-
-
-def test_the_routers_configured_lists_are_summarised_once_per_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_routers_configured_lists_are_scanned_for_every_request(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    The proxy's walk and the Router's read the configured lists through their summary, made once for the three list
-    objects: three body checks and two first calls of the Router make one. An equal copy put in place of a configured
-    list is another configuration and is summarised again; once the replacement holds no target with a header field,
-    the body check reads the request in its checked reading alone, 5 values.
+    Nothing keeps what the configured lists hold: the proxy's walk and the Router's first call scan the Router's own
+    three lists every time, so three body checks and two first calls make five scans, each of the lists the Router
+    holds then. An equal copy put in place of a configured list is scanned as it is, and once the lists hold no mapping
+    with a header field the body check reads the request in its checked reading alone, 5 values.
     """
     from litellm.proxy.auth.auth_utils import is_request_body_safe
     from litellm.router_utils.fallback_event_handlers import call_fallbacks
 
-    made: Final = _count_summaries(monkeypatch)
+    scans: Final = _count_scans(monkeypatch)
     reads: Final = _count_reads_by_part(monkeypatch)
     router: Final = _router_whose_target_carries(_THE_BETA_HEADER)
     body: Final = {"model": "requested", **_parameter_only_fallbacks("metadata", 100)}
@@ -2702,15 +2787,375 @@ def test_the_routers_configured_lists_are_summarised_once_per_configuration(monk
         body["fallbacks"],
         body["fallbacks"],
     ]
-    assert len(made) == 1
+    assert len(scans) == 5
+    assert all(_scanned_the_routers_lists(lists, router) for lists, _ in scans)
 
     router.context_window_fallbacks = copy.deepcopy(router.context_window_fallbacks)
     assert checked() == 112
-    assert len(made) == 2
+    assert _scanned_the_routers_lists(scans[-1][0], router)
 
     router.context_window_fallbacks = [{"requested": ["other"]}]
     assert checked() == 5
-    assert len(made) == 3
+    assert len(scans) == 7
+
+
+# The second reader's T, a target whose headers carry the beta, and L, a list only Anthropic's reading refuses: it reads
+# the mapping without a model as a group map and stops at the number
+_THE_SHAPE_REFUSAL: Final = "a fallback list entry must be a model name or a mapping, got int"
+
+
+def _beta_target() -> dict[str, object]:  # mutable-ok: a target the walk reads as a body sends it
+    return {"model": "other", "extra_headers": dict(_THE_BETA_HEADER)}
+
+
+def _numbers_in_metadata() -> list[object]:  # mutable-ok: a fallback field's list, as a body sends it
+    return [{"model": "other"}, {"metadata": {"ids": [1]}}]
+
+
+def _router_configured_with(context_window_fallbacks: Sequence[Mapping[str, object]]) -> Router:
+    """A Router of `requested` and `other` whose own context_window_fallbacks are ``context_window_fallbacks``"""
+    return Router(
+        model_list=[
+            {"model_name": name, "litellm_params": {"model": f"anthropic/{name}", "api_key": "fake"}}
+            for name in ("requested", "other")
+        ],
+        context_window_fallbacks=[dict(chain) for chain in context_window_fallbacks] or None,
+    )
+
+
+def _the_routers_call(body: Mapping[str, object]) -> Mapping[str, object]:
+    """
+    The kwargs of the Router's first call of a /v1/messages request with ``body``: its router_settings_override is
+    promoted into the call by router_settings_override_fields, as the proxy does, the function the walk reads it by
+    """
+    from litellm.llms.anthropic.common_utils import anthropic_owns_fallbacks
+    from litellm.router_utils.fallback_event_handlers import (
+        ROUTER_FALLBACK_FIELDS,
+        ROUTER_SETTINGS_OVERRIDE_KWARG,
+        router_settings_override_fields,
+    )
+
+    sent: Final = {
+        key: value for key, value in copy.deepcopy(dict(body)).items() if key != ROUTER_SETTINGS_OVERRIDE_KWARG
+    }
+    override: Final = copy.deepcopy(body.get(ROUTER_SETTINGS_OVERRIDE_KWARG))
+    settings: Final[Mapping[str, object]] = override if isinstance(override, dict) else {}
+    promoted: Final = router_settings_override_fields(
+        sent, settings, ROUTER_FALLBACK_FIELDS, anthropic_owns_fallbacks=anthropic_owns_fallbacks(sent)
+    )
+    return {
+        **sent,
+        **{field: settings[setting] for field, setting in promoted.items()},
+        "original_generic_function": anthropic_messages,
+    }
+
+
+def _refusal(check: Callable[[], object]) -> str | None:
+    """What a check refused a request or a call with, or None when it passed it"""
+    import litellm
+
+    try:
+        check()
+    except (ValueError, litellm.BadRequestError) as refusal:
+        return str(refusal)
+    return None
+
+
+def _the_gateways_router() -> Router:
+    """The Router the last request through the gateway was served by"""
+    from litellm.proxy import proxy_server
+
+    router: Final = proxy_server.llm_router
+    assert router is not None
+    return router
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fallbacks", "configured", "client_side_credentials", "proxy_refusal", "router_refusal"),
+    [
+        pytest.param(
+            _numbers_in_metadata(),
+            _configured_target_with(_THE_BETA_HEADER),
+            False,
+            _THE_SHAPE_REFUSAL,
+            _THE_SHAPE_REFUSAL,
+            id="a-number-beside-a-configured-target-with-the-beta",
+        ),
+        pytest.param(
+            [_beta_target(), {"metadata": {"note": ["ab"] * 15_994}}],
+            (),
+            True,
+            "the request's fallback lists hold more than 1000 entries in all",
+            None,
+            id="15994-names-beside-a-target-with-the-beta",
+        ),
+    ],
+)
+async def test_an_overrides_fallbacks_the_call_takes_as_its_own_are_read_as_the_calls_own_before_the_key_is_read(
+    monkeypatch: pytest.MonkeyPatch,
+    fallbacks: list[object],  # mutable-ok: a fallback field's list, as a body sends it
+    configured: Sequence[Mapping[str, object]],
+    client_side_credentials: bool,
+    proxy_refusal: str,
+    router_refusal: str | None,
+) -> None:
+    """
+    The second reader's blocker 1: `router_settings_override.fallbacks` with no `fallbacks` at the body's root becomes
+    the call's own `fallbacks`, so the proxy reads it as the body's own is read, in both readings when a hop can change
+    the reading. Beside a configured target with the beta, L's number gets the shape 400 before the key is read, the
+    Router's refusal of the same call. With client credentials allowed and no configured list, T in the list brings
+    the beta: Anthropic's reading counts the note's names as entries and the proxy refuses them past the request's
+    entry budget, where the Router, whose net for that reading is the most the proxy can have passed, serves the call.
+    """
+    from litellm.router_utils.fallback_event_handlers import call_fallbacks
+
+    body: Final = {"router_settings_override": {"fallbacks": fallbacks}}
+    result: Final = await _Gateway(monkeypatch).send(
+        copy.deepcopy(body),
+        credentials=False,
+        client_side_credentials=client_side_credentials,
+        router_context_window_fallbacks=configured,
+    )
+
+    assert result.response.status_code == 400, result.response.text
+    assert proxy_refusal in result.response.text
+    assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+    router: Final = _the_gateways_router()
+    refused: Final = _refusal(
+        partial(call_fallbacks, _the_routers_call({"model": "requested", **body}), _configured_lists_of(router))
+    )
+    assert refused is None if router_refusal is None else refused is not None and router_refusal in refused
+
+
+@pytest.mark.asyncio
+async def test_a_configured_list_the_walk_cannot_read_does_not_hide_a_target_with_the_beta_in_another(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The second reader's blocker 2: the Router's own `fallbacks` is L, which Anthropic's reading stops at, and its
+    context_window_fallbacks hold T. The scan of the configured lists reads no value as an entry and stops at no shape,
+    so it reaches T past L. A request whose own `fallbacks` is L, which replaces the configured one in its call, gets
+    the shape 400 before the key is read, the Router's refusal of the same call, which reaches T through its
+    context_window_fallbacks.
+    """
+    from litellm.router_utils.fallback_event_handlers import call_fallbacks
+
+    result: Final = await _Gateway(monkeypatch).send(
+        {"fallbacks": _numbers_in_metadata()},
+        credentials=False,
+        router_fallbacks=({"model": "other"}, {"metadata": {"ids": [1]}}),
+        router_context_window_fallbacks=({"requested": [_beta_target()]},),
+    )
+
+    assert result.response.status_code == 400, result.response.text
+    assert _THE_SHAPE_REFUSAL in result.response.text
+    assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+    router: Final = _the_gateways_router()
+    refused: Final = _refusal(
+        partial(
+            call_fallbacks,
+            _the_routers_call({"model": "requested", "fallbacks": _numbers_in_metadata()}),
+            _configured_lists_of(router),
+        )
+    )
+    assert refused is not None and _THE_SHAPE_REFUSAL in refused
+
+
+def test_a_configured_target_changed_in_place_is_read_as_it_is_now() -> None:
+    """
+    The second reader's blocker 3: a request is checked beside a configured target without headers and passes; then
+    the beta is added to that target in place, the lists staying the same objects. The next request is checked against
+    the target as it is now: L gets the shape 400, the Router's refusal of the same call.
+    """
+    from litellm.proxy.auth.auth_utils import is_request_body_safe
+    from litellm.router_utils.fallback_event_handlers import FallbackListShapeError, call_fallbacks
+
+    target: Final[dict[str, object]] = {"model": "other"}  # mutable-ok: the configured target the admin changes
+    router: Final = _router_configured_with(({"requested": [target]},))
+    body: Final = {"model": "requested", "fallbacks": _numbers_in_metadata()}
+
+    assert is_request_body_safe(copy.deepcopy(body), {}, router, "requested", route="/v1/messages")
+    target["extra_headers"] = dict(_THE_BETA_HEADER)
+    with pytest.raises(FallbackListShapeError, match=_THE_SHAPE_REFUSAL):
+        is_request_body_safe(copy.deepcopy(body), {}, router, "requested", route="/v1/messages")
+    refused: Final = _refusal(partial(call_fallbacks, _the_routers_call(body), _configured_lists_of(router)))
+    assert refused is not None and _THE_SHAPE_REFUSAL in refused
+
+
+@pytest.mark.asyncio
+async def test_saved_fallbacks_the_call_takes_as_its_own_are_read_both_ways_beside_a_configured_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The second reader's limit (a): a key's saved `fallbacks` with no `fallbacks` in the request becomes the call's own,
+    which the Router reads in Anthropic's reading too beside a configured target with the beta. The check of the saved
+    settings reads it so: L gets the shape 400 from the proxy, naming the saved settings, the Router's refusal of the
+    same call.
+    """
+    from litellm.router_utils.fallback_event_handlers import call_fallbacks
+
+    saved: Final = {"fallbacks": _numbers_in_metadata()}
+    result: Final = await _Gateway(monkeypatch).send(
+        {}, key_router_settings=saved, router_context_window_fallbacks=_configured_target_with(_THE_BETA_HEADER)
+    )
+
+    assert result.response.status_code == 400, result.response.text
+    assert f"Key or team router_settings: Rejected Request: {_THE_SHAPE_REFUSAL}" in result.response.text
+    assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+    router: Final = _the_gateways_router()
+    call: Final = _the_routers_call({"model": "requested", "router_settings_override": saved})
+    refused: Final = _refusal(partial(call_fallbacks, call, _configured_lists_of(router)))
+    assert refused is not None and _THE_SHAPE_REFUSAL in refused
+
+
+def _groups_of_empty_lists(prefix: str, groups: int) -> dict[str, object]:  # mutable-ok: a group map a body sends
+    """A model group map of ``groups`` groups mapped to empty lists: one entry, and two reads per group"""
+    return {f"{prefix}{index}": [] for index in range(groups)}
+
+
+@pytest.mark.asyncio
+async def test_a_saved_list_past_the_clients_read_cap_in_the_reading_both_ways_forces_is_served_by_both(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The second reader's limit (b): with the beta, a saved context_window_fallbacks target whose own `fallbacks` maps
+    8,000 model groups to empty lists, beside a configured content_policy_fallbacks target with a header field, which
+    can drop the beta on its hop, so both readings apply. The saved list takes about 16,000 reads in each reading,
+    within the saved settings' 160,000. The Router's net for the reading both ways forces is the most the proxy can
+    have passed for one request, 176,000, so the proxy and the Router serve it.
+    """
+    saved: Final = {
+        "context_window_fallbacks": [
+            {"requested": [{"model": "other", "fallbacks": [_groups_of_empty_lists("group-", 8_000)]}]}
+        ]
+    }
+    result: Final = await _Gateway(monkeypatch, requested_answers=True).send(
+        {},
+        beta=True,
+        key_router_settings=saved,
+        router_content_policy_fallbacks=({"requested": [{"model": "other", "extra_headers": {"x-trace": "1"}}]},),
+    )
+
+    assert result.response.status_code == 200, result.response.text
+    assert result.calls == {"requested": 1, "other": 0, "forbidden": 0, "attacker": 0}
+
+
+@pytest.mark.asyncio
+async def test_the_requests_and_the_saved_lists_the_proxy_passed_together_are_served_by_the_router(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    One call can hold the request's own lists and lists its saved settings promote, each charged by the proxy against
+    its own read cap. Without the beta, beside a configured target with the beta: the request's `fallbacks`, a target
+    and a map of 7,900 groups, takes 5 + 3 + 2 x 7,900 = 15,808 reads; a saved context_window_fallbacks target whose
+    own `fallbacks` is a target and a map of 79,000 groups takes 10 + 3 + 2 x 79,000 = 158,013. Both pass the proxy.
+    The Router reads 15,803 + 158,003 = 173,806 values of the call's lists in the reading both ways forces, past the
+    saved settings' 160,000 alone, and within its net, the two caps together, 176,000: it serves the request.
+    """
+    body: Final = {"fallbacks": [{"model": "other"}, _groups_of_empty_lists("c", 7_900)]}
+    saved: Final = {
+        "context_window_fallbacks": [
+            {"requested": [{"model": "other", "fallbacks": [{"model": "other"}, _groups_of_empty_lists("s", 79_000)]}]}
+        ]
+    }
+    result: Final = await _Gateway(monkeypatch, requested_answers=True).send(
+        body, key_router_settings=saved, router_content_policy_fallbacks=({"requested": [_beta_target()]},)
+    )
+
+    assert result.response.status_code == 200, result.response.text
+    assert result.calls == {"requested": 1, "other": 0, "forbidden": 0, "attacker": 0}
+
+
+# Where a list can stand in a request, the configuration beside it, and the verdict the proxy and the Router's first
+# call both give for L there: refused when a reading that reads L as Anthropic's applies
+_CONFIGURED_CARRIERS: Final[Mapping[str, tuple[Mapping[str, object], ...]]] = MappingProxyType(
+    {
+        "no-carrier": (),
+        "a-carrier-without-the-beta": _configured_target_with(MappingProxyType({"x-trace": "1"})),
+        "a-carrier-with-the-beta": _configured_target_with(_THE_BETA_HEADER),
+    }
+)
+_ONE_VERDICT_ROWS: Final = tuple(
+    pytest.param(source, beta, configuration, refused, id=f"{source}-{'beta' if beta else 'no-beta'}-{configuration}")
+    for source, beta, configuration, refused in (
+        ("body", False, "no-carrier", False),
+        ("body", False, "a-carrier-without-the-beta", False),
+        ("body", False, "a-carrier-with-the-beta", True),
+        ("override", False, "no-carrier", False),
+        ("override", False, "a-carrier-without-the-beta", False),
+        ("override", False, "a-carrier-with-the-beta", True),
+        ("target", False, "no-carrier", False),
+        ("target", False, "a-carrier-without-the-beta", False),
+        ("target", False, "a-carrier-with-the-beta", True),
+        ("saved", False, "no-carrier", False),
+        ("saved", False, "a-carrier-without-the-beta", False),
+        ("saved", False, "a-carrier-with-the-beta", True),
+        ("body", True, "no-carrier", True),
+        ("body", True, "a-carrier-without-the-beta", True),
+        ("body", True, "a-carrier-with-the-beta", True),
+        ("override", True, "no-carrier", False),
+        ("override", True, "a-carrier-without-the-beta", False),
+        ("override", True, "a-carrier-with-the-beta", False),
+        ("target", True, "no-carrier", True),
+        ("target", True, "a-carrier-without-the-beta", True),
+        ("target", True, "a-carrier-with-the-beta", True),
+        ("saved", True, "no-carrier", False),
+        ("saved", True, "a-carrier-without-the-beta", False),
+        ("saved", True, "a-carrier-with-the-beta", False),
+    )
+)
+
+
+def _a_body_holding_l(source: str, beta: bool) -> dict[str, object]:  # mutable-ok: a request body the checks read
+    """A /v1/messages body with L at its root, in its router_settings_override, or as a target's own list"""
+    holders: Final[Mapping[str, Mapping[str, object]]] = MappingProxyType(
+        {
+            "body": {"fallbacks": _numbers_in_metadata()},
+            "override": {"router_settings_override": {"fallbacks": _numbers_in_metadata()}},
+            "target": {"fallbacks": [{"model": "other", "fallbacks": _numbers_in_metadata()}]},
+            "saved": {"router_settings_override": {"fallbacks": _numbers_in_metadata()}},
+        }
+    )
+    return {"model": "requested", **({"extra_headers": dict(_THE_BETA_HEADER)} if beta else {}), **holders[source]}
+
+
+@pytest.mark.parametrize(("source", "beta", "configuration", "refused"), _ONE_VERDICT_ROWS)
+def test_the_proxy_and_the_routers_first_call_give_one_verdict_for_every_source_of_a_list(
+    monkeypatch: pytest.MonkeyPatch, source: str, beta: bool, configuration: str, refused: bool
+) -> None:
+    """
+    L at the body's root, in its router_settings_override, as a target's own list and in saved settings, with and
+    without the beta, beside no configured target with a header field, one without the beta and one with it. Without
+    the beta L is refused exactly when a configured target brings the beta; with it the body's own `fallbacks` and a
+    target's own list under it are Anthropic's and refused, and an override's `fallbacks` rides in the Router's own
+    list, LiteLLM's. The proxy's check and the Router's first call of the same request give the same verdict, with the
+    same message, and the Router charges the call's lists no more than the proxy charged them.
+    """
+    from litellm.proxy.auth.auth_utils import check_request_body
+    from litellm.router_utils.fallback_event_handlers import call_fallbacks
+
+    router: Final = _router_configured_with(_CONFIGURED_CARRIERS[configuration])
+    body: Final = _a_body_holding_l(source, beta)
+    reads: Final = _count_reads_by_part(monkeypatch)
+    proxy_refusal: Final = _refusal(
+        partial(
+            check_request_body,
+            copy.deepcopy(body),
+            {},
+            router,
+            "requested",
+            route="/v1/messages",
+            saved_settings=source == "saved",
+        )
+    )
+    proxy_reads: Final = sum(charged for _, budget, charged in reads if budget is not None)
+    router_refusal: Final = _refusal(partial(call_fallbacks, _the_routers_call(body), _configured_lists_of(router)))
+
+    assert (proxy_refusal is not None) is refused, proxy_refusal
+    assert (router_refusal is not None) is refused, router_refusal
+    assert not refused or (_THE_SHAPE_REFUSAL in str(proxy_refusal) and _THE_SHAPE_REFUSAL in str(router_refusal))
+    assert _router_call_reads(reads) <= proxy_reads
 
 
 @pytest.mark.asyncio
