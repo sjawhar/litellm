@@ -6309,11 +6309,12 @@ async def test_an_owners_key_delete_records_the_tombstones_again_only_once_its_d
 ) -> None:
     """The owner deletes two keys, revoked at t=0 with a 30 s tombstone. At t=19 the request's record shows both
     tombstones standing, so the revocation before the deletes sends nothing; the deletes run together. The second
-    key's fails at t=19, while the database still holds the first key's, which commits only at t=48.5. Another pod's
+    key's fails at t=19, while the database still holds the first key's, and the caller has no answer yet: the request
+    waits for every delete. The first key's delete commits only at t=48.5, once the test releases it. Another pod's
     read began at t=48, before that delete committed, and got the first key; it stores it at t=50. The tombstones are
     recorded again once every delete has ended, at t=48.5, standing until t=78.5, so that store keeps nothing and an
     outage that follows does not serve the deleted key; a record made when the second delete failed, at t=19, would
-    have lapsed at t=49. The caller still gets the failed delete's error."""
+    have lapsed at t=49. The caller then gets the failed delete's error."""
     import asyncio
 
     from tests.unit.proxy.last_good_tombstone_race import (
@@ -6330,27 +6331,41 @@ async def test_an_owners_key_delete_records_the_tombstones_again_only_once_its_d
     prisma_client: Final = _routed_key_database(key_rows, key_rows)
     deletes_each_key: Final = prisma_client.delete_data.side_effect
     second_delete_failed: Final = asyncio.Event()
+    release_first_delete: Final = asyncio.Event()
 
-    async def the_first_delete_commits_after_the_second_failed(tokens: Sequence[str]) -> dict[str, int]:
+    async def the_first_delete_commits_once_released(tokens: Sequence[str]) -> dict[str, int]:
         if tuple(tokens) == (failed,):
             second_delete_failed.set()
             raise ConnectionResetError("the database dropped the second delete")
-        await second_delete_failed.wait()
-        race.clock.now = 48.5
+        await release_first_delete.wait()
         return await deletes_each_key(tokens=tokens)
 
-    prisma_client.delete_data.side_effect = the_first_delete_commits_after_the_second_failed
+    prisma_client.delete_data.side_effect = the_first_delete_commits_once_released
     monkeypatch.setattr(  # test-quality-ok: the proxy's database, whose first key delete commits late
         "litellm.proxy.proxy_server.prisma_client", prisma_client
     )
-    await revoked_before_the_write(race, (delayed, failed))
 
-    with pytest.raises(ConnectionResetError, match="dropped the second delete"):
-        await delete_verification_tokens(
+    async def the_request() -> object:
+        # Its first revocation at t=0 is made in its own task, whose record the delete's revocation then reads
+        await revoked_before_the_write(race, (delayed, failed))
+        return await delete_verification_tokens(
             tokens=[delayed, failed],
             user_api_key_cache=race.cache,
             user_api_key_dict=UserAPIKeyAuth(user_id="user-1", user_role=LitellmUserRoles.INTERNAL_USER.value),
         )
+
+    request: Final = asyncio.create_task(the_request())
+    await second_delete_failed.wait()
+    try:
+        # Time enough for a delete that returned the first failure at once to answer the caller
+        answered, _ = await asyncio.wait({request}, timeout=0.05)
+        assert request not in answered
+    finally:
+        race.clock.now = 48.5
+        release_first_delete.set()
+
+    with pytest.raises(ConnectionResetError, match="dropped the second delete"):
+        await request
 
     served: Final = await served_after_another_pod_stores(
         race, delayed, UserAPIKeyAuth(token=delayed), read_began_at=48.0, stored_at=50.0

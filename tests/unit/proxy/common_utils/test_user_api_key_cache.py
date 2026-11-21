@@ -1981,6 +1981,99 @@ class TestLastGoodEntries:
         assert await redis.init_async_client().ttl(f"last_good_tombstone:{key}") == 30
         assert pair.cancelled() is not write_raises
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cancelled", [False, True], ids=["left_alone", "cancelled_while_it_waits"])
+    async def test_a_record_after_the_write_that_redis_never_answers_ends_at_its_own_deadline(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, cancelled: bool
+    ) -> None:
+        """The pair revokes the key at t=0 and its write at t=19 returns. The record after it renews the key's tombstone
+        in this pod's memory, until t=49, and then its pipeline never gets an answer from Redis, as a client with no
+        socket timeout can wait. At the record's own deadline (here 0.05 s) the record gives up with a warning naming
+        it, and the request ends: with the write's result, or cancelled when it was cancelled while it waited. The
+        test's own one-second wait stands for a request that would otherwise never end."""
+        monkeypatch.setattr(  # test-quality-ok: the deadline is shortened so the test waits for it in real time
+            "litellm.proxy.common_utils.user_api_key_cache.LAST_GOOD_RECORD_TIMEOUT_SECONDS", 0.05, raising=False
+        )
+        clock, redis, cache, _pipelines = self._on_a_30_s_tombstone(monkeypatch)
+        key: Final = "hashed-key-whose-record-redis-never-answers"
+        record_sent: Final = asyncio.Event()
+        never_answered: Final = asyncio.Event()
+        sends: Final = redis.async_set_then_delete_or_raise
+        calls: Final = [0]  # mutable-ok: counts the pipelines' calls, the revocation's then the record's
+
+        async def redis_stops_answering_the_record(
+            set_keys: Sequence[str], value: object, ttl: int, delete_keys: Sequence[str]
+        ) -> None:
+            calls[0] += 1
+            if calls[0] == 2:
+                record_sent.set()
+                await never_answered.wait()
+            await sends(set_keys, value, ttl, delete_keys)
+
+        monkeypatch.setattr(  # test-quality-ok: Redis stops answering once the record sends its pipeline
+            redis, "async_set_then_delete_or_raise", redis_stops_answering_the_record
+        )
+
+        async def write() -> str:
+            clock.now = 19.0
+            return "written"
+
+        with caplog.at_level(logging.WARNING, logger="LiteLLM Proxy"):
+            pair: Final = asyncio.create_task(revoke_last_good_then(cache, (key,), write))
+            await record_sent.wait()
+            if cancelled:
+                _ = pair.cancel()
+            try:
+                done, _pending = await asyncio.wait({pair}, timeout=1.0)
+            finally:
+                never_answered.set()
+
+        assert pair in done
+        assert pair.cancelled() is cancelled
+        if not cancelled:
+            assert pair.result() == "written"
+        assert any("within 0.05 s" in record.getMessage() for record in caplog.records)
+        clock.now = 40.0
+        assert cache.last_good_memory.tombstoned(key) is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "write_raises", [False, True], ids=["after_a_write_that_returned", "after_one_that_raised"]
+    )
+    async def test_a_record_after_the_write_that_raises_itself_does_not_replace_the_writes_outcome(
+        self, monkeypatch: pytest.MonkeyPatch, write_raises: bool
+    ) -> None:
+        """The pair revokes the key, and the record after its write fails in its own memory part with an error of its
+        own. That error is logged inside the record, and the caller gets the write's own error if it raised, else its
+        result."""
+        from litellm.proxy.common_utils.user_api_key_cache import LastGoodMemory
+
+        _clock, _redis, cache, _pipelines = self._on_a_30_s_tombstone(monkeypatch)
+        key: Final = "hashed-key-whose-record-fails-in-memory"
+        tombstones: Final = LastGoodMemory.tombstone
+        record_fails: Final = [False]  # mutable-ok: set by the write, so only the record's memory tombstone fails
+
+        def tombstone(memory: LastGoodMemory, cache_key: str, ttl_seconds: float) -> None:
+            if record_fails[0]:
+                raise RuntimeError("the memory tombstone failed")
+            tombstones(memory, cache_key, ttl_seconds)
+
+        monkeypatch.setattr(  # test-quality-ok: the record's memory tombstone fails once the write has run
+            LastGoodMemory, "tombstone", tombstone
+        )
+
+        async def write() -> str:
+            record_fails[0] = True
+            if write_raises:
+                raise ConnectionResetError("the commit's answer was lost")
+            return "written"
+
+        if write_raises:
+            with pytest.raises(ConnectionResetError, match="answer was lost"):
+                await revoke_last_good_then(cache, (key,), write)
+        else:
+            assert await revoke_last_good_then(cache, (key,), write) == "written"
+
 
 async def _in_redis(redis: RedisCache, prefix: str, cache_keys: Sequence[str]) -> tuple[bool, ...]:
     """Whether the Redis server holds ``<prefix>:<cache key>``, for each of ``cache_keys``."""

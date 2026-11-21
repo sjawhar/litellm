@@ -23,6 +23,7 @@ from litellm.constants import (
     DEFAULT_MANAGEMENT_OBJECT_IN_MEMORY_CACHE_TTL,
     LAST_GOOD_AUTH_ENTRIES_IN_MEMORY,
     LAST_GOOD_ENTRY_TTL_SECONDS,
+    LAST_GOOD_RECORD_TIMEOUT_SECONDS,
     LAST_GOOD_SERVED_COPY_TTL_SECONDS,
     LAST_GOOD_TOMBSTONE_TTL_SECONDS,
 )
@@ -978,19 +979,30 @@ async def revoke_last_good(cache: DualCache, cache_keys: Sequence[str]) -> None:
 
 async def _record_tombstones_again(store: UserApiKeyCache, keys: Sequence[str]) -> None:
     """Record again the tombstones of ``keys`` and drop their entries, in this pod's memory and in Redis (two round
-    trips however many keys). Best effort, since the write before it may have committed: a Redis that fails here is
-    logged, not raised, and leaves an old row another worker stored after the first tombstones lapsed until that entry
-    expires."""
-    for cache_key in keys:
-        store.last_good_memory.tombstone(cache_key, LAST_GOOD_TOMBSTONE_TTL_SECONDS)
-    if store.redis_cache is None:
-        return
+    trips however many keys), the Redis part, the wait for a connection included, within
+    ``LAST_GOOD_RECORD_TIMEOUT_SECONDS``. Best effort, since the write before it may have committed: a failure here,
+    the deadline included, is logged, never raised, and leaves an old row another worker stored after the first
+    tombstones lapsed until that entry expires. ``KeyboardInterrupt`` and ``SystemExit`` are not contained."""
     try:
-        await store.redis_cache.async_set_then_delete_or_raise(
-            tuple(_last_good_tombstone_key(key) for key in keys),
-            1,
-            LAST_GOOD_TOMBSTONE_TTL_SECONDS,
-            tuple(_last_good_redis_key(key) for key in keys),
+        for cache_key in keys:
+            store.last_good_memory.tombstone(cache_key, LAST_GOOD_TOMBSTONE_TTL_SECONDS)
+        if store.redis_cache is None:
+            return
+        await asyncio.wait_for(
+            store.redis_cache.async_set_then_delete_or_raise(
+                tuple(_last_good_tombstone_key(key) for key in keys),
+                1,
+                LAST_GOOD_TOMBSTONE_TTL_SECONDS,
+                tuple(_last_good_redis_key(key) for key in keys),
+            ),
+            timeout=LAST_GOOD_RECORD_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        verbose_proxy_logger.warning(
+            "Could not record the tombstones of %s again after their write within %s s, so an old row stored meanwhile "
+            "stays until its entry expires",
+            ", ".join(keys),
+            LAST_GOOD_RECORD_TIMEOUT_SECONDS,
         )
     except Exception as e:  # noqa: BLE001  # best effort: the write may have committed
         verbose_proxy_logger.warning(
@@ -1005,9 +1017,9 @@ async def _record_tombstones_to_the_end(cache: DualCache, cache_keys: Sequence[s
     """Record again, once a strict write has returned or raised, the tombstones of the entries it ended
     (``_record_tombstones_again``), and run that record to its end even when this task is cancelled meanwhile, once or
     more: it runs as a task of its own, awaited shielded, and a cancellation that arrives while waiting is noted and
-    the wait goes on. Returns whether one arrived, for the caller to raise it once its own outcome allows. The wait is
-    bounded by the Redis client's timeouts: each command waits at most its socket timeout (``REDIS_SOCKET_TIMEOUT``,
-    0.1 s unless set, which ``litellm/_redis.py`` gives every client), and an open circuit breaker refuses at once.
+    the wait goes on. Returns whether one arrived, for the caller to raise it once its own outcome allows. The record
+    ends within ``LAST_GOOD_RECORD_TIMEOUT_SECONDS`` of its Redis part (its own deadline), so the wait does too. No
+    ordinary exception of the record reaches the caller.
 
     Another worker's read that began before the write committed, while the first tombstones stood, can store the old
     row once they lapse; a tombstone recorded at time e refuses every store until e plus
@@ -1024,6 +1036,8 @@ async def _record_tombstones_to_the_end(cache: DualCache, cache_keys: Sequence[s
         except asyncio.CancelledError:
             # The record goes on; the cancellation is raised once it is done
             cancelled = True
+        except Exception:  # noqa: BLE001  # the record logs its own failures; none reaches the caller
+            break
     if not record.cancelled():
         _ = record.exception()  # retrieved: the record logs its own failure
     return cancelled
