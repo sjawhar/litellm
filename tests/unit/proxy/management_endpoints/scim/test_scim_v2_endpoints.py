@@ -7428,6 +7428,45 @@ async def test_scim_user_delete_answers_503_with_the_user_kept_when_redis_is_los
     prisma.db.litellm_usertable.delete.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_scim_user_delete_records_the_users_tombstone_again_after_its_row_delete_that_needed_no_redis(
+    mocker, monkeypatch
+):
+    """The request revokes the user at t=0, so at t=19 the DELETE's own revocation of the user and the user row delete
+    paired with it send no Redis command: the request's record shows the first tombstone standing until t=30. Another
+    pod's read began at t=19, before the delete committed, and got the old user row; it stores it at t=31, once that
+    tombstone lapsed. Once the user row delete returns, the pair records the user's tombstone again in Redis, so that
+    tombstone refuses the store and a later database outage serves no entry for the deleted user, not its old row."""
+    from tests.unit.proxy.last_good_tombstone_race import (
+        revoked_before_the_write,
+        served_after_another_pod_stores,
+        tombstone_race,
+    )
+
+    race: Final = tombstone_race(monkeypatch)
+    prisma: Final = _scim_user_with_a_key(mocker, serves_last_good=True, redis=race.redis, last_good_clock=race.clock)
+    mocker.patch(  # test-quality-ok: the race's auth cache, on its wall clock too, replaces the one the harness built
+        "litellm.proxy.proxy_server.user_api_key_cache", race.cache
+    )
+    # Stands in for /team/member_delete without the revocation it runs, so the user row delete pairs the user alone
+    mocker.patch(  # test-quality-ok: the roster writes are module-level, not injectable
+        f"{_SCIM_MODULE}.team_member_delete", AsyncMock()
+    )
+    # Stands in for the row cleanup, whose organization memberships delete pairs the user too
+    referencing_rows: Final = mocker.patch(  # test-quality-ok: the row cleanup is module-level, not injectable
+        f"{_SCIM_MODULE}._delete_rows_referencing_user", AsyncMock()
+    )
+    await revoked_before_the_write(race, (_SCIM_USER_ID,))
+
+    response: Final = await delete_user(user_id=_SCIM_USER_ID)
+    served: Final = await served_after_another_pod_stores(race, _SCIM_USER_ID, _active_scim_user())
+
+    assert response.status_code == 204
+    referencing_rows.assert_awaited_once()
+    prisma.db.litellm_usertable.delete.assert_awaited_once_with(where={"user_id": _SCIM_USER_ID})
+    assert served is None
+
+
 _GROUP_ID: Final = "scim-group"
 _GROUP_ALIAS: Final = "scim-group-lanes"
 _GROUP_MEMBER_ID: Final = "scim-group-member"

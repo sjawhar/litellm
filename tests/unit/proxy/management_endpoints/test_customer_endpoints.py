@@ -1921,3 +1921,71 @@ async def test_with_last_good_entries_off_each_customer_write_runs_in_its_order_
     assert [
         (user_id, rows.rows[user_id].blocked, rows.rows[user_id].budget_id) for user_id, _ in rows.standing
     ] == written
+
+
+@pytest.mark.asyncio
+async def test_customer_block_records_its_tombstone_again_after_the_upsert_so_no_outage_serves_the_unblocked_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The request first revokes customer c1's entry, its id's verdict and the restricted registry at t=0, with a 30 s
+    tombstone. The block of c1 runs at t=19, when the request's record shows that tombstone standing, so neither its
+    revocation nor the one paired with c1's upsert sends Redis anything. Another pod's read began at t=19, before the
+    upsert committed, and got c1 unblocked; it stores that row at t=31, once the first tombstone lapsed at t=30. The
+    block records c1's tombstone again once its upsert returns, standing until t=49, so that store keeps nothing and an
+    outage that follows serves no entry for c1, rather than the unblocked row."""
+    from litellm.proxy.common_utils.user_api_key_cache import end_user_cache_key
+    from litellm.proxy.management_endpoints.customer_endpoints import block_user
+    from tests.unit.proxy.last_good_tombstone_race import (
+        revoked_before_the_write,
+        served_after_another_pod_stores,
+        tombstone_race,
+    )
+
+    race: Final = tombstone_race(monkeypatch)
+    unblocked: Final = LiteLLM_EndUserTable(user_id="c1", blocked=False)
+    rows: Final = _EndUserRows(unblocked)
+    _serve_end_user_rows(monkeypatch, rows, race.cache)
+    await revoked_before_the_write(race, _customer_cache_keys("c1"))
+
+    blocked: Final = await block_user(data=BlockUsers(user_ids=["c1"]))
+
+    assert (blocked, rows.rows["c1"].blocked) == (
+        {"blocked_users": [LiteLLM_EndUserTable(user_id="c1", blocked=True)]},
+        True,
+    )
+    served: Final = await served_after_another_pod_stores(race, end_user_cache_key("c1"), unblocked)
+    assert served is None
+
+
+@pytest.mark.asyncio
+async def test_restricting_customer_update_records_its_tombstone_again_so_no_outage_serves_the_unrestricted_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An update that gives customer c1 a model allowlist moves it into the restricted registry, so it revokes c1's
+    entry, its id's verdict and the registry, then writes the row paired with a second revocation of them. The request
+    first revokes them at t=0, with a 30 s tombstone. The update runs at t=19, when the request's record shows that
+    tombstone standing, so neither of its revocations sends Redis anything. Another pod's read began at t=19, before
+    the update committed, and got c1 with no allowlist; it stores that row at t=31, once the first tombstone lapsed at
+    t=30. The update records c1's tombstone again once its write returns, standing until t=49, so that store keeps
+    nothing and an outage that follows serves no entry for c1, rather than the row that restricts no model."""
+    from litellm.proxy.common_utils.user_api_key_cache import end_user_cache_key
+    from litellm.proxy.management_endpoints.customer_endpoints import update_end_user
+    from tests.unit.proxy.last_good_tombstone_race import (
+        revoked_before_the_write,
+        served_after_another_pod_stores,
+        tombstone_race,
+    )
+
+    race: Final = tombstone_race(monkeypatch)
+    unrestricted: Final = LiteLLM_EndUserTable(user_id="c1", blocked=False)
+    rows: Final = _EndUserRows(unrestricted)
+    _serve_end_user_rows(monkeypatch, rows, race.cache)
+    await revoked_before_the_write(race, _customer_cache_keys("c1"))
+
+    updated: Final = await update_end_user(
+        data=UpdateCustomerRequest(user_id="c1", models=["m1"]), user_api_key_dict=_ADMIN
+    )
+
+    assert (updated.user_id, updated.models, rows.rows["c1"].models) == ("c1", ["m1"], ["m1"])
+    served: Final = await served_after_another_pod_stores(race, end_user_cache_key("c1"), unrestricted)
+    assert served is None

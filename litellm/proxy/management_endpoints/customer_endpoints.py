@@ -891,11 +891,14 @@ async def delete_end_user(
                 )
 
             # A deleted customer falls back to the default end-user budget and leaves the restricted registry, so its
-            # entries are revoked before the delete, as for a block
-            await revoke_last_good(user_api_key_cache, _end_user_cache_keys(data.user_ids))
-            # All users exist, proceed with deletion
-            response: Final = await _typed_table(EndUserRepository(prisma_client)).delete_many(
-                where={"user_id": {"in": data.user_ids}}
+            # entries are revoked right before the delete, as for a block, and recorded again after it
+            response: Final = await revoke_last_good_then(
+                user_api_key_cache,
+                _end_user_cache_keys(data.user_ids),
+                partial(
+                    _typed_table(EndUserRepository(prisma_client)).delete_many,
+                    where={"user_id": {"in": data.user_ids}},
+                ),
             )
             verbose_proxy_logger.debug("received response from updating prisma client. response=%s", response)
 

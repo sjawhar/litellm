@@ -1789,14 +1789,18 @@ async def organization_member_delete(
 
         # The user's entry carries its organization memberships, which the org admin route checks read
         member_user_ids: Final = (data.user_id,) if data.user_id is not None else ()
-        await revoke_last_good(user_api_key_cache, member_user_ids)
-        member_to_delete: Final = await _table(OrganizationMembershipRepository(prisma_client)).delete(
-            where={
-                "user_id_organization_id": {
-                    "user_id": data.user_id,
-                    "organization_id": data.organization_id,
-                }
-            }
+        member_to_delete: Final = await revoke_last_good_then(
+            user_api_key_cache,
+            member_user_ids,
+            partial(
+                _table(OrganizationMembershipRepository(prisma_client)).delete,
+                where={
+                    "user_id_organization_id": {
+                        "user_id": data.user_id,
+                        "organization_id": data.organization_id,
+                    }
+                },
+            ),
         )
         await evict_and_broadcast(cache_keys=member_user_ids, user_api_key_cache=user_api_key_cache)
         return member_to_delete

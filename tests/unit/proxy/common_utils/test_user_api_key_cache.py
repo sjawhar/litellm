@@ -1557,8 +1557,8 @@ class TestLastGoodEntries:
     @pytest.mark.parametrize(
         ("seconds", "keys", "executions"),
         [
-            ((100.0,), 1000, 2),
-            ((LAST_GOOD_TOMBSTONE_TTL_SECONDS - LAST_GOOD_LATE_STORE_MARGIN_SECONDS + 1.0, 0.0), 4, 4),
+            ((100.0,), 1000, 4),
+            ((LAST_GOOD_TOMBSTONE_TTL_SECONDS - LAST_GOOD_LATE_STORE_MARGIN_SECONDS + 1.0, 0.0), 4, 6),
         ],
         ids=["a_pass_of_1000_keys_at_100_s_an_execution", "a_first_set_pipeline_that_stalls"],
     )
@@ -1569,7 +1569,8 @@ class TestLastGoodEntries:
         every key in two executions, its tombstones' SETs and then its entries' DELs, so 1,000 keys at 100 s an
         execution take one pass of 200 s. When the first SET pipeline is answered 596 s after its SETs landed, a 600 s
         tombstone may lapse within the margin of the write, so the pass is sent again. Either way the write after the
-        revocation runs with every tombstone standing for more than the margin."""
+        revocation runs with every tombstone standing for more than the margin, and two more executions record the
+        tombstones again after it."""
         clock: Final = _Clock()
         redis: Final = fake_redis_cache()
         cache: Final = _cache_on_driven_clocks(monkeypatch, clock, redis.cache)
@@ -1719,7 +1720,8 @@ class TestLastGoodEntries:
         """Redis is lost once the pass's SET pipeline is answered, so its DEL pipeline fails with every tombstone
         recorded and every entry still there: the request is refused with 503 and its write is not made, and no key of
         the failed pass counts as revoked, in this task's record or in this pod's memory. A retry in the same task,
-        with Redis back, sends every key again rather than skipping one: every entry is gone."""
+        with Redis back, sends every key again rather than skipping one (two executions), records the tombstones again
+        after the write (two more), and every entry is gone."""
         from fastapi import HTTPException
 
         redis: Final = fake_redis_cache()
@@ -1754,10 +1756,76 @@ class TestLastGoodEntries:
         assert await revoke_last_good_then(cache, cache_keys, write) == "written"
 
         assert written == ["written"]
-        assert pipelines.executions == 3
+        assert pipelines.executions == 5
         assert await _in_redis(redis.cache, "last_good_tombstone", cache_keys) == (True, True)
         assert await _in_redis(redis.cache, "last_good", cache_keys) == (False, False)
         assert [cache.last_good_memory.tombstoned(key) for key in cache_keys] == [True, True]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "stored", ["after_the_write", "during_a_write_that_outlasts_the_tombstone"], ids=lambda stored: stored
+    )
+    async def test_an_old_row_a_read_from_before_the_write_stores_once_the_first_tombstone_lapses_is_not_served(
+        self, monkeypatch: pytest.MonkeyPatch, stored: str
+    ) -> None:
+        """With a 30 s tombstone the request revokes the key at t=0, and its paired write at t=19 needs no Redis, the
+        record showing the tombstone standing for 11 s more. Another pod's read began at t=19, before the write
+        committed, and got the old row. Stored at t=31, after the write, once the first tombstone lapsed at t=30, the
+        tombstone recorded again after the write refuses it. Stored at t=32 while a write that ends at t=35 is still
+        running, it is kept, and the delete of that second record drops it. Either way an outage serves nothing."""
+        monkeypatch.setattr(  # test-quality-ok: the reviewer's trace takes a 30 s tombstone; no setting seam
+            "litellm.proxy.common_utils.user_api_key_cache.LAST_GOOD_TOMBSTONE_TTL_SECONDS", 30
+        )
+        clock: Final = _Clock(now=0.0)
+        redis: Final = fake_redis_cache()
+        cache: Final = _cache_on_driven_clocks(monkeypatch, clock, redis.cache)
+        other_pod: Final = _cache_on_driven_clocks(monkeypatch, clock, redis.cache)
+        key: Final = "hashed-key-revoked"
+        pipelines: Final = ScriptedPipelines(monkeypatch, redis.cache)
+
+        async def another_pod_stores_the_old_row_at(seconds: float) -> None:
+            clock.now = seconds
+            with last_good_reads_started_at(19.0):
+                await remember_last_good(other_pod, key, UserAPIKeyAuth(token=key))
+
+        async def write() -> str:
+            if stored == "during_a_write_that_outlasts_the_tombstone":
+                await another_pod_stores_the_old_row_at(32.0)
+                assert await _in_redis(redis.cache, "last_good", (key,)) == (True,)
+            clock.now = 35.0 if stored == "during_a_write_that_outlasts_the_tombstone" else 20.0
+            return "written"
+
+        await revoke_last_good(cache, (key,))
+        clock.now = 19.0
+        executions_before_the_write: Final = pipelines.executions
+
+        assert await revoke_last_good_then(cache, (key,), write) == "written"
+        if stored == "after_the_write":
+            await another_pod_stores_the_old_row_at(31.0)
+        outage_pod: Final = _cache_on_driven_clocks(monkeypatch, clock, redis.cache)
+
+        assert executions_before_the_write == 2
+        assert await recall_last_good(outage_pod, key, UserAPIKeyAuth) is None
+        assert await _in_redis(redis.cache, "last_good", (key,)) == (False,)
+        assert pipelines.executions == 4
+
+    @pytest.mark.asyncio
+    async def test_a_paired_write_with_the_setting_off_sends_no_redis_command_after_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With last good entries not served, the pair is just the write: no pipeline before or after it, and no
+        tombstone in Redis or in this pod's memory."""
+        redis: Final = fake_redis_cache()
+        cache: Final = UserApiKeyCache(redis_cache=redis.cache, serve_last_good_entries=False, last_good_clock=_Clock())
+        pipelines: Final = ScriptedPipelines(monkeypatch, redis.cache)
+
+        async def write() -> str:
+            return "written"
+
+        assert await revoke_last_good_then(cache, ("hashed-key",), write) == "written"
+        assert pipelines.executions == 0
+        assert await _in_redis(redis.cache, "last_good_tombstone", ("hashed-key",)) == (False,)
+        assert cache.last_good_memory.tombstoned("hashed-key") is False
 
 
 async def _in_redis(redis: RedisCache, prefix: str, cache_keys: Sequence[str]) -> tuple[bool, ...]:

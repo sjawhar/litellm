@@ -967,15 +967,53 @@ async def revoke_last_good(cache: DualCache, cache_keys: Sequence[str]) -> None:
         store.last_good_memory.tombstone(cache_key, LAST_GOOD_TOMBSTONE_TTL_SECONDS)
 
 
+async def record_last_good_tombstones_again(cache: DualCache, cache_keys: Sequence[str]) -> None:
+    """Record again, once a strict write has committed, the tombstones of the entries it ended, and drop the entries,
+    in this pod's memory and in Redis (two round trips however many keys). Another worker's read that began before the
+    write committed, while the first tombstones stood, can store the old row once they lapse; a tombstone recorded at
+    time e refuses every store until e plus ``LAST_GOOD_TOMBSTONE_TTL_SECONDS``, by which time such a read is late, and
+    its delete drops one stored before e. Nothing with the setting off or with no keys.
+
+    Best effort, since the write has committed: a Redis that fails here is logged, not raised, and leaves an old row
+    another worker stored after the first tombstones lapsed until that entry expires."""
+    store: Final = _last_good_store(cache)
+    if store is None or not store.serve_last_good_entries or not cache_keys:
+        return
+    keys: Final = tuple(dict.fromkeys(cache_keys))
+    for cache_key in keys:
+        store.last_good_memory.tombstone(cache_key, LAST_GOOD_TOMBSTONE_TTL_SECONDS)
+    if store.redis_cache is None:
+        return
+    try:
+        await store.redis_cache.async_set_then_delete_or_raise(
+            tuple(_last_good_tombstone_key(key) for key in keys),
+            1,
+            LAST_GOOD_TOMBSTONE_TTL_SECONDS,
+            tuple(_last_good_redis_key(key) for key in keys),
+        )
+    except Exception as e:  # noqa: BLE001  # best effort: the write has committed
+        verbose_proxy_logger.warning(
+            "Could not record the tombstones of %s again after their write, so an old row stored meanwhile stays "
+            "until its entry expires: %s",
+            ", ".join(keys),
+            e,
+        )
+
+
 async def revoke_last_good_then(
     cache: DualCache, cache_keys: Sequence[str], write: Callable[[], Awaitable[_Written]]
 ) -> _Written:
     """``revoke_last_good`` of ``cache_keys``, then ``write``, with nothing awaited in between: a write that ends what
     those entries hold. A request that already revoked them, while their tombstones stand, needs no Redis here; once
-    a slow step may have outlasted them, they are revoked again, or the 503 leaves ``write`` unmade. No keys: just the
-    write."""
+    a slow step may have outlasted them, they are revoked again, or the 503 leaves ``write`` unmade. Once ``write``
+    returns, their tombstones are recorded again (``record_last_good_tombstones_again``): a write that needed no Redis
+    here can start with only ``LAST_GOOD_LATE_STORE_MARGIN_SECONDS`` of them left, and a read another worker began
+    before it committed could otherwise store the old row once they lapse. A write inside a transaction commits later,
+    so its caller records them again after the commit too. No keys: just the write."""
     await revoke_last_good(cache, cache_keys)
-    return await write()
+    written: Final = await write()
+    await record_last_good_tombstones_again(cache, cache_keys)
+    return written
 
 
 # Rows that keep appearing between a read and its delete for this many rounds are left, and the request refused
