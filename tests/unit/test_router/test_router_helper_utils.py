@@ -322,12 +322,12 @@ async def test_router_function_with_retries(model_list, sync_mode):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fallback_field", ("context_window_fallbacks", "content_policy_fallbacks"))
-async def test_router_retries_reject_non_list_error_fallbacks(model_list, fallback_field: str):
+async def test_router_call_rejects_non_list_error_fallbacks(model_list, fallback_field: str):
+    """The call's one walk of its fallback lists, before the first attempt, refuses an error field that is not a list"""
     router = Router(model_list=model_list)
 
     with pytest.raises(litellm.BadRequestError, match=f"{fallback_field} must be a list"):
-        await router.async_function_with_retries(
-            original_function=router._acompletion,
+        await router.acompletion(
             model="gpt-5-mini",
             messages=[{"role": "user", "content": "Hello, how are you?"}],
             max_tokens=5,

@@ -22,6 +22,7 @@ from litellm.router_utils.fallback_event_handlers import (
     MidStreamFallbackControls,
     _trigger_cooldown_for_failed_deployment,
     attempted_retries_for_request,
+    call_fallbacks,
     carry_over_routed_deployment,
     clear_pre_routing_selection,
     committed_retry_budget_for_request,
@@ -32,7 +33,6 @@ from litellm.router_utils.fallback_event_handlers import (
     log_success_fallback_event,
     mid_stream_fallback_snapshot_kwargs,
     mid_stream_retry_kwargs,
-    pop_request_fallbacks,
     record_pre_routing_selection,
     record_retry_attempt,
     reject_non_list_litellm_fallbacks,
@@ -1637,13 +1637,16 @@ async def test_the_routers_first_call_checks_a_targets_own_list_without_the_prox
     ],
 )
 def test_the_router_entry_reads_a_targets_own_lists_before_the_first_call(target_lists: dict, message: str):
-    """A hop merges the target, and the Router reads its lists then, so they are refused before the first call"""
+    """
+    A hop merges the target, and the Router reads its lists then, so the call's one walk refuses them before the first
+    attempt
+    """
     kwargs: Final[dict[str, object]] = {
         "model": "requested",
         "fallbacks": [{"requested": [{"model": "other", **target_lists}]}],
     }
     with pytest.raises(litellm.BadRequestError, match=message):
-        pop_request_fallbacks(kwargs, None)
+        call_fallbacks(kwargs, {})
 
 
 def test_the_router_entry_leaves_a_targets_own_list_to_anthropic_under_the_beta():
@@ -1659,14 +1662,16 @@ def test_the_router_entry_leaves_a_targets_own_list_to_anthropic_under_the_beta(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("field", ["context_window_fallbacks", "content_policy_fallbacks"])
 async def test_the_router_reads_a_nested_targets_own_fallbacks_in_an_error_field_with_the_calls_context(field: str):
-    """The call is not an Anthropic messages call, so a nested target's own `fallbacks` is LiteLLM's, with its rules"""
+    """
+    The call is not an Anthropic messages call, so a nested target's own `fallbacks` is LiteLLM's, with its rules: the
+    call's one walk refuses it before the first attempt
+    """
     router: Final = Router(
         model_list=[{"model_name": "requested", "litellm_params": {"model": "openai/requested", "api_key": "fake"}}]
     )
     nested: Final = [{"requested": [{"model": "other", "fallbacks": [{"requested": "abc"}]}]}]
     with pytest.raises(litellm.BadRequestError, match="LiteLLM fallbacks must map model group 'requested' to a list"):
-        await router.async_function_with_retries(
-            original_function=router._acompletion,
+        await router.acompletion(
             model="requested",
             messages=[{"role": "user", "content": "hi"}],
             mock_response="unused",

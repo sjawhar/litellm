@@ -219,6 +219,7 @@ from litellm.router_utils.fallback_event_handlers import (
     MID_STREAM_FALLBACK_CONTROLS_KEY,
     AttemptedFallbackTargets,
     attempted_retries_for_request,
+    call_fallbacks,
     carry_over_pre_routing_selection,
     carry_over_routed_deployment,
     check_non_standard_fallback_format,
@@ -7952,9 +7953,13 @@ class Router:
         include_fallback_errors: Final = kwargs.get("include_fallback_errors", False) is True
         disable_fallbacks: Final[bool | None] = kwargs.pop("disable_fallbacks", False)
         record_disable_fallbacks(kwargs, disable_fallbacks is True)
-        fallbacks: Final[list | None] = request_fallbacks(
+        fallbacks: Final[list | None] = call_fallbacks(
             kwargs,  # pyright: ignore[reportUnknownArgumentType]  # the Router's untyped call kwargs
-            cast("list[object] | None", self.fallbacks),  # cast-ok: untyped router attribute
+            {
+                "fallbacks": self.fallbacks,
+                "context_window_fallbacks": self.context_window_fallbacks,
+                "content_policy_fallbacks": self.content_policy_fallbacks,
+            },
         )
         context_window_fallbacks: list | None = kwargs.get("context_window_fallbacks", self.context_window_fallbacks)
         content_policy_fallbacks: list | None = kwargs.get("content_policy_fallbacks", self.content_policy_fallbacks)
@@ -8067,23 +8072,11 @@ class Router:
             cast("list[object] | None", self.fallbacks),  # cast-ok: untyped router attribute
         )
         parent_otel_span: Final = get_parent_otel_span_from_kwargs(kwargs)
-        model_group: Final[str | None] = kwargs.get("model")
         context_window_fallbacks: Final = kwargs.pop("context_window_fallbacks", self.context_window_fallbacks)
         content_policy_fallbacks: Final = kwargs.pop("content_policy_fallbacks", self.content_policy_fallbacks)
-        reject_non_list_litellm_fallbacks(
-            cast(object, context_window_fallbacks),  # cast-ok: public Router kwargs are untyped
-            cast(object, model_group),  # cast-ok: public Router kwargs are untyped
-            field="context_window_fallbacks",
-            call_kwargs=kwargs,  # pyright: ignore[reportUnknownArgumentType]  # the Router's untyped call kwargs
-        )
-        reject_non_list_litellm_fallbacks(
-            cast(object, content_policy_fallbacks),  # cast-ok: public Router kwargs are untyped
-            cast(object, model_group),  # cast-ok: public Router kwargs are untyped
-            field="content_policy_fallbacks",
-            call_kwargs=kwargs,  # pyright: ignore[reportUnknownArgumentType]  # the Router's untyped call kwargs
-        )
         # Support per-request model_group_retry_policy override (from key/team settings)
         model_group_retry_policy: Final = kwargs.pop("model_group_retry_policy", self.model_group_retry_policy)
+        model_group: Final[str | None] = kwargs.get("model")
         request_num_retries: Final[int | None] = kwargs.pop("num_retries", None)
         num_retries = request_num_retries
         if num_retries is None:
