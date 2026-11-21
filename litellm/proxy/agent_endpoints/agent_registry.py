@@ -5,7 +5,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import datetime, timezone
 from functools import partial
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final, NamedTuple, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, Final, NamedTuple, Protocol, TypedDict
 
 from fastapi import HTTPException
 from pydantic import TypeAdapter, ValidationError
@@ -446,17 +446,14 @@ async def _retire_identity_managed_agent(tx: "Prisma", agent_id: str) -> tuple[s
     history_data: Final[LiteLLM_RetiredAgentUpsertInput] = {"create": history_create, "update": {}}
     # The history row ends nothing a last good entry holds, and a refused round rolls it back with the transaction
     await tx.litellm_retiredagent.upsert(where=history_where, data=history_data)
-    keys_table: Final = cast(  # cast-ok: generated actions take TypedDict filters; TableActions widens them to Mapping
-        "TableActions[prisma_models.LiteLLM_VerificationToken]", tx.litellm_verificationtoken
-    )
     if not serves_last_good_entries(user_api_key_cache):
         # No last good entry to revoke, so the agent's keys go in one delete, as without that setting
-        tokens: Final = tuple(key.token for key in await keys_table.find_many(where=keys_where))
+        tokens: Final = tuple(key.token for key in await tx.litellm_verificationtoken.find_many(where=keys_where))
         await tx.litellm_verificationtoken.delete_many(where=keys_where)
         return tokens
     deleted_keys: Final = await revoke_and_delete_read_rows(
         user_api_key_cache,
-        partial(keys_table.find_many, where=keys_where),
+        partial(tx.litellm_verificationtoken.find_many, where=keys_where),
         lambda keys: tuple(key.token for key in keys),
         lambda keys: tx.litellm_verificationtoken.delete_many(
             # bounded-ok: revoke_and_delete_read_rows hands each call at most IN_LIST_CHUNK_SIZE rows
