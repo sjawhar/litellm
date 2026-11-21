@@ -31,10 +31,12 @@ MAX_FALLBACK_LIST_ENTRIES: Final = 1000
 # request reads it on every call, so it is bounded too. 10,000 holds 2,500 groups with three fallbacks each.
 MAX_SAVED_FALLBACK_LIST_ENTRIES: Final = 10000
 # The values one walk of fallback lists may read per entry of the budget its lists are counted against: every list,
-# mapping and scalar each time the walk reaches it, each item and key of a list or mapping it reads, and a target's
-# header fields where the walk reads them. At the entry budget a body costs 1 to 5 reads per entry in the readings the
-# walk reads: a list of names read once 1, read both ways 2, ten nested group maps around 990 names read both ways
-# about 5. 16 is three times the dearest of them; past it the walk refuses with 400, as past the budget.
+# mapping and scalar each time the walk reaches it, null included, each item and key of a list or mapping each time
+# the walk passes over it, and the header fields of the request and of a target where the walk reads their beta, each
+# line also by every 64 characters. At the entry budget a body costs 1 to about 6 reads per entry in the readings the
+# walk reads: a list of names 1 in Anthropic's reading and 2 in LiteLLM's, which tells its format in a pass of its
+# own, and ten nested group maps around 990 names read both ways 6,092. 16 is about 2.6 times the dearest of them;
+# past it the walk refuses with 400, as past the budget.
 FALLBACK_WALK_READS_PER_ENTRY: Final = 16
 ROUTER_FALLBACK_ERROR_DETAIL_MAX_CHARS: Final = 2000
 RUNTIME_UPDATABLE_ROUTER_SETTINGS: Final[frozenset[str]] = frozenset(
