@@ -2956,7 +2956,7 @@ class ConfigGeneralSettings(LiteLLMPydanticObjectBase):
             "was checked against was served from its last good entry, and fresh otherwise. It is added where the "
             "proxy builds a call's headers with ProxyBaseLLMRequestProcessing.get_custom_headers, the same place the "
             "key's spend and limit headers come from; a response built another way does not carry it, for example "
-            "the pass-through routes such as /anthropic/* and the error answers of the image and rerank endpoints. "
+            "the error answers of the image and rerank endpoints. "
             "The logging payload and the spend log row of every call that is logged, a failed one included, carry "
             "the same value as metadata.user_api_key_auth_entries. Creating a customer that is blocked or has a "
             "budget, models, a region, a default model or an object permission, or an update that sets any of them, "
