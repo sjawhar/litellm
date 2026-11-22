@@ -657,6 +657,10 @@ class _Gateway:
         route: str = "/v1/messages",
         # False sends the request with no API key, as a caller before authentication
         credentials: bool = True,
+        # More HTTP headers the client sends, such as anthropic-version
+        http_headers: Mapping[str, str] = MappingProxyType({}),
+        # general_settings.forward_client_headers_to_llm_api, which sends the client's x- headers as the call's headers
+        forward_client_headers: bool = False,
     ) -> "_GatewayResult":
         import httpx
         import respx
@@ -733,6 +737,7 @@ class _Gateway:
                 **({"allow_requests_on_db_unavailable": True} if allow_requests_on_db_unavailable else {}),
                 **({"enforce_fallback_model_access": True} if enforce_fallback_model_access else {}),
                 **({"allow_client_side_credentials": True} if client_side_credentials else {}),
+                **({"forward_client_headers_to_llm_api": True} if forward_client_headers else {}),
             },
             "user_custom_auth": None,
             "proxy_logging_obj": ProxyLogging(user_api_key_cache=cache),
@@ -748,6 +753,7 @@ class _Gateway:
         headers = {
             **({"Authorization": f"Bearer {_CALLER_KEY}"} if credentials else {}),
             **({"anthropic-beta": _SERVER_SIDE_FALLBACK_BETA} if beta else {}),
+            **http_headers,
         }
 
         def error_reply(error: tuple[int, str, str]) -> "httpx.Response":
@@ -1571,8 +1577,9 @@ def _walk_reads(names: int, *, anthropic: bool) -> int:
 
 
 # What the walk charges for the scoped header the proxy builds from one HTTP anthropic-beta line before the beta check
-# reads it: the field 1, its two copies 2, its extra_headers' scan 1 and the walk's own pass over that mapping 1
-_ONE_BETA_LINE_READS: Final = 5
+# reads it, a mapping of its providers and its extra_headers as the call carries it: the field 1, its two copies of two
+# members 4, its extra_headers' scan 1 and the walk's own pass over that mapping 1
+_ONE_BETA_LINE_READS: Final = 7
 
 
 def _visits_before_the_refusal(*, beta: bool) -> int:
@@ -2023,8 +2030,8 @@ def test_without_the_beta_the_walk_reads_none_of_a_parameter_only_targets_values
     The review's bodies on /v1/messages without the beta. LiteLLM's reading, the one the request is checked in, merges
     both mappings into the call and reads only their fallback fields, which they lack. No target carries a header
     field, so no hop takes Anthropic's reading, which would read the second mapping's values as model names, and the
-    walk does not read it: it reads the request's anthropic-beta line, 5, the list, 1, and its two mappings in the
-    format pass and in the read, 4, 10 values however long the parameters are, and only the two targets get the entry
+    walk does not read it: it reads the request's anthropic-beta line, 7, the list, 1, and its two mappings in the
+    format pass and in the read, 4, 12 values however long the parameters are, and only the two targets get the entry
     check.
     """
     from litellm.proxy.auth.auth_utils import is_request_body_safe
@@ -2087,8 +2094,8 @@ def test_under_the_beta_a_target_that_can_drop_it_gets_litellms_reading_charged(
     with a header field replaces the call's headers on its hop, which can drop the beta, so the walk then reads
     `fallbacks` as LiteLLM's too, and charges it. JSON cannot share a list, but a Python caller can: twenty model
     groups mapped to one list of 900 names hold 922 entries with the error field's two, within the budget. Anthropic's
-    reading reads the anthropic-beta line, 5, the list of groups, 21, each group's values and the shared list reached,
-    2 each, the shared list once, 900, and the error field, 5: 971 reads in all, and 3 more for the target's header
+    reading reads the anthropic-beta line, 7, the list of groups, 21, each group's values and the shared list reached,
+    2 each, the shared list once, 900, and the error field, 5: 973 reads in all, and 3 more for the target's header
     field, charged when the walk reaches the target, the field reached, scanned and passed over. LiteLLM's reads the
     list of groups, 41 with its format pass, then each group's values, the shared list reached and read, 902 each, and
     passes 16,000 at the 17th group, refused before it reads the list.
@@ -2116,11 +2123,11 @@ def test_under_the_beta_a_target_that_can_drop_it_gets_litellms_reading_charged(
 
     if not can_drop_the_beta:
         assert check()
-        assert sum(reads) == 971
+        assert sum(reads) == 973
         return
     with pytest.raises(FallbackBudgetError, match="reading the request's fallback lists takes more than 16000 reads"):
         check()
-    assert sum(reads) == 971 + 3 + 41 + 17 * 902
+    assert sum(reads) == 973 + 3 + 41 + 17 * 902
 
 
 _SHAPES_ONLY_ANTHROPICS_READING_REFUSES: Final = (
@@ -2190,7 +2197,7 @@ def test_the_reviews_body_with_a_number_after_its_strings_gets_two_entry_checks_
 
 # Few entries and many values a walk reads: a group map of 16,000 groups mapped to a string, one entry in LiteLLM's
 # reading, and in Anthropic's a parameter-only mapping whose one message holds 16,000 values. The walk charges the
-# 16,000 values before it reads them: 16,003 reads in LiteLLM's reading, and 16,011 in Anthropic's with its beta line
+# 16,000 values before it reads them: 16,003 reads in LiteLLM's reading, and 16,013 in Anthropic's with its beta line
 _WITHIN_THE_BUDGET_PAST_THE_READ_CAP: Final = (
     pytest.param(
         {"fallbacks": [{f"group-{index}": "x" for index in range(16_000)}]}, False, 16_003, id="litellms-reading"
@@ -2198,7 +2205,7 @@ _WITHIN_THE_BUDGET_PAST_THE_READ_CAP: Final = (
     pytest.param(
         {"fallbacks": [{"model": "other"}, {"messages": [{f"k{index}": "v" for index in range(16_000)}]}]},
         True,
-        16_011,
+        16_013,
         id="anthropics-reading",
     ),
 )
@@ -3863,6 +3870,198 @@ def test_iter_request_fallback_targets_takes_each_member_of_an_unchecked_body_on
 
     assert len(made) == members
     assert len(handed_out) == targets
+
+
+# -- Nesting past the depth no reader follows is refused with 400 on every path, a context_window_fallback_dict's too --
+
+_NESTING_THE_WALK_READS: Final = 2 * 5  # 2 x ROUTER_MAX_FALLBACKS, its default
+_NESTING_OF_THE_REVIEW: Final = 330
+
+
+def _nested_swap_dictionaries(levels: int) -> dict[str, object]:  # mutable-ok: a request body
+    """
+    The review's body: a context_window_fallback_dict whose one swap is a target holding its own dictionary, ``levels``
+    targets deep, the innermost one's dictionary swapping in a model name. Target k stands at depth k, so the
+    dictionaries stand at depths 0 to ``levels``.
+    """
+    innermost: Final[dict[str, object]] = {  # mutable-ok: a target as a body sends it
+        "model": "other",
+        "context_window_fallback_dict": {"a": "other"},
+    }
+    return {
+        "model": "requested",
+        "context_window_fallback_dict": {
+            "a": reduce(
+                lambda inner, _: {"model": "other", "context_window_fallback_dict": {"a": inner}},
+                range(levels - 1),
+                innermost,
+            )
+        },
+    }
+
+
+_THE_DEPTH_REFUSAL: Final = "fallback nesting exceeds the allowed validation depth"
+
+
+@pytest.mark.parametrize(
+    ("levels", "read"),
+    [
+        pytest.param(_NESTING_THE_WALK_READS, True, id="at-the-depth"),
+        pytest.param(_NESTING_THE_WALK_READS + 1, False, id="one-past-it"),
+        pytest.param(_NESTING_OF_THE_REVIEW, False, id="the-reviews-330-levels"),
+    ],
+)
+def test_a_nested_context_window_fallback_dict_is_read_to_the_depth_and_refused_past_it_in_both_walks(
+    levels: int, read: bool
+) -> None:
+    """
+    A context_window_fallback_dict swaps in targets one level down, as a list does, and each target's own dictionary
+    is read in turn. Both walks check how deep they read before they read a list or such a dictionary: with ten
+    targets the deepest dictionary stands at depth 10, 2 x ROUTER_MAX_FALLBACKS, and is read; one more target, or the
+    review's 330, is refused with the shape 400 naming the field, by the proxy's check and by the Router's first call
+    of the same body as a library call, where 330 levels raised RecursionError and 11 passed.
+    """
+    import litellm
+    from litellm.proxy.auth.auth_utils import is_request_body_safe
+    from litellm.router_utils.fallback_event_handlers import FallbackListShapeError, call_fallbacks
+
+    body: Final = _nested_swap_dictionaries(levels)
+    router: Final = _router_configured_with(())
+    proxy_check: Final = partial(
+        is_request_body_safe, copy.deepcopy(body), {}, router, "requested", route="/v1/messages"
+    )
+    router_call: Final = partial(call_fallbacks, _the_routers_call(body), router)
+
+    if read:
+        assert proxy_check()
+        assert router_call() is None
+        return
+    with pytest.raises(FallbackListShapeError, match=_THE_DEPTH_REFUSAL) as refusal:
+        proxy_check()
+    assert refusal.value.param == "context_window_fallback_dict"
+    with pytest.raises(litellm.BadRequestError, match=_THE_DEPTH_REFUSAL):
+        router_call()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "levels",
+    [_NESTING_THE_WALK_READS + 1, _NESTING_OF_THE_REVIEW],
+    ids=["one-past-the-depth", "the-reviews-330-levels"],
+)
+async def test_a_nested_context_window_fallback_dict_past_the_depth_gets_the_400_before_the_key_is_read(
+    monkeypatch: pytest.MonkeyPatch, levels: int
+) -> None:
+    """
+    The review's input through the proxy, with no key: the check before the key refuses it with 400 naming
+    `context_window_fallback_dict`, where 330 levels raised RecursionError there and the caller got a 401
+    authentication error
+    """
+    body: Final = _nested_swap_dictionaries(levels)
+    result: Final = await _Gateway(monkeypatch).send(
+        {"context_window_fallback_dict": body["context_window_fallback_dict"]}, credentials=False
+    )
+
+    assert result.response.status_code == 400, result.response.text
+    assert _THE_DEPTH_REFUSAL in result.response.text
+    assert _error_param(result.response) == "context_window_fallback_dict"
+    assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+
+
+# -- The proxy charges the header fields the call carries, as the setup builds them, so the Router charges no more --
+
+_ANTHROPIC_VERSION: Final = MappingProxyType({"anthropic-version": "2023-06-01"})
+_BOTH_ANTHROPIC_HEADERS: Final = MappingProxyType({**_ANTHROPIC_VERSION, **_THE_BETA_HEADER})
+# An x- header the client sends on every row, which the proxy forwards when it forwards the client's headers
+_A_CLIENT_HEADER: Final = MappingProxyType({"x-request-note": "n1"})
+# (HTTP headers beside the client's x- header, client headers forwarded, the reads one proxy walk charges, the reads the
+# Router's first walk charges), written out: the body's one list, context_window_fallbacks [{"requested": ["other"]}],
+# 5; the scoped header the setup builds from Anthropic's headers, a mapping of its providers and its extra_headers,
+# reached 1, copied twice 4, its extra_headers scanned and passed over, 2 a line, no line past 64 characters; and with
+# client headers forwarded the call's headers, reached 1 and 2 a line, the x- header and the beta line
+_HTTP_HEADER_ROWS: Final = (
+    pytest.param(MappingProxyType({}), False, 5, 5, id="no-anthropic-header"),
+    pytest.param(_ANTHROPIC_VERSION, False, 5 + 7, 5 + 7, id="anthropic-version"),
+    pytest.param(_THE_BETA_HEADER, False, 5 + 7, 5 + 7, id="the-beta"),
+    pytest.param(_BOTH_ANTHROPIC_HEADERS, False, 5 + 9, 5 + 9, id="both"),
+    pytest.param(MappingProxyType({}), True, 5 + 3, 5 + 3, id="no-anthropic-header-forwarded"),
+    pytest.param(_ANTHROPIC_VERSION, True, 5 + 7 + 3, 5 + 7 + 3, id="anthropic-version-forwarded"),
+    pytest.param(_THE_BETA_HEADER, True, 5 + 7 + 5, 5 + 7 + 5, id="the-beta-forwarded"),
+    pytest.param(_BOTH_ANTHROPIC_HEADERS, True, 5 + 9 + 5, 5 + 9 + 5, id="both-forwarded"),
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("http_headers", "forwarded", "proxy_charge", "router_charge"), _HTTP_HEADER_ROWS)
+async def test_the_proxy_charges_the_header_fields_the_call_carries_and_the_router_no_more(
+    monkeypatch: pytest.MonkeyPatch,
+    http_headers: Mapping[str, str],
+    forwarded: bool,
+    proxy_charge: int,
+    router_charge: int,
+) -> None:
+    """
+    The review's second point: the proxy charged the scoped header it builds from Anthropic's HTTP headers as a mapping
+    of one member, where the call carries the setup's, of two, and did not charge the client headers the setup
+    forwards as the call's headers. The checks now build both as the setup does, so each of the proxy's three walks of
+    the request charges what the Router's first walk of the call charges, with no Anthropic header, with
+    anthropic-version, with the beta, with both, each with and without forwarded client headers.
+    """
+    reads: Final = _count_reads_by_part(monkeypatch)
+    walks: Final = _count_proxy_walk_scans(monkeypatch)
+    result: Final = await _Gateway(monkeypatch, requested_answers=True).send(
+        {"context_window_fallbacks": [{"requested": ["other"]}]},
+        http_headers={**http_headers, **_A_CLIENT_HEADER},
+        forward_client_headers=forwarded,
+    )
+
+    assert result.response.status_code == 200, result.response.text
+    assert len(walks) == 3
+    assert _proxy_reads(reads) == 3 * proxy_charge
+    assert _router_call_reads(reads) == router_charge
+    assert router_charge <= proxy_charge
+
+
+_SAVED_PART: Final = "the fallback lists of the key's or team's saved router_settings"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("groups", "served"),
+    [(7_995, True), (7_996, False)],
+    ids=["the-largest-body-the-proxy-passes", "the-reviews-edge"],
+)
+async def test_at_the_combined_limit_the_router_serves_every_request_the_proxy_passed(
+    monkeypatch: pytest.MonkeyPatch, groups: int, served: bool
+) -> None:
+    """
+    The review's edge: the body's `fallbacks` hold one map of model groups mapped to empty lists, the key's saved
+    context_window_fallbacks one map of 79,999 such groups, and the request carries anthropic-version. The proxy charges
+    the scoped header as the call carries it, 7, and the body's list, 3 and 2 a group: 7,995 groups take exactly
+    16,000 reads and pass, and the saved list 160,000 in its own part; the Router's first walk charges the call's
+    lists and header fields the same, 176,000, its net, and serves the request. 7,996 groups take 16,002, refused with
+    400 before the key is read, at the 16,001st read; the proxy passed them before, and the Router refused them at its
+    176,001st.
+    """
+    reads: Final = _count_reads_by_part(monkeypatch)
+    result: Final = await _Gateway(monkeypatch, requested_answers=True).send(
+        {"fallbacks": [_groups_of_empty_lists("g", groups)]},
+        key_router_settings={"context_window_fallbacks": [_groups_of_empty_lists("s", 79_999)]},
+        http_headers=_ANTHROPIC_VERSION,
+    )
+
+    if not served:
+        assert result.response.status_code == 400, result.response.text
+        assert "reading the request's fallback lists takes more than 16000 reads" in result.response.text
+        assert _proxy_reads(reads) == 16_001
+        assert _router_call_reads(reads) == 0
+        assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+        return
+    assert result.response.status_code == 200, result.response.text
+    assert _proxy_reads(reads) == 4 * 16_000
+    assert sum(charged for part, _, charged in reads if part == _SAVED_PART) == 160_000
+    assert _router_call_reads(reads) == 176_000
+    assert result.calls == {"requested": 1, "other": 0, "forbidden": 0, "attacker": 0}
 
 
 @pytest.mark.asyncio
