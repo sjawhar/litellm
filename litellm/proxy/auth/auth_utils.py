@@ -655,9 +655,12 @@ def key_fallback_model_names(
 
 
 # How iter_request_fallback_targets reads a place of a request body: a mapping merged into a call, read for its
-# fallback fields, those of its router_settings_override and the values of its context_window_fallback_dict; a
-# fallback list, or a mapping a reader iterates as one; and an entry of such a list, a model name or a mapping
+# fallback fields, its router_settings_override and its context_window_fallback_dict; a router_settings_override, read
+# for its fallback fields; a context_window_fallback_dict, read for the models it swaps in; a fallback list, or a
+# mapping a reader iterates as one; and an entry of such a list, a model name or a mapping
 _MERGED_MAPPING: Final = "a mapping merged into a call"
+_SETTINGS_OVERRIDE: Final = "a router_settings_override"
+_SWAPPED_MODELS: Final = "a context_window_fallback_dict"
 _FALLBACK_LIST: Final = "a fallback list"
 _FALLBACK_ENTRY: Final = "a fallback entry"
 # The fallback fields some reader of which merges every mapping of the list into a call, a model group map included:
@@ -697,19 +700,16 @@ def _fallback_field_places(source: object) -> tuple[_FallbackPlace, ...]:
 
 def _merged_mapping_places(mapping: Mapping[str, object]) -> tuple[_FallbackPlace, ...]:
     """
-    The fallback fields of a mapping merged into a call and of its router_settings_override, and the models its
-    context_window_fallback_dict swaps in, as the walk of a request body reads them (iter_body_fallback_entries)
+    The fallback fields of a mapping merged into a call, then its router_settings_override and its
+    context_window_fallback_dict, each a place of its own, so one the body holds in many mappings is read once, as the
+    walk of a request body reads them (iter_body_fallback_entries)
     """
+    override: Final = mapping.get(ROUTER_SETTINGS_OVERRIDE_KWARG)
     swaps: Final = mapping.get(CONTEXT_WINDOW_FALLBACK_DICT_FIELD)
-    swapped_in: Final = (
-        tuple(_FallbackPlace(_FALLBACK_ENTRY, target) for target in swaps.values())
-        if _is_request_mapping(swaps)
-        else ()
-    )
     return (
         *_fallback_field_places(mapping),
-        *_fallback_field_places(mapping.get(ROUTER_SETTINGS_OVERRIDE_KWARG)),
-        *swapped_in,
+        *((_FallbackPlace(_SETTINGS_OVERRIDE, override),) if _is_request_mapping(override) else ()),
+        *((_FallbackPlace(_SWAPPED_MODELS, swaps),) if _is_request_mapping(swaps) else ()),
     )
 
 
@@ -728,13 +728,27 @@ def _fallback_list_places(value: object, merges_every_mapping: bool) -> tuple[_F
     return ()
 
 
+def _swapped_model_places(swaps: object) -> tuple[_FallbackPlace, ...]:
+    """The models a context_window_fallback_dict swaps in: the client wrapper swaps each value in, a list of targets"""
+    if not _is_request_mapping(swaps):
+        return ()
+    return tuple(_FallbackPlace(_FALLBACK_ENTRY, target) for target in swaps.values())
+
+
 def _fallback_place_contents(
     place: _FallbackPlace,
 ) -> tuple[str | Mapping[str, object] | None, tuple[_FallbackPlace, ...]]:
-    """The target a place is, if it is one, and the places it holds, in the order they stand"""
+    """
+    The target a place is, if it is one, and the places it holds, in the order they stand. Each key or value it takes
+    from a list or a mapping becomes one place, and only the place that holds that list or mapping takes them.
+    """
     value: Final = place.value
     if place.kind == _MERGED_MAPPING:
         return None, (_merged_mapping_places(value) if _is_request_mapping(value) else ())
+    if place.kind == _SETTINGS_OVERRIDE:
+        return None, _fallback_field_places(value)
+    if place.kind == _SWAPPED_MODELS:
+        return None, _swapped_model_places(value)
     if place.kind == _FALLBACK_LIST:
         return None, _fallback_list_places(value, place.merges_every_mapping)
     if isinstance(value, str):
@@ -742,12 +756,16 @@ def _fallback_place_contents(
     if not _is_request_mapping(value):
         # Neither a model name nor a mapping: no reader calls it, and this reading refuses nothing
         return None, ()
-    group_map: Final = bool(value) and all(is_object_list(item) for item in value.values())
-    # Every mapping a reader merges has its own fallback lists read. One without a string `model` is a model group
-    # map in one reading and merged into the call in another, so its values are read as lists of targets too.
+    if fallback_entry_is_target(value):
+        # A target: merged into the call, its own fallback lists read
+        return value, (_FallbackPlace(_MERGED_MAPPING, value),)
+    # A mapping without a string `model` is a model group map in one reading and merged into the call in another, so
+    # its own fallback lists are read, and its values as lists of targets too
+    members: Final = tuple(value.values())
+    group_map: Final = bool(members) and all(is_object_list(member) for member in members)
     inside: Final = (
         _FallbackPlace(_MERGED_MAPPING, value),
-        *(() if fallback_entry_is_target(value) else (_FallbackPlace(_FALLBACK_LIST, item) for item in value.values())),
+        *(_FallbackPlace(_FALLBACK_LIST, member) for member in members),
     )
     return (None if group_map and not place.merges_every_mapping else value), inside
 
@@ -767,10 +785,11 @@ def iter_request_fallback_targets(request_body: Mapping[str, object]) -> Iterato
     a list, in a list only the Router reads as group maps (``context_window_fallbacks``, ``content_policy_fallbacks``,
     ``default_fallbacks``).
 
-    It refuses nothing. An entry that is neither a model name nor a mapping is passed by, and no limit applies: this
-    reading reads values the proxy's checks of the request did not charge, so a limit could refuse a body they passed.
-    Each list and mapping is read a fixed number of times however deep it stands and however often the body holds it,
-    so the work is linear in the body.
+    For a body of built-in containers it refuses nothing and raises nothing: an entry that is neither a model name nor
+    a mapping is passed by, and no limit applies, since this reading reads values the proxy's checks of the request did
+    not charge, so a limit could refuse a body they passed. Each list and mapping is a place read a fixed number of
+    times, however deep it stands and however many mappings of the body hold it, and only that place takes its keys
+    and values, so the work is linear in the body.
     """
     pending: Final[list[_FallbackPlace]] = [  # mutable-ok: the reading's own stack of places
         _FallbackPlace(_MERGED_MAPPING, request_body)
