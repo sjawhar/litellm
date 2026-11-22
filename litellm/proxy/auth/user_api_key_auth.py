@@ -11,7 +11,7 @@ import asyncio
 import fnmatch
 import re
 import secrets
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Final, NamedTuple, Protocol, Union, cast
 
@@ -61,6 +61,7 @@ from litellm.proxy.auth.auth_checks import (  # noqa: F401  # legacy module expo
     check_end_user_budget,
     common_checks,
     delete_cache_key_object,
+    deny_ambiguous_provider_fallbacks,
     get_end_user_object,
     get_jwt_key_mapping_object,
     get_key_end_user_budget_id,
@@ -92,14 +93,16 @@ from litellm.proxy.auth.auth_object_prefetch import (
     prefetch_identity_keys,
 )
 from litellm.proxy.auth.auth_utils import (
+    FallbackModelNames,
     abbreviate_api_key,
-    fallback_target_model_name,
+    check_request_body,
+    explained_fallback_name_refusal,
     get_end_user_id_from_request_body,
     get_model_from_request,
     get_request_route,
     get_request_route_template,
     is_invalid_virtual_key_error,
-    iter_request_fallback_targets,
+    key_fallback_model_names,
     log_model_access_denial,
     normalize_request_route,
     pre_db_read_auth_checks,
@@ -169,6 +172,13 @@ from litellm.proxy.utils import (
 from litellm.repositories.table_repositories import JWTKeyMappingRepository, TeamMembershipRepository
 from litellm.repositories.verification_token_repository import VerificationTokenRepository
 from litellm.router_utils.common_utils import resolve_model_group_alias
+from litellm.router_utils.fallback_event_handlers import (
+    CONTEXT_WINDOW_FALLBACK_DICT_FIELD,
+    FALLBACK_LIST_FIELDS,
+    HEADER_CARRIER_KWARGS,
+    ROUTER_SETTINGS_OVERRIDE_KWARG,
+    FallbackBudgetError,
+)
 from litellm.secret_managers.main import get_secret_bool
 from litellm.types.services import ServiceTypes
 
@@ -3814,9 +3824,7 @@ async def enforce_key_and_fallback_model_access(
         model_list: Final = config.get("model_list", [])
         new_model_list: Final = model_list
         verbose_proxy_logger.debug("\n new llm router model list %s", new_model_list)
-    elif isinstance(valid_token.models, list) and "all-team-models" in valid_token.models:
-        pass
-    else:
+    elif not (isinstance(valid_token.models, list) and "all-team-models" in valid_token.models):
         model: Final = _get_model_from_request_context(
             request_data=request_data,
             route=route,
@@ -3833,13 +3841,35 @@ async def enforce_key_and_fallback_model_access(
                 llm_router=llm_router,
             )
 
-        fallback_names: Final = tuple(
-            name
-            for target in iter_request_fallback_targets(request_data)
-            if (name := fallback_target_model_name(target)) is not None
-        )
+    # Fallback targets are checked for an all-team-models key and a key with its own config too: neither turns off the
+    # checks of what the request carries. The team, member, user, project and agent checks of every fallback target
+    # run in common_checks.
+    await enforce_fallback_target_access(
+        valid_token=valid_token,
+        names=key_fallback_model_names(request_data, route=route, request=request, llm_router=llm_router),
+        llm_model_list=llm_model_list,  # pyright: ignore[reportUnknownArgumentType]  # the proxy's untyped model list
+        llm_router=llm_router,
+    )
 
-        for _name in dict.fromkeys(fallback_names):  # dedupe, preserve order
+
+async def enforce_fallback_target_access(
+    *,
+    valid_token: UserAPIKeyAuth,
+    names: FallbackModelNames,
+    llm_model_list: Sequence[object] | None,
+    llm_router: litellm.Router | None,
+) -> None:
+    """
+    The key's model checks of every model a request's fallback lists name, for the body and for the key or team
+    router settings the proxy applies after auth alike. A name in Anthropic's list, the body's or a target's own, gets
+    its refusals first, so no error a request can be recovered from comes before them.
+    """
+    deny_ambiguous_provider_fallbacks(
+        provider_fallback_models=names.anthropic, valid_token=valid_token, llm_router=llm_router
+    )
+
+    for _name in names.litellm:
+        with explained_fallback_name_refusal(names, (_name,)):
             await can_key_call_model(
                 model=_name,
                 llm_model_list=llm_model_list,
@@ -3851,6 +3881,77 @@ async def enforce_key_and_fallback_model_access(
                 llm_router=llm_router,
                 user_model=None,
             )
+
+    # Anthropic serves its own fallback models, so they need the key's model access but no Router group. A name there
+    # that is an alias, or that the router serves from another model, is refused above, so this check reads each name
+    # as Anthropic gets it.
+    for _name in names.anthropic:
+        await can_key_call_model(
+            model=_name,
+            llm_model_list=llm_model_list,
+            valid_token=valid_token,
+            llm_router=llm_router,
+        )
+
+
+async def enforce_router_settings_fallback_access(
+    *,
+    request_data: Mapping[str, object],
+    valid_token: UserAPIKeyAuth,
+    general_settings: Mapping[str, object],
+    llm_router: litellm.Router | None,
+    request: Request,
+) -> None:
+    """
+    The checks a body's fallback lists get, for the key or team router_settings_override the proxy applies after auth,
+    through the same entry points: the body's check of every target, then the key's model checks of every model the
+    lists name. Their targets merge into this request's call, so its model, its header fields and its own fallback
+    lists come along: whose list a ``fallbacks`` is depends on every target the request's hops can merge. The saved
+    settings are counted apart from the request's own lists, each against its own limit, and a refusal for going over
+    one names which.
+    """
+    route: Final = get_request_route(request)
+    model: Final = request_data.get("model")
+    settings_request: Final = {
+        key: request_data[key]
+        for key in (
+            "model",
+            ROUTER_SETTINGS_OVERRIDE_KWARG,
+            *HEADER_CARRIER_KWARGS,
+            *FALLBACK_LIST_FIELDS,
+            CONTEXT_WINDOW_FALLBACK_DICT_FIELD,
+        )
+        if key in request_data
+    }
+    try:
+        names: Final = check_request_body(
+            settings_request,
+            general_settings,
+            llm_router,
+            model if isinstance(model, str) else "",
+            route=route,
+            request=request,
+            saved_settings=True,
+        )
+    except FallbackBudgetError as e:
+        raise ProxyException(
+            message=str(e),
+            type=ProxyErrorTypes.bad_request_error,
+            param=e.param,
+            code=status.HTTP_400_BAD_REQUEST,
+        ) from e
+    except ValueError as e:
+        raise ProxyException(
+            message=f"Key or team router_settings: {e}",
+            type=ProxyErrorTypes.bad_request_error,
+            param="router_settings",
+            code=status.HTTP_400_BAD_REQUEST,
+        ) from e
+    if not (names.litellm or names.anthropic):
+        return
+    await enforce_fallback_target_access(
+        valid_token=valid_token, names=names, llm_model_list=None, llm_router=llm_router
+    )
 
 
 _enforce_key_and_fallback_model_access: Final = enforce_key_and_fallback_model_access

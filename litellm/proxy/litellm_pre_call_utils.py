@@ -4,7 +4,7 @@ import json
 import re
 import time
 from collections import OrderedDict
-from collections.abc import Mapping, MutableMapping, Sequence
+from collections.abc import Iterator, Mapping, MutableMapping, Sequence
 from datetime import datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
@@ -35,7 +35,7 @@ from litellm.constants import (
     X_LITELLM_DISABLE_CALLBACKS,
 )
 from litellm.integrations.custom_guardrail import without_server_streaming_classification
-from litellm.litellm_core_utils.core_helpers import is_codex_user_agent
+from litellm.litellm_core_utils.core_helpers import is_codex_user_agent, is_object_dict, is_object_mapping
 from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
 from litellm.litellm_core_utils.initialize_dynamic_callback_params import (
     TRUSTED_CALLBACK_VARS_FIELD,
@@ -216,6 +216,7 @@ def sanitize_for_log(value: object) -> str:
 
 
 from litellm.router import Router
+from litellm.router_utils.fallback_event_handlers import MID_STREAM_FALLBACK_CONTROLS_KEY, ROUTER_FALLBACKS_KWARG
 from litellm.secret_managers.main import get_secret_bool
 from litellm.types.llms.anthropic import ANTHROPIC_API_HEADERS
 from litellm.types.services import ServiceTypes
@@ -348,6 +349,12 @@ _UNTRUSTED_ROOT_CONTROL_FIELDS: Final = (
     # protection on a real deployment failure or force a false "not caller-controlled"
     # reading that lets its own bad timeout cool down deployments other tenants rely on.
     "client_side_timeout",
+    # Set only by route_request, from the key/team router_settings (a client's own router_settings_override loses its
+    # fallbacks under the server-side-fallback beta). A body value would skip every fallback check.
+    ROUTER_FALLBACKS_KWARG,
+    # Router-internal fallback state, never a caller's to set.
+    "fallback_model_group",
+    MID_STREAM_FALLBACK_CONTROLS_KEY,
 )
 
 _UNTRUSTED_METADATA_CONTROL_FIELDS: Final = (
@@ -702,6 +709,117 @@ def metadata_variable_name_for_route(route: str) -> Literal["metadata", "litellm
     return "metadata"
 
 
+_CLIENT_METADATA_BUCKETS: Final = ("metadata", "litellm_metadata")
+
+
+def _strip_session_id_omitted_marker(
+    data: dict[str, object],  # mutable-ok: strips in place on the request body the pre-call pipeline threads through
+) -> None:
+    """The proxy's own mark of an omitted session id, which a caller's metadata may not carry"""
+    for metadata_key in _CLIENT_METADATA_BUCKETS:
+        if isinstance(client_metadata := data.get(metadata_key), dict):
+            client_metadata.pop(SESSION_ID_OMITTED_METADATA_KEY, None)
+
+
+def _sanitize_client_metadata(
+    data: dict[str, object],  # mutable-ok: strips in place on the request body the pre-call pipeline threads through
+    *,
+    allow_client_message_redaction_opt_out: bool,
+    allow_client_pricing_override: bool,
+) -> None:
+    """
+    What the request setup drops from what a caller sent, in its `metadata` and `litellm_metadata` and in the body
+    fields the same strips cover: header controls the caller may not set, `user_api_key_*` identity slots (the proxy
+    writes them into one bucket, so a caller's in the other would surface as a forged identity in guardrails, spend
+    tracking and audit logs), pipeline control fields, pricing overrides unless the key or team allows them,
+    router-owned fallback stamps, callback credentials, and message-logging opt-outs when the proxy turns message
+    logging off and the key or team does not allow them. The setup runs it on a request body;
+    client_metadata_the_setup_would_change runs it on a copy of a fallback target.
+    """
+    for metadata_key in _CLIENT_METADATA_BUCKETS:
+        if not is_object_dict(user_metadata := data.get(metadata_key)):
+            continue
+        _strip_untrusted_request_header_controls(
+            user_metadata.get("headers"),
+            allow_client_message_redaction_opt_out=allow_client_message_redaction_opt_out,
+        )
+        for field in [
+            key
+            for key in user_metadata
+            if isinstance(key, str) and (key.startswith("user_api_key_") or key in _UNTRUSTED_METADATA_CONTROL_FIELDS)
+        ]:
+            user_metadata.pop(field, None)
+    if not allow_client_pricing_override:
+        _strip_client_pricing_overrides(data)
+    _strip_router_reserved_metadata(data)
+    _strip_client_callback_credentials(data)
+    if not allow_client_message_redaction_opt_out and litellm.turn_off_message_logging is True:
+        _strip_client_message_redaction_opt_out(data)
+
+
+# A side of a compared mapping that does not hold the key
+_ABSENT: Final = object()
+
+
+def _changed_paths(before: object, after: object) -> Iterator[str]:
+    """
+    The dotted paths at which ``after`` drops, adds or changes a value of ``before``, mapping by mapping, in key order.
+    A value ``after`` holds as the very object ``before`` holds is unchanged and is not read, so the comparison goes no
+    deeper than the copy it is given made new objects.
+    """
+    pending: Final[list[tuple[object, object, tuple[str, ...]]]] = [  # mutable-ok: the comparison's own stack
+        (before, after, ())
+    ]
+    while pending:
+        old, new, path = pending.pop()
+        if old is new:
+            continue
+        if old is _ABSENT or new is _ABSENT:
+            yield ".".join(path)
+        elif is_object_mapping(old) and is_object_mapping(new):
+            # Pushed last key first, so the paths come out in key order
+            pending.extend(
+                (old.get(key, _ABSENT), new.get(key, _ABSENT), (*path, str(key)))
+                for key in reversed(tuple({**old, **new}))
+            )
+        elif old != new:
+            yield ".".join(path)
+
+
+def _bucket_copy(bucket: Mapping[str, object]) -> dict[str, object]:  # mutable-ok: the strips rewrite this copy
+    """A bucket copied as deep as the strips change one, its own keys and those of its ``headers``, and no deeper"""
+    return {key: dict(value) if key == "headers" and is_object_dict(value) else value for key, value in bucket.items()}
+
+
+def client_metadata_the_setup_would_change(
+    target: Mapping[str, object], metadata_variable_name: str
+) -> tuple[str, ...]:
+    """
+    The paths of a fallback target's metadata buckets that the request setup would drop or change in a request body.
+    Each bucket, parsed as a body's is, goes through the setup's own strips on a copy: the session marker's and
+    _sanitize_client_metadata's. The key's and team's opt-ins are taken as off, since a target is checked before the
+    key is read; the proxy-wide settings are as they are. Only the two buckets are read, and only as deep as the
+    strips change them, so a target nested deeper than the fallback walker reads is refused by the walker; the root
+    fields the same strips drop from a body are in the entry check's own list of root fields. On a route whose
+    metadata is `metadata`, the setup merges a body's `litellm_metadata` into it and drops the bucket, so a target may
+    not bring that bucket there.
+    """
+    before: Final = {
+        name: _normalized_metadata_object(name, value)
+        for name in _CLIENT_METADATA_BUCKETS
+        if (value := target.get(name)) is not None
+    }
+    after: Final[dict[str, object]] = {  # mutable-ok: the setup's strips rewrite this copy in place
+        name: _bucket_copy(bucket) for name, bucket in before.items()
+    }
+    _strip_session_id_omitted_marker(after)
+    _sanitize_client_metadata(after, allow_client_message_redaction_opt_out=False, allow_client_pricing_override=False)
+    dropped_bucket: Final = (
+        ("litellm_metadata",) if metadata_variable_name == "metadata" and "litellm_metadata" in target else ()
+    )
+    return (*dropped_bucket, *_changed_paths(before, after))
+
+
 def _promoted_trace_control_fields(
     requester_metadata: Mapping[str, object],
     litellm_metadata: Mapping[str, object],
@@ -850,9 +968,7 @@ def apply_missing_session_id_policy(
     general_settings: Mapping[str, object] | None,
     request: Request,
 ) -> None:
-    for metadata_key in ("metadata", "litellm_metadata"):
-        if isinstance(client_metadata := data.get(metadata_key), dict):
-            client_metadata.pop(SESSION_ID_OMITTED_METADATA_KEY, None)
+    _strip_session_id_omitted_marker(data)
     metadata: Final = data.get(_metadata_variable_name)
     policy: Final = general_settings.get("missing_session_id") if general_settings else None
     if policy is None or not _is_llm_inference_route(request):
@@ -1227,6 +1343,9 @@ def _tenant_service_name(user_api_key_dict: UserAPIKeyAuth) -> str | None:
     )
 
 
+_COMMA_JOINED_REPEATED_HEADERS: Final = frozenset({"anthropic-beta"})
+
+
 def clean_headers(
     headers: Headers,
     litellm_key_header_name: str | None = None,
@@ -1276,7 +1395,11 @@ def clean_headers(
         elif header_lower not in _SPECIAL_HEADERS_CACHE and (
             litellm_key_lower is None or header_lower != litellm_key_lower
         ):
-            clean_headers[header] = value
+            clean_headers[header] = (
+                f"{clean_headers[header]},{value}"
+                if header_lower in _COMMA_JOINED_REPEATED_HEADERS and header in clean_headers
+                else value
+            )
     return clean_headers
 
 
@@ -1571,15 +1694,19 @@ class LiteLLMProxyRequestSetup:
         # A deliberately tiny value can force a 408 on every deployment in a fallback chain,
         # so this marker (never trusted verbatim from the client; stripped above) must cover
         # every source cooldown_handlers._trigger_cooldown_for_failed_deployment needs to
-        # distinguish from a real deployment health signal.
-        if (
-            header_timeout is not None
-            or header_stream_timeout is not None
-            or request_data.get("timeout") is not None
-            or request_data.get("request_timeout") is not None
-            or request_data.get("stream_timeout") is not None
-        ):
-            data["client_side_timeout"] = True
+        # distinguish from a real deployment health signal. It names the caller's own timeouts, so a fallback hop that
+        # clears one can tell whether a timeout of the caller's is still in the call (fallback_target_params_over_call).
+        caller_timeouts: Final = tuple(
+            name
+            for name, header_value in (
+                ("timeout", header_timeout),
+                ("request_timeout", None),
+                ("stream_timeout", header_stream_timeout),
+            )
+            if header_value is not None or request_data.get(name) is not None
+        )
+        if caller_timeouts:
+            data["client_side_timeout"] = caller_timeouts
 
         num_retries: Final = LiteLLMProxyRequestSetup._get_num_retries_from_request(headers)
         if num_retries is not None:
@@ -2331,47 +2458,15 @@ async def add_litellm_data_to_request(
     # profile_id) don't see attacker-injected admin slots preserved in
     # the deepcopy.
 
-    # Strip internal pipeline state and admin-injection slots from user input.
-    # Runs AFTER the string-to-dict parse above so JSON-string metadata (sent
-    # via multipart/form-data or extra_body) cannot smuggle admin fields past
-    # the isinstance(dict) guard.
-    #
-    # The proxy populates a family of ``user_api_key_*`` fields below
-    # (user_api_key_metadata, user_api_key_user_id, user_api_key_alias,
-    # user_api_key_spend, user_api_key_team_metadata, …) into
-    # data[_metadata_variable_name]. Because the proxy only writes to ONE of
-    # the two metadata dicts, a caller pre-populating any of these keys on
-    # the OTHER metadata dict would have their forged values surface in
-    # guardrails, spend tracking, audit logs, and identity resolution. Strip
-    # by prefix so new ``user_api_key_*`` fields added in the future are
-    # covered without per-key maintenance.
-    for _meta_key in ("metadata", "litellm_metadata"):
-        _user_meta = data.get(_meta_key)
-        if isinstance(_user_meta, dict):
-            _strip_untrusted_request_header_controls(
-                _user_meta.get("headers"),
-                allow_client_message_redaction_opt_out=(_allow_client_message_redaction_opt_out),
-            )
-            for _k in [
-                k for k in _user_meta if k.startswith("user_api_key_") or k in _UNTRUSTED_METADATA_CONTROL_FIELDS
-            ]:
-                _user_meta.pop(_k, None)
-
-    # Strip pricing overrides AFTER the litellm_metadata string-to-dict parse
-    # above, for the same reason as the user_api_key_* strip — JSON-string
-    # metadata (sent via multipart/form-data or extra_body) wouldn't be a
-    # dict yet at the earlier strip point and the isinstance(dict) guard
-    # would silently skip the field.
-    if not _key_or_team_allows_client_pricing_override(user_api_key_dict):
-        _strip_client_pricing_overrides(data)
-    _strip_router_reserved_metadata(data)
-
-    # Same reason as the strips above: runs after the metadata string-to-dict parse
-    # so JSON-string metadata cannot smuggle callback credentials past the dict guard.
-    _strip_client_callback_credentials(data)
-
-    if not _allow_client_message_redaction_opt_out and litellm.turn_off_message_logging is True:
-        _strip_client_message_redaction_opt_out(data)
+    # Strip internal pipeline state, admin-injection slots, pricing overrides, callback credentials and message-logging
+    # opt-outs from user input. Runs AFTER the string-to-dict parse above so JSON-string metadata (sent via
+    # multipart/form-data or extra_body) cannot smuggle them past the isinstance(dict) guard. A fallback target's
+    # buckets go through the same function (client_metadata_the_setup_would_change).
+    _sanitize_client_metadata(
+        data,
+        allow_client_message_redaction_opt_out=_allow_client_message_redaction_opt_out,
+        allow_client_pricing_override=_key_or_team_allows_client_pricing_override(user_api_key_dict),
+    )
 
     # Fill in the proxy_server_request body snapshot now that metadata has
     # been parsed. Consumers (standard_logging_payload, lago,

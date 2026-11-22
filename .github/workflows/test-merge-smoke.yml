@@ -2,7 +2,7 @@ name: smoke
 
 on:
   pull_request:
-    branches: [main, litellm_internal_staging, litellm_oss_staging, "litellm_**"]
+    branches: [main, litellm_internal_staging, litellm_oss_staging, "litellm_**", "release/**"]
   workflow_dispatch:
 
 permissions:

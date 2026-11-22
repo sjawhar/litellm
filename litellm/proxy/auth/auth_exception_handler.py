@@ -26,6 +26,7 @@ from litellm.proxy.auth.auth_utils import (  # noqa: F401  # legacy module expor
     is_invalid_virtual_key_error,
     mark_invalid_virtual_key_error,
     normalize_request_route,
+    request_names_provider_fallback_models,
 )
 from litellm.proxy.auth.model_access_denied import ModelAccessDeniedHTTPException
 from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
@@ -73,6 +74,16 @@ def _as_proxy_exception(e: Exception) -> ProxyException:
         return e
     if PrismaDBExceptionHandler.is_database_service_unavailable_error(e):
         return PrismaDBExceptionHandler.service_unavailable_proxy_exception(e)
+    from litellm.router_utils.fallback_event_handlers import FallbackListShapeError
+
+    if isinstance(e, FallbackListShapeError):
+        # A malformed fallback list is the caller's request, refused with the 400 the Router and saved settings give
+        return ProxyException(
+            message=str(e),
+            type=ProxyErrorTypes.bad_request_error,
+            param=e.param,
+            code=status.HTTP_400_BAD_REQUEST,
+        )
     return ProxyException(
         message="Authentication Error, " + str(e),
         type=ProxyErrorTypes.auth_error,
@@ -124,6 +135,23 @@ def _identity_log_suffix(resolved_identity: UserAPIKeyAuth | None) -> str:
     return f"\nKey Identity: {known}" if known else ""
 
 
+def _outage_identity_would_skip_provider_fallback_checks(
+    e: Exception, request_data: Mapping[str, object], route: str, request: Request
+) -> bool:
+    """
+    Whether the database-outage identity would serve a request whose fallbacks Anthropic gets name a model, an identity
+    that carries none of the checks such a model needs. Read in the order of the handler's own condition: the setting
+    first, the classification of the error, which imports the optional database client, only with the setting on, and
+    the walk of the fallback lists only for an error the setting recovers. That condition reads the setting and the
+    classification again after this, deliberately: its two lines stay as they were, and both are cheap reads.
+    """
+    return (
+        PrismaDBExceptionHandler.should_allow_request_on_db_unavailable()
+        and PrismaDBExceptionHandler.is_database_connection_error(e)
+        and request_names_provider_fallback_models(request_data, route, request)
+    )
+
+
 class UserAPIKeyAuthExceptionHandler:
     @staticmethod
     async def handle_authentication_error(
@@ -154,7 +182,9 @@ class UserAPIKeyAuthExceptionHandler:
             proxy_logging_obj,
         )
 
-        if (
+        # The fallback identity carries none of the checks a model in Anthropic's own fallbacks needs, so such a request
+        # gets the error as with the setting off
+        if not _outage_identity_would_skip_provider_fallback_checks(e, request_data, route, request) and (
             PrismaDBExceptionHandler.should_allow_request_on_db_unavailable()
             and PrismaDBExceptionHandler.is_database_connection_error(e)
         ):

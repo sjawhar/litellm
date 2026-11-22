@@ -2777,19 +2777,21 @@ class TestIsRequestBodySafeBlocksFallbackSmuggle:
                 model="gpt-4",
             )
 
-    def test_grouping_only_deep_chain_is_rejected_at_depth_limit(self):
-        """A deep grouping-only chain (``{"g": [{"g": [...]}]}``) is rejected at the
-        validation-depth limit rather than accepted or raising RecursionError."""
+    def test_grouping_only_deep_chain_is_read_only_as_deep_as_the_router_reads_it(self):
+        """In a deep grouping-only chain (``{"g": [{"g": [...]}]}``) the Router merges the second mapping into the
+        call as a parameter and reads nothing under it, so the walk stops there instead of at the depth limit."""
         node: object = ["safe-model"]
         for _ in range(5000):
             node = [{"grp": node}]
-        with pytest.raises(ValueError, match="depth"):
+        assert (
             is_request_body_safe(
                 request_body={"model": "gpt-4", "fallbacks": node},
                 general_settings={},
                 llm_router=None,
                 model="gpt-4",
             )
+            is True
+        )
 
     def test_pathologically_deep_model_nesting_is_rejected(self):
         with pytest.raises(ValueError, match="depth"):

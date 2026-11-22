@@ -22,6 +22,7 @@ from unittest.mock import patch
 
 import httpx
 import pytest
+from starlette.datastructures import Headers
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../..")))
 
@@ -4451,3 +4452,119 @@ def test_anthropic_error_frame_exception_classes_an_overloaded_frame_as_internal
     error: Final = anthropic_error_frame_exception("overloaded_error", "Overloaded", 503, "claude-sonnet-4-5")
 
     assert type(error) is litellm.InternalServerError
+
+
+@pytest.mark.parametrize(
+    ("request_kwargs", "expected"),
+    [
+        pytest.param(
+            {"extra_headers": {"anthropic-beta": "server-side-fallback-2026-07-01"}}, True, id="extra-headers"
+        ),
+        pytest.param({"headers": {"Anthropic-Beta": "a-beta, server-side-fallback-2026-06-01"}}, True, id="headers"),
+        pytest.param(
+            {
+                "provider_specific_header": [
+                    {"custom_llm_provider": "typesafe", "extra_headers": {"x-other": "1"}},
+                    {"custom_llm_provider": "anthropic", "extra_headers": {"anthropic-beta": "server-side-fallback-x"}},
+                ]
+            },
+            True,
+            id="proxy-scoped-headers",
+        ),
+        pytest.param({"headers": {b"anthropic-beta": b"server-side-fallback-2026-07-01"}}, True, id="bytes-headers"),
+        pytest.param({"extra_headers": {"anthropic-beta": "Server-Side-Fallback-2026-07-01"}}, True, id="token-case"),
+        pytest.param({"extra_headers": {"anthropic-beta": "fallback-credit-2026-07-01"}}, False, id="other-beta"),
+        pytest.param({"extra_headers": {"x-server-side-fallback-2026-07-01": "1"}}, False, id="other-header"),
+        pytest.param({"fallbacks": "default"}, False, id="no-headers"),
+    ],
+)
+def test_anthropic_owns_fallbacks_only_when_the_beta_header_opts_in(
+    request_kwargs: Mapping[str, object], expected: bool
+) -> None:
+    from litellm.llms.anthropic.common_utils import anthropic_owns_fallbacks
+
+    assert anthropic_owns_fallbacks(request_kwargs) is expected
+
+
+_SERVER_SIDE_FALLBACK_BETA: Final = "server-side-fallback-2026-07-01"
+# A line of a million empty tokens, the review's: each beta check split and stripped every one of them
+_A_MILLION_COMMAS: Final = "," * 1_000_000
+
+
+@pytest.mark.parametrize(
+    ("headers", "expected"),
+    [
+        pytest.param({"anthropic-beta": _SERVER_SIDE_FALLBACK_BETA}, True, id="the-token"),
+        pytest.param({"anthropic-beta": "context-management-2025-06-27"}, False, id="another-token"),
+        pytest.param({"Anthropic-Beta": "SERVER-SIDE-FALLBACK-2026-07-01"}, True, id="mixed-case"),
+        pytest.param({"anthropic-beta": "server-side-fallbac\u212a-2026-07-01"}, True, id="a-kelvin-sign-lowers-to-k"),
+        pytest.param({"anthropic-beta": " \t server-side-fallback-x \t "}, True, id="padded"),
+        pytest.param({"anthropic-beta": "\u00a0server-side-fallback-x"}, True, id="padded-with-a-no-break-space"),
+        pytest.param({"anthropic-beta": "a-beta, server-side-fallback-x ,b-beta"}, True, id="several-values"),
+        pytest.param({"anthropic-beta": "xserver-side-fallback-x"}, False, id="the-prefix-inside-another-token"),
+        pytest.param({"anthropic-beta": "a b server-side-fallback-x"}, False, id="the-prefix-after-a-word"),
+        pytest.param(
+            {"anthropic-beta": "xserver-side-fallback-server-side-fallback-"}, False, id="the-prefix-twice-in-a-token"
+        ),
+        pytest.param({"anthropic-beta": "x-server-side-fallback-a,server-side-fallback-b"}, True, id="a-later-token"),
+        pytest.param({"anthropic-beta": "server-side-fallback"}, False, id="the-prefix-without-its-dash"),
+        pytest.param({"anthropic-beta": "server-side-fallback-"}, True, id="the-bare-prefix"),
+        pytest.param({"anthropic-beta": ""}, False, id="an-empty-value"),
+        pytest.param({"anthropic-beta": None}, False, id="a-null-value"),
+        pytest.param({"anthropic-beta": [_SERVER_SIDE_FALLBACK_BETA]}, False, id="a-list-of-values"),
+        pytest.param({"x-anthropic-beta": _SERVER_SIDE_FALLBACK_BETA}, False, id="another-header"),
+        pytest.param({b"anthropic-beta": _SERVER_SIDE_FALLBACK_BETA.encode()}, True, id="bytes"),
+        pytest.param({"anthropic-beta": bytearray(b"SERVER-SIDE-FALLBACK-x")}, True, id="a-bytearray"),
+        pytest.param(
+            Headers(raw=[(b"anthropic-beta", b"a-beta"), (b"anthropic-beta", _SERVER_SIDE_FALLBACK_BETA.encode())]),
+            True,
+            id="repeated-lines",
+        ),
+        pytest.param(
+            Headers(raw=[(b"anthropic-beta", b"server-side"), (b"anthropic-beta", b"-fallback-x")]),
+            False,
+            id="the-prefix-split-across-two-lines",
+        ),
+        pytest.param(
+            {"anthropic-beta": _A_MILLION_COMMAS + _SERVER_SIDE_FALLBACK_BETA},
+            True,
+            id="a-long-line-with-the-token-last",
+        ),
+        pytest.param({"anthropic-beta": _A_MILLION_COMMAS}, False, id="a-long-line-without-the-token"),
+        pytest.param("anthropic-beta: server-side-fallback-x", False, id="not-a-header-mapping"),
+    ],
+)
+def test_the_beta_check_gives_the_same_answer_for_every_header_value(headers: object, expected: bool) -> None:
+    """
+    The answers the check gave when it joined every anthropic-beta value with a comma, split the line and stripped and
+    lowercased each token: a token must start with the prefix, case and surrounding whitespace aside, wherever it
+    stands in the line and in whichever line it comes
+    """
+    from litellm.llms.anthropic.common_utils import anthropic_beta_opts_into_server_side_fallback
+
+    assert anthropic_beta_opts_into_server_side_fallback(headers) is expected
+
+
+def test_the_beta_check_reads_no_token_of_a_value_without_the_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Each value is searched for the prefix once, and only a value that holds it is read token by token: the review's
+    line of a million commas is never read token by token without the token, and once with the token last
+    """
+    from litellm.llms.anthropic import common_utils
+
+    token_reading: Final = (
+        common_utils._holds_server_side_fallback_token  # pyright: ignore[reportPrivateUsage]  # the token reader
+    )
+    read: Final[list[int]] = []  # mutable-ok: each token reading appends the length of the value it reads
+
+    def counted(beta: str) -> bool:
+        read.append(len(beta))
+        return token_reading(beta)
+
+    monkeypatch.setattr(common_utils, "_holds_server_side_fallback_token", counted)
+
+    assert common_utils.anthropic_beta_opts_into_server_side_fallback({"anthropic-beta": _A_MILLION_COMMAS}) is False
+    assert read == []
+    with_the_token: Final = {"x-other": "1", "anthropic-beta": _A_MILLION_COMMAS + _SERVER_SIDE_FALLBACK_BETA}
+    assert common_utils.anthropic_beta_opts_into_server_side_fallback(with_the_token) is True
+    assert read == [len(_A_MILLION_COMMAS) + len(_SERVER_SIDE_FALLBACK_BETA)]
