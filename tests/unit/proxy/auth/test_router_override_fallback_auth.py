@@ -4754,8 +4754,10 @@ def test_an_anthropic_beta_line_in_another_case_is_read_as_the_request_setup_for
     headers the request setup forwards. Where the proxy forwards them proxy-wide it forwards every such line, so the
     checks read Anthropic's reading alone, as the Router's first walk of the call the setup's own steps build. Where
     only a model group forwards them, the setup forwards the line for that group's model alone, so the checks read
-    both readings, the Router here Anthropic's. Without forwarding the setup drops the line and every walk reads
-    LiteLLM's. Before, the checks read LiteLLM's reading alone in all three.
+    both readings, the Router here Anthropic's. With the line in the call, the call's `fallbacks` is Anthropic's, and
+    the Router's first call hands back its own list instead, `router_fallbacks`, which this call does not carry.
+    Without forwarding the setup drops the line, every walk reads LiteLLM's, and the Router hands back the call's
+    `fallbacks`. Before, the checks read LiteLLM's reading alone in all three.
     """
     import litellm
     from litellm.proxy import proxy_server
@@ -4796,7 +4798,7 @@ def test_an_anthropic_beta_line_in_another_case_is_read_as_the_request_setup_for
     walks: Final = _record_walks(monkeypatch)
     assert call_fallbacks(
         {**data, "fallbacks": fallbacks, "original_generic_function": anthropic_messages}, router
-    ) == (fallbacks)
+    ) == (None if router_reading == "anthropic" else fallbacks)
     assert [seen.reading for seen in walks] == [router_reading]
 
 
