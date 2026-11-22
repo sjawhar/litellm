@@ -631,8 +631,10 @@ class _WalkState:
     """
     What every part of one walk shares: the readings it reads, each way it read a list or a mapping, the branches it
     reached in a way it does not read yet, the targets of the request's lists that carry a header field and that it
-    recorded while it decides whether both readings apply, keyed by identity (_FallbackRead.entry), and whether a
-    router_settings_override's ``fallbacks`` rides in ROUTER_FALLBACKS_KWARG (router_settings_override_fields)
+    recorded while it decides whether both readings apply, keyed by identity (_FallbackRead.entry), whether a
+    router_settings_override's ``fallbacks`` rides in ROUTER_FALLBACKS_KWARG (router_settings_override_fields), and
+    whether the request's beta stands only in fields the request setup can replace, so that the call may carry it or
+    not (walk_fallback_lists)
     """
 
     enforced: FallbackReading
@@ -640,6 +642,7 @@ class _WalkState:
     deferred: list[Iterator[FallbackEntry | FallbackListRead]]  # mutable-ok: the walk's own queue of unread branches
     carrying: dict[int, Mapping[str, object]]  # mutable-ok: the walk's own record, never handed out
     anthropic_owns_fallbacks: bool = False
+    beta_can_drop: bool = False
 
     def deferred_branches(self) -> Iterator[FallbackEntry | FallbackListRead]:
         """Each branch the walk deferred, in order, read once the readings the walk reads include its way"""
@@ -771,13 +774,14 @@ class _FallbackRead:
         is charged once, whatever the order of the fields, lists and targets that hold it, and reading the beta later
         charges nothing more. A target the walk first reaches after it decided that both readings apply, in a branch
         only the other reading reads, is neither kept nor charged for its header fields: no beta check reads them then,
-        and the walk passes over none of them. A target of the Router's configured lists is never kept or charged here
-        (configured_part).
+        and the walk passes over none of them. Where the request's beta can drop, the Router's first call can read that
+        other reading first, as the call's own, and charge such a target there, so the walk charges it in either
+        reading. A target of the Router's configured lists is never kept or charged here (configured_part).
         """
         if (
             self.records_carriers
             and self.reading is FallbackReading.BOTH
-            and self.state.enforced is not FallbackReading.BOTH
+            and (self.state.enforced is not FallbackReading.BOTH or self.state.beta_can_drop)
             and not isinstance(target, str)
             and _carries_a_header_field(target)
             and id(target) not in self.state.carrying
@@ -877,11 +881,12 @@ def walk_fallback_lists(
     the beta. ``request_fields`` are the request's own header fields, given by the proxy's walks that run before the
     request setup (RequestHeaderFields): the beta is read in them, and ``carriers``, the header fields those walks
     expect the setup to give the call, only decide what the walk charges. A beta that stands only in fields the setup
-    can replace can be gone from the call, so both readings apply. Without ``request_fields`` the beta is read in
+    can replace can be gone from the call, so every decision the beta takes holds for the call with it and without it:
+    both readings apply, the override's ``fallbacks`` is read as the call's own, which it becomes without the beta,
+    and a target with a header field is charged in either reading. Without ``request_fields`` the beta is read in
     ``carriers``, the call as it is: the Router's walk, and the proxy's walk of saved settings, which runs after the
-    setup.
-    The walk reads the checked reading first, deferring each branch only the other reading reads, and reads those
-    branches only when both readings apply: a reading no hop can take is not read.
+    setup. The walk reads the checked reading first, deferring each branch only the other reading reads, and reads
+    those branches only when both readings apply: a reading no hop can take is not read.
 
     ``budget`` caps the entries of the lists, each counted once however many ways the walk reads it, and the values it
     reads, at FALLBACK_WALK_READS_PER_ENTRY per entry of the budget, in every reading it reads, the deferred branches
@@ -894,7 +899,7 @@ def walk_fallback_lists(
     refused and records no carrier. Each target of the request's lists that carries a header field and that the checked
     reading reaches is charged for its header fields when the walk records it, so what a walk charges does not depend
     on the order of the fields, lists and targets it reads; a target first reached in a branch only the other reading
-    reads is not charged for them, since nothing then reads them (_FallbackRead.entry).
+    reads is not charged for them, since nothing then reads them, unless the beta can drop (_FallbackRead.entry).
 
     The walk never passes over a container the request controls before it has charged that container's length: its own
     passes go through _FallbackRead.pass_over, and the header fields the beta check scans or copies, the call's, each
@@ -931,7 +936,9 @@ def walk_fallback_lists(
     beta_can_drop: Final = replaceable_beta and not kept_beta
     checked: Final = FallbackReading.ANTHROPIC if request_beta else FallbackReading.LITELLM
     walk.state.enforced = checked
-    walk.state.anthropic_owns_fallbacks = request_beta and router_serves
+    walk.state.beta_can_drop = beta_can_drop
+    # Where the override's ``fallbacks`` lands: under the Router's own list only with a beta the call keeps
+    walk.state.anthropic_owns_fallbacks = kept_beta and router_serves
     configured_part: Final = walk.configured_part()
     checked_walk: Final = _recorded(
         itertools.chain(
@@ -1034,10 +1041,12 @@ def _length(container: object) -> int:
 # The characters of a header line one read covers: the beta check lowercases every name, and decodes, joins and splits
 # the value of every anthropic-beta line
 _HEADER_CHARS_PER_READ: Final = 64
+# The types a header name or value is read as text in: the beta check decodes bytes and bytearray
+_HEADER_TEXT_TYPES: Final = (str, bytes, bytearray)
 
 
 def _header_line_reads(name: object, value: object) -> int:
-    texts: Final = tuple(len(text) for text in (name, value) if isinstance(text, (str, bytes, bytearray)))
+    texts: Final = tuple(len(text) for text in (name, value) if isinstance(text, _HEADER_TEXT_TYPES))
     return sum(texts) // _HEADER_CHARS_PER_READ
 
 
@@ -1050,20 +1059,25 @@ _REQUEST_HEADER_READ_CAP: Final = FALLBACK_WALK_READS_PER_ENTRY * MAX_FALLBACK_L
 _ANTHROPIC_BETA_NAMES: Final = ("anthropic-beta", b"anthropic-beta")
 
 
-def _header_line_size(line: object) -> tuple[bool, int]:
+def is_anthropic_beta_name(name: object) -> bool:
     """
-    Whether a raw header line, the pair of its name and value, is an anthropic-beta line, and its characters, both told
-    from lengths: a name is lowercased only when it is as long as anthropic-beta, so no work on a name or a value is
-    linear in its length before the line's characters are charged
+    Whether a header name, text or bytes, is anthropic-beta in any case: told from its length first, so a name is
+    lowercased only when it is as long as anthropic-beta and no work on a long name comes before it is charged
     """
-    pair: Final[Sequence[object]] = line if is_object_sequence(line) and len(line) == 2 else (None, None)
-    name: Final = pair[0]
-    is_beta: Final = (
-        isinstance(name, (str, bytes))
+    return (
+        isinstance(name, _HEADER_TEXT_TYPES)
         and len(name) == len(_ANTHROPIC_BETA_NAMES[0])
         and name.lower() in _ANTHROPIC_BETA_NAMES
     )
-    return is_beta, sum(len(text) for text in pair if isinstance(text, (str, bytes, bytearray)))
+
+
+def _header_line_size(line: object) -> tuple[bool, int]:
+    """
+    Whether a raw header line, the pair of its name and value, is an anthropic-beta line, and its characters, both told
+    from lengths: no work on a name or a value is linear in its length before the line's characters are charged
+    """
+    pair: Final[Sequence[object]] = line if is_object_sequence(line) and len(line) == 2 else (None, None)
+    return is_anthropic_beta_name(pair[0]), sum(len(text) for text in pair if isinstance(text, _HEADER_TEXT_TYPES))
 
 
 def charge_request_header_lines(lines: Collection[object], passes: int) -> None:

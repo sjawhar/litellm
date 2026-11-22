@@ -1729,13 +1729,15 @@ class _WalkSeen:
     """
     One walk of fallback lists: who made it, the proxy's checks before the request setup ("proxy"), its check of saved
     settings after it ("saved") or the Router ("router"); the reading it read; the targets it reached in Anthropic's
-    lists; and the header fields of the call it was given, as they were then
+    lists; the header fields of the call it was given, as they were then; and, by reading, "anthropic" or "litellm",
+    the targets it reached in that reading's lists, each as its JSON when the walk returned
     """
 
     who: str
     reading: str
     anthropic_targets: tuple[object, ...]
     call: Mapping[str, object]
+    seen: Mapping[str, frozenset[str]]
 
 
 def _record_walks(monkeypatch: pytest.MonkeyPatch) -> Sequence[_WalkSeen]:
@@ -1784,6 +1786,16 @@ def _record_walks(monkeypatch: pytest.MonkeyPatch) -> Sequence[_WalkSeen]:
                         if key in carriers
                     }
                 ),
+                MappingProxyType(
+                    {
+                        reading: frozenset(
+                            json.dumps(entry.target, sort_keys=True, default=repr)
+                            for entry in walk.entries
+                            if entry.anthropic is (reading == "anthropic")
+                        )
+                        for reading in ("anthropic", "litellm")
+                    }
+                ),
             )
         )
         return walk
@@ -1791,6 +1803,13 @@ def _record_walks(monkeypatch: pytest.MonkeyPatch) -> Sequence[_WalkSeen]:
     for module in (auth_utils, fallback_event_handlers):
         monkeypatch.setattr(module, "walk_fallback_lists", recorded)
     return seen
+
+
+def _assert_the_checks_reached_what_the_router_reached(proxies: Sequence[_WalkSeen], router: _WalkSeen) -> None:
+    """Every target the Router's walk reached in a reading, the proxy's walks reached in that reading too"""
+    for reading in ("anthropic", "litellm"):
+        checked: Final = frozenset[str]().union(*(walk.seen[reading] for walk in proxies))
+        assert router.seen[reading] <= checked, (reading, sorted(router.seen[reading] - checked))
 
 
 # The part the proxy's checks charge the request's HTTP header lines to, apart from its fallback lists
@@ -4337,9 +4356,10 @@ class _BetaPlace:
     """
     Where a request's beta stands: the header fields its body carries, its HTTP headers beside the client's key and
     whether they carry the beta, the client header forwarding the proxy configures, whether the key's information goes
-    into forwarded headers, and the body's field the request setup replaces, if any. Then the reading each of the
-    proxy's three walks reads and the values each charges the request's lists and header fields, and the reading the
-    Router's first walk of the call reads and what it charges, None where that depends on the key's information.
+    into forwarded headers, the body's field the request setup replaces, if any, and whether the lists stand in the
+    body's own `router_settings_override` rather than at its root. Then the reading each of the proxy's three walks
+    reads and the reading the Router's first walk of the call reads, and the values each charges the request's lists
+    and header fields where asserted: the Router's from the call where that depends on the key's information.
     """
 
     name: str
@@ -4349,10 +4369,12 @@ class _BetaPlace:
     forwarding: str = "none"
     user_information: bool = False
     replaced: str | None = None
+    in_override: bool = False
     proxy_reading: str = "both"
-    proxy_reads: int = 0
+    proxy_reads: int | None = None
     router_reading: str = "litellm"
     router_reads: int | None = None
+    router_reads_from_call: bool = False
 
 
 # The body's `fallbacks` is [{"model": "other"}]: LiteLLM's reading charges it 3 (the list, its format pass and its
@@ -4389,6 +4411,7 @@ _BETA_PLACES: Final = (
         replaced="headers",
         # No client header to forward: the checks expect the body's own headers in the call
         proxy_reads=3 + 5,
+        router_reads_from_call=True,
     ),
     _BetaPlace(
         "provider-specific-header-the-setup-replaces",
@@ -4428,7 +4451,55 @@ _BETA_PLACES: Final = (
         router_reading="anthropic",
         router_reads=3 + 7 + 2,
     ),
+    # The same lists in the body's own router_settings_override, its `fallbacks` holding a target whose headers carry
+    # the beta: without the beta the override's `fallbacks` becomes the call's own, read both ways once that target
+    # can bring the beta back on a hop
+    _BetaPlace(
+        "override-provider-specific-header-the-setup-replaces",
+        {"provider_specific_header": _beta_in_a_scoped_header()},
+        http_headers=_ANTHROPIC_VERSION,
+        replaced="provider_specific_header",
+        in_override=True,
+        router_reading="both",
+    ),
+    _BetaPlace(
+        "override-proxy-wide-forwarding-of-a-client-header",
+        {"headers": dict(_THE_BETA_HEADER)},
+        http_headers=_A_CLIENT_HEADER,
+        forwarding="proxy-wide",
+        replaced="headers",
+        in_override=True,
+        router_reading="both",
+    ),
+    _BetaPlace(
+        "override-provider-specific-header-alone",
+        {"provider_specific_header": _beta_in_a_scoped_header()},
+        http_headers=MappingProxyType({}),
+        in_override=True,
+        router_reading="anthropic",
+    ),
 )
+
+
+def _a_target_bringing_the_beta() -> dict[str, object]:  # mutable-ok: a target as a body sends it
+    """A target whose own header field carries the beta, which a hop to it merges into the call"""
+    return {"model": "other", "extra_headers": dict(_THE_BETA_HEADER)}
+
+
+def _the_places_lists(place: _BetaPlace, *extra: Mapping[str, object]) -> dict[str, object]:  # mutable-ok: a body
+    """
+    The lists a beta place sends, ``extra`` added to its `fallbacks`: the body's own `fallbacks`, or the three lists of
+    the body's own router_settings_override
+    """
+    if not place.in_override:
+        return {"fallbacks": [{"model": "other"}, *(dict(entry) for entry in extra)]}
+    return {
+        "router_settings_override": {
+            "fallbacks": [_a_target_bringing_the_beta(), "other", *(dict(entry) for entry in extra)],
+            "context_window_fallbacks": [{"requested": ["other"]}],
+            "content_policy_fallbacks": [{"requested": ["other"]}],
+        }
+    }
 
 
 def _call_headers_reads(call: Mapping[str, object]) -> int:
@@ -4456,10 +4527,17 @@ async def test_the_checks_read_the_beta_where_the_request_carries_it_and_the_rou
     checks read both, the call's and Anthropic's. Where the beta stands only in the body's own
     `provider_specific_header` and nothing replaces it, the checks read both too, the strict side, while the Router
     reads Anthropic's. Where it stands in a field the setup keeps too, the HTTP headers or `extra_headers`, every walk
-    reads Anthropic's alone. A mapping without a `model` that carries `mock_response` gets the entry check's refusal
-    before the key is read wherever the checks read both readings, and is a model group map elsewhere.
+    reads Anthropic's alone. Each target the Router's first walk of the call reaches in a reading, the checks reach in
+    that reading too; and where the beta can drop, so do the targets that walk reaches for the call with the beta kept
+    and with it dropped. The first reader's point 1 is the override rows: the lists stand in the body's own
+    router_settings_override, whose `fallbacks` becomes the call's own once the beta is gone, and a target there that
+    brings the beta back makes the Router read it as Anthropic's list too. A mapping without a `model` that carries
+    `mock_response` gets the entry check's refusal before the key is read wherever the checks read both readings, and
+    is a model group map elsewhere.
     """
     import litellm
+    from litellm.proxy import proxy_server
+    from litellm.router_utils.fallback_event_handlers import call_fallbacks
     from litellm.types.router import ModelGroupSettings
 
     if place.forwarding == "model-group":
@@ -4470,31 +4548,51 @@ async def test_the_checks_read_the_beta_where_the_request_carries_it_and_the_rou
         monkeypatch.setattr(litellm, "add_user_information_to_llm_headers", True)
     reads: Final = _count_reads_by_part(monkeypatch)
     walks: Final = _record_walks(monkeypatch)
+    body: Final = {"model": "requested", **copy.deepcopy(dict(place.fields)), **_the_places_lists(place)}
     served: Final = await _Gateway(monkeypatch, requested_answers=True).send(
-        {**copy.deepcopy(dict(place.fields)), "fallbacks": [{"model": "other"}]},
+        copy.deepcopy(body),
         beta=place.http_beta,
         http_headers=place.http_headers,
         forward_client_headers=place.forwarding == "proxy-wide",
+        client_side_credentials=place.in_override,
     )
 
     assert served.response.status_code == 200, served.response.text
     assert served.calls == {"requested": 1, "other": 0, "forbidden": 0, "attacker": 0}
-    assert [walk.reading for walk in walks if walk.who == "proxy"] == [place.proxy_reading] * 3
-    assert _proxy_reads(reads) == 3 * place.proxy_reads
+    proxies: Final = [walk for walk in walks if walk.who == "proxy"]
+    assert [walk.reading for walk in proxies] == [place.proxy_reading] * 3
+    if place.proxy_reads is not None:
+        assert _proxy_reads(reads) == 3 * place.proxy_reads
     routers: Final = [walk for walk in walks if walk.who == "router"]
     assert [walk.reading for walk in routers] == [place.router_reading]
     call: Final = routers[0].call
     if place.replaced is not None:
         assert call.get(place.replaced) != place.fields[place.replaced]
-    assert _router_call_reads(reads) == (
-        place.router_reads if place.router_reads is not None else 3 + _call_headers_reads(call)
-    )
+    if place.router_reads is not None:
+        assert _router_call_reads(reads) == place.router_reads
+    if place.router_reads_from_call:
+        assert _router_call_reads(reads) == 3 + _call_headers_reads(call)
+    _assert_the_checks_reached_what_the_router_reached(proxies, routers[0])
+    if place.proxy_reading == "both":
+        # The Router's first walk of the call with the beta kept, and of the call with the beta's field gone
+        router: Final = proxy_server.llm_router
+        assert router is not None
+        dropped: Final = {
+            key: value for key, value in body.items() if key not in ("headers", "provider_specific_header")
+        }
+        for outcome in (body, dropped):
+            before = len(walks)
+            _ = call_fallbacks(_the_routers_call(outcome), router)
+            assert [walk.who for walk in walks[before:]] == ["router"]
+            _assert_the_checks_reached_what_the_router_reached(proxies, walks[before])
 
+    with_a_mock: Final = _the_places_lists(place, {"mock_response": "pwned"})
     refused: Final = await _Gateway(monkeypatch, requested_answers=True).send(
-        {**copy.deepcopy(dict(place.fields)), "fallbacks": [{"model": "other"}, {"mock_response": "pwned"}]},
+        {"model": "requested", **copy.deepcopy(dict(place.fields)), **with_a_mock},
         beta=place.http_beta,
         http_headers=place.http_headers,
         forward_client_headers=place.forwarding == "proxy-wide",
+        client_side_credentials=place.in_override,
     )
     if place.proxy_reading == "both":
         assert refused.response.status_code == 401, refused.response.text
@@ -4503,6 +4601,203 @@ async def test_the_checks_read_the_beta_where_the_request_carries_it_and_the_rou
         return
     assert refused.response.status_code == 200, refused.response.text
     assert refused.calls == {"requested": 1, "other": 0, "forbidden": 0, "attacker": 0}
+
+
+# Where a beta the request setup can replace stands, with the HTTP headers that make the setup replace it, and whether
+# the proxy forwards client headers proxy-wide
+_REPLACED_BETA_PLACEMENTS: Final = (
+    pytest.param(
+        MappingProxyType({"provider_specific_header": _beta_in_a_scoped_header()}),
+        _ANTHROPIC_VERSION,
+        False,
+        id="the-bodys-provider-specific-header-beside-anthropic-version",
+    ),
+    pytest.param(
+        MappingProxyType({"headers": dict(_THE_BETA_HEADER)}),
+        _A_CLIENT_HEADER,
+        True,
+        id="the-bodys-headers-forwarded-proxy-wide",
+    ),
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("fields", "http_headers", "forwarded"), _REPLACED_BETA_PLACEMENTS)
+async def test_an_overrides_fallbacks_the_call_takes_as_its_own_get_the_refusals_of_anthropics_list(
+    monkeypatch: pytest.MonkeyPatch, fields: Mapping[str, object], http_headers: Mapping[str, str], forwarded: bool
+) -> None:
+    """
+    The first reader's point 1, with client-side credentials on and no saved router settings: the request's beta
+    stands only in a body field the request setup replaces, and the body's own router_settings_override holds a
+    `fallbacks` of a target whose header field carries the beta beside a key alias. The setup drops the beta, so the
+    override's `fallbacks` becomes the call's own, and a hop to that target brings the beta back and sends the list to
+    Anthropic. The checks read the override's `fallbacks` as the call's own, in both readings, so the alias gets the
+    refusal of a name in Anthropic's list, 403 `key_model_access_denied`. Without the alias the request is served, and
+    the Router's first walk of the call the setup built, which carries no beta, reads the override's `fallbacks` both
+    ways, each target of it as the checks reach it. Before, the checks read that `fallbacks` as the Router's own list,
+    LiteLLM's alone, and the alias passed every check of a LiteLLM name.
+    """
+    from litellm.llms.anthropic.common_utils import anthropic_owns_fallbacks
+
+    walks: Final = _record_walks(monkeypatch)
+    refused: Final = await _Gateway(monkeypatch, requested_answers=True).send(
+        {
+            **copy.deepcopy(dict(fields)),
+            "router_settings_override": {"fallbacks": [_a_target_bringing_the_beta(), _ALIASED_PROVIDER_FALLBACK]},
+        },
+        key_aliases={_ALIASED_PROVIDER_FALLBACK: "other"},
+        client_side_credentials=True,
+        http_headers=http_headers,
+        forward_client_headers=forwarded,
+    )
+
+    assert refused.response.status_code == 403, refused.response.text
+    assert "key_model_access_denied" in refused.response.text
+    assert f"The requested model '{_ALIASED_PROVIDER_FALLBACK}' is not available" in refused.response.text
+    assert refused.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+
+    before: Final = len(walks)
+    served: Final = await _Gateway(monkeypatch, requested_answers=True).send(
+        {
+            **copy.deepcopy(dict(fields)),
+            "router_settings_override": {"fallbacks": [_a_target_bringing_the_beta(), "other"]},
+        },
+        client_side_credentials=True,
+        http_headers=http_headers,
+        forward_client_headers=forwarded,
+    )
+
+    assert served.response.status_code == 200, served.response.text
+    assert served.calls == {"requested": 1, "other": 0, "forbidden": 0, "attacker": 0}
+    proxies: Final = [walk for walk in walks[before:] if walk.who == "proxy"]
+    assert [walk.reading for walk in proxies] == ["both"] * 3
+    routers: Final = [walk for walk in walks[before:] if walk.who == "router"]
+    assert [walk.reading for walk in routers] == ["both"]
+    assert not anthropic_owns_fallbacks(routers[0].call)
+    assert json.dumps(_a_target_bringing_the_beta(), sort_keys=True) in routers[0].seen["anthropic"]
+    _assert_the_checks_reached_what_the_router_reached(proxies, routers[0])
+
+
+def test_a_target_only_the_other_reading_reaches_is_charged_for_its_header_fields_where_the_beta_can_drop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A body whose beta stands only in its own `provider_specific_header`, so the call may carry it or not, and whose
+    `fallbacks` hold a mapping without a `model` with a header line of 64,000 characters. Anthropic's reading, checked
+    first, reads that mapping as a model group map; LiteLLM's merges it into the call as a target. The Router's first
+    walk of the call without the beta reads LiteLLM's reading first and charges the target's header fields, over 1,000
+    reads. The checks charge them in either reading where the beta can drop, so they charge at least what that walk
+    does. Before, they charged nothing for the header fields of a target first reached in the other reading.
+    """
+    from litellm.proxy.auth.auth_utils import request_fallback_walk
+    from litellm.router_utils.fallback_event_handlers import FallbackReading, call_fallbacks
+
+    fallbacks: Final = [{"model": "other"}, {"extra_headers": {"x-long": "v" * 64_000}}]
+    router: Final = _router_configured_with(())
+    reads: Final = _count_reads_by_part(monkeypatch)
+    request: Final = Request({"type": "http", "method": "POST", "path": "/v1/messages", "headers": []})
+
+    walk: Final = request_fallback_walk(
+        "/v1/messages",
+        request,
+        {"model": "requested", "provider_specific_header": _beta_in_a_scoped_header(), "fallbacks": fallbacks},
+        llm_router=router,
+    )
+    proxy_reads: Final = _proxy_reads(reads)
+    call: Final = {
+        "model": "requested",
+        "fallbacks": copy.deepcopy(fallbacks),
+        "original_generic_function": anthropic_messages,
+    }
+
+    assert walk.reading is FallbackReading.BOTH
+    assert call_fallbacks(call, router) == fallbacks
+    assert _router_call_reads(reads) > 1_000
+    assert _router_call_reads(reads) <= proxy_reads
+
+
+@pytest.mark.parametrize(
+    "name",
+    [b"anthropic-beta", bytearray(b"Anthropic-Beta"), "anthropic-beta"],
+    ids=["bytes", "bytearray", "text"],
+)
+def test_anthropic_beta_lines_are_charged_for_their_join_whatever_type_their_name_has(name: object) -> None:
+    """
+    The first reader's point 2: 1,000 anthropic-beta lines with 60-character values. Counted for 12 passes they take
+    12,000 reads and their characters 1,156 more; the join of the beta lines then takes 1,000 times their 74,000
+    characters, 1,156,250 reads, past the 16,000 of the request's HTTP headers. A name in bytes, in a bytearray or in
+    text is told for an anthropic-beta name, in any case, so each is refused with 400. Before, a bytearray name was
+    not, and the lines passed at 13,156 reads.
+    """
+    from litellm.router_utils.fallback_event_handlers import FallbackBudgetError, charge_request_header_lines
+
+    lines: Final = [(name, b"v" * 60) for _ in range(1_000)]
+
+    with pytest.raises(FallbackBudgetError, match="reading the request's HTTP headers takes more than 16000 reads"):
+        charge_request_header_lines(lines, 12)
+
+
+@pytest.mark.parametrize(
+    ("forwarding", "proxy_reading", "router_reading"),
+    [
+        pytest.param("proxy-wide", "anthropic", "anthropic", id="forwarded-proxy-wide"),
+        pytest.param("model-group", "both", "anthropic", id="forwarded-for-the-requested-model-group"),
+        pytest.param("none", "litellm", "litellm", id="not-forwarded"),
+    ],
+)
+def test_an_anthropic_beta_line_in_another_case_is_read_as_the_request_setup_forwards_it(
+    monkeypatch: pytest.MonkeyPatch, forwarding: str, proxy_reading: str, router_reading: str
+) -> None:
+    """
+    The first reader's point 3: on a server that keeps the case of header names, a line named `Anthropic-Beta` is not
+    put in the scoped header, whose step matches `anthropic-beta` exactly, and reaches the call only in the client
+    headers the request setup forwards. Where the proxy forwards them proxy-wide it forwards every such line, so the
+    checks read Anthropic's reading alone, as the Router's first walk of the call the setup's own steps build. Where
+    only a model group forwards them, the setup forwards the line for that group's model alone, so the checks read
+    both readings, the Router here Anthropic's. Without forwarding the setup drops the line and every walk reads
+    LiteLLM's. Before, the checks read LiteLLM's reading alone in all three.
+    """
+    import litellm
+    from litellm.proxy import proxy_server
+    from litellm.proxy.auth.auth_utils import request_fallback_walk
+    from litellm.proxy.litellm_pre_call_utils import (
+        LiteLLMProxyRequestSetup,
+        add_provider_specific_headers_to_request,
+        clean_headers,
+    )
+    from litellm.router_utils.fallback_event_handlers import call_fallbacks
+    from litellm.types.router import ModelGroupSettings
+
+    settings: Final = {"forward_client_headers_to_llm_api": True} if forwarding == "proxy-wide" else {}
+    monkeypatch.setattr(proxy_server, "general_settings", settings)
+    if forwarding == "model-group":
+        monkeypatch.setattr(
+            litellm, "model_group_settings", ModelGroupSettings(forward_client_headers_to_llm_api=["requested"])
+        )
+    lines: Final = [(b"Anthropic-Beta", _SERVER_SIDE_FALLBACK_BETA.encode()), (b"x-request-note", b"n1")]
+    request: Final = Request({"type": "http", "method": "POST", "path": "/v1/messages", "headers": lines})
+    router: Final = _router_configured_with(())
+    fallbacks: Final = [{"model": "other"}]
+
+    walk: Final = request_fallback_walk(
+        "/v1/messages", request, {"model": "requested", "fallbacks": fallbacks}, llm_router=router
+    )
+
+    assert walk.reading.value == proxy_reading
+    # The call the request setup builds from the same headers, with its own steps
+    cleaned: Final = clean_headers(request.headers)
+    forwarded: Final = LiteLLMProxyRequestSetup.add_litellm_data_for_backend_llm_call(
+        headers=cleaned, request_data={}, user_api_key_dict=UserAPIKeyAuth(), general_settings=settings
+    )
+    data: Final = LiteLLMProxyRequestSetup.add_headers_to_llm_call_by_model_group(
+        data={**forwarded, "model": "requested"}, headers=cleaned, user_api_key_dict=UserAPIKeyAuth()
+    )
+    _ = add_provider_specific_headers_to_request(data, cleaned)
+    walks: Final = _record_walks(monkeypatch)
+    assert call_fallbacks(
+        {**data, "fallbacks": fallbacks, "original_generic_function": anthropic_messages}, router
+    ) == (fallbacks)
+    assert [seen.reading for seen in walks] == [router_reading]
 
 
 @pytest.mark.asyncio

@@ -57,6 +57,7 @@ from litellm.router_utils.fallback_event_handlers import (
     charge_request_header_lines,
     fallback_entry_is_target,
     fallback_target_model_name,
+    is_anthropic_beta_name,
     router_configured_fallbacks,
     walk_fallback_lists,
 )
@@ -604,32 +605,42 @@ def request_fallback_walk(
 @dataclass(frozen=True, slots=True)
 class _CallHeaderFields:
     """
-    The header fields a walk expects the call of a request to carry, ``call``, and the scoped header the request setup
-    builds from the request's HTTP headers alone, ``scoped``, None where they carry no line it scopes
+    The header fields a walk expects the call of a request to carry, ``call``; the scoped header the request setup
+    builds from the request's HTTP headers alone, ``scoped``, None where they carry no line it scopes; and the HTTP
+    anthropic-beta lines it does not scope, ``unscoped_beta``, those named in another case, which reach the call only in
+    the client headers it forwards, None where there is none
     """
 
     call: Mapping[str, object]
     scoped: object = None
+    unscoped_beta: Mapping[str, object] | None = None
 
 
 def _request_header_fields(request_body: Mapping[str, object], built: _CallHeaderFields) -> RequestHeaderFields:
     """
     The request's own header fields, in which the walks before the request setup read the beta, each with whether the
     setup keeps it in the call. Kept: the scoped header the setup builds from the HTTP headers themselves, which every
-    anthropic-beta line they carry lands in; ``extra_headers``, to which the setup only adds its traceparent line, never
-    a beta; and the body's ``headers`` where no client header forwarding is configured. Replaceable: the body's
-    ``headers`` where client header forwarding is configured, proxy-wide or for any model group, whatever the model and
-    the key; and the body's ``provider_specific_header``, which the setup replaces with that scoped header whenever the
-    HTTP headers carry a line it scopes. Whether the setup will replace a field is not guessed: a beta that stands only
-    in replaceable fields is read both ways.
+    anthropic-beta line they carry in lower case lands in; ``extra_headers``, to which the setup only adds its
+    traceparent line, never a beta; the body's ``headers`` where no client header forwarding is configured; and an
+    HTTP anthropic-beta line in another case where client headers are forwarded proxy-wide, since every such line is
+    then forwarded. Replaceable: the body's ``headers`` where client header forwarding is configured, proxy-wide or for
+    any model group, whatever the model and the key; the body's ``provider_specific_header``, which the setup replaces
+    with that scoped header whenever the HTTP headers carry a line it scopes; and an HTTP anthropic-beta line in another
+    case where only a model group forwards client headers, since the setup forwards it only for a model the group
+    names. Without forwarding the setup drops such a line, so the call never carries it and it is no beta. Whether the
+    setup will replace a field or forward a line is not guessed: a beta that stands only in replaceable fields is read
+    both ways.
     """
+    proxy_wide: Final = _proxy_wide_client_header_forwarding()
     forwarding: Final = _client_header_forwarding_configured()
     body_headers: Final = (("headers", request_body["headers"]),) if "headers" in request_body else ()
+    unscoped_beta: Final = (("headers", built.unscoped_beta),) if built.unscoped_beta is not None else ()
     return RequestHeaderFields(
         kept=(
             *((("provider_specific_header", built.scoped),) if built.scoped is not None else ()),
             *((("extra_headers", built.call["extra_headers"]),) if "extra_headers" in built.call else ()),
             *(() if forwarding else body_headers),
+            *(unscoped_beta if proxy_wide else ()),
         ),
         replaceable=(
             *(body_headers if forwarding else ()),
@@ -638,8 +649,17 @@ def _request_header_fields(request_body: Mapping[str, object], built: _CallHeade
                 if "provider_specific_header" in request_body
                 else ()
             ),
+            *(unscoped_beta if forwarding and not proxy_wide else ()),
         ),
     )
+
+
+def _proxy_wide_client_header_forwarding() -> bool:
+    """Whether the proxy forwards the client's headers on every call (add_litellm_data_for_backend_llm_call)"""
+    from litellm.proxy.proxy_server import general_settings as proxy_general_settings
+
+    settings: Final[Mapping[str, object]] = proxy_general_settings or {}
+    return settings.get("forward_client_headers_to_llm_api") is True
 
 
 def _client_header_forwarding_configured() -> bool:
@@ -650,11 +670,8 @@ def _client_header_forwarding_configured() -> bool:
     key's information the setup adds to forwarded headers (litellm.add_user_information_to_llm_headers) is added only
     on these two paths.
     """
-    from litellm.proxy.proxy_server import general_settings as proxy_general_settings
-
-    settings: Final[Mapping[str, object]] = proxy_general_settings or {}
     group_settings: Final = litellm.model_group_settings
-    return settings.get("forward_client_headers_to_llm_api") is True or (
+    return _proxy_wide_client_header_forwarding() or (
         group_settings is not None and group_settings.forward_client_headers_to_llm_api is not None
     )
 
@@ -698,7 +715,8 @@ def _call_header_carriers(
     the key, which the checks have not read, is left out: the key's information it adds to forwarded headers
     (litellm.add_user_information_to_llm_headers), and a model group the key's own aliases bring under forwarding.
     These fields decide what the walk charges; the scoped header is handed back apart too, as the field the HTTP
-    headers' own beta stands in (_request_header_fields).
+    headers' own beta stands in, and so are the anthropic-beta lines the setup does not scope, since it matches that
+    name in lower case only, which reach the call only in forwarded client headers (_request_header_fields).
 
     The request's HTTP header lines are charged before any step passes over them (charge_request_header_lines), taken
     with no copy (_request_header_lines), and a header field the body carries is kept by reference, never copied or
@@ -735,6 +753,9 @@ def _call_header_carriers(
     )
     scoped: Final[dict[str, object]] = {}  # mutable-ok: the setup's own step writes the scoped header into it
     _ = add_provider_specific_headers_to_request(scoped, cleaned)
+    unscoped_beta: Final = {
+        name: value for name, value in cleaned.items() if name != "anthropic-beta" and is_anthropic_beta_name(name)
+    }
     forwarded: Final[Mapping[str, object]] = (
         LiteLLMProxyRequestSetup._get_forwardable_headers(  # pyright: ignore[reportPrivateUsage]  # the setup's choice
             dict(cleaned)
@@ -768,6 +789,7 @@ def _call_header_carriers(
             ),
         },
         scoped.get("provider_specific_header"),
+        unscoped_beta or None,
     )
 
 
@@ -784,8 +806,9 @@ def _request_header_lines(request: Request) -> Collection[object]:
 
 # The passes the steps of _call_header_carriers make over the request's HTTP header lines, at most: the two header
 # lookups that tell which header carried the key, clean_headers' list of the lines and its loop over it, the two scans
-# for the OAuth token and the typesafe headers, the copy and the scan for forwardable headers, the traceparent step's
-# length, lookup and read, and the charge's own pass that sizes the lines
+# for the OAuth token and the typesafe headers, the scan for anthropic-beta lines they leave unscoped, the copy and the
+# scan for forwardable headers, the traceparent step's lookup and read, and the charge's own pass that sizes the lines.
+# The traceparent step's test of whether there is any header takes the length, which Starlette's header mapping holds.
 _SETUP_PASSES_OVER_HEADER_LINES: Final = 12
 
 
