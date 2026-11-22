@@ -53,6 +53,7 @@ from litellm.router_utils.fallback_event_handlers import (
     FallbackEntry,
     FallbackListShapeError,
     FallbackWalk,
+    charge_request_header_lines,
     fallback_entry_is_target,
     fallback_target_model_name,
     router_configured_fallbacks,
@@ -590,6 +591,24 @@ def request_fallback_walk(
         saved_settings_budget=MAX_SAVED_FALLBACK_LIST_ENTRIES if saved_settings else None,
         configured=router_configured_fallbacks(llm_router) if messages_call else NO_CONFIGURED_FALLBACKS,
         router_serves=llm_router is not None,
+        headers_replaceable=messages_call and _client_header_forwarding_configured(),
+    )
+
+
+def _client_header_forwarding_configured() -> bool:
+    """
+    Whether the request setup can replace a call's ``headers`` with the client's forwardable headers after the key is
+    read, decided by what the proxy configures and not by the key: the proxy-wide forwarding, or a model group
+    forwarding, which the key's own aliases can bring a request under (add_headers_to_llm_call_by_model_group). The
+    key's information the setup adds to forwarded headers (litellm.add_user_information_to_llm_headers) is added only
+    on these two paths.
+    """
+    from litellm.proxy.proxy_server import general_settings as proxy_general_settings
+
+    settings: Final[Mapping[str, object]] = proxy_general_settings or {}
+    group_settings: Final = litellm.model_group_settings
+    return settings.get("forward_client_headers_to_llm_api") is True or (
+        group_settings is not None and group_settings.forward_client_headers_to_llm_api is not None
     )
 
 
@@ -630,6 +649,10 @@ def _call_header_carriers(
     strips before it forwards is neither forwardable nor scoped, so it changes none of these. What the setup decides by
     the key, which the checks have not read, is left out: the key's information it adds to forwarded headers
     (litellm.add_user_information_to_llm_headers), and a model group the key's own aliases bring under forwarding.
+
+    The request's HTTP header lines are charged before any step passes over them (charge_request_header_lines), and a
+    header field the body carries is kept by reference, never copied or read here: the walk charges it before it reads
+    it. The traceparent the setup adds to the body's ``extra_headers`` is laid over that mapping without a copy.
     """
     from litellm.proxy.litellm_pre_call_utils import (  # the setup module imports this one
         LiteLLMProxyRequestSetup,
@@ -639,6 +662,7 @@ def _call_header_carriers(
     )
     from litellm.proxy.proxy_server import general_settings as proxy_general_settings
 
+    charge_request_header_lines(request.headers.raw, _SETUP_PASSES_OVER_HEADER_LINES)
     settings: Final[Mapping[str, object]] = proxy_general_settings or {}
     # The setup reads which header carried the proxy's key from the same request headers
     authenticated_with: Final = (
@@ -667,22 +691,59 @@ def _call_header_carriers(
         if _forwards_client_headers(request_body, llm_router, settings)
         else {}
     )
+    added: Final[dict[str, object]] = {}  # mutable-ok: the setup's own step writes its traceparent line into it
+    _add_otel_traceparent_to_data(added, request=request)
+    traced: Final = added.get("extra_headers")
+    traceparent: Final = traced.get("traceparent") if is_object_mapping(traced) else None
     body_extra_headers: Final = request_body.get("extra_headers")
-    traced: Final[dict[str, object]] = (  # mutable-ok: the setup's own step adds the traceparent to its copy
-        {"extra_headers": dict(body_extra_headers)} if is_object_mapping(body_extra_headers) else {}
+    extra_headers: Final = (
+        body_extra_headers
+        if traceparent is None
+        else traced
+        if "extra_headers" not in request_body
+        else _HeadersWithLine(body_extra_headers, "traceparent", traceparent)
+        if is_object_mapping(body_extra_headers) and "traceparent" not in body_extra_headers
+        else body_extra_headers
     )
-    if body_extra_headers is None or is_object_mapping(body_extra_headers):
-        _add_otel_traceparent_to_data(traced, request=request)
     return {
         **{key: request_body[key] for key in HEADER_CARRIER_KWARGS if key in request_body},
         **({"headers": forwarded} if forwarded else {}),
-        **({"extra_headers": traced["extra_headers"]} if "extra_headers" in traced else {}),
+        **({"extra_headers": extra_headers} if "extra_headers" in request_body or traceparent is not None else {}),
         **(
             {"provider_specific_header": scoped["provider_specific_header"]}
             if "provider_specific_header" in scoped
             else {}
         ),
     }
+
+
+# The passes the steps of _call_header_carriers make over the request's HTTP header lines, at most: the two header
+# lookups that tell which header carried the key, clean_headers' list of the lines and its loop over it, the two scans
+# for the OAuth token and the typesafe headers, the copy and the scan for forwardable headers, the traceparent step's
+# length, lookup and read, and the charge's own pass that sizes the lines
+_SETUP_PASSES_OVER_HEADER_LINES: Final = 12
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _HeadersWithLine(Mapping[object, object]):
+    """
+    A header mapping the body carries, held by reference, with the one line the request setup adds to it: its length
+    is known without a pass, and the walk passes over it only after it charged it
+    """
+
+    headers: Mapping[object, object]
+    name: str
+    value: object
+
+    def __getitem__(self, key: object) -> object:
+        return self.value if key == self.name else self.headers[key]
+
+    def __iter__(self) -> Iterator[object]:
+        yield from self.headers
+        yield self.name
+
+    def __len__(self) -> int:
+        return len(self.headers) + 1
 
 
 def _reject_unreadable_litellm_list(value: object, field: str) -> None:
