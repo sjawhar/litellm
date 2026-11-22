@@ -3802,45 +3802,66 @@ def _a_list_held_twice_at_every_level(levels: int) -> dict[str, object]:  # muta
     return {"fallbacks": reduce(lambda inner, _: [{"a": inner, "b": inner}], range(levels), ["x"])}
 
 
+def _many_targets_sharing_one_swap_dictionary(count: int) -> dict[str, object]:  # mutable-ok: a request body
+    """``count`` targets in `fallbacks`, each holding the same context_window_fallback_dict of ``count`` swaps"""
+    swaps: Final = {str(index): "backup" for index in range(count)}
+    return {"fallbacks": [{"model": "primary", "context_window_fallback_dict": swaps} for _ in range(count)]}
+
+
+_UNCHECKED_BODIES: Final[Mapping[str, Callable[[], Mapping[str, object]]]] = MappingProxyType(
+    {
+        "a-chain-of-5000-targets": partial(_a_chain_of_targets, 5_000),
+        "a-target-whose-own-list-holds-it": _a_target_whose_own_list_holds_it,
+        "a-list-held-twice-at-20-levels": partial(_a_list_held_twice_at_every_level, 20),
+        "300-targets-sharing-one-swap-dictionary": partial(_many_targets_sharing_one_swap_dictionary, 300),
+    }
+)
+
+
 @pytest.mark.parametrize(
-    ("shape", "reads", "targets"),
+    ("shape", "members", "targets"),
     [
         pytest.param("a-chain-of-5000-targets", 3 * 5_000 + 1, 5_000, id="a-chain-of-5000-targets"),
-        pytest.param("a-target-whose-own-list-holds-it", 5, 1, id="a-target-whose-own-list-holds-it"),
-        pytest.param("a-list-held-twice-at-20-levels", 3 * 20 + 3, 20 + 1, id="a-list-held-twice-at-20-levels"),
+        pytest.param("a-target-whose-own-list-holds-it", 6, 1, id="a-target-whose-own-list-holds-it"),
+        pytest.param("a-list-held-twice-at-20-levels", 4 * 20 + 3, 20 + 1, id="a-list-held-twice-at-20-levels"),
+        pytest.param(
+            "300-targets-sharing-one-swap-dictionary",
+            4 * 300 + 2,
+            300 + 1,
+            id="300-targets-sharing-one-swap-dictionary",
+        ),
     ],
 )
-def test_iter_request_fallback_targets_reads_each_place_of_an_unchecked_body_once(
-    monkeypatch: pytest.MonkeyPatch, shape: str, reads: int, targets: int
+def test_iter_request_fallback_targets_takes_each_member_of_an_unchecked_body_once(
+    monkeypatch: pytest.MonkeyPatch, shape: str, members: int, targets: int
 ) -> None:
     """
-    A library caller's body that no check read: the function reads each place once, a mapping merged into a call, a
-    list or an entry, however deep it stands, however often the body holds it, and when the body holds itself, and
-    raises nothing. A chain of 5,000 targets is read in 3 places a target and 1 more, 15,001 reads, past any depth a
-    reader follows; the target in its own list in 5; twenty levels of a list held twice in 3 a level and 3 more, 63,
-    where following every path would read the innermost list 2 ** 20 times.
+    A library caller's body that no check read. Each key or value the function takes from a list or a mapping becomes
+    one place, and only the place holding that list or mapping takes them, once, however deep it stands, however many
+    mappings of the body hold it, and when the body holds itself; so the places it makes count its work, and it raises
+    nothing. A chain of 5,000 targets: the body, its list, and 3 a target, less the last one's list, 15,001; the
+    target in its own list: 6; twenty levels of a list held twice: 4 a level and 3 more, 83, where following every
+    path would take 2 ** 20; 300 targets sharing one context_window_fallback_dict of 300 swaps: the body and its list,
+    then 3 a target, its entry, its merged mapping and its dictionary's place, and the dictionary's 300 values once,
+    4 x 300 + 2 = 1,202, where taking the values once a target took 300 ** 2 + 2 x 300 + 2 = 90,602.
     """
     from litellm.proxy.auth import auth_utils
     from litellm.proxy.auth.auth_utils import iter_request_fallback_targets
 
-    contents: Final = auth_utils._fallback_place_contents  # pyright: ignore[reportPrivateUsage]  # the one place read
-    read: Final[list[object]] = []  # mutable-ok: each read appends the place it read
+    place: Final = auth_utils._FallbackPlace  # pyright: ignore[reportPrivateUsage]  # each member taken becomes one
+    made: Final[list[object]] = []  # mutable-ok: each place made appends the member it holds
 
-    def counted(place: object) -> object:
-        read.append(place)
-        return contents(place)  # pyright: ignore[reportArgumentType]  # a place the function made
+    class _CountedPlace(place):
+        __slots__ = ()
 
-    monkeypatch.setattr(auth_utils, "_fallback_place_contents", counted)
-    body: Final = (
-        _a_chain_of_targets(5_000)
-        if shape == "a-chain-of-5000-targets"
-        else _a_target_whose_own_list_holds_it()
-        if shape == "a-target-whose-own-list-holds-it"
-        else _a_list_held_twice_at_every_level(20)
-    )
-    handed_out: Final = tuple(iter_request_fallback_targets(body))
+        def __init__(self, *fields: object) -> None:
+            super().__init__(*fields)  # pyright: ignore[reportArgumentType]  # a place's own fields
+            made.append(self.value)
 
-    assert len(read) == reads
+    monkeypatch.setattr(auth_utils, "_FallbackPlace", _CountedPlace)
+    handed_out: Final = tuple(iter_request_fallback_targets(_UNCHECKED_BODIES[shape]()))
+
+    assert len(made) == members
     assert len(handed_out) == targets
 
 
