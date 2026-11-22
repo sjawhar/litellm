@@ -831,6 +831,20 @@ NO_CONFIGURED_FALLBACKS: Final = ConfiguredFallbacks()
 _NO_CONFIGURED_LISTS: Final[Mapping[str, object]] = MappingProxyType({})
 
 
+@dataclass(frozen=True, slots=True)
+class RequestHeaderFields:
+    """
+    The header fields a request brings to the proxy, in which the proxy's walks before the request setup read the beta:
+    ``kept`` the fields the setup keeps in the call it builds, ``replaceable`` the body's own fields it can put another
+    field in place of, each a field name with its value. Whose list ``fallbacks`` is rests on these fields as the
+    request carries them, never on the fields the checks expect the setup to build: a beta in a kept field stays in the
+    call, and a beta that stands only in replaceable fields can be gone from it, so both readings apply.
+    """
+
+    kept: tuple[tuple[str, object], ...]
+    replaceable: tuple[tuple[str, object], ...]
+
+
 def walk_fallback_lists(
     body: Mapping[str, object],
     *,
@@ -842,11 +856,11 @@ def walk_fallback_lists(
     configured_lists: Mapping[str, object] = _NO_CONFIGURED_LISTS,
     read_cap: int | None = None,
     router_serves: bool = True,
-    headers_replaceable: bool = False,
+    request_fields: RequestHeaderFields | None = None,
 ) -> FallbackWalk:
     """
     One walk of every fallback list a request body carries, with whose list each ``fallbacks`` field is on every hop.
-    ``carriers`` holds the request's header fields, which the Router's provider_owns_fallbacks_field reads for the
+    ``carriers`` holds the header fields of the call, which the Router's provider_owns_fallbacks_field reads for the
     beta: on an anthropic_messages call they make a ``fallbacks`` field Anthropic's with it and LiteLLM's without it,
     the reading the request is checked in. Only a hop changes that: a target that carries a header field replaces the
     call's on its hop, and the Router keeps it on later hops. Every hop's target is an entry of a list LiteLLM reads in
@@ -860,9 +874,12 @@ def walk_fallback_lists(
     router_settings_override that router_settings_override_fields promotes to it when the call carries none: both are
     read as the call's own, so every list that can become it is read in every reading the Router can read it in.
     ``router_serves`` says whether a Router serves the call, which decides where an override's ``fallbacks`` lands under
-    the beta. ``headers_replaceable`` says the request setup can replace the call's ``headers`` after the key is read,
-    as the proxy's forwarding of client headers does: a beta that stands only there can then be gone from the call, so
-    both readings apply. The proxy's walks pass it; the Router's walk reads the call after the setup and does not.
+    the beta. ``request_fields`` are the request's own header fields, given by the proxy's walks that run before the
+    request setup (RequestHeaderFields): the beta is read in them, and ``carriers``, the header fields those walks
+    expect the setup to give the call, only decide what the walk charges. A beta that stands only in fields the setup
+    can replace can be gone from the call, so both readings apply. Without ``request_fields`` the beta is read in
+    ``carriers``, the call as it is: the Router's walk, and the proxy's walk of saved settings, which runs after the
+    setup.
     The walk reads the checked reading first, deferring each branch only the other reading reads, and reads those
     branches only when both readings apply: a reading no hop can take is not read.
 
@@ -880,10 +897,11 @@ def walk_fallback_lists(
     reads is not charged for them, since nothing then reads them (_FallbackRead.entry).
 
     The walk never passes over a container the request controls before it has charged that container's length: its own
-    passes go through _FallbackRead.pass_over, and the header fields the beta check scans or copies, the request's and
-    each target's, are charged before the check runs (_charge_header_carriers). Every key and value it reads counts,
-    null included, and no read costs more than a fixed amount: a group label is built from a few keys cut to a fixed
-    length after its map is charged, and a header line is charged by its characters too.
+    passes go through _FallbackRead.pass_over, and the header fields the beta check scans or copies, the call's, each
+    request field it reads the beta in and each target's, are charged before the check runs (_charge_header_carriers).
+    Every key and value it reads counts, null included, and no read costs more than a fixed amount: a group label is
+    built from a few keys cut to a fixed length after its map is charged, and a header line is charged by its
+    characters too.
     """
     walk: Final = _FallbackRead.start(
         FallbackReading.BOTH if anthropic_messages_call else FallbackReading.LITELLM,
@@ -894,19 +912,23 @@ def walk_fallback_lists(
     )
     if anthropic_messages_call:
         _charge_header_carriers(walk, carriers)
-    # Each header field read once for the beta, after the walk charged it
-    beta_in: Final = (
-        {key: anthropic_owns_fallbacks({key: carriers[key]}) for key in HEADER_CARRIER_KWARGS if key in carriers}
-        if anthropic_messages_call
-        else {}
+    fields: Final = (
+        request_fields
+        if request_fields is not None
+        else RequestHeaderFields(tuple((key, carriers[key]) for key in HEADER_CARRIER_KWARGS if key in carriers), ())
     )
-    request_beta: Final = any(beta_in.values())
-    # The request setup can replace the call's ``headers`` after the key is read: a beta that stands there alone can go
-    beta_can_drop: Final = (
-        headers_replaceable
-        and beta_in.get("headers", False)
-        and not any(held for key, held in beta_in.items() if key != "headers")
+    if anthropic_messages_call and request_fields is not None:
+        _charge_request_fields(walk, carriers, request_fields)
+    # Each header field read for the beta after the walk charged it
+    kept_beta: Final = anthropic_messages_call and any(
+        anthropic_owns_fallbacks({key: value}) for key, value in fields.kept
     )
+    replaceable_beta: Final = anthropic_messages_call and any(
+        anthropic_owns_fallbacks({key: value}) for key, value in fields.replaceable
+    )
+    request_beta: Final = kept_beta or replaceable_beta
+    # A beta that stands only in fields the request setup can replace can be gone from the call
+    beta_can_drop: Final = replaceable_beta and not kept_beta
     checked: Final = FallbackReading.ANTHROPIC if request_beta else FallbackReading.LITELLM
     walk.state.enforced = checked
     walk.state.anthropic_owns_fallbacks = request_beta and router_serves
@@ -1024,22 +1046,34 @@ def _header_line_reads(name: object, value: object) -> int:
 _REQUEST_HEADER_LINES: Final = "the request's HTTP headers"
 _REQUEST_HEADER_READ_CAP: Final = FALLBACK_WALK_READS_PER_ENTRY * MAX_FALLBACK_LIST_ENTRIES
 
+# The name of the header lines the beta check joins, as a server or a request body may spell it
+_ANTHROPIC_BETA_NAMES: Final = ("anthropic-beta", b"anthropic-beta")
+
 
 def _header_line_size(line: object) -> tuple[bool, int]:
-    """Whether a raw header line, the pair of its name and value, is an anthropic-beta line, and its characters"""
+    """
+    Whether a raw header line, the pair of its name and value, is an anthropic-beta line, and its characters, both told
+    from lengths: a name is lowercased only when it is as long as anthropic-beta, so no work on a name or a value is
+    linear in its length before the line's characters are charged
+    """
     pair: Final[Sequence[object]] = line if is_object_sequence(line) and len(line) == 2 else (None, None)
     name: Final = pair[0]
-    is_beta: Final = isinstance(name, (str, bytes)) and name.lower() in ("anthropic-beta", b"anthropic-beta")
+    is_beta: Final = (
+        isinstance(name, (str, bytes))
+        and len(name) == len(_ANTHROPIC_BETA_NAMES[0])
+        and name.lower() in _ANTHROPIC_BETA_NAMES
+    )
     return is_beta, sum(len(text) for text in pair if isinstance(text, (str, bytes, bytearray)))
 
 
 def charge_request_header_lines(lines: Collection[object], passes: int) -> None:
     """
     The request's HTTP header lines, as the server holds them, charged before ``passes`` passes over them build the
-    call's header fields: their number for each pass, then their characters by every 64, and the anthropic-beta lines
-    a join puts together once for each such line. Past FALLBACK_WALK_READS_PER_ENTRY reads per entry of the request's
-    budget the request is refused with 400 before any pass but the one that sizes them, whatever the server lets a
-    client send.
+    call's header fields: their number for each pass, from the collection's length before any pass; then, in the one
+    pass that sizes them, their characters by every 64, from the length of each name and value; and the anthropic-beta
+    lines a join puts together once for each such line. Past FALLBACK_WALK_READS_PER_ENTRY reads per entry of the
+    request's budget the request is refused with 400 before any pass but the one that sizes them, whatever the server
+    lets a client send.
     """
     tally: Final = _FallbackTally.limited(_REQUEST_HEADER_LINES, None, "headers", read_cap=_REQUEST_HEADER_READ_CAP)
     tally.charge(None, 0, passes * _length(lines), None)
@@ -1093,6 +1127,17 @@ def _charge_header_carriers(walk: _FallbackRead, source: Mapping[str, object]) -
             _charge_scoped_headers(walk, source[key])
         else:
             _charge_header_lines(walk, source[key], key)
+
+
+def _charge_request_fields(walk: _FallbackRead, carriers: Mapping[str, object], fields: RequestHeaderFields) -> None:
+    """
+    Each of the request's own header fields the walk reads the beta in that is not one of the ``carriers`` it charged,
+    such as a body's ``headers`` the checks expect forwarded client headers to replace, charged before the beta is read
+    """
+    charged: Final = tuple(carriers[key] for key in HEADER_CARRIER_KWARGS if key in carriers)
+    for key, value in (*fields.kept, *fields.replaceable):
+        if not any(value is carried for carried in charged):
+            _charge_header_carriers(walk, {key: value})
 
 
 def walk_fallback_list(value: object, field: str, reading: FallbackReading) -> FallbackWalk:

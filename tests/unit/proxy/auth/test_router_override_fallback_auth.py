@@ -1632,6 +1632,7 @@ def _count_walks(monkeypatch: pytest.MonkeyPatch) -> Sequence[Mapping[str, objec
         configured_lists: Mapping[str, object] = no_lists,
         read_cap: int | None = None,
         router_serves: bool = True,
+        request_fields: fallback_event_handlers.RequestHeaderFields | None = None,
     ) -> fallback_event_handlers.FallbackWalk:
         walks.append({**body, **configured_lists})
         return walk_fallback_lists(
@@ -1644,6 +1645,7 @@ def _count_walks(monkeypatch: pytest.MonkeyPatch) -> Sequence[Mapping[str, objec
             configured_lists=configured_lists,
             read_cap=read_cap,
             router_serves=router_serves,
+            request_fields=request_fields,
         )
 
     for module in (auth_utils, fallback_event_handlers):
@@ -1702,6 +1704,7 @@ def _count_proxy_walk_scans(monkeypatch: pytest.MonkeyPatch) -> Sequence[tuple[b
         configured_lists: Mapping[str, object] = no_lists,
         read_cap: int | None = None,
         router_serves: bool = True,
+        request_fields: fallback_event_handlers.RequestHeaderFields | None = None,
     ) -> fallback_event_handlers.FallbackWalk:
         given.append((saved_settings_budget is not None, configured))
         return walk_fallback_lists(
@@ -1714,10 +1717,80 @@ def _count_proxy_walk_scans(monkeypatch: pytest.MonkeyPatch) -> Sequence[tuple[b
             configured_lists=configured_lists,
             read_cap=read_cap,
             router_serves=router_serves,
+            request_fields=request_fields,
         )
 
     monkeypatch.setattr(auth_utils, "walk_fallback_lists", counted)
     return given
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _WalkSeen:
+    """
+    One walk of fallback lists: who made it, the proxy's checks before the request setup ("proxy"), its check of saved
+    settings after it ("saved") or the Router ("router"); the reading it read; the targets it reached in Anthropic's
+    lists; and the header fields of the call it was given, as they were then
+    """
+
+    who: str
+    reading: str
+    anthropic_targets: tuple[object, ...]
+    call: Mapping[str, object]
+
+
+def _record_walks(monkeypatch: pytest.MonkeyPatch) -> Sequence[_WalkSeen]:
+    """Every walk of fallback lists that returns from now on, the proxy's checks' and the Router's, in order"""
+    from litellm.proxy.auth import auth_utils
+    from litellm.router_utils import fallback_event_handlers
+
+    seen: Final[list[_WalkSeen]] = []  # mutable-ok: each walk appends what it read once it returns
+    walk_fallback_lists: Final = fallback_event_handlers.walk_fallback_lists
+    no_lists: Final[Mapping[str, object]] = MappingProxyType({})
+
+    def recorded(
+        body: Mapping[str, object],
+        *,
+        carriers: Mapping[str, object],
+        anthropic_messages_call: bool,
+        budget: int | None = None,
+        saved_settings_budget: int | None = None,
+        configured: fallback_event_handlers.ConfiguredFallbacks = fallback_event_handlers.NO_CONFIGURED_FALLBACKS,
+        configured_lists: Mapping[str, object] = no_lists,
+        read_cap: int | None = None,
+        router_serves: bool = True,
+        request_fields: fallback_event_handlers.RequestHeaderFields | None = None,
+    ) -> fallback_event_handlers.FallbackWalk:
+        walk: Final = walk_fallback_lists(
+            body,
+            carriers=carriers,
+            anthropic_messages_call=anthropic_messages_call,
+            budget=budget,
+            saved_settings_budget=saved_settings_budget,
+            configured=configured,
+            configured_lists=configured_lists,
+            read_cap=read_cap,
+            router_serves=router_serves,
+            request_fields=request_fields,
+        )
+        seen.append(
+            _WalkSeen(
+                "router" if read_cap is not None else "saved" if saved_settings_budget is not None else "proxy",
+                walk.reading.value,
+                tuple(entry.target for entry in walk.entries if entry.anthropic),
+                MappingProxyType(
+                    {
+                        key: copy.copy(carriers[key])
+                        for key in fallback_event_handlers.HEADER_CARRIER_KWARGS
+                        if key in carriers
+                    }
+                ),
+            )
+        )
+        return walk
+
+    for module in (auth_utils, fallback_event_handlers):
+        monkeypatch.setattr(module, "walk_fallback_lists", recorded)
+    return seen
 
 
 # The part the proxy's checks charge the request's HTTP header lines to, apart from its fallback lists
@@ -4158,6 +4231,46 @@ def test_a_body_header_field_past_the_read_cap_is_refused_with_no_pass_over_it(
     assert passes == []
 
 
+def test_a_long_http_header_name_is_refused_before_it_is_lowercased_or_its_list_copied() -> None:
+    """
+    The second reader's input: one HTTP header line on /v1/messages, before any key, whose name holds 2,000,000
+    characters. The checks take the header lines from the ASGI scope as the server put them there, with no copy, charge
+    the passes over them from the list's length, 12 for its one line, and its characters from the lengths of its name
+    and value, 31,250, before any work on them: past the 16,000 reads of the request's HTTP headers the request is
+    refused with 400 before the name is lowercased, and the scope still holds its own list. Before, the name was
+    lowercased, and the list copied, first.
+    """
+    from litellm.proxy.auth.auth_utils import is_request_body_safe
+    from litellm.router_utils.fallback_event_handlers import FallbackBudgetError
+
+    lowered: Final[list[int]] = []  # mutable-ok: each lowercasing of the header name appends its length
+
+    class _LoweringRecordedName(bytes):
+        """A header name that records each time it is lowercased"""
+
+        def lower(self) -> bytes:
+            lowered.append(len(self))
+            return bytes.lower(self)
+
+    lines: Final = [(_LoweringRecordedName(b"x-" + b"n" * 1_999_998), b"v")]
+    request: Final = Request({"type": "http", "method": "POST", "path": "/v1/messages", "headers": lines})
+
+    with pytest.raises(
+        FallbackBudgetError, match="reading the request's HTTP headers takes more than 16000 reads"
+    ) as refusal:
+        is_request_body_safe(
+            {"model": "requested"},
+            {},
+            _router_without_fallback_group(),
+            "requested",
+            route="/v1/messages",
+            request=request,
+        )
+    assert refusal.value.param == "headers"
+    assert lowered == []
+    assert request.scope["headers"] is lines
+
+
 # -- A beta only the body's own headers carry is read both ways where the proxy can replace those headers ------------
 
 
@@ -4208,6 +4321,313 @@ async def test_a_beta_only_the_bodys_headers_carry_is_read_both_ways_where_forwa
         return
     assert result.response.status_code == 401, result.response.text
     assert refusal in result.response.text
+    assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+
+
+# -- Before the request setup the checks read the beta where the request carries it; after it, where the call does --
+
+
+def _beta_in_a_scoped_header() -> dict[str, object]:  # mutable-ok: a header field as a body sends it
+    """A body's own provider_specific_header for Anthropic whose extra_headers carry the beta"""
+    return {"custom_llm_provider": "anthropic", "extra_headers": dict(_THE_BETA_HEADER)}
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _BetaPlace:
+    """
+    Where a request's beta stands: the header fields its body carries, its HTTP headers beside the client's key and
+    whether they carry the beta, the client header forwarding the proxy configures, whether the key's information goes
+    into forwarded headers, and the body's field the request setup replaces, if any. Then the reading each of the
+    proxy's three walks reads and the values each charges the request's lists and header fields, and the reading the
+    Router's first walk of the call reads and what it charges, None where that depends on the key's information.
+    """
+
+    name: str
+    fields: Mapping[str, object]
+    http_headers: Mapping[str, str]
+    http_beta: bool = False
+    forwarding: str = "none"
+    user_information: bool = False
+    replaced: str | None = None
+    proxy_reading: str = "both"
+    proxy_reads: int = 0
+    router_reading: str = "litellm"
+    router_reads: int | None = None
+
+
+# The body's `fallbacks` is [{"model": "other"}]: LiteLLM's reading charges it 3 (the list, its format pass and its
+# read), Anthropic's 2 (the list and its read), both readings 5. A header field of one short line is charged 3 (reached,
+# scanned by the beta check and passed over by the walk), a scoped header of one line 7 (reached, copied twice by the
+# beta check, 4, and its extra_headers, 2). Each proxy walk charges the header fields it expects the call to carry and
+# each of the request's own fields it reads the beta in that is not one of them.
+_BETA_PLACES: Final = (
+    _BetaPlace(
+        "model-group-forwarding-of-the-requested-model",
+        {"headers": dict(_THE_BETA_HEADER)},
+        http_headers=_A_CLIENT_HEADER,
+        forwarding="model-group",
+        replaced="headers",
+        # The forwarded x- header and the body's own headers, 3 each
+        proxy_reads=3 + 3 + 5,
+        router_reads=3 + 3,
+    ),
+    _BetaPlace(
+        "proxy-wide-forwarding-of-a-client-header",
+        {"headers": dict(_THE_BETA_HEADER)},
+        http_headers=_A_CLIENT_HEADER,
+        forwarding="proxy-wide",
+        replaced="headers",
+        proxy_reads=3 + 3 + 5,
+        router_reads=3 + 3,
+    ),
+    _BetaPlace(
+        "proxy-wide-forwarding-of-the-keys-information",
+        {"headers": dict(_THE_BETA_HEADER)},
+        http_headers=MappingProxyType({}),
+        forwarding="proxy-wide",
+        user_information=True,
+        replaced="headers",
+        # No client header to forward: the checks expect the body's own headers in the call
+        proxy_reads=3 + 5,
+    ),
+    _BetaPlace(
+        "provider-specific-header-the-setup-replaces",
+        {"provider_specific_header": _beta_in_a_scoped_header()},
+        http_headers=_ANTHROPIC_VERSION,
+        replaced="provider_specific_header",
+        # The scoped header of anthropic-version and the body's own, 7 each
+        proxy_reads=7 + 7 + 5,
+        router_reads=7 + 3,
+    ),
+    _BetaPlace(
+        "provider-specific-header-alone",
+        {"provider_specific_header": _beta_in_a_scoped_header()},
+        http_headers=MappingProxyType({}),
+        proxy_reads=7 + 5,
+        router_reading="anthropic",
+        router_reads=7 + 2,
+    ),
+    _BetaPlace(
+        "provider-specific-header-beside-the-http-beta",
+        {"provider_specific_header": _beta_in_a_scoped_header()},
+        http_headers=MappingProxyType({}),
+        http_beta=True,
+        replaced="provider_specific_header",
+        proxy_reading="anthropic",
+        # The scoped header of the HTTP beta and the body's own, 7 each
+        proxy_reads=7 + 7 + 2,
+        router_reading="anthropic",
+        router_reads=7 + 2,
+    ),
+    _BetaPlace(
+        "provider-specific-header-beside-extra-headers",
+        {"provider_specific_header": _beta_in_a_scoped_header(), "extra_headers": dict(_THE_BETA_HEADER)},
+        http_headers=MappingProxyType({}),
+        proxy_reading="anthropic",
+        proxy_reads=3 + 7 + 2,
+        router_reading="anthropic",
+        router_reads=3 + 7 + 2,
+    ),
+)
+
+
+def _call_headers_reads(call: Mapping[str, object]) -> int:
+    """
+    What a walk charges the ``headers`` field of a call, a mapping of text lines: reached, passed over by the beta
+    check's scan and by the walk, and each line by every 64 characters of its name and value
+    """
+    from litellm.litellm_core_utils.core_helpers import is_object_mapping
+
+    headers: Final = call.get("headers")
+    lines: Final = tuple(headers.items()) if is_object_mapping(headers) else ()
+    return 1 + 2 * len(lines) + sum((len(str(name)) + len(str(value))) // 64 for name, value in lines)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("place", _BETA_PLACES, ids=[place.name for place in _BETA_PLACES])
+async def test_the_checks_read_the_beta_where_the_request_carries_it_and_the_router_reads_the_call_it_gets(
+    monkeypatch: pytest.MonkeyPatch, place: _BetaPlace
+) -> None:
+    """
+    The second reader's point 3, and each place a beta can stand. Where the request setup really replaces the body's
+    field the beta stands in, its own `headers` by the client header that a model group of the request's own model or
+    the whole proxy forwards, or by the key's information, and its own `provider_specific_header` by the scoped header
+    it builds from an HTTP `anthropic-version`, the Router's first walk of the call reads LiteLLM's reading and the
+    checks read both, the call's and Anthropic's. Where the beta stands only in the body's own
+    `provider_specific_header` and nothing replaces it, the checks read both too, the strict side, while the Router
+    reads Anthropic's. Where it stands in a field the setup keeps too, the HTTP headers or `extra_headers`, every walk
+    reads Anthropic's alone. A mapping without a `model` that carries `mock_response` gets the entry check's refusal
+    before the key is read wherever the checks read both readings, and is a model group map elsewhere.
+    """
+    import litellm
+    from litellm.types.router import ModelGroupSettings
+
+    if place.forwarding == "model-group":
+        monkeypatch.setattr(
+            litellm, "model_group_settings", ModelGroupSettings(forward_client_headers_to_llm_api=["requested"])
+        )
+    if place.user_information:
+        monkeypatch.setattr(litellm, "add_user_information_to_llm_headers", True)
+    reads: Final = _count_reads_by_part(monkeypatch)
+    walks: Final = _record_walks(monkeypatch)
+    served: Final = await _Gateway(monkeypatch, requested_answers=True).send(
+        {**copy.deepcopy(dict(place.fields)), "fallbacks": [{"model": "other"}]},
+        beta=place.http_beta,
+        http_headers=place.http_headers,
+        forward_client_headers=place.forwarding == "proxy-wide",
+    )
+
+    assert served.response.status_code == 200, served.response.text
+    assert served.calls == {"requested": 1, "other": 0, "forbidden": 0, "attacker": 0}
+    assert [walk.reading for walk in walks if walk.who == "proxy"] == [place.proxy_reading] * 3
+    assert _proxy_reads(reads) == 3 * place.proxy_reads
+    routers: Final = [walk for walk in walks if walk.who == "router"]
+    assert [walk.reading for walk in routers] == [place.router_reading]
+    call: Final = routers[0].call
+    if place.replaced is not None:
+        assert call.get(place.replaced) != place.fields[place.replaced]
+    assert _router_call_reads(reads) == (
+        place.router_reads if place.router_reads is not None else 3 + _call_headers_reads(call)
+    )
+
+    refused: Final = await _Gateway(monkeypatch, requested_answers=True).send(
+        {**copy.deepcopy(dict(place.fields)), "fallbacks": [{"model": "other"}, {"mock_response": "pwned"}]},
+        beta=place.http_beta,
+        http_headers=place.http_headers,
+        forward_client_headers=place.forwarding == "proxy-wide",
+    )
+    if place.proxy_reading == "both":
+        assert refused.response.status_code == 401, refused.response.text
+        assert "may not carry mock_response" in refused.response.text
+        assert refused.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+        return
+    assert refused.response.status_code == 200, refused.response.text
+    assert refused.calls == {"requested": 1, "other": 0, "forbidden": 0, "attacker": 0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("names", "status", "refusal"),
+    [
+        pytest.param(1, 403, "The requested model 'forbidden' is not available", id="a-name-the-key-may-not-call"),
+        pytest.param(
+            176_000,
+            400,
+            "the fallback lists of the key's or team's saved router_settings hold more than 10000 entries in all",
+            id="a-list-past-the-routers-read-limit",
+        ),
+    ],
+)
+async def test_the_saved_settings_check_reads_the_call_the_request_setup_built(
+    monkeypatch: pytest.MonkeyPatch, names: int, status: int, refusal: str
+) -> None:
+    """
+    The second reader's case: a model group forwards client headers for `requested`, the key maps `alias` to it, and a
+    request for `alias` carries the beta only in its body's `headers`, beside an HTTP `x-request-note`. The request
+    setup reads `alias`, which no group forwards for, and keeps the body's `headers`, so the call reads Anthropic's
+    reading; only then does the key's alias make the model `requested`. The checks before the setup read both
+    readings. The check of the key's saved settings runs after the setup and reads the call as it is: under the beta
+    a saved target's own `fallbacks` goes to Anthropic, where `{"g": ["forbidden"]}` is a model group map whose
+    `forbidden` the key may not call, refused with 403 by the key's model check of the saved settings; and a `g` list
+    of 176,000 names passes the saved settings' 10,000 entries and gets their 400, where the Router's first walk of
+    the same call refuses it past its 176,000 reads. Before, that check built the forwarded headers again for
+    `requested`, read LiteLLM's reading, where the mapping is a parameter override, and passed both.
+    """
+    import litellm
+    from litellm.router_utils.fallback_event_handlers import call_fallbacks
+    from litellm.types.router import ModelGroupSettings
+
+    monkeypatch.setattr(
+        litellm, "model_group_settings", ModelGroupSettings(forward_client_headers_to_llm_api=["requested"])
+    )
+    group: Final = ["forbidden"] if names == 1 else [f"g{index}" for index in range(names)]
+    settings: Final = {"fallbacks": [{"model": "other", "fallbacks": [{"model": "other"}, {"g": group}]}]}
+    walks: Final = _record_walks(monkeypatch)
+    reads: Final = _count_reads_by_part(monkeypatch)
+    result: Final = await _Gateway(monkeypatch, requested_answers=True).send(
+        {"model": "alias", "headers": dict(_THE_BETA_HEADER)},
+        key_router_settings=settings,
+        key_aliases={"alias": "requested"},
+        client_side_credentials=True,
+        http_headers=_A_CLIENT_HEADER,
+    )
+
+    assert result.response.status_code == status, result.response.text
+    assert refusal in result.response.text
+    assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
+    assert [walk.reading for walk in walks if walk.who == "proxy"] == ["both"] * 3
+    # A walk past its limits raises instead of returning
+    assert [walk.reading for walk in walks if walk.who == "saved"] == (["anthropic"] if status == 403 else [])
+    assert _router_call_reads(reads) == 0
+
+    call: Final = _the_routers_call(
+        {"model": "requested", "headers": dict(_THE_BETA_HEADER), "router_settings_override": settings}
+    )
+    router: Final = _router_configured_with(())
+    if status == 400:
+        with pytest.raises(
+            litellm.BadRequestError, match="reading the request's fallback lists takes more than 176000 reads"
+        ):
+            call_fallbacks(call, router)
+        return
+    assert call_fallbacks(call, router) == settings["fallbacks"]
+    routers: Final = [walk for walk in walks if walk.who == "router"]
+    assert [walk.reading for walk in routers] == ["anthropic"]
+    assert "forbidden" in routers[0].anthropic_targets
+    # The beta line 3; the Router's own list reached, passed over to tell its format and to read it, 3; the target's
+    # own list reached and read, 3; the group map's values passed over, 1; the group's list reached and read, 2
+    assert _router_call_reads(reads) == 3 + 3 + 3 + 1 + 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fields", "beta", "forwarding", "served"),
+    [
+        pytest.param(
+            {"headers": dict(_THE_BETA_HEADER)}, False, "model-group", False, id="the-bodys-headers-a-group-forwards"
+        ),
+        pytest.param(
+            {"provider_specific_header": _beta_in_a_scoped_header()},
+            False,
+            "none",
+            False,
+            id="the-bodys-provider-specific-header",
+        ),
+        pytest.param({}, True, "proxy-wide", True, id="the-http-headers-the-proxy-forwards"),
+        pytest.param(
+            {"extra_headers": dict(_THE_BETA_HEADER)}, False, "proxy-wide", True, id="the-bodys-extra-headers"
+        ),
+    ],
+)
+async def test_default_under_a_beta_the_request_setup_can_replace_is_refused_and_under_one_it_keeps_served(
+    monkeypatch: pytest.MonkeyPatch, fields: Mapping[str, object], beta: bool, forwarding: str, served: bool
+) -> None:
+    """
+    The strict side of reading both ways: where the beta stands only in a body field the request setup can replace,
+    the body's own `headers` while a model group forwards client headers, any group, or the body's own
+    `provider_specific_header`, the checks read `fallbacks` as LiteLLM's list too, so `"default"`, which Anthropic's
+    reading alone accepts, is refused with 400 before the key is read. A beta in the HTTP headers or in
+    `extra_headers`, which the setup keeps, leaves it Anthropic's, and the request is served, forwarding or not.
+    """
+    import litellm
+    from litellm.types.router import ModelGroupSettings
+
+    if forwarding == "model-group":
+        monkeypatch.setattr(
+            litellm, "model_group_settings", ModelGroupSettings(forward_client_headers_to_llm_api=["forbidden"])
+        )
+    result: Final = await _Gateway(monkeypatch, requested_answers=True).send(
+        {**copy.deepcopy(dict(fields)), "fallbacks": "default"},
+        beta=beta,
+        forward_client_headers=forwarding == "proxy-wide",
+    )
+
+    if served:
+        assert result.response.status_code == 200, result.response.text
+        assert result.calls == {"requested": 1, "other": 0, "forbidden": 0, "attacker": 0}
+        return
+    assert result.response.status_code == 400, result.response.text
+    assert "fallbacks must be a list of model groups" in result.response.text
     assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
 
 

@@ -25,7 +25,7 @@ from litellm.constants import (
     MINIMUM_CUSTOM_KEY_LENGTH,
     STANDARD_CUSTOMER_ID_HEADERS,
 )
-from litellm.litellm_core_utils.core_helpers import is_object_list, is_object_mapping
+from litellm.litellm_core_utils.core_helpers import is_object_list, is_object_mapping, is_object_sequence
 from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
 from litellm.litellm_core_utils.safe_json_loads import safe_json_loads
 from litellm.litellm_core_utils.url_utils import (
@@ -53,6 +53,7 @@ from litellm.router_utils.fallback_event_handlers import (
     FallbackEntry,
     FallbackListShapeError,
     FallbackWalk,
+    RequestHeaderFields,
     charge_request_header_lines,
     fallback_entry_is_target,
     fallback_target_model_name,
@@ -561,37 +562,83 @@ def request_fallback_walk(
     saved_settings: bool = False,
 ) -> FallbackWalk:
     """
-    One walk of every fallback list a request carries, read as the Router gets the call: an anthropic_messages call on
-    /v1/messages, whose header carriers are the ones the request setup gives the call (_call_header_carriers), so the
-    walk reads the beta where the call holds it and charges what the Router's walk of the call charges. The request's
-    own lists may hold MAX_FALLBACK_LIST_ENTRIES entries in all; with ``saved_settings`` the body's
-    router_settings_override is the key's or team's saved router settings, counted apart against
-    MAX_SAVED_FALLBACK_LIST_ENTRIES. The walk refuses more, or reads past FALLBACK_WALK_READS_PER_ENTRY per entry of
-    either, with a 400 before it reads them, in every reading it reads; it reads no reading a hop cannot take
-    (walk_fallback_lists). On /v1/messages the mappings of ``llm_router``'s own configured lists are hops too: a scan
-    of all three lists, made by this walk and kept by nothing (router_configured_fallbacks), decides with the request's
-    targets whether both readings apply, as in the Router's own walk of the call. The checks of one request walk its
-    lists up to four times, with an await between any two of them, during which the Router's lists or its opt-in can
-    change: so each walk scans them as they are then, and no scan outlives the walk that made it. The body's
+    One walk of every fallback list a request carries, read as the Router gets the call. Every walk but one runs before
+    the request setup: on /v1/messages it reads the beta in the request's own header fields, the HTTP headers and the
+    fields the body carries, as they are (_request_header_fields), and a beta that stands only in body fields the
+    setup can replace is read both ways; the header fields it expects the setup to give the call (_call_header_carriers)
+    only decide what it charges, which is at least what the Router's walk of the call charges for them. With
+    ``saved_settings`` the body is the call the request setup built, the one walk that runs after it, since the key's
+    or team's saved router settings come in only then (common_request_processing): its header fields are read as the
+    setup left them, with no field built again and none expected to be replaced, so the walk reads the call's own
+    reading, and ``request`` is not read. The request's own lists may hold MAX_FALLBACK_LIST_ENTRIES entries in all;
+    with ``saved_settings`` the body's router_settings_override is the key's or team's saved router settings, counted
+    apart against MAX_SAVED_FALLBACK_LIST_ENTRIES. The walk refuses more, or reads past FALLBACK_WALK_READS_PER_ENTRY
+    per entry of either, with a 400 before it reads them, in every reading it reads; it reads no reading a hop cannot
+    take (walk_fallback_lists). On /v1/messages the mappings of ``llm_router``'s own configured lists are hops too: a
+    scan of all three lists, made by this walk and kept by nothing (router_configured_fallbacks), decides with the
+    request's targets whether both readings apply, as in the Router's own walk of the call. The checks of one request
+    walk its lists up to four times, with an await between any two of them, during which the Router's lists or its
+    opt-in can change: so each walk scans them as they are then, and no scan outlives the walk that made it. The body's
     router_settings_override is read as the call gets it after the proxy promotes it (router_settings_override_fields):
     the setting that can become the call's own ``fallbacks`` is read as the body's own ``fallbacks`` is. So the walk
     charges a request's lists, and the saved ones, in every reading the Router can read them in.
     """
     messages_call: Final = route.endswith("/v1/messages")
-    carriers: Final = (
+    built: Final = (
         _call_header_carriers(request_body, request, llm_router)
-        if messages_call and request is not None
-        else {key: request_body[key] for key in HEADER_CARRIER_KWARGS if key in request_body}
+        if messages_call and request is not None and not saved_settings
+        else _CallHeaderFields({key: request_body[key] for key in HEADER_CARRIER_KWARGS if key in request_body})
     )
     return walk_fallback_lists(
         request_body,
-        carriers=carriers,
+        carriers=built.call,
         anthropic_messages_call=messages_call,
         budget=MAX_FALLBACK_LIST_ENTRIES,
         saved_settings_budget=MAX_SAVED_FALLBACK_LIST_ENTRIES if saved_settings else None,
         configured=router_configured_fallbacks(llm_router) if messages_call else NO_CONFIGURED_FALLBACKS,
         router_serves=llm_router is not None,
-        headers_replaceable=messages_call and _client_header_forwarding_configured(),
+        request_fields=_request_header_fields(request_body, built) if messages_call and not saved_settings else None,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _CallHeaderFields:
+    """
+    The header fields a walk expects the call of a request to carry, ``call``, and the scoped header the request setup
+    builds from the request's HTTP headers alone, ``scoped``, None where they carry no line it scopes
+    """
+
+    call: Mapping[str, object]
+    scoped: object = None
+
+
+def _request_header_fields(request_body: Mapping[str, object], built: _CallHeaderFields) -> RequestHeaderFields:
+    """
+    The request's own header fields, in which the walks before the request setup read the beta, each with whether the
+    setup keeps it in the call. Kept: the scoped header the setup builds from the HTTP headers themselves, which every
+    anthropic-beta line they carry lands in; ``extra_headers``, to which the setup only adds its traceparent line, never
+    a beta; and the body's ``headers`` where no client header forwarding is configured. Replaceable: the body's
+    ``headers`` where client header forwarding is configured, proxy-wide or for any model group, whatever the model and
+    the key; and the body's ``provider_specific_header``, which the setup replaces with that scoped header whenever the
+    HTTP headers carry a line it scopes. Whether the setup will replace a field is not guessed: a beta that stands only
+    in replaceable fields is read both ways.
+    """
+    forwarding: Final = _client_header_forwarding_configured()
+    body_headers: Final = (("headers", request_body["headers"]),) if "headers" in request_body else ()
+    return RequestHeaderFields(
+        kept=(
+            *((("provider_specific_header", built.scoped),) if built.scoped is not None else ()),
+            *((("extra_headers", built.call["extra_headers"]),) if "extra_headers" in built.call else ()),
+            *(() if forwarding else body_headers),
+        ),
+        replaceable=(
+            *(body_headers if forwarding else ()),
+            *(
+                (("provider_specific_header", request_body["provider_specific_header"]),)
+                if "provider_specific_header" in request_body
+                else ()
+            ),
+        ),
     )
 
 
@@ -618,7 +665,8 @@ def _forwards_client_headers(
     """
     Whether the request setup sends the client's forwardable headers as the call's ``headers``: the proxy-wide setting,
     or a model group setting that names the request's model (add_headers_to_llm_call_by_model_group), read with the
-    model the body names, since the key's own aliases are not read yet
+    model the body names, since the key's own aliases are not read yet. A guess at what the setup will do, so it decides
+    only which header fields a walk charges, never whose list ``fallbacks`` is (_request_header_fields).
     """
     from litellm.proxy.auth.auth_checks import check_model_access_helper  # the checks module imports this one
 
@@ -638,7 +686,7 @@ def _forwards_client_headers(
 
 def _call_header_carriers(
     request_body: Mapping[str, object], request: Request, llm_router: Router | None
-) -> Mapping[str, object]:
+) -> _CallHeaderFields:
     """
     The header fields the anthropic_messages call of this request carries, built from the request by the request
     setup's own steps (add_litellm_data_to_request): the body's ``headers``, ``extra_headers`` and
@@ -649,10 +697,13 @@ def _call_header_carriers(
     strips before it forwards is neither forwardable nor scoped, so it changes none of these. What the setup decides by
     the key, which the checks have not read, is left out: the key's information it adds to forwarded headers
     (litellm.add_user_information_to_llm_headers), and a model group the key's own aliases bring under forwarding.
+    These fields decide what the walk charges; the scoped header is handed back apart too, as the field the HTTP
+    headers' own beta stands in (_request_header_fields).
 
-    The request's HTTP header lines are charged before any step passes over them (charge_request_header_lines), and a
-    header field the body carries is kept by reference, never copied or read here: the walk charges it before it reads
-    it. The traceparent the setup adds to the body's ``extra_headers`` is laid over that mapping without a copy.
+    The request's HTTP header lines are charged before any step passes over them (charge_request_header_lines), taken
+    with no copy (_request_header_lines), and a header field the body carries is kept by reference, never copied or
+    read here: the walk charges it before it reads it. The traceparent the setup adds to the body's ``extra_headers``
+    is laid over that mapping without a copy.
     """
     from litellm.proxy.litellm_pre_call_utils import (  # the setup module imports this one
         LiteLLMProxyRequestSetup,
@@ -662,7 +713,7 @@ def _call_header_carriers(
     )
     from litellm.proxy.proxy_server import general_settings as proxy_general_settings
 
-    charge_request_header_lines(request.headers.raw, _SETUP_PASSES_OVER_HEADER_LINES)
+    charge_request_header_lines(_request_header_lines(request), _SETUP_PASSES_OVER_HEADER_LINES)
     settings: Final[Mapping[str, object]] = proxy_general_settings or {}
     # The setup reads which header carried the proxy's key from the same request headers
     authenticated_with: Final = (
@@ -705,16 +756,30 @@ def _call_header_carriers(
         if is_object_mapping(body_extra_headers) and "traceparent" not in body_extra_headers
         else body_extra_headers
     )
-    return {
-        **{key: request_body[key] for key in HEADER_CARRIER_KWARGS if key in request_body},
-        **({"headers": forwarded} if forwarded else {}),
-        **({"extra_headers": extra_headers} if "extra_headers" in request_body or traceparent is not None else {}),
-        **(
-            {"provider_specific_header": scoped["provider_specific_header"]}
-            if "provider_specific_header" in scoped
-            else {}
-        ),
-    }
+    return _CallHeaderFields(
+        {
+            **{key: request_body[key] for key in HEADER_CARRIER_KWARGS if key in request_body},
+            **({"headers": forwarded} if forwarded else {}),
+            **({"extra_headers": extra_headers} if "extra_headers" in request_body or traceparent is not None else {}),
+            **(
+                {"provider_specific_header": scoped["provider_specific_header"]}
+                if "provider_specific_header" in scoped
+                else {}
+            ),
+        },
+        scoped.get("provider_specific_header"),
+    )
+
+
+def _request_header_lines(request: Request) -> Collection[object]:
+    """
+    The request's HTTP header lines, taken with no pass and no copy: the list of name and value pairs the server put in
+    the ASGI scope, which Starlette's header mapping holds as its own list, or, for a request without such a list, the
+    items of its header mapping
+    """
+    scope: Final[object] = getattr(request, "scope", None)
+    lines: Final = scope.get("headers") if is_object_mapping(scope) else None
+    return lines if is_object_sequence(lines) else request.headers.items()
 
 
 # The passes the steps of _call_header_carriers make over the request's HTTP header lines, at most: the two header
