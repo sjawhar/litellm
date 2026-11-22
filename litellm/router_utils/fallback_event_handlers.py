@@ -699,6 +699,19 @@ class _FallbackRead:
             self.reading, self.state, _FallbackTally.limited(_CONFIGURED_LISTS, None), records_carriers=False
         )
 
+    def descend(self, depth: int, field: str | None) -> None:
+        """
+        The one check of how deep the walk reads. The walk goes a level deeper only by reading the entries of a list
+        (iter_fallback_entries) or of a context_window_fallback_dict (iter_body_fallback_entries), and it checks here
+        before either, at that list's or dictionary's depth. So every path, through the three lists, the override, a
+        target's own lists, a group map's values, a mapping in a list's place or a context_window_fallback_dict, stops
+        where no reader follows, with the shape 400, and the walk's recursion stays a few frames a level deep.
+        """
+        if depth > 2 * litellm.ROUTER_MAX_FALLBACKS:
+            raise FallbackListShapeError(
+                "Rejected Request: fallback nesting exceeds the allowed validation depth.", field
+            )
+
     def first_read(self, way: tuple[object, ...]) -> bool:
         if way in self.state.read:
             return False
@@ -1080,8 +1093,7 @@ def iter_fallback_entries(
     walk's part as the walk reaches it, null included, and a list or a mapping by its length before the walk passes
     over it (_FallbackRead.pass_over).
     """
-    if depth > 2 * litellm.ROUTER_MAX_FALLBACKS:
-        raise FallbackListShapeError("Rejected Request: fallback nesting exceeds the allowed validation depth.", field)
+    walk.descend(depth, field)
     walk.reach(field)
     if not walk.first_read(("list", id(value), field, depth, widest_reading, group, via_litellm_fallbacks)):
         return
@@ -1289,6 +1301,8 @@ def iter_body_fallback_entries(
                     walk.state.deferred.append(branch)
     if CONTEXT_WINDOW_FALLBACK_DICT_FIELD not in body:
         return
+    # The values are targets one level down, as a list's are, and a target's own dictionary is read in turn
+    walk.descend(depth, CONTEXT_WINDOW_FALLBACK_DICT_FIELD)
     walk.reach(CONTEXT_WINDOW_FALLBACK_DICT_FIELD)
     context_window_swaps: Final = body[CONTEXT_WINDOW_FALLBACK_DICT_FIELD]
     if _is_mapping(context_window_swaps):

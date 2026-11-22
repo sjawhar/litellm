@@ -58,7 +58,6 @@ from litellm.router_utils.fallback_event_handlers import (
     router_configured_fallbacks,
     walk_fallback_lists,
 )
-from litellm.types.llms.anthropic import ANTHROPIC_API_HEADERS
 from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     LITELLM_PASS_THROUGH_ENDPOINT_MARKER,
 )
@@ -562,9 +561,9 @@ def request_fallback_walk(
 ) -> FallbackWalk:
     """
     One walk of every fallback list a request carries, read as the Router gets the call: an anthropic_messages call on
-    /v1/messages, whose header carriers are the body's, with the provider_specific_header the proxy builds from the
-    request's Anthropic headers in place of the body's (add_provider_specific_headers_to_request). The request's own
-    lists may hold MAX_FALLBACK_LIST_ENTRIES entries in all; with ``saved_settings`` the body's
+    /v1/messages, whose header carriers are the ones the request setup gives the call (_call_header_carriers), so the
+    walk reads the beta where the call holds it and charges what the Router's walk of the call charges. The request's
+    own lists may hold MAX_FALLBACK_LIST_ENTRIES entries in all; with ``saved_settings`` the body's
     router_settings_override is the key's or team's saved router settings, counted apart against
     MAX_SAVED_FALLBACK_LIST_ENTRIES. The walk refuses more, or reads past FALLBACK_WALK_READS_PER_ENTRY per entry of
     either, with a 400 before it reads them, in every reading it reads; it reads no reading a hop cannot take
@@ -578,19 +577,11 @@ def request_fallback_walk(
     charges a request's lists, and the saved ones, in every reading the Router can read them in.
     """
     messages_call: Final = route.endswith("/v1/messages")
-    header_lines: Final = tuple(
-        (name.lower(), value)
-        for name, value in (request.headers.items() if messages_call and request is not None else ())
+    carriers: Final = (
+        _call_header_carriers(request_body, request, llm_router)
+        if messages_call and request is not None
+        else {key: request_body[key] for key in HEADER_CARRIER_KWARGS if key in request_body}
     )
-    # The proxy joins a repeated anthropic-beta line with a comma, as HTTP reads it
-    sent: Final = {
-        header: ",".join(value for name, value in header_lines if name == header)
-        for header in dict.fromkeys(name for name, _ in header_lines if name in ANTHROPIC_API_HEADERS)
-    }
-    carriers: Final = {
-        **{key: request_body[key] for key in HEADER_CARRIER_KWARGS if key in request_body},
-        **({"provider_specific_header": {"extra_headers": sent}} if sent else {}),
-    }
     return walk_fallback_lists(
         request_body,
         carriers=carriers,
@@ -600,6 +591,98 @@ def request_fallback_walk(
         configured=router_configured_fallbacks(llm_router) if messages_call else NO_CONFIGURED_FALLBACKS,
         router_serves=llm_router is not None,
     )
+
+
+def _forwards_client_headers(
+    request_body: Mapping[str, object], llm_router: Router | None, general_settings: Mapping[str, object]
+) -> bool:
+    """
+    Whether the request setup sends the client's forwardable headers as the call's ``headers``: the proxy-wide setting,
+    or a model group setting that names the request's model (add_headers_to_llm_call_by_model_group), read with the
+    model the body names, since the key's own aliases are not read yet
+    """
+    from litellm.proxy.auth.auth_checks import check_model_access_helper  # the checks module imports this one
+
+    if general_settings.get("forward_client_headers_to_llm_api") is True:
+        return True
+    group_settings: Final = litellm.model_group_settings
+    model: Final = request_body.get("model")
+    return (
+        isinstance(model, str)
+        and group_settings is not None
+        and group_settings.forward_client_headers_to_llm_api is not None
+        and check_model_access_helper(
+            model=model, llm_router=llm_router, models=group_settings.forward_client_headers_to_llm_api
+        )
+    )
+
+
+def _call_header_carriers(
+    request_body: Mapping[str, object], request: Request, llm_router: Router | None
+) -> Mapping[str, object]:
+    """
+    The header fields the anthropic_messages call of this request carries, built from the request by the request
+    setup's own steps (add_litellm_data_to_request): the body's ``headers``, ``extra_headers`` and
+    ``provider_specific_header``; the scoped headers the setup builds from the request's HTTP headers, its Anthropic
+    ones, an Anthropic OAuth token it forwards and its other scoped ones, in place of the body's
+    (add_provider_specific_headers_to_request); the client's forwardable headers in place of the body's ``headers``
+    when the proxy forwards them; and the traceparent the setup adds to ``extra_headers``. The header control the setup
+    strips before it forwards is neither forwardable nor scoped, so it changes none of these. What the setup decides by
+    the key, which the checks have not read, is left out: the key's information it adds to forwarded headers
+    (litellm.add_user_information_to_llm_headers), and a model group the key's own aliases bring under forwarding.
+    """
+    from litellm.proxy.litellm_pre_call_utils import (  # the setup module imports this one
+        LiteLLMProxyRequestSetup,
+        _add_otel_traceparent_to_data,  # pyright: ignore[reportPrivateUsage]  # the setup's own step
+        add_provider_specific_headers_to_request,
+        clean_headers,
+    )
+    from litellm.proxy.proxy_server import general_settings as proxy_general_settings
+
+    settings: Final[Mapping[str, object]] = proxy_general_settings or {}
+    # The setup reads which header carried the proxy's key from the same request headers
+    authenticated_with: Final = (
+        "x-litellm-api-key"
+        if "x-litellm-api-key" in request.headers
+        else "authorization"
+        if "authorization" in request.headers
+        else "x-api-key"
+    )
+    key_header_name: Final = settings.get("litellm_key_header_name")
+    cleaned: Final[Mapping[str, str]] = clean_headers(
+        request.headers,
+        litellm_key_header_name=key_header_name if isinstance(key_header_name, str) else None,
+        forward_llm_provider_auth_headers=bool(
+            settings.get("forward_llm_provider_auth_headers")
+            or getattr(litellm, "forward_llm_provider_auth_headers", False)
+        ),
+        authenticated_with_header=authenticated_with,
+    )
+    scoped: Final[dict[str, object]] = {}  # mutable-ok: the setup's own step writes the scoped header into it
+    _ = add_provider_specific_headers_to_request(scoped, cleaned)
+    forwarded: Final[Mapping[str, object]] = (
+        LiteLLMProxyRequestSetup._get_forwardable_headers(  # pyright: ignore[reportPrivateUsage]  # the setup's choice
+            dict(cleaned)
+        )
+        if _forwards_client_headers(request_body, llm_router, settings)
+        else {}
+    )
+    body_extra_headers: Final = request_body.get("extra_headers")
+    traced: Final[dict[str, object]] = (  # mutable-ok: the setup's own step adds the traceparent to its copy
+        {"extra_headers": dict(body_extra_headers)} if is_object_mapping(body_extra_headers) else {}
+    )
+    if body_extra_headers is None or is_object_mapping(body_extra_headers):
+        _add_otel_traceparent_to_data(traced, request=request)
+    return {
+        **{key: request_body[key] for key in HEADER_CARRIER_KWARGS if key in request_body},
+        **({"headers": forwarded} if forwarded else {}),
+        **({"extra_headers": traced["extra_headers"]} if "extra_headers" in traced else {}),
+        **(
+            {"provider_specific_header": scoped["provider_specific_header"]}
+            if "provider_specific_header" in scoped
+            else {}
+        ),
+    }
 
 
 def _reject_unreadable_litellm_list(value: object, field: str) -> None:
@@ -785,11 +868,11 @@ def iter_request_fallback_targets(request_body: Mapping[str, object]) -> Iterato
     a list, in a list only the Router reads as group maps (``context_window_fallbacks``, ``content_policy_fallbacks``,
     ``default_fallbacks``).
 
-    For a body of built-in containers it refuses nothing and raises nothing: an entry that is neither a model name nor
-    a mapping is passed by, and no limit applies, since this reading reads values the proxy's checks of the request did
-    not charge, so a limit could refuse a body they passed. Each list and mapping is a place read a fixed number of
-    times, however deep it stands and however many mappings of the body hold it, and only that place takes its keys
-    and values, so the work is linear in the body.
+    For a body of built-in containers it refuses nothing and raises nothing, deep nesting included: an entry that is
+    neither a model name nor a mapping is passed by, and no limit applies, since this reading reads values the proxy's
+    checks of the request did not charge, so a limit could refuse a body they passed. Each list and mapping is a place
+    read a fixed number of times, however deep it stands and however many mappings of the body hold it, and only that
+    place takes its keys and values, so the work is linear in the body.
     """
     pending: Final[list[_FallbackPlace]] = [  # mutable-ok: the reading's own stack of places
         _FallbackPlace(_MERGED_MAPPING, request_body)
