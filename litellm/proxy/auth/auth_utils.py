@@ -654,12 +654,16 @@ def _request_header_fields(request_body: Mapping[str, object], built: _CallHeade
     )
 
 
-def _proxy_wide_client_header_forwarding() -> bool:
-    """Whether the proxy forwards the client's headers on every call (add_litellm_data_for_backend_llm_call)"""
+def _proxy_general_settings() -> Mapping[str, object]:
+    """The proxy's general settings as loaded, read by setting name only (proxy_server.general_settings)"""
     from litellm.proxy.proxy_server import general_settings as proxy_general_settings
 
-    settings: Final[Mapping[str, object]] = proxy_general_settings or {}
-    return settings.get("forward_client_headers_to_llm_api") is True
+    return proxy_general_settings or {}
+
+
+def _proxy_wide_client_header_forwarding() -> bool:
+    """Whether the proxy forwards the client's headers on every call (add_litellm_data_for_backend_llm_call)"""
+    return _proxy_general_settings().get("forward_client_headers_to_llm_api") is True
 
 
 def _client_header_forwarding_configured() -> bool:
@@ -727,30 +731,11 @@ def _call_header_carriers(
         LiteLLMProxyRequestSetup,
         _add_otel_traceparent_to_data,  # pyright: ignore[reportPrivateUsage]  # the setup's own step
         add_provider_specific_headers_to_request,
-        clean_headers,
     )
-    from litellm.proxy.proxy_server import general_settings as proxy_general_settings
 
     charge_request_header_lines(_request_header_lines(request), _SETUP_PASSES_OVER_HEADER_LINES)
-    settings: Final[Mapping[str, object]] = proxy_general_settings or {}
-    # The setup reads which header carried the proxy's key from the same request headers
-    authenticated_with: Final = (
-        "x-litellm-api-key"
-        if "x-litellm-api-key" in request.headers
-        else "authorization"
-        if "authorization" in request.headers
-        else "x-api-key"
-    )
-    key_header_name: Final = settings.get("litellm_key_header_name")
-    cleaned: Final[Mapping[str, str]] = clean_headers(
-        request.headers,
-        litellm_key_header_name=key_header_name if isinstance(key_header_name, str) else None,
-        forward_llm_provider_auth_headers=bool(
-            settings.get("forward_llm_provider_auth_headers")
-            or getattr(litellm, "forward_llm_provider_auth_headers", False)
-        ),
-        authenticated_with_header=authenticated_with,
-    )
+    settings: Final = _proxy_general_settings()
+    cleaned: Final = _cleaned_request_headers(request, settings)
     scoped: Final[dict[str, object]] = {}  # mutable-ok: the setup's own step writes the scoped header into it
     _ = add_provider_specific_headers_to_request(scoped, cleaned)
     unscoped_beta: Final = {
@@ -790,6 +775,32 @@ def _call_header_carriers(
         },
         scoped.get("provider_specific_header"),
         unscoped_beta or None,
+    )
+
+
+def _cleaned_request_headers(request: Request, settings: Mapping[str, object]) -> Mapping[str, str]:
+    """
+    The request's HTTP headers as the request setup cleans them before it scopes or forwards any (clean_headers), with
+    the header that carried the proxy's key told as the setup tells it, from the same headers: names and values as text
+    """
+    from litellm.proxy.litellm_pre_call_utils import clean_headers  # the setup module imports this one
+
+    authenticated_with: Final = (
+        "x-litellm-api-key"
+        if "x-litellm-api-key" in request.headers
+        else "authorization"
+        if "authorization" in request.headers
+        else "x-api-key"
+    )
+    key_header_name: Final = settings.get("litellm_key_header_name")
+    return clean_headers(
+        request.headers,
+        litellm_key_header_name=key_header_name if isinstance(key_header_name, str) else None,
+        forward_llm_provider_auth_headers=bool(
+            settings.get("forward_llm_provider_auth_headers")
+            or getattr(litellm, "forward_llm_provider_auth_headers", False)
+        ),
+        authenticated_with_header=authenticated_with,
     )
 
 
