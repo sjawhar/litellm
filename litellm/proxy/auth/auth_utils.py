@@ -2,7 +2,7 @@ import importlib.util
 import os
 import re
 import sys
-from collections.abc import Collection, Generator, Iterable, Mapping, Sequence
+from collections.abc import Collection, Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache, partial
@@ -11,6 +11,7 @@ from typing import Any, Final, Protocol
 
 from fastapi import HTTPException, Request, status
 from pydantic import PositiveInt, TypeAdapter, ValidationError
+from typing_extensions import TypeIs  # noqa: TID251  # TypeIs reaches typing only on 3.13
 
 import litellm
 from litellm import Router, constants, provider_list
@@ -24,7 +25,7 @@ from litellm.constants import (
     MINIMUM_CUSTOM_KEY_LENGTH,
     STANDARD_CUSTOMER_ID_HEADERS,
 )
-from litellm.litellm_core_utils.core_helpers import is_object_mapping
+from litellm.litellm_core_utils.core_helpers import is_object_list, is_object_mapping
 from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
 from litellm.litellm_core_utils.safe_json_loads import safe_json_loads
 from litellm.litellm_core_utils.url_utils import (
@@ -42,12 +43,17 @@ from litellm.router_utils.clientside_credential_handler import (
     reject_fallback_target_routing,
 )
 from litellm.router_utils.fallback_event_handlers import (
+    CONTEXT_WINDOW_FALLBACK_DICT_FIELD,
+    FALLBACK_LIST_FIELDS,
     HEADER_CARRIER_KWARGS,
     NO_CONFIGURED_FALLBACKS,
+    ROUTER_FALLBACKS_KWARG,
+    ROUTER_SETTINGS_OVERRIDE_KWARG,
     FallbackChecks,
     FallbackEntry,
     FallbackListShapeError,
     FallbackWalk,
+    fallback_entry_is_target,
     fallback_target_model_name,
     router_configured_fallbacks,
     walk_fallback_lists,
@@ -646,6 +652,147 @@ def key_fallback_model_names(
     team router settings the proxy applies after auth come through check_request_body, as the body does.
     """
     return FallbackModelNames.of(request_fallback_walk(route, request, request_body, llm_router=llm_router).check())
+
+
+# How iter_request_fallback_targets reads a place of a request body: a mapping merged into a call, read for its
+# fallback fields, those of its router_settings_override and the values of its context_window_fallback_dict; a
+# fallback list, or a mapping a reader iterates as one; and an entry of such a list, a model name or a mapping
+_MERGED_MAPPING: Final = "a mapping merged into a call"
+_FALLBACK_LIST: Final = "a fallback list"
+_FALLBACK_ENTRY: Final = "a fallback entry"
+# The fallback fields some reader of which merges every mapping of the list into a call, a model group map included:
+# litellm.acompletion's own fallback loop merges each mapping of a ``fallbacks`` list, and the Router each mapping of a
+# list in the client-side format
+_FIELDS_MERGING_EVERY_MAPPING: Final = ("fallbacks", ROUTER_FALLBACKS_KWARG)
+
+
+@dataclass(frozen=True, slots=True)
+class _FallbackPlace:
+    """
+    One place iter_request_fallback_targets reads, how it reads it, and, for a list or an entry of one, whether a
+    reader merges a model group map there into a call
+    """
+
+    kind: str
+    value: object
+    merges_every_mapping: bool = True
+
+
+def _is_request_mapping(
+    value: object,
+) -> TypeIs[Mapping[str, object]]:  # guard-ok: a request body and its fallback entries come from JSON or call kwargs
+    return isinstance(value, Mapping)
+
+
+def _fallback_field_places(source: object) -> tuple[_FallbackPlace, ...]:
+    """The fallback fields a mapping carries, each a list to read"""
+    if not _is_request_mapping(source):
+        return ()
+    return tuple(
+        _FallbackPlace(_FALLBACK_LIST, source[field], field in _FIELDS_MERGING_EVERY_MAPPING)
+        for field in FALLBACK_LIST_FIELDS
+        if field in source
+    )
+
+
+def _merged_mapping_places(mapping: Mapping[str, object]) -> tuple[_FallbackPlace, ...]:
+    """
+    The fallback fields of a mapping merged into a call and of its router_settings_override, and the models its
+    context_window_fallback_dict swaps in, as the walk of a request body reads them (iter_body_fallback_entries)
+    """
+    swaps: Final = mapping.get(CONTEXT_WINDOW_FALLBACK_DICT_FIELD)
+    swapped_in: Final = (
+        tuple(_FallbackPlace(_FALLBACK_ENTRY, target) for target in swaps.values())
+        if _is_request_mapping(swaps)
+        else ()
+    )
+    return (
+        *_fallback_field_places(mapping),
+        *_fallback_field_places(mapping.get(ROUTER_SETTINGS_OVERRIDE_KWARG)),
+        *swapped_in,
+    )
+
+
+def _fallback_list_places(value: object, merges_every_mapping: bool) -> tuple[_FallbackPlace, ...]:
+    """
+    The entries of a fallback list. The Router iterates a fallback list, and iterating a mapping walks its keys, so a
+    mapping in a list's place holds each key as a model name, and the lists the keys map to.
+    """
+    if is_object_mapping(value):
+        return (
+            *(_FallbackPlace(_FALLBACK_ENTRY, name) for name in value),
+            *(_FallbackPlace(_FALLBACK_LIST, targets) for targets in value.values()),
+        )
+    if is_object_list(value):
+        return tuple(_FallbackPlace(_FALLBACK_ENTRY, item, merges_every_mapping) for item in value)
+    return ()
+
+
+def _fallback_place_contents(
+    place: _FallbackPlace,
+) -> tuple[str | Mapping[str, object] | None, tuple[_FallbackPlace, ...]]:
+    """The target a place is, if it is one, and the places it holds, in the order they stand"""
+    value: Final = place.value
+    if place.kind == _MERGED_MAPPING:
+        return None, (_merged_mapping_places(value) if _is_request_mapping(value) else ())
+    if place.kind == _FALLBACK_LIST:
+        return None, _fallback_list_places(value, place.merges_every_mapping)
+    if isinstance(value, str):
+        return value, ()
+    if not _is_request_mapping(value):
+        # Neither a model name nor a mapping: no reader calls it, and this reading refuses nothing
+        return None, ()
+    group_map: Final = bool(value) and all(is_object_list(item) for item in value.values())
+    # Every mapping a reader merges has its own fallback lists read. One without a string `model` is a model group
+    # map in one reading and merged into the call in another, so its values are read as lists of targets too.
+    inside: Final = (
+        _FallbackPlace(_MERGED_MAPPING, value),
+        *(() if fallback_entry_is_target(value) else (_FallbackPlace(_FALLBACK_LIST, item) for item in value.values())),
+    )
+    return (None if group_map and not place.merges_every_mapping else value), inside
+
+
+def iter_request_fallback_targets(request_body: Mapping[str, object]) -> Iterator[str | Mapping[str, object]]:
+    """
+    Every fallback target a request body holds, read the widest way, for code outside this package that applies a
+    rule of its own to each: a model name, or a mapping a reader merges into a call, each handed out once, a name by
+    its text and a mapping by its identity.
+
+    It reads every place the walk of a request's fallback lists reads (walk_fallback_lists), in both readings of every
+    ``fallbacks`` field whatever the route and the headers, since a hop can change the reading: the fallback fields
+    of the body, of its router_settings_override and of every mapping merged into a call, at every depth, the values
+    of every context_window_fallback_dict, and a mapping in a list's place by its keys. A mapping without a string
+    ``model`` is a model group map to the Router and a parameter override to litellm.acompletion's own fallback loop,
+    so its values are read as lists of targets too, and it is handed out itself unless it is a group map, every value
+    a list, in a list only the Router reads as group maps (``context_window_fallbacks``, ``content_policy_fallbacks``,
+    ``default_fallbacks``).
+
+    It refuses nothing. An entry that is neither a model name nor a mapping is passed by, and no limit applies: this
+    reading reads values the proxy's checks of the request did not charge, so a limit could refuse a body they passed.
+    Each list and mapping is read a fixed number of times however deep it stands and however often the body holds it,
+    so the work is linear in the body.
+    """
+    pending: Final[list[_FallbackPlace]] = [  # mutable-ok: the reading's own stack of places
+        _FallbackPlace(_MERGED_MAPPING, request_body)
+    ]
+    read: Final[set[tuple[str, int, bool]]] = set()  # mutable-ok: each place read, by identity, never handed out
+    names: Final[set[str]] = set()  # mutable-ok: the names handed out
+    mappings: Final[set[int]] = set()  # mutable-ok: the identities of the mappings handed out
+    while pending:
+        place = pending.pop()
+        way = (place.kind, id(place.value), place.merges_every_mapping)
+        if way in read:
+            continue
+        read.add(way)
+        target, inside = _fallback_place_contents(place)
+        pending.extend(reversed(inside))
+        if isinstance(target, str):
+            if target not in names:
+                names.add(target)
+                yield target
+        elif target is not None and id(target) not in mappings:
+            mappings.add(id(target))
+            yield target
 
 
 def _read_both_ways_note(groups: Sequence[str]) -> str:
