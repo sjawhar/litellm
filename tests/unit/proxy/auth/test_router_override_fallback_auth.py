@@ -1720,8 +1720,16 @@ def _count_proxy_walk_scans(monkeypatch: pytest.MonkeyPatch) -> Sequence[tuple[b
     return given
 
 
+# The part the proxy's checks charge the request's HTTP header lines to, apart from its fallback lists
+_HTTP_HEADER_LINES_PART: Final = "the request's HTTP headers"
+
+
 def _count_reads(monkeypatch: pytest.MonkeyPatch) -> list[int]:
-    """The values every fallback walk charges from now on, one count per charge, the charge it refuses included"""
+    """
+    The values every fallback walk charges from now on, one count per charge, the charge it refuses included; the
+    request's HTTP header lines, charged in a part of their own before the proxy builds the call's header fields from
+    them, are counted apart (_count_header_line_reads)
+    """
     from litellm.router_utils import fallback_event_handlers
 
     tally: Final = fallback_event_handlers._FallbackTally  # pyright: ignore[reportPrivateUsage]  # the walk's counter
@@ -1729,7 +1737,8 @@ def _count_reads(monkeypatch: pytest.MonkeyPatch) -> list[int]:
     reads: Final[list[int]] = []  # mutable-ok: each charge appends the values it charges
 
     def counted(self: object, container: object, entries: int, charged: int, field: str | None) -> None:
-        reads.append(charged)
+        if getattr(self, "part", None) != _HTTP_HEADER_LINES_PART:
+            reads.append(charged)
         charge(self, container, entries, charged, field)  # pyright: ignore[reportArgumentType]  # a tally
 
     monkeypatch.setattr(tally, "charge", counted)
@@ -3925,12 +3934,14 @@ def test_a_nested_context_window_fallback_dict_is_read_to_the_depth_and_refused_
     from litellm.proxy.auth.auth_utils import is_request_body_safe
     from litellm.router_utils.fallback_event_handlers import FallbackListShapeError, call_fallbacks
 
-    body: Final = _nested_swap_dictionaries(levels)
     router: Final = _router_configured_with(())
+    # Each walk gets a body built afresh by a loop: no copy of it recurses through its nesting
     proxy_check: Final = partial(
-        is_request_body_safe, copy.deepcopy(body), {}, router, "requested", route="/v1/messages"
+        is_request_body_safe, _nested_swap_dictionaries(levels), {}, router, "requested", route="/v1/messages"
     )
-    router_call: Final = partial(call_fallbacks, _the_routers_call(body), router)
+    router_call: Final = partial(
+        call_fallbacks, {**_nested_swap_dictionaries(levels), "original_generic_function": anthropic_messages}, router
+    )
 
     if read:
         assert proxy_check()
@@ -4062,6 +4073,142 @@ async def test_at_the_combined_limit_the_router_serves_every_request_the_proxy_p
     assert sum(charged for part, _, charged in reads if part == _SAVED_PART) == 160_000
     assert _router_call_reads(reads) == 176_000
     assert result.calls == {"requested": 1, "other": 0, "forbidden": 0, "attacker": 0}
+
+
+# -- The proxy builds the call's header fields without a pass over a field the body carries before it charges it -----
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _PassCountedHeaders(Mapping[str, str]):
+    """A header field a body carries that records each pass over it: its iterator and each of its three views"""
+
+    lines: Mapping[str, str]
+    passes: list[str]  # mutable-ok: each pass over the field appends its name
+
+    def __getitem__(self, key: str) -> str:
+        return self.lines[key]
+
+    def __iter__(self) -> Iterator[str]:
+        self.passes.append("__iter__")
+        return iter(self.lines)
+
+    def __len__(self) -> int:
+        return len(self.lines)
+
+    def keys(self) -> object:  # pyright: ignore[reportIncompatibleMethodOverride]  # a view counted as a pass
+        self.passes.append("keys")
+        return Mapping.keys(self)
+
+    def items(self) -> object:  # pyright: ignore[reportIncompatibleMethodOverride]  # a view counted as a pass
+        self.passes.append("items")
+        return Mapping.items(self)
+
+    def values(self) -> object:  # pyright: ignore[reportIncompatibleMethodOverride]  # a view counted as a pass
+        self.passes.append("values")
+        return Mapping.values(self)
+
+
+_A_TRACEPARENT: Final = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+
+
+@pytest.mark.parametrize(
+    ("field", "traceparent"),
+    [
+        pytest.param("extra_headers", False, id="extra-headers"),
+        pytest.param("extra_headers", True, id="extra-headers-beside-a-forwarded-traceparent"),
+        pytest.param("headers", False, id="headers"),
+        pytest.param("provider_specific_header", False, id="provider-specific-header"),
+    ],
+)
+def test_a_body_header_field_past_the_read_cap_is_refused_with_no_pass_over_it(
+    monkeypatch: pytest.MonkeyPatch, field: str, traceparent: bool
+) -> None:
+    """
+    The second reader's input: a /v1/messages body whose header field holds 200,000 short lines, checked before any
+    key. The proxy builds the call's header fields from the request as the request setup does, the traceparent the
+    setup adds to `extra_headers` included, and keeps the body's field by reference: the walk charges it by its length
+    and refuses it with 400 before anything passes over it. Before, the field was copied whole first.
+    """
+    import litellm
+    from litellm.proxy import proxy_server
+    from litellm.proxy.auth.auth_utils import is_request_body_safe
+    from litellm.router_utils.fallback_event_handlers import FallbackBudgetError
+
+    if traceparent:
+        monkeypatch.setattr(proxy_server, "open_telemetry_logger", object())
+        monkeypatch.setattr(litellm, "forward_traceparent_to_llm_provider", True)
+    passes: Final[list[str]] = []  # mutable-ok: each pass over the body's header field appends its name
+    header_field: Final = _PassCountedHeaders({f"x-h-{index}": "v" for index in range(200_000)}, passes)
+    http_headers: Final = [
+        (b"x-request-note", b"n1"),
+        *([(b"traceparent", _A_TRACEPARENT.encode())] if traceparent else []),
+    ]
+    request: Final = Request({"type": "http", "method": "POST", "path": "/v1/messages", "headers": http_headers})
+
+    with pytest.raises(FallbackBudgetError, match="takes more than 16000 reads") as refusal:
+        is_request_body_safe(
+            {"model": "requested", field: header_field},
+            {"allow_client_side_credentials": True},
+            _router_without_fallback_group(),
+            "requested",
+            route="/v1/messages",
+            request=request,
+        )
+    assert refusal.value.param == field
+    assert passes == []
+
+
+# -- A beta only the body's own headers carry is read both ways where the proxy can replace those headers ------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("forwarding", "carried", "refusal"),
+    [
+        pytest.param("proxy-wide", ("mock_response", "pwned"), "may not carry mock_response", id="proxy-wide-mock"),
+        pytest.param(
+            "proxy-wide", ("success_callback", "langfuse"), "may not carry success_callback", id="proxy-wide-callback"
+        ),
+        pytest.param("model-group", ("mock_response", "pwned"), "may not carry mock_response", id="model-group-mock"),
+        pytest.param(
+            "model-group", ("success_callback", "langfuse"), "may not carry success_callback", id="model-group-callback"
+        ),
+        pytest.param("none", ("mock_response", "pwned"), None, id="no-forwarding-mock"),
+        pytest.param("none", ("success_callback", "langfuse"), None, id="no-forwarding-callback"),
+    ],
+)
+async def test_a_beta_only_the_bodys_headers_carry_is_read_both_ways_where_forwarding_can_replace_them(
+    monkeypatch: pytest.MonkeyPatch, forwarding: str, carried: tuple[str, str], refusal: str | None
+) -> None:
+    """
+    With client-side credentials allowed, a body's own `headers` carry the beta and the HTTP request none. Where the
+    proxy forwards client headers, proxy-wide or for a model group, whichever group and whatever the key's aliases, the
+    request setup can replace those `headers` after the key is read, and the Router would then read `fallbacks` as
+    LiteLLM's own, merging a mapping without a `model` into the call on a hop. The checks read both readings there, so
+    such a mapping that carries `mock_response` or `success_callback` gets the entry check's refusal before the key is
+    read, a 401 as every entry-check refusal before the key. Without forwarding the beta stays in the call: the checks
+    read Anthropic's reading alone, the mapping is a model group map there, and the request is served.
+    """
+    import litellm
+    from litellm.types.router import ModelGroupSettings
+
+    if forwarding == "model-group":
+        monkeypatch.setattr(
+            litellm, "model_group_settings", ModelGroupSettings(forward_client_headers_to_llm_api=["forbidden"])
+        )
+    result: Final = await _Gateway(monkeypatch, requested_answers=True).send(
+        {"headers": dict(_THE_BETA_HEADER), "fallbacks": [{"model": "other"}, dict((carried,))]},
+        client_side_credentials=True,
+        forward_client_headers=forwarding == "proxy-wide",
+    )
+
+    if refusal is None:
+        assert result.response.status_code == 200, result.response.text
+        assert result.calls == {"requested": 1, "other": 0, "forbidden": 0, "attacker": 0}
+        return
+    assert result.response.status_code == 401, result.response.text
+    assert refusal in result.response.text
+    assert result.calls == {"requested": 0, "other": 0, "forbidden": 0, "attacker": 0}
 
 
 @pytest.mark.asyncio

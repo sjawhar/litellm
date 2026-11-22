@@ -842,6 +842,7 @@ def walk_fallback_lists(
     configured_lists: Mapping[str, object] = _NO_CONFIGURED_LISTS,
     read_cap: int | None = None,
     router_serves: bool = True,
+    headers_replaceable: bool = False,
 ) -> FallbackWalk:
     """
     One walk of every fallback list a request body carries, with whose list each ``fallbacks`` field is on every hop.
@@ -859,8 +860,11 @@ def walk_fallback_lists(
     router_settings_override that router_settings_override_fields promotes to it when the call carries none: both are
     read as the call's own, so every list that can become it is read in every reading the Router can read it in.
     ``router_serves`` says whether a Router serves the call, which decides where an override's ``fallbacks`` lands under
-    the beta. The walk reads the checked reading first, deferring each branch only the other reading reads, and reads
-    those branches only when both readings apply: a reading no hop can take is not read.
+    the beta. ``headers_replaceable`` says the request setup can replace the call's ``headers`` after the key is read,
+    as the proxy's forwarding of client headers does: a beta that stands only there can then be gone from the call, so
+    both readings apply. The proxy's walks pass it; the Router's walk reads the call after the setup and does not.
+    The walk reads the checked reading first, deferring each branch only the other reading reads, and reads those
+    branches only when both readings apply: a reading no hop can take is not read.
 
     ``budget`` caps the entries of the lists, each counted once however many ways the walk reads it, and the values it
     reads, at FALLBACK_WALK_READS_PER_ENTRY per entry of the budget, in every reading it reads, the deferred branches
@@ -890,8 +894,18 @@ def walk_fallback_lists(
     )
     if anthropic_messages_call:
         _charge_header_carriers(walk, carriers)
-    request_beta: Final = anthropic_messages_call and provider_owns_fallbacks_field(
-        carriers, anthropic_messages_call=True
+    # Each header field read once for the beta, after the walk charged it
+    beta_in: Final = (
+        {key: anthropic_owns_fallbacks({key: carriers[key]}) for key in HEADER_CARRIER_KWARGS if key in carriers}
+        if anthropic_messages_call
+        else {}
+    )
+    request_beta: Final = any(beta_in.values())
+    # The request setup can replace the call's ``headers`` after the key is read: a beta that stands there alone can go
+    beta_can_drop: Final = (
+        headers_replaceable
+        and beta_in.get("headers", False)
+        and not any(held for key, held in beta_in.items() if key != "headers")
     )
     checked: Final = FallbackReading.ANTHROPIC if request_beta else FallbackReading.LITELLM
     walk.state.enforced = checked
@@ -904,7 +918,8 @@ def walk_fallback_lists(
         checked,
     )
     if checked_walk.error is not None or not (
-        anthropic_messages_call and _both_readings_apply(walk.state, request_beta=request_beta, configured=configured)
+        anthropic_messages_call
+        and (beta_can_drop or _both_readings_apply(walk.state, request_beta=request_beta, configured=configured))
     ):
         return checked_walk
     walk.state.enforced = FallbackReading.BOTH
@@ -1002,6 +1017,36 @@ _HEADER_CHARS_PER_READ: Final = 64
 def _header_line_reads(name: object, value: object) -> int:
     texts: Final = tuple(len(text) for text in (name, value) if isinstance(text, (str, bytes, bytearray)))
     return sum(texts) // _HEADER_CHARS_PER_READ
+
+
+# The part the proxy's checks charge the request's HTTP header lines to, before they build the call's header fields
+# from them as the request setup does: refused past the request's own read cap, apart from its lists
+_REQUEST_HEADER_LINES: Final = "the request's HTTP headers"
+_REQUEST_HEADER_READ_CAP: Final = FALLBACK_WALK_READS_PER_ENTRY * MAX_FALLBACK_LIST_ENTRIES
+
+
+def _header_line_size(line: object) -> tuple[bool, int]:
+    """Whether a raw header line, the pair of its name and value, is an anthropic-beta line, and its characters"""
+    pair: Final[Sequence[object]] = line if is_object_sequence(line) and len(line) == 2 else (None, None)
+    name: Final = pair[0]
+    is_beta: Final = isinstance(name, (str, bytes)) and name.lower() in ("anthropic-beta", b"anthropic-beta")
+    return is_beta, sum(len(text) for text in pair if isinstance(text, (str, bytes, bytearray)))
+
+
+def charge_request_header_lines(lines: Collection[object], passes: int) -> None:
+    """
+    The request's HTTP header lines, as the server holds them, charged before ``passes`` passes over them build the
+    call's header fields: their number for each pass, then their characters by every 64, and the anthropic-beta lines
+    a join puts together once for each such line. Past FALLBACK_WALK_READS_PER_ENTRY reads per entry of the request's
+    budget the request is refused with 400 before any pass but the one that sizes them, whatever the server lets a
+    client send.
+    """
+    tally: Final = _FallbackTally.limited(_REQUEST_HEADER_LINES, None, "headers", read_cap=_REQUEST_HEADER_READ_CAP)
+    tally.charge(None, 0, passes * _length(lines), None)
+    sized: Final = tuple(_header_line_size(line) for line in lines)
+    tally.charge(None, 0, sum(chars for _, chars in sized) // _HEADER_CHARS_PER_READ, None)
+    beta_chars: Final = tuple(chars for is_beta, chars in sized if is_beta)
+    tally.charge(None, 0, len(beta_chars) * sum(beta_chars) // _HEADER_CHARS_PER_READ, None)
 
 
 def _charge_header_lines(walk: _FallbackRead, headers: object, field: str) -> None:
