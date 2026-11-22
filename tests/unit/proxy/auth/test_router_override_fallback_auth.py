@@ -15,7 +15,7 @@ import sys
 from collections.abc import Callable, Coroutine, Iterable, Iterator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from functools import partial
+from functools import partial, reduce
 from pathlib import Path
 from types import MappingProxyType, ModuleType
 from typing import Final
@@ -3602,6 +3602,246 @@ def test_a_configured_list_changed_between_two_checks_of_one_request_is_seen_by_
 
     assert later_check_refusal is not None and _THE_SHAPE_REFUSAL in later_check_refusal
     assert router_refusal is not None and _THE_SHAPE_REFUSAL in router_refusal
+
+
+# -- iter_request_fallback_targets: every target a body holds, read the widest way, for code outside the package ----
+
+
+def _described(targets: Iterable[object]) -> list[str]:  # mutable-ok: a sorted list for an equality assertion
+    """Targets as their JSON, sorted, so a hand-written list compares with what a reading handed out in any order"""
+    return sorted(json.dumps(target, sort_keys=True) for target in targets)
+
+
+# (body, the targets iter_request_fallback_targets hands out, the targets the base's function handed out), each list
+# written by hand: the base's from its source, which read the three LiteLLM fields of the body and of its
+# router_settings_override, every value of a mapping without a string `model`, the same three fields of a target, and
+# handed out every mapping but a model group map, every value a list
+_TARGET_ROWS: Final = (
+    pytest.param(
+        {
+            "model": "requested",
+            "fallbacks": ["a", {"model": "b"}],
+            "context_window_fallbacks": [{"requested": ["c", {"model": "d"}]}],
+            "content_policy_fallbacks": [{"requested": ["e"]}],
+        },
+        ["a", {"model": "b"}, "c", {"model": "d"}, "e"],
+        ["a", {"model": "b"}, "c", {"model": "d"}, "e"],
+        id="the-three-lists",
+    ),
+    pytest.param(
+        {
+            "model": "requested",
+            "router_settings_override": {
+                "fallbacks": ["a"],
+                "context_window_fallbacks": [{"requested": [{"model": "b"}]}],
+                "content_policy_fallbacks": [{"requested": ["c"]}],
+            },
+        },
+        ["a", {"model": "b"}, "c"],
+        ["a", {"model": "b"}, "c"],
+        id="the-overrides-lists",
+    ),
+    pytest.param(
+        {"model": "requested", "fallbacks": [{"requested": ["a", {"model": "b"}]}]},
+        [{"requested": ["a", {"model": "b"}]}, "a", {"model": "b"}],
+        ["a", {"model": "b"}],
+        id="a-group-map-litellms-own-loop-merges",
+    ),
+    pytest.param(
+        {"model": "requested", "fallbacks": [{"model": "a", "fallbacks": ["b", {"model": "c"}]}]},
+        [{"model": "a", "fallbacks": ["b", {"model": "c"}]}, "b", {"model": "c"}],
+        [{"model": "a", "fallbacks": ["b", {"model": "c"}]}, "b", {"model": "c"}],
+        id="a-targets-own-list",
+    ),
+    pytest.param(
+        {
+            "model": "requested",
+            "context_window_fallbacks": [
+                {"requested": [{"model": "a", "context_window_fallbacks": [{"a": [{"model": "b", "timeout": 5}]}]}]}
+            ],
+        },
+        [
+            {"model": "a", "context_window_fallbacks": [{"a": [{"model": "b", "timeout": 5}]}]},
+            {"model": "b", "timeout": 5},
+        ],
+        [
+            {"model": "a", "context_window_fallbacks": [{"a": [{"model": "b", "timeout": 5}]}]},
+            {"model": "b", "timeout": 5},
+        ],
+        id="a-mapping-target-at-depth-two",
+    ),
+    pytest.param(
+        {"model": "requested", "fallbacks": "default", "extra_headers": dict(_THE_BETA_HEADER)},
+        [],
+        [],
+        id="default-under-the-beta",
+    ),
+    pytest.param(
+        {"model": "requested", "fallbacks": [{"model": "a"}, {"timeout": 5, "stop": ["END"]}]},
+        [{"model": "a"}, {"timeout": 5, "stop": ["END"]}, "END"],
+        [{"model": "a"}, {"timeout": 5, "stop": ["END"]}, "END"],
+        id="a-parameter-override-read-both-ways",
+    ),
+    pytest.param(
+        {"model": "requested", "context_window_fallback_dict": {"small": "big", "other": {"model": "x"}}},
+        ["big", {"model": "x"}],
+        [],
+        id="the-models-a-context-window-fallback-dict-swaps-in",
+    ),
+    pytest.param(
+        {"model": "requested", "router_fallbacks": [{"requested": ["a"]}], "default_fallbacks": ["b"]},
+        [{"requested": ["a"]}, "a", "b"],
+        [],
+        id="router-fallbacks-and-default-fallbacks",
+    ),
+    pytest.param(
+        {"model": "requested", "fallbacks": {"a": [{"model": "b"}]}},
+        ["a", {"model": "b"}],
+        [],
+        id="a-mapping-in-a-lists-place",
+    ),
+)
+
+
+@pytest.mark.parametrize(("body", "targets", "base_targets"), _TARGET_ROWS)
+def test_iter_request_fallback_targets_hands_out_every_target_a_body_holds(
+    body: Mapping[str, object], targets: Sequence[object], base_targets: Sequence[object]
+) -> None:
+    """
+    A proxy callback outside this package imports iter_request_fallback_targets to apply a rule of its own to every
+    fallback target of a request. It reads every place the walk of the lists reads, in both readings of `fallbacks`,
+    whatever the route and the headers: the three lists, the override's, a target's own at every depth, the models a
+    context_window_fallback_dict swaps in, `router_fallbacks`, `default_fallbacks` and a mapping in a list's place. A
+    model group map is handed out where litellm.acompletion's own loop merges it, in `fallbacks`, and where the
+    Router's client-side format can, in `router_fallbacks`; `"default"` holds no target.
+    """
+    from litellm.proxy.auth.auth_utils import iter_request_fallback_targets
+
+    assert _described(iter_request_fallback_targets(body)) == _described(targets)
+
+
+@pytest.mark.parametrize(("body", "targets", "base_targets"), _TARGET_ROWS)
+def test_iter_request_fallback_targets_hands_out_every_target_the_base_function_did(
+    body: Mapping[str, object], targets: Sequence[object], base_targets: Sequence[object]
+) -> None:
+    """
+    The function is never weaker than the one of the same name before this pull request: every target that one handed
+    out for each body, written by hand from its source, is handed out
+    """
+    from litellm.proxy.auth.auth_utils import iter_request_fallback_targets
+
+    handed_out: Final = frozenset(_described(iter_request_fallback_targets(body)))
+
+    assert frozenset(_described(base_targets)) <= handed_out
+    assert frozenset(_described(base_targets)) <= frozenset(_described(targets))
+
+
+@pytest.mark.parametrize("shape", ["the-checked-readings-entry-limit", "values-only-the-other-reading-reads"])
+def test_iter_request_fallback_targets_reads_a_body_the_checks_passed_whole_and_refuses_nothing(shape: str) -> None:
+    """
+    Proxy callbacks run after the proxy's checks, so a body they passed must not be refused here. On /v1/messages
+    without the beta the checks read LiteLLM's reading alone: the review's nested body at the entry limit, 1,000
+    entries, passes them, and so does a parameter-only target whose metadata note holds 200,000 names, which that
+    reading merges without reading its values. The function reads both readings, more than the checks charged, and
+    hands out every target: the ten mappings and 990 names; or the two mappings, the note's key and its one name.
+    """
+    from litellm.proxy.auth.auth_utils import is_request_body_safe, iter_request_fallback_targets
+
+    body: Final = {
+        "model": "requested",
+        **(
+            {"fallbacks": _nested_fallbacks(990)}
+            if shape == "the-checked-readings-entry-limit"
+            else _parameter_only_fallbacks("metadata", 200_000)
+        ),
+    }
+    request: Final = _messages_request(_WITHOUT_THE_BETA)
+
+    assert is_request_body_safe(
+        body, {}, _router_without_fallback_group(), "requested", route="/v1/messages", request=request
+    )
+    targets: Final = tuple(iter_request_fallback_targets(body))
+    if shape == "the-checked-readings-entry-limit":
+        assert len(targets) == 1_000
+        assert {target for target in targets if isinstance(target, str)} == {f"n{index}" for index in range(990)}
+        return
+    fallbacks: Final = body["fallbacks"]
+    assert isinstance(fallbacks, list)
+    assert [target if isinstance(target, str) else id(target) for target in targets] == [
+        id(fallbacks[0]),
+        id(fallbacks[1]),
+        "note",
+        "ab",
+    ]
+
+
+def _a_chain_of_targets(length: int) -> dict[str, object]:  # mutable-ok: a request body
+    """A body whose `fallbacks` holds a target whose own `fallbacks` holds the next, ``length`` targets deep"""
+    innermost: Final[dict[str, object]] = {"model": f"m{length - 1}"}  # mutable-ok: a target as a body sends it
+    return {
+        "fallbacks": [
+            reduce(
+                lambda inner, index: {"model": f"m{index}", "fallbacks": [inner]}, range(length - 2, -1, -1), innermost
+            )
+        ]
+    }
+
+
+def _a_target_whose_own_list_holds_it() -> dict[str, object]:  # mutable-ok: a request body
+    """A body whose one target's own `fallbacks` holds that target, as a library caller can build it"""
+    target: Final[dict[str, object]] = {"model": "m"}  # mutable-ok: the target its own list holds
+    target["fallbacks"] = [target]
+    return {"fallbacks": [target]}
+
+
+def _a_list_held_twice_at_every_level(levels: int) -> dict[str, object]:  # mutable-ok: a request body
+    """
+    ``levels`` model group maps, each mapping two groups to the same list, which holds the next map: a reading that
+    followed every path would read the innermost list 2 ** ``levels`` times
+    """
+    return {"fallbacks": reduce(lambda inner, _: [{"a": inner, "b": inner}], range(levels), ["x"])}
+
+
+@pytest.mark.parametrize(
+    ("shape", "reads", "targets"),
+    [
+        pytest.param("a-chain-of-5000-targets", 3 * 5_000 + 1, 5_000, id="a-chain-of-5000-targets"),
+        pytest.param("a-target-whose-own-list-holds-it", 5, 1, id="a-target-whose-own-list-holds-it"),
+        pytest.param("a-list-held-twice-at-20-levels", 3 * 20 + 3, 20 + 1, id="a-list-held-twice-at-20-levels"),
+    ],
+)
+def test_iter_request_fallback_targets_reads_each_place_of_an_unchecked_body_once(
+    monkeypatch: pytest.MonkeyPatch, shape: str, reads: int, targets: int
+) -> None:
+    """
+    A library caller's body that no check read: the function reads each place once, a mapping merged into a call, a
+    list or an entry, however deep it stands, however often the body holds it, and when the body holds itself, and
+    raises nothing. A chain of 5,000 targets is read in 3 places a target and 1 more, 15,001 reads, past any depth a
+    reader follows; the target in its own list in 5; twenty levels of a list held twice in 3 a level and 3 more, 63,
+    where following every path would read the innermost list 2 ** 20 times.
+    """
+    from litellm.proxy.auth import auth_utils
+    from litellm.proxy.auth.auth_utils import iter_request_fallback_targets
+
+    contents: Final = auth_utils._fallback_place_contents  # pyright: ignore[reportPrivateUsage]  # the one place read
+    read: Final[list[object]] = []  # mutable-ok: each read appends the place it read
+
+    def counted(place: object) -> object:
+        read.append(place)
+        return contents(place)  # pyright: ignore[reportArgumentType]  # a place the function made
+
+    monkeypatch.setattr(auth_utils, "_fallback_place_contents", counted)
+    body: Final = (
+        _a_chain_of_targets(5_000)
+        if shape == "a-chain-of-5000-targets"
+        else _a_target_whose_own_list_holds_it()
+        if shape == "a-target-whose-own-list-holds-it"
+        else _a_list_held_twice_at_every_level(20)
+    )
+    handed_out: Final = tuple(iter_request_fallback_targets(body))
+
+    assert len(read) == reads
+    assert len(handed_out) == targets
 
 
 @pytest.mark.asyncio
