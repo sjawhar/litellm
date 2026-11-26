@@ -70,6 +70,37 @@ def test_exit_flush_bounds_optional_work_and_restores_callers_budget() -> None:
     assert optional_callback_budget(3.0) == 3.0
 
 
+@pytest.mark.asyncio
+async def test_flush_waits_for_a_callback_the_full_queue_rejected() -> None:
+    """A full queue parks a callback on a background task instead of queueing it, so a flush that
+    only joined the queue could return while that spend write had not run. The shutdown drain is
+    built on this flush (dispatch://INFRA-6002)."""
+
+    async def retry_at_once(_delay: float) -> None:
+        return None
+
+    worker: Final = LoggingWorker(timeout=2.0, max_queue_size=1, concurrency=1, retry_sleep=retry_at_once)
+    ran: Final[list[str]] = []  # mutable-ok: records which callbacks finished, which is the assertion
+
+    async def queued_callback() -> None:
+        await asyncio.sleep(0.05)
+        ran.append("queued")
+
+    async def rejected_callback() -> None:
+        ran.append("rejected")
+
+    worker._ensure_queue()
+    worker.enqueue(queued_callback())
+    worker.enqueue(rejected_callback())
+    try:
+        await asyncio.wait_for(worker.flush(), timeout=10)
+    finally:
+        await worker.stop()
+
+    assert sorted(ran) == ["queued", "rejected"], f"flush returned with callbacks still pending: {ran}"
+
+
+
 class _RecordCollector(logging.Handler):
     """Captures emitted log records so a test can assert on real logging output
     (level, message args, traceback) instead of patching the logger object."""

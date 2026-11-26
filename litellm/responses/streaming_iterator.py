@@ -184,7 +184,7 @@ def _running_loop() -> asyncio.AbstractEventLoop | None:
         return None
 
 
-def _spawn_logging_task(
+def spawn_logging_task(
     running_loop: asyncio.AbstractEventLoop, coroutine: Coroutine[object, object, object], *, task_name: str
 ) -> asyncio.Task[object]:
     task: Final = running_loop.create_task(coroutine)
@@ -192,6 +192,14 @@ def _spawn_logging_task(
     task.add_done_callback(_PENDING_LOGGING_TASKS.discard)
     task.add_done_callback(lambda done: _log_background_task_failure(done, task_name=task_name))
     return task
+
+
+async def drain_logging_tasks(timeout: float = 5.0) -> None:
+    if not _PENDING_LOGGING_TASKS:
+        return
+    _, pending = await asyncio.wait(tuple(_PENDING_LOGGING_TASKS), timeout=timeout)
+    if pending:
+        verbose_logger.warning("Timed out draining logging tasks on shutdown: %d tasks still alive", len(pending))
 
 
 _ERROR_CODE_HTTP_STATUS: Final[Mapping[str, int]] = MappingProxyType(
@@ -872,7 +880,7 @@ class BaseResponsesAPIStreamingIterator:
         running_loop: Final = _running_loop()
         if running_loop is not None:
             self._record_pending_logging_task(
-                _spawn_logging_task(
+                spawn_logging_task(
                     running_loop,
                     async_post_call_success_deployment_hook(
                         request_data=request_payload,
@@ -908,7 +916,7 @@ class BaseResponsesAPIStreamingIterator:
         running_loop: Final = _running_loop()
         if running_loop is not None:
             self._record_pending_logging_task(
-                _spawn_logging_task(
+                spawn_logging_task(
                     running_loop,
                     self._run_failure_handlers_in_order(exception, traceback_exception, end_time),
                     task_name="Responses stream failure logging",

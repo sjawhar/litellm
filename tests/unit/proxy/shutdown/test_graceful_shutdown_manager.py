@@ -179,3 +179,27 @@ async def test_emits_periodic_drain_waiting_log_while_waiting():
         timeout=10, count_fn=count_fn, poll_interval=0, log_interval=0
     )
     assert drained == 3
+
+
+# ── remaining budget ──────────────────────────────────────────────────────────
+
+
+def test_remaining_is_the_whole_timeout_before_shutdown_starts(monkeypatch):
+    monkeypatch.setenv("GRACEFUL_SHUTDOWN_TIMEOUT", "30")
+    assert GracefulShutdownManager.remaining() == 30.0
+
+
+def test_remaining_counts_down_while_the_teardown_runs(monkeypatch):
+    """The teardown's drain, its callback flush and its last spend commit share one window, so each
+    step has to ask what is left rather than take the whole timeout again."""
+    monkeypatch.setenv("GRACEFUL_SHUTDOWN_TIMEOUT", "30")
+    elapsed = [0.0]
+    GracefulShutdownManager.start_shutdown(clock=lambda: elapsed[0])
+
+    elapsed[0] = 12.0
+    assert GracefulShutdownManager.remaining(clock=lambda: elapsed[0]) == 18.0
+    assert GracefulShutdownManager.remaining(5.0, clock=lambda: elapsed[0]) == 5.0
+
+    elapsed[0] = 45.0
+    assert GracefulShutdownManager.remaining(clock=lambda: elapsed[0]) == 0.0
+    assert GracefulShutdownManager.remaining(5.0, clock=lambda: elapsed[0]) == 0.0

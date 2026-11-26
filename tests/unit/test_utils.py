@@ -9417,3 +9417,34 @@ def test_runtime_model_cost_registrations_resolve_bedrock_routing(monkeypatch: p
     )
     assert registrations[key] == rates
     assert model_utils.runtime_model_cost_registrations("bedrock/converse/openai.other-converse", "bedrock") == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deferred", (False, True))
+async def test_success_enqueue_is_tracked_without_starting_callbacks_synchronously(deferred: bool) -> None:
+    from litellm.litellm_core_utils.litellm_logging import Logging
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+    from litellm.responses.streaming_iterator import drain_logging_tasks
+    from litellm.utils import _schedule_async_success_logging
+
+    now: Final = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    logging_obj: Final = Logging(
+        model="gpt-4o-mini",
+        messages=[],
+        stream=False,
+        call_type="acompletion",
+        start_time=now,
+        litellm_call_id="shutdown-enqueue",
+        function_id="shutdown-enqueue",
+    )
+    logging_obj.defer_async_logging = deferred
+    _schedule_async_success_logging(logging_obj, ModelResponse(), now, now, False)
+    if deferred:
+        assert not logging_obj.async_success_log_enqueued
+        assert logging_obj.enqueue_deferred_logging is not None
+        logging_obj.enqueue_deferred_logging()
+    assert "has_logged_async_success" not in logging_obj.model_call_details
+    await drain_logging_tasks()
+    assert GLOBAL_LOGGING_WORKER.pending_count > 0, "Tracked enqueue must finish before worker draining starts"
+    await GLOBAL_LOGGING_WORKER.flush()
+    assert logging_obj.model_call_details["has_logged_async_success"] is True

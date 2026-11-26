@@ -70,7 +70,7 @@ class GracefulShutdownManager:
             return DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT
 
     @classmethod
-    def start_shutdown(cls) -> None:
+    def start_shutdown(cls, clock: Callable[[], float] = time.monotonic) -> None:
         """
         Mark the worker as draining. Idempotent — repeated calls (e.g. SIGTERM
         followed by a preStop hit on /health/drain) do not reset the clock.
@@ -78,11 +78,18 @@ class GracefulShutdownManager:
         if cls._is_shutting_down:
             return
         cls._is_shutting_down = True
-        cls._shutdown_started_at = time.monotonic()
+        cls._shutdown_started_at = clock()
         verbose_proxy_logger.info(
             "graceful_shutdown_started in_flight_requests=%s",
             get_in_flight_requests(),
         )
+
+    @classmethod
+    def remaining(cls, cap: float | None = None, *, clock: Callable[[], float] = time.monotonic) -> float:
+        """Seconds left of the shutdown budget, so the teardown's later steps share one window."""
+        elapsed: Final = 0.0 if cls._shutdown_started_at is None else clock() - cls._shutdown_started_at
+        remaining: Final = max(0.0, cls.get_timeout() - elapsed)
+        return remaining if cap is None else min(max(0.0, cap), remaining)
 
     @classmethod
     async def wait_for_drain(

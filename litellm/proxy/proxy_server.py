@@ -69,6 +69,7 @@ from litellm.constants import (
     DEFAULT_SHARED_HEALTH_CHECK_LOCK_TTL,
     DEFAULT_SHARED_HEALTH_CHECK_TTL,
     DEFAULT_SLACK_ALERTING_THRESHOLD,
+    GRACEFUL_SHUTDOWN_TEARDOWN_HEADROOM_SECONDS,
     LANGFUSE_SHUTDOWN_FLUSH_TIMEOUT_MILLIS,
     LITELLM_EMBEDDING_PROVIDERS_SUPPORTING_INPUT_ARRAY_OF_TOKENS,
     LITELLM_SETTINGS_SAFE_DB_OVERRIDES,
@@ -85,6 +86,7 @@ from litellm.litellm_core_utils.bug_report import (
 from litellm.litellm_core_utils.litellm_logging import (
     _init_custom_logger_compatible_class,
 )
+from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER, LoggingWorker
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 from litellm.litellm_core_utils.safe_json_loads import safe_json_loads
 from litellm.litellm_core_utils.token_counter import offload_token_count
@@ -919,6 +921,7 @@ from litellm.proxy.video_endpoints.endpoints import router as video_router
 from litellm.repositories.base_repository import SupportsModelDump
 from litellm.repositories.credentials_repository import CredentialsRepository
 from litellm.repositories.prisma_protocols import TableActions
+from litellm.responses.streaming_iterator import drain_logging_tasks
 from litellm.router import (
     AssistantsTypedDict,
     Deployment,
@@ -1204,6 +1207,48 @@ async def _flush_spend_logs_queue_on_shutdown() -> None:
         )
     except Exception as e:  # noqa: BLE001  # shutdown must continue even if the drain fails
         verbose_proxy_logger.exception("Error flushing spend logs queue on shutdown: %s", e)
+
+
+async def _flush_spend_on_shutdown() -> None:
+    from litellm.proxy.utils import update_daily_tag_spend
+
+    await flush_spend_counters_on_shutdown()
+    if prisma_client is not None:
+        await update_daily_tag_spend(prisma_client=prisma_client, proxy_logging_obj=proxy_logging_obj)
+    await _flush_spend_logs_queue_on_shutdown()
+
+
+async def _flush_spend_around_logging_drain_on_shutdown(
+    flush_spend: Callable[[], Awaitable[None]] = _flush_spend_on_shutdown,
+    *,
+    worker: LoggingWorker = GLOBAL_LOGGING_WORKER,
+    clock: Callable[[], float] = time.monotonic,
+    drain_tasks: Callable[[float], Awaitable[None]] = drain_logging_tasks,
+) -> None:
+    await flush_spend()
+    remaining: Final = GracefulShutdownManager.remaining(clock=clock)
+    callback_timeout: Final = max(0.0, remaining - GRACEFUL_SHUTDOWN_TEARDOWN_HEADROOM_SECONDS)
+    verbose_proxy_logger.info(
+        "Draining success callbacks before the final spend flush remaining_s=%.3f callback_timeout_s=%.3f",
+        remaining,
+        callback_timeout,
+    )
+
+    async def drain_callbacks() -> None:
+        await drain_tasks(callback_timeout)
+        await worker.flush()
+
+    try:
+        await asyncio.wait_for(drain_callbacks(), timeout=callback_timeout)
+    except asyncio.TimeoutError:
+        verbose_proxy_logger.warning(
+            "Success callback shutdown budget exhausted with %d unfinished callbacks; accounting may be incomplete",
+            worker.pending_count,
+        )
+    finally:
+        await worker.stop(discard_pending=True, timeout=GracefulShutdownManager.remaining(2.0, clock=clock))
+    await drain_tasks(GracefulShutdownManager.remaining(5.0, clock=clock))
+    await flush_spend()
 
 
 async def proxy_shutdown_event(worker_heartbeat: ProxyWorkerHeartbeat | None = None) -> None:
@@ -1823,9 +1868,7 @@ async def proxy_startup_event(app: FastAPI) -> AsyncGenerator[ProxyLifespanState
                 except Exception as e:
                     verbose_proxy_logger.error("Error stopping in-flight scheduled jobs: %s", e)
 
-            await flush_spend_counters_on_shutdown()
-
-            await _flush_spend_logs_queue_on_shutdown()
+            await _flush_spend_around_logging_drain_on_shutdown()
 
             await proxy_config.stop_config_sync_subscriber()
 
