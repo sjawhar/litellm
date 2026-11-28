@@ -49,12 +49,15 @@ USER root
 COPY --from=uvbin /uv /usr/local/bin/uv
 COPY --from=uvbin /uvx /usr/local/bin/uvx
 
+# The Rust toolchain is pinned to one Wolfi revision: it compiles litellm/rust_bridge/_native.abi3.so, and an
+# unpinned `rust` takes whatever revision Wolfi serves on the build day, so two builds of one commit can run
+# different native code. Move to another toolchain by changing the `rust-1.100=` pin below.
 RUN for i in 1 2 3; do \
       apk add --no-cache \
         python-3.13 \
         python-3.13-dev \
         gcc \
-        rust \
+        rust-1.100=1.100.0-r0 \
         bash \
         coreutils \
         curl \
